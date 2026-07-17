@@ -1,0 +1,164 @@
+// Package lifeproto is daemonkit's native lifecycle envelope over wire.Framing:
+// one LF-delimited JSON object per message, always {"v":1,"op":...} plus
+// op-specific fields. The wire format is frozen — field names, op strings, and
+// key order are a compatibility contract with the Swift DaemonKit peer, which
+// pins the same lifeProtocolVersion; golden-bytes tests hold both sides in sync.
+package lifeproto
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	"github.com/yasyf/daemonkit/wire"
+)
+
+// Version is the lifecycle protocol version carried in every envelope's "v"
+// field. The Swift peer pins the same constant; it must equal 1.
+const Version = 1
+
+// The op strings name each lifecycle operation. Frozen wire values.
+const (
+	OpHealth   = "health"
+	OpShutdown = "shutdown"
+	OpHello    = "hello"
+	OpHandoff  = "handoff"
+)
+
+// ErrProtocolVersion means a decoded envelope carried a "v" other than Version.
+var ErrProtocolVersion = errors.New("lifeproto: unsupported protocol version")
+
+// Envelope is the {v, op} header every message begins with; ReadEnvelope decodes
+// it to dispatch on Op before the concrete request type is known.
+type Envelope struct {
+	V  int    `json:"v"`
+	Op string `json:"op"`
+}
+
+// HealthRequest asks the peer for its health snapshot.
+type HealthRequest struct {
+	V  int    `json:"v"`
+	Op string `json:"op"`
+}
+
+// HealthResponse is the peer's health snapshot. Features is the only source of
+// capability truth — never a version compare.
+type HealthResponse struct {
+	V        int      `json:"v"`
+	Op       string   `json:"op"`
+	Version  string   `json:"version"`
+	PID      int      `json:"pid"`
+	State    string   `json:"state"`
+	Draining bool     `json:"draining"`
+	Busy     bool     `json:"busy"`
+	Features []string `json:"features"`
+}
+
+// ShutdownRequest asks the peer to shut down.
+type ShutdownRequest struct {
+	V  int    `json:"v"`
+	Op string `json:"op"`
+}
+
+// ShutdownResponse acknowledges a shutdown request.
+type ShutdownResponse struct {
+	V  int    `json:"v"`
+	Op string `json:"op"`
+	OK bool   `json:"ok"`
+}
+
+// HelloRequest opens the capability handshake.
+type HelloRequest struct {
+	V  int    `json:"v"`
+	Op string `json:"op"`
+}
+
+// HelloResponse announces the peer's protocol version (the "v" field) and its
+// advertised feature bits.
+type HelloResponse struct {
+	V        int      `json:"v"`
+	Op       string   `json:"op"`
+	Features []string `json:"features"`
+}
+
+// HandoffRequest asks the peer to release its socket for a successor.
+type HandoffRequest struct {
+	V  int    `json:"v"`
+	Op string `json:"op"`
+}
+
+// HandoffResponse acknowledges a handoff request.
+type HandoffResponse struct {
+	V  int    `json:"v"`
+	Op string `json:"op"`
+	OK bool   `json:"ok"`
+}
+
+// NewHealthRequest builds a health request at the current protocol version.
+func NewHealthRequest() HealthRequest { return HealthRequest{V: Version, Op: OpHealth} }
+
+// NewHealthResponse builds a health snapshot; a nil features slice encodes as [].
+func NewHealthResponse(version string, pid int, state string, draining, busy bool, features []string) HealthResponse {
+	return HealthResponse{
+		V: Version, Op: OpHealth, Version: version, PID: pid, State: state,
+		Draining: draining, Busy: busy, Features: nonNil(features),
+	}
+}
+
+// NewShutdownRequest builds a shutdown request.
+func NewShutdownRequest() ShutdownRequest { return ShutdownRequest{V: Version, Op: OpShutdown} }
+
+// NewShutdownResponse builds a shutdown acknowledgement.
+func NewShutdownResponse(ok bool) ShutdownResponse {
+	return ShutdownResponse{V: Version, Op: OpShutdown, OK: ok}
+}
+
+// NewHelloRequest builds a hello request.
+func NewHelloRequest() HelloRequest { return HelloRequest{V: Version, Op: OpHello} }
+
+// NewHelloResponse builds a hello announcement; a nil features slice encodes as [].
+func NewHelloResponse(features []string) HelloResponse {
+	return HelloResponse{V: Version, Op: OpHello, Features: nonNil(features)}
+}
+
+// NewHandoffRequest builds a handoff request.
+func NewHandoffRequest() HandoffRequest { return HandoffRequest{V: Version, Op: OpHandoff} }
+
+// NewHandoffResponse builds a handoff acknowledgement.
+func NewHandoffResponse(ok bool) HandoffResponse {
+	return HandoffResponse{V: Version, Op: OpHandoff, OK: ok}
+}
+
+// Write marshals msg to a compact JSON frame and writes it over f.
+func Write(f *wire.Framing, msg any) error {
+	if err := f.WriteJSON(msg); err != nil {
+		return fmt.Errorf("lifeproto: write: %w", err)
+	}
+	return nil
+}
+
+// ReadEnvelope reads one frame and returns its {v, op} envelope plus the raw
+// frame bytes, so a server dispatches on Op and then unmarshals the raw bytes
+// into the concrete request type. It rejects a mismatched protocol version with
+// ErrProtocolVersion.
+func ReadEnvelope(f *wire.Framing) (Envelope, []byte, error) {
+	b, err := f.ReadFrame()
+	if err != nil {
+		return Envelope{}, nil, err
+	}
+	var e Envelope
+	if err := json.Unmarshal(b, &e); err != nil {
+		return Envelope{}, nil, fmt.Errorf("lifeproto: decode envelope: %w", err)
+	}
+	if e.V != Version {
+		return Envelope{}, nil, fmt.Errorf("%w: got v=%d, want %d", ErrProtocolVersion, e.V, Version)
+	}
+	return e, b, nil
+}
+
+func nonNil(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
+}
