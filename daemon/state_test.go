@@ -140,6 +140,28 @@ func TestStateFileUpdateUnlocked(t *testing.T) {
 	}
 }
 
+// TestStateFileReadErrorPropagates: a failing read (here the path is a
+// directory) aborts Update before mutate ever runs, so a transient read error
+// never rewrites the state file from empty.
+func TestStateFileReadErrorPropagates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sf := StateFile{Path: path}
+	err := sf.Update(context.Background(), func(map[string]json.RawMessage) error {
+		t.Error("mutate ran on a failed read")
+		return nil
+	})
+	if err == nil {
+		t.Fatal("Update succeeded on an unreadable state file, want error")
+	}
+	fi, statErr := os.Stat(path)
+	if statErr != nil || !fi.IsDir() {
+		t.Errorf("state path clobbered after a read error: %v", statErr)
+	}
+}
+
 // TestStateFileMutateErrorAborts: a mutate error propagates and nothing is written.
 func TestStateFileMutateErrorAborts(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")

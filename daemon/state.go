@@ -55,11 +55,14 @@ func (s StateFile) UpdateUnlocked(mutate Mutate) error {
 
 func (s StateFile) read() (map[string]json.RawMessage, error) {
 	data, err := os.ReadFile(s.Path)
-	if errors.Is(err, os.ErrNotExist) || len(data) == 0 {
+	if errors.Is(err, os.ErrNotExist) {
 		return map[string]json.RawMessage{}, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("read state %s: %w", s.Path, err)
+	}
+	if len(data) == 0 {
+		return map[string]json.RawMessage{}, nil
 	}
 	var state map[string]json.RawMessage
 	if err := json.Unmarshal(data, &state); err != nil {
