@@ -11,7 +11,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 
 base="$outdir/.fixture-base"
 (cd "$root" && CGO_ENABLED=0 go build -o "$base" ./internal/trustfixture)
-for f in fixture-devid-a fixture-devid-b fixture-adhoc; do
+for f in fixture-devid-a fixture-devid-b fixture-devid-unhardened fixture-adhoc; do
   cp "$base" "$outdir/$f"
 done
 rm -f "$base"
@@ -22,14 +22,18 @@ codesign --force --sign "$DAEMONKIT_SIGN_IDENTITY" \
 codesign --force --sign "$DAEMONKIT_SIGN_IDENTITY" \
   --identifier com.yasyf.daemonkit.fixture-b --options runtime --timestamp \
   "$outdir/fixture-devid-b"
+# Developer ID but NO hardened runtime — exercises the CS_RUNTIME rejection.
+codesign --force --sign "$DAEMONKIT_SIGN_IDENTITY" \
+  --identifier com.yasyf.daemonkit.fixture-unhardened --timestamp \
+  "$outdir/fixture-devid-unhardened"
 codesign --force --sign - \
   --identifier com.yasyf.daemonkit.fixture-adhoc \
   "$outdir/fixture-adhoc"
 
-for f in fixture-devid-a fixture-devid-b fixture-adhoc; do
+for f in fixture-devid-a fixture-devid-b fixture-devid-unhardened fixture-adhoc; do
   codesign --verify --strict "$outdir/$f"
   echo "$f:"
   codesign --display --verbose=2 "$outdir/$f" 2>&1 |
     sed -nE 's/^(Identifier=|TeamIdentifier=|Authority=)/  \1/p'
 done
-echo "trust-fixtures: wrote 3 verified fixtures to $outdir"
+echo "trust-fixtures: wrote 4 verified fixtures to $outdir"

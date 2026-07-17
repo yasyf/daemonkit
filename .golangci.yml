@@ -21,6 +21,12 @@ linters:
     - staticcheck
     - unused
   settings:
+    govet:
+      # unsafeptr: trust/ and appgroup/ deref dlsym'd C data symbols (fixed dyld
+      # addresses, not Go pointers) — legitimate FFI its heuristic can't tell from
+      # a bug. Kept in lockstep with the -unsafeptr=false vet step.
+      disable:
+        - unsafeptr
     errcheck:
       # Best-effort teardown closes are the package idiom (ported from fusekit);
       # a failed Close on these paths has no caller-visible remedy.

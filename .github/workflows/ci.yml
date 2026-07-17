@@ -26,7 +26,10 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Vet
-        run: go vet ./...
+        # -unsafeptr=false: trust/ and appgroup/ deref dlsym'd C data symbols
+        # (fixed dyld addresses) — legitimate FFI vet's unsafeptr can't tell from
+        # a bug. Every other analyzer stays on.
+        run: go vet -unsafeptr=false ./...
       - name: Test (race, via the process-cap harness)
         run: ./scripts/test.sh -race ./...
       - name: Build (pure)
