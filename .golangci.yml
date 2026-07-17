@@ -35,10 +35,12 @@ linters:
       # by design, not by defect.
       - linters: [gosec]
         text: "G204"
-      # File-path APIs (Info.plist readers, lock files) open caller-supplied
-      # paths by design.
+      # File-path and socket APIs (Info.plist readers, lock files, unix-socket
+      # dials) take caller-supplied paths by design.
       - linters: [gosec]
         text: "G304"
+      - linters: [gosec]
+        text: "G704"
       # Best-effort teardown closes are the package idiom (ported from fusekit);
       # exclude-functions can't name every concrete Close method.
       - linters: [errcheck]

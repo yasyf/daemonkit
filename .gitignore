@@ -33,6 +33,9 @@ coverage.txt
 # bootstrap verify binary smoke test
 .go-smoke/
 
+# signed trust E2E fixtures (regenerate: scripts/trust-fixtures.sh)
+.trust-fixtures/
+
 # Xcode
 DerivedData/
 *.xcuserstate
