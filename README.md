@@ -57,12 +57,12 @@ One row per package; the Status column is the extraction's live state.
 
 | Surface | Owns | Status |
 |---|---|---|
-| `proc` | Detached spawn, single-entrant sockets, process caps, orphan reaping | Porting from fusekit |
-| `service` | LaunchAgent + keepalive-app reconciliation | Porting from fusekit |
-| `version` | Release/dev version taxonomy, newest-wins skew | Porting from cc-interact |
-| `paths` | Per-app dotdir conventions | Porting from cc-interact |
-| `appgroup` | App Group container resolution, cgo-free | Porting from fusekit |
-| `bundle` | Info.plist reads, stable `.app` path conventions | Designed |
+| `proc` | Detached spawn, single-entrant sockets, process caps, child reaping | Landed |
+| `service` | LaunchAgent + keepalive-app reconciliation | Landed |
+| `version` | Release/dev version taxonomy, newest-wins skew | Landed |
+| `paths` | Per-app dotdir conventions | Landed |
+| `appgroup` | App Group container resolution, cgo-free | Landed |
+| `bundle` | Info.plist reads, stable `.app` path conventions | Landed |
 | `wire` | LF-JSON framing, bounded serve loop, peer credentials | Designed |
 | `trust` | Codesign peer verification (audit-token designated requirements) | Designed |
 | `daemon` | Takeover ladder, skew watch, idle exit | Designed |
