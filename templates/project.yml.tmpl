@@ -1,0 +1,147 @@
+# XcodeGen spec for a daemonkit host app + WidgetKit appex + hostless test
+# bundle. Generalized from cc-pool's widget/project.yml.
+#
+# Rendered by repo-bootstrap's daemonkit layer: every `__PLACEHOLDER__` below is
+# substituted at scaffold time. `xcodegen generate` then emits
+# __APP_NAME__.xcodeproj plus the Info.plists under Generated/ (gitignored) —
+# this file stays the source of truth.
+#
+# Version keys are REFERENCES, never literals: CFBundleShortVersionString /
+# CFBundleVersion resolve $(MARKETING_VERSION)/$(CURRENT_PROJECT_VERSION), which
+# come from a per-build Version.xcconfig written by gen-version-xcconfig.sh
+# (build number = epoch-nanos, unique per build). Run the generator BEFORE
+# `xcodegen generate`; the xcconfig is gitignored and never carries a static
+# build number. Do NOT set MARKETING_VERSION/CURRENT_PROJECT_VERSION in any
+# `settings:` block — a target/project build setting overrides the xcconfig.
+#
+# Signing: Manual with an ad-hoc identity ("-") by default so a plain
+# `xcodebuild build CODE_SIGNING_ALLOWED=NO` works with no Apple ID. Release CI
+# overrides on the command line (CODE_SIGN_IDENTITY, DEVELOPMENT_TEAM,
+# PROVISIONING_PROFILE_SPECIFIER) and signs inward-out per target.
+name: __APP_NAME__
+options:
+  bundleIdPrefix: __BUNDLE_ID__
+  deploymentTarget:
+    macOS: "__DEPLOYMENT_TARGET__"
+  createIntermediateGroups: true
+
+# The generated, per-build version file supplies MARKETING_VERSION and
+# CURRENT_PROJECT_VERSION as the base configuration for both configs. It is the
+# lowest-priority settings layer, so nothing in `settings:` may redefine those
+# two keys or it would win over the xcconfig.
+configFiles:
+  Debug: Version.xcconfig
+  Release: Version.xcconfig
+
+settings:
+  base:
+    SWIFT_VERSION: "__SWIFT_VERSION__"
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "-"
+    PRODUCT_NAME: $(TARGET_NAME)
+
+targetTemplates:
+  HostApp:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/App
+      - path: Sources/Shared
+    info:
+      properties:
+        CFBundleDisplayName: __DISPLAY_NAME__
+        # XcodeGen writes literal values into the generated plist; without these
+        # $(…) references the version build settings (from Version.xcconfig, plus
+        # any command-line overrides) never reach the bundle — and WidgetKit's
+        # chronod caches widget metadata keyed by bundle version.
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSUIElement: true # agent app: no Dock icon, no menu bar (never LSBackgroundOnly)
+        LSApplicationCategoryType: public.app-category.developer-tools
+
+targets:
+  __APP_NAME__:
+    templates: [HostApp]
+    info:
+      path: Generated/App-Info.plist
+    # Non-sandboxed (non-App-Store). The App Group is its ONLY entitlement — the
+    # profile-authorized claim that turns the first group-container access into a
+    # silent (no-prompt) TCC grant. See templates/entitlements/app.entitlements.tmpl.
+    entitlements:
+      path: __APP_NAME__.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: __BUNDLE_ID__
+        # Release CI installs this named profile into
+        # ~/Library/MobileDevice/Provisioning Profiles/ so xcodebuild resolves it
+        # by name; it authorizes the App Group claim. Harmless under ad-hoc local
+        # builds (Manual signing with identity "-" ignores it).
+        PROVISIONING_PROFILE_SPECIFIER: "__PROFILE_APP__"
+    dependencies:
+      - target: __APP_NAME__Widget
+        embed: true
+        codeSign: true
+
+  __APP_NAME__Widget:
+    # Legacy NSExtension-style WidgetKit appex (PlugIns/), the best-trodden
+    # XcodeGen path. If gallery discovery ever breaks, the ExtensionKit
+    # conversion is mechanical: type extensionkit-extension + replace the
+    # NSExtension dict with EXAppExtensionAttributes/EXExtensionPointIdentifier.
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: Sources/Widget
+      - path: Sources/Shared
+    info:
+      path: Generated/Widget-Info.plist
+      properties:
+        CFBundleDisplayName: __DISPLAY_NAME__
+        # Same $(…) wiring as the host app — the appex must carry the stamped
+        # version too; it is the bundle chronod actually inspects.
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    # macOS requires app extensions to be sandboxed; a home-relative read-only
+    # temporary exception grants the widget access to the app's dotdir. Sandbox
+    # exceptions are not provisioning-restricted, so this works with local
+    # signing. See templates/entitlements/widget.entitlements.tmpl.
+    entitlements:
+      path: __APP_NAME__Widget.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: __BUNDLE_ID__.widget
+        SKIP_INSTALL: true
+
+  __APP_NAME__Tests:
+    # Host-less unit-test bundle for PURE logic only. It compiles the code under
+    # test straight into the bundle — no TEST_HOST, no app launch, no signed
+    # appex — so it runs standalone in CI. Keep it pure: anything needing AppKit
+    # or a live system service belongs in the VM e2e, not here. UNUserNotification
+    # and other bundle-keyed APIs crash outside a real bundle — never touch them.
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests
+      - path: Sources/Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: __BUNDLE_ID__.tests
+        GENERATE_INFOPLIST_FILE: "YES"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+
+schemes:
+  __APP_NAME__:
+    build:
+      targets:
+        __APP_NAME__: all
+        __APP_NAME__Tests: [test]
+    test:
+      config: Debug
+      targets:
+        - __APP_NAME__Tests
+    run:
+      config: Debug
+    archive:
+      config: Release

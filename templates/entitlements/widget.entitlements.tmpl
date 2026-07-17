@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Widget appex entitlements: sandboxed (required for app extensions) with a
+     home-relative read-only temporary exception for the app's dotdir. Sandbox
+     exceptions are not provisioning-restricted, so this works with local
+     (ad-hoc) signing. The path is relative to the REAL home. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<key>com.apple.security.temporary-exception.files.home-relative-path.read-only</key>
+	<array>
+		<string>__HOME_REL_PATH__</string>
+	</array>
+</dict>
+</plist>

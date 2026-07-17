@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Host app entitlements: App Group only. Non-sandboxed (non-App-Store). The
+     Developer ID profile authorizes this group, so the first group-container
+     access is a silent (no-prompt) TCC grant. $(TeamIdentifierPrefix) expands to
+     the "<TEAMID>." literal at signing, yielding the "<TEAMID>.__APP_GROUP__"
+     App Group identifier. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>$(TeamIdentifierPrefix)__APP_GROUP__</string>
+	</array>
+</dict>
+</plist>

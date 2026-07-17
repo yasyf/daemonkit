@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Shared-container appex entitlements (File-Provider-style): sandboxed, App
+     Group (authorized by the Developer ID profile), plus a home-relative
+     read-write temporary exception resolved against the REAL home (pair with
+     getpwuid in Swift). Not wired into the default project — render + reference
+     it when a consumer adds a shared-container/File-Provider appex. Never add a
+     restricted entitlement (e.g. fileprovider.testing-mode) the profile can't
+     authorize. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>$(TeamIdentifierPrefix)__APP_GROUP__</string>
+	</array>
+	<key>com.apple.security.temporary-exception.files.home-relative-path.read-write</key>
+	<array>
+		<string>__HOME_REL_PATH__</string>
+	</array>
+</dict>
+</plist>
