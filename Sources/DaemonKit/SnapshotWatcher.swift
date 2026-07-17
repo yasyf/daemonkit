@@ -90,12 +90,12 @@ public final class SnapshotWatcher<S: Decodable & Sendable>: @unchecked Sendable
             queue: internalQueue
         )
         src.setEventHandler { [weak self] in self?.scheduleReload() }
+        src.setRegistrationHandler { [weak self] in self?.deliverCurrentState() }
         src.setCancelHandler { close(dirFD) }
         lock.lock()
         source = src
         lock.unlock()
         src.resume()
-        internalQueue.async { [weak self] in self?.deliverCurrentState() }
     }
 
     /// Stops watching. Safe to call more than once.

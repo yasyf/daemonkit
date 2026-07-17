@@ -134,7 +134,11 @@ public final class SocketServer: @unchecked Sendable {
         lock.unlock()
 
         var byte: UInt8 = 1
-        _ = write(wfd, &byte, 1)
+        var written: Int
+        repeat {
+            written = write(wfd, &byte, 1)
+        } while written == -1 && errno == EINTR
+        precondition(written == 1, "shutdown pipe write failed: errno \(errno)")
         acceptQueue.sync {}
         handlerGroup.wait()
 

@@ -40,32 +40,35 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
     }
 }
 
-@Test func enabledReconcilesToActiveWithoutSideEffects() throws {
-    let service = FakeLoginItemService(status: .enabled)
-    #expect(try LoginItem(service: service).reconcile() == .active)
-    #expect(service.registerCount == 0)
-    #expect(service.openedSettings == false)
-}
-
-@Test func requiresApprovalOpensSettingsAndPends() throws {
-    let service = FakeLoginItemService(status: .requiresApproval)
-    #expect(try LoginItem(service: service).reconcile() == .pendingApproval)
-    #expect(service.openedSettings == true)
-    #expect(service.registerCount == 0)
-}
-
-@Test(arguments: [LoginItemStatus.notFound, LoginItemStatus.notRegistered])
-func unregisteredStatusesRegister(status: LoginItemStatus) throws {
-    let service = FakeLoginItemService(status: status)
-    #expect(try LoginItem(service: service).reconcile() == .registered)
-    #expect(service.registerCount == 1)
-    #expect(service.openedSettings == false)
-}
-
-@Test func registrationFailureSurfacesTypedError() {
-    let service = FakeLoginItemService(status: .notRegistered, registerError: RegistrationBoom())
-    #expect(throws: LoginItemError.self) {
-        _ = try LoginItem(service: service).reconcile()
+@Suite(.timeLimit(.minutes(1)))
+struct LoginItemTests {
+    @Test func enabledReconcilesToActiveWithoutSideEffects() throws {
+        let service = FakeLoginItemService(status: .enabled)
+        #expect(try LoginItem(service: service).reconcile() == .active)
+        #expect(service.registerCount == 0)
+        #expect(service.openedSettings == false)
     }
-    #expect(service.registerCount == 1)
+
+    @Test func requiresApprovalOpensSettingsAndPends() throws {
+        let service = FakeLoginItemService(status: .requiresApproval)
+        #expect(try LoginItem(service: service).reconcile() == .pendingApproval)
+        #expect(service.openedSettings == true)
+        #expect(service.registerCount == 0)
+    }
+
+    @Test(arguments: [LoginItemStatus.notFound, LoginItemStatus.notRegistered])
+    func unregisteredStatusesRegister(status: LoginItemStatus) throws {
+        let service = FakeLoginItemService(status: status)
+        #expect(try LoginItem(service: service).reconcile() == .registered)
+        #expect(service.registerCount == 1)
+        #expect(service.openedSettings == false)
+    }
+
+    @Test func registrationFailureSurfacesTypedError() {
+        let service = FakeLoginItemService(status: .notRegistered, registerError: RegistrationBoom())
+        #expect(throws: LoginItemError.self) {
+            _ = try LoginItem(service: service).reconcile()
+        }
+        #expect(service.registerCount == 1)
+    }
 }

@@ -41,7 +41,16 @@ private func sendLine(to path: String, _ payload: Data, timeout: TimeInterval = 
     guard withAddress(&addr, { connect(descriptor, $0, $1) }) == 0 else { return nil }
 
     var timeoutValue = timeval(tv_sec: Int(timeout), tv_usec: 0)
-    setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeoutValue, socklen_t(MemoryLayout<timeval>.size))
+    precondition(
+        setsockopt(
+            descriptor,
+            SOL_SOCKET,
+            SO_RCVTIMEO,
+            &timeoutValue,
+            socklen_t(MemoryLayout<timeval>.size)
+        ) == 0,
+        "setsockopt(SO_RCVTIMEO) failed: errno \(errno)"
+    )
     var noSignal: Int32 = 1
     setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size))
 
@@ -74,114 +83,117 @@ private func leaveStaleSocket(at path: String) {
     close(descriptor)
 }
 
-@Test func roundTripsOneLine() throws {
-    let dir = try shortSocketDir()
-    defer { try? FileManager.default.removeItem(at: dir) }
-    let path = dir.appendingPathComponent("s.sock").path
-    let server = SocketServer(path: path) { request in
-        var upper = Data("echo:".utf8)
-        upper.append(request)
-        return upper
-    }
-    try server.start()
-    defer { server.stop() }
-
-    let reply = sendLine(to: path, Data("hello".utf8))
-    #expect(reply == Data("echo:hello".utf8))
-}
-
-@Test func chmodsSocketTo0600BeforeAccepting() throws {
-    let dir = try shortSocketDir()
-    defer { try? FileManager.default.removeItem(at: dir) }
-    let path = dir.appendingPathComponent("s.sock").path
-    let server = SocketServer(path: path) { $0 }
-    try server.start()
-    defer { server.stop() }
-
-    var status = stat()
-    #expect(stat(path, &status) == 0)
-    #expect((status.st_mode & 0o777) == 0o600)
-}
-
-@Test func refusesToBindOverALivePeer() throws {
-    let dir = try shortSocketDir()
-    defer { try? FileManager.default.removeItem(at: dir) }
-    let path = dir.appendingPathComponent("s.sock").path
-    let live = SocketServer(path: path) { $0 }
-    try live.start()
-    defer { live.stop() }
-
-    let intruder = SocketServer(path: path) { $0 }
-    do {
-        try intruder.start()
-        Issue.record("expected addressInUse")
-    } catch let error as SocketServerError {
-        guard case .addressInUse = error else {
-            Issue.record("expected .addressInUse, got \(error)")
-            return
+@Suite(.serialized, .timeLimit(.minutes(1)))
+struct SocketServerTests {
+    @Test func roundTripsOneLine() throws {
+        let dir = try shortSocketDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("s.sock").path
+        let server = SocketServer(path: path) { request in
+            var upper = Data("echo:".utf8)
+            upper.append(request)
+            return upper
         }
-    }
-}
-
-@Test func reclaimsADeadSocket() throws {
-    let dir = try shortSocketDir()
-    defer { try? FileManager.default.removeItem(at: dir) }
-    let path = dir.appendingPathComponent("s.sock").path
-    leaveStaleSocket(at: path)
-    #expect(FileManager.default.fileExists(atPath: path))
-
-    let server = SocketServer(path: path) { request in
-        var out = Data("re:".utf8)
-        out.append(request)
-        return out
-    }
-    try server.start()
-    defer { server.stop() }
-
-    #expect(sendLine(to: path, Data("ping".utf8)) == Data("re:ping".utf8))
-}
-
-@Test func dropsLinesOverTheByteCap() throws {
-    let dir = try shortSocketDir()
-    defer { try? FileManager.default.removeItem(at: dir) }
-    let path = dir.appendingPathComponent("s.sock").path
-    let server = SocketServer(path: path, configuration: .init(maxLineBytes: 16)) { $0 }
-    try server.start()
-    defer { server.stop() }
-
-    let oversized = Data(String(repeating: "x", count: 128).utf8)
-    let reply = sendLine(to: path, oversized)
-    #expect(reply?.isEmpty == true)
-
-    let small = Data("small".utf8)
-    #expect(sendLine(to: path, small) == small)
-}
-
-@Test func cleanShutdownUnlinksAndStopsAccepting() throws {
-    let dir = try shortSocketDir()
-    defer { try? FileManager.default.removeItem(at: dir) }
-    let path = dir.appendingPathComponent("s.sock").path
-    let server = SocketServer(path: path) { $0 }
-    try server.start()
-    #expect(sendLine(to: path, Data("up".utf8)) == Data("up".utf8))
-
-    server.stop()
-    #expect(!FileManager.default.fileExists(atPath: path))
-    #expect(sendLine(to: path, Data("down".utf8)) == nil)
-}
-
-@Test func rejectsAnOverlongPath() {
-    let path = "/tmp/" + String(repeating: "a", count: 200) + ".sock"
-    let server = SocketServer(path: path) { $0 }
-    do {
         try server.start()
-        Issue.record("expected pathTooLong")
-    } catch let error as SocketServerError {
-        guard case .pathTooLong = error else {
-            Issue.record("expected .pathTooLong, got \(error)")
-            return
+        defer { server.stop() }
+
+        let reply = sendLine(to: path, Data("hello".utf8))
+        #expect(reply == Data("echo:hello".utf8))
+    }
+
+    @Test func chmodsSocketTo0600BeforeAccepting() throws {
+        let dir = try shortSocketDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("s.sock").path
+        let server = SocketServer(path: path) { $0 }
+        try server.start()
+        defer { server.stop() }
+
+        var status = stat()
+        #expect(stat(path, &status) == 0)
+        #expect((status.st_mode & 0o777) == 0o600)
+    }
+
+    @Test func refusesToBindOverALivePeer() throws {
+        let dir = try shortSocketDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("s.sock").path
+        let live = SocketServer(path: path) { $0 }
+        try live.start()
+        defer { live.stop() }
+
+        let intruder = SocketServer(path: path) { $0 }
+        do {
+            try intruder.start()
+            Issue.record("expected addressInUse")
+        } catch let error as SocketServerError {
+            guard case .addressInUse = error else {
+                Issue.record("expected .addressInUse, got \(error)")
+                return
+            }
         }
-    } catch {
-        Issue.record("expected SocketServerError, got \(error)")
+    }
+
+    @Test func reclaimsADeadSocket() throws {
+        let dir = try shortSocketDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("s.sock").path
+        leaveStaleSocket(at: path)
+        #expect(FileManager.default.fileExists(atPath: path))
+
+        let server = SocketServer(path: path) { request in
+            var out = Data("re:".utf8)
+            out.append(request)
+            return out
+        }
+        try server.start()
+        defer { server.stop() }
+
+        #expect(sendLine(to: path, Data("ping".utf8)) == Data("re:ping".utf8))
+    }
+
+    @Test func dropsLinesOverTheByteCap() throws {
+        let dir = try shortSocketDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("s.sock").path
+        let server = SocketServer(path: path, configuration: .init(maxLineBytes: 16)) { $0 }
+        try server.start()
+        defer { server.stop() }
+
+        let oversized = Data(String(repeating: "x", count: 128).utf8)
+        let reply = sendLine(to: path, oversized)
+        #expect(reply?.isEmpty == true)
+
+        let small = Data("small".utf8)
+        #expect(sendLine(to: path, small) == small)
+    }
+
+    @Test func cleanShutdownUnlinksAndStopsAccepting() throws {
+        let dir = try shortSocketDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("s.sock").path
+        let server = SocketServer(path: path) { $0 }
+        try server.start()
+        #expect(sendLine(to: path, Data("up".utf8)) == Data("up".utf8))
+
+        server.stop()
+        #expect(!FileManager.default.fileExists(atPath: path))
+        #expect(sendLine(to: path, Data("down".utf8)) == nil)
+    }
+
+    @Test func rejectsAnOverlongPath() {
+        let path = "/tmp/" + String(repeating: "a", count: 200) + ".sock"
+        let server = SocketServer(path: path) { $0 }
+        do {
+            try server.start()
+            Issue.record("expected pathTooLong")
+        } catch let error as SocketServerError {
+            guard case .pathTooLong = error else {
+                Issue.record("expected .pathTooLong, got \(error)")
+                return
+            }
+        } catch {
+            Issue.record("expected SocketServerError, got \(error)")
+        }
     }
 }

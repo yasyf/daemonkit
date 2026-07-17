@@ -27,39 +27,42 @@ private final class FireRecorder: @unchecked Sendable {
     }
 }
 
-@Test func coalescerCollapsesToOneFirePerInterval() {
-    let clock = MutableClock(Date(timeIntervalSince1970: 0))
-    let recorder = FireRecorder()
-    let coalescer = ReloadCoalescer(
-        interval: 300,
-        now: { clock.now },
-        reload: { recorder.record($0) }
-    )
+@Suite(.timeLimit(.minutes(1)))
+struct ReloadCoalescerTests {
+    @Test func coalescerCollapsesToOneFirePerInterval() {
+        let clock = MutableClock(Date(timeIntervalSince1970: 0))
+        let recorder = FireRecorder()
+        let coalescer = ReloadCoalescer(
+            interval: 300,
+            now: { clock.now },
+            reload: { recorder.record($0) }
+        )
 
-    coalescer.record(trigger: "a")
-    coalescer.record(trigger: "b")
-    #expect(recorder.triggers == ["a"])
+        coalescer.record(trigger: "a")
+        coalescer.record(trigger: "b")
+        #expect(recorder.triggers == ["a"])
 
-    clock.now = Date(timeIntervalSince1970: 299)
-    coalescer.record(trigger: "c")
-    #expect(recorder.triggers == ["a"])
+        clock.now = Date(timeIntervalSince1970: 299)
+        coalescer.record(trigger: "c")
+        #expect(recorder.triggers == ["a"])
 
-    clock.now = Date(timeIntervalSince1970: 300)
-    coalescer.record(trigger: "d")
-    #expect(recorder.triggers == ["a", "d"])
+        clock.now = Date(timeIntervalSince1970: 300)
+        coalescer.record(trigger: "d")
+        #expect(recorder.triggers == ["a", "d"])
 
-    clock.now = Date(timeIntervalSince1970: 601)
-    coalescer.record(trigger: "e")
-    #expect(recorder.triggers == ["a", "d", "e"])
-}
+        clock.now = Date(timeIntervalSince1970: 601)
+        coalescer.record(trigger: "e")
+        #expect(recorder.triggers == ["a", "d", "e"])
+    }
 
-@Test func coalescerFiresFirstRecordImmediately() {
-    let recorder = FireRecorder()
-    let coalescer = ReloadCoalescer(
-        interval: 300,
-        now: { Date(timeIntervalSince1970: 0) },
-        reload: { recorder.record($0) }
-    )
-    coalescer.record(trigger: "boot")
-    #expect(recorder.triggers == ["boot"])
+    @Test func coalescerFiresFirstRecordImmediately() {
+        let recorder = FireRecorder()
+        let coalescer = ReloadCoalescer(
+            interval: 300,
+            now: { Date(timeIntervalSince1970: 0) },
+            reload: { recorder.record($0) }
+        )
+        coalescer.record(trigger: "boot")
+        #expect(recorder.triggers == ["boot"])
+    }
 }
