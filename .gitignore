@@ -1,0 +1,46 @@
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local environment
+.env*
+
+# Claude Code
+.context/
+.claude-scratch/
+.scratch/
+.claude/worktrees/
+.claude/settings.local.json
+
+# Python bytecode (guard hooks are Python even in non-Python repos)
+__pycache__/
+*.py[cod]
+
+# Go build output
+/bin/
+/dist/
+
+# Test / coverage
+*.test
+*.out
+coverage.txt
+
+# go-task cache
+.task/
+
+# bootstrap verify binary smoke test
+.go-smoke/
+
+# Xcode
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# SwiftPM
+.build/
+.swiftpm/
+
+# XcodeBuildMCP (local session state: machine-specific device/simulator IDs)
+.xcodebuildmcp/
