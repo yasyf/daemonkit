@@ -172,3 +172,25 @@ func TestFlockCrossProcess(t *testing.T) {
 		t.Fatalf("parent acquired in %v without blocking — flock is not excluding across processes; child output:\n%s", waited, out.String())
 	}
 }
+
+// TestTryLockBusyThenFree: a held lock refuses a second TryLock with ErrLockBusy,
+// and a fresh TryLock succeeds once the first releases. Separate open file
+// descriptions on one file exercise the same exclusion as two processes.
+func TestTryLockBusyThenFree(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "try.lock")
+
+	h1, err := TryLock(path)
+	if err != nil {
+		t.Fatalf("first TryLock: %v", err)
+	}
+	if _, err := TryLock(path); !errors.Is(err, ErrLockBusy) {
+		t.Fatalf("second TryLock err = %v, want ErrLockBusy", err)
+	}
+
+	h1.Release()
+	h2, err := TryLock(path)
+	if err != nil {
+		t.Fatalf("TryLock after release = %v, want success", err)
+	}
+	h2.Release()
+}

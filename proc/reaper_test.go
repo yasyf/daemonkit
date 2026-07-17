@@ -409,14 +409,35 @@ func startTermIgnorer(t *testing.T) (int, func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command("/bin/sh", "-c", `trap "" TERM; read _`)
+	rout, wout, err := os.Pipe()
+	if err != nil {
+		pr.Close()
+		pw.Close()
+		t.Fatal(err)
+	}
+	// echo after trap: the ready byte proves the child has exec'd /bin/sh (comm
+	// is stable, no fork-window mismatch) and installed the TERM trap before we
+	// Track it.
+	cmd := exec.Command("/bin/sh", "-c", `trap "" TERM; echo r; read _`)
 	cmd.Stdin = pr
+	cmd.Stdout = wout
 	if err := cmd.Start(); err != nil {
 		pr.Close()
 		pw.Close()
+		rout.Close()
+		wout.Close()
 		t.Fatalf("start term-ignorer: %v", err)
 	}
-	pr.Close() // the child holds its own dup; keep pw open so read blocks
+	pr.Close()   // the child holds its own dup; keep pw open so read blocks
+	wout.Close() // the child holds its own dup; parent reads readiness on rout
+	if _, err := rout.Read(make([]byte, 1)); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		pw.Close()
+		rout.Close()
+		t.Fatalf("await term-ignorer ready: %v", err)
+	}
+	rout.Close()
 	var once sync.Once
 	wait := func() { once.Do(func() { _ = cmd.Wait() }) }
 	t.Cleanup(func() {

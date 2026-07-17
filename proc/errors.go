@@ -23,3 +23,8 @@ var ErrPeerStarting = errors.New("a peer owns the socket lock but is not answeri
 // ErrLockStillHeld means Evict made way but the contended lock was not
 // released within the post-evict poll deadline.
 var ErrLockStillHeld = errors.New("socket lock still held after eviction")
+
+// ErrLockBusy means TryLock found the lock already held by another owner. It is
+// the non-blocking counterpart to Flock's ctx-bounded wait; consumers alias it
+// (var ErrLockBusy = proc.ErrLockBusy) and match with errors.Is.
+var ErrLockBusy = errors.New("proc: lock held by another owner")

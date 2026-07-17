@@ -25,6 +25,28 @@ func (h *FlockHandle) Release() {
 	_ = h.f.Close()
 }
 
+// TryLock takes an exclusive advisory lock on path without blocking, returning
+// ErrLockBusy when another owner already holds it. The caller Releases the
+// returned handle; the lock file is left on disk (see Release).
+func TryLock(path string) (*FlockHandle, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil { //nolint:gosec // G703: callers pass lock paths they own, not user-tainted input
+		return nil, fmt.Errorf("create lock dir: %w", err)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // G304: callers pass lock paths they own, not user input
+	if err != nil {
+		return nil, fmt.Errorf("open lock %s: %w", path, err)
+	}
+	err = unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+	if err == nil {
+		return &FlockHandle{f: f}, nil
+	}
+	_ = f.Close()
+	if errors.Is(err, unix.EWOULDBLOCK) {
+		return nil, ErrLockBusy
+	}
+	return nil, fmt.Errorf("flock %s: %w", path, err)
+}
+
 // Flock takes an exclusive cross-process advisory lock on path. It polls
 // rather than blocking in the syscall so ctx cancellation is observed and no
 // goroutine leaks on a stuck holder.
