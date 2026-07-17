@@ -20,6 +20,36 @@ linters:
     - revive
     - staticcheck
     - unused
+  settings:
+    errcheck:
+      # Best-effort teardown closes are the package idiom (ported from fusekit);
+      # a failed Close on these paths has no caller-visible remedy.
+      exclude-functions:
+        - (io.Closer).Close
+        - syscall.Close
+        - os.RemoveAll
+  exclusions:
+    rules:
+      # daemonkit's whole job is spawning processes (launchctl, brew, open,
+      # daemon binaries) with caller-fixed argv — G204 fires on every call site
+      # by design, not by defect.
+      - linters: [gosec]
+        text: "G204"
+      # File-path APIs (Info.plist readers, lock files) open caller-supplied
+      # paths by design.
+      - linters: [gosec]
+        text: "G304"
+      # Best-effort teardown closes are the package idiom (ported from fusekit);
+      # exclude-functions can't name every concrete Close method.
+      - linters: [errcheck]
+        text: 'Error return value of `.*\.Close` is not checked'
+      # G104 duplicates errcheck verbatim; errcheck (with the idiom carve-outs
+      # above) owns unhandled-error reporting.
+      - linters: [gosec]
+        text: "G104"
+      # Test fixtures read/write their own temp paths and don't wrap errors.
+      - path: _test\.go$
+        linters: [gosec, errorlint]
 
 formatters:
   enable:
