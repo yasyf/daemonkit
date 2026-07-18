@@ -82,19 +82,20 @@ type Policy struct {
 	Requirement *Requirement
 }
 
-// Check enforces the same-UID floor on every platform, then — when a Requirement
-// is configured — the designated requirement against the peer's audit token. A
-// configured Requirement with no verifier fails closed (ErrNoVerifier).
+// Check enforces the same-effective-UID floor on every platform, then — when a
+// Requirement is configured — the designated requirement against the peer's
+// audit token. A configured Requirement with no verifier fails closed
+// (ErrNoVerifier).
 //
-// The darwin code-identity check is time-of-check only: LOCAL_PEERTOKEN
-// identifies the process on the peer socket when Check runs, not the process
-// that connected, so a same-UID peer that execs or passes its fd onward after
-// Check keeps the connection's trust. Accepted: the same-UID floor confines
-// the window to the user's own processes. A surface needing per-message
-// identity uses XPC (setCodeSigningRequirement) instead.
+// LOCAL_PEERTOKEN resolves the peer socket's process at query time, so it does
+// NOT bind identity to the connector: a same-UID peer can fork a holder and exec
+// a genuine signed binary to lend its identity, and the floor does not confine
+// fd delegation across a setuid/SCM_RIGHTS boundary. This is a known-unsound
+// binding for code authentication; a surface needing a real per-message identity
+// guarantee uses XPC (setCodeSigningRequirement), not this Policy.
 func (p Policy) Check(peer wire.Peer) error {
-	if peer.UID != os.Getuid() {
-		return fmt.Errorf("%w: uid %d != %d", ErrUntrustedPeer, peer.UID, os.Getuid())
+	if peer.UID != os.Geteuid() {
+		return fmt.Errorf("%w: uid %d != %d", ErrUntrustedPeer, peer.UID, os.Geteuid())
 	}
 	if p.Requirement == nil {
 		return nil

@@ -31,6 +31,7 @@ var injectionEntitlements = []string{
 	entDisableLV,
 	"com.apple.security.cs.allow-dyld-environment-variables",
 	"com.apple.security.cs.allow-unsigned-executable-memory",
+	"com.apple.security.cs.allow-jit",
 	"com.apple.security.cs.disable-executable-page-protection",
 	"com.apple.security.get-task-allow",
 }
@@ -76,16 +77,30 @@ func loadSecurity() {
 		secErr = fmt.Errorf("trust: dlopen Security: %w", err)
 		return
 	}
-	purego.RegisterLibFunc(&cfDataCreate, cf, "CFDataCreate")
-	purego.RegisterLibFunc(&cfStringCreateWithCString, cf, "CFStringCreateWithCString")
-	purego.RegisterLibFunc(&cfDictionaryCreate, cf, "CFDictionaryCreate")
-	purego.RegisterLibFunc(&cfNumberGetValue, cf, "CFNumberGetValue")
-	purego.RegisterLibFunc(&cfDictionaryGetValue, cf, "CFDictionaryGetValue")
-	purego.RegisterLibFunc(&cfRelease, cf, "CFRelease")
-	purego.RegisterLibFunc(&secCodeCopyGuestWithAttributes, sec, "SecCodeCopyGuestWithAttributes")
-	purego.RegisterLibFunc(&secRequirementCreateWithString, sec, "SecRequirementCreateWithString")
-	purego.RegisterLibFunc(&secCodeCheckValidityWithErrors, sec, "SecCodeCheckValidityWithErrors")
-	purego.RegisterLibFunc(&secCodeCopySigningInformation, sec, "SecCodeCopySigningInformation")
+	// purego.RegisterLibFunc panics on a missing symbol; probe with Dlsym first
+	// so framework skew fails closed through secErr instead of crashing.
+	for _, fn := range []struct {
+		target any
+		lib    uintptr
+		name   string
+	}{
+		{&cfDataCreate, cf, "CFDataCreate"},
+		{&cfStringCreateWithCString, cf, "CFStringCreateWithCString"},
+		{&cfDictionaryCreate, cf, "CFDictionaryCreate"},
+		{&cfNumberGetValue, cf, "CFNumberGetValue"},
+		{&cfDictionaryGetValue, cf, "CFDictionaryGetValue"},
+		{&cfRelease, cf, "CFRelease"},
+		{&secCodeCopyGuestWithAttributes, sec, "SecCodeCopyGuestWithAttributes"},
+		{&secRequirementCreateWithString, sec, "SecRequirementCreateWithString"},
+		{&secCodeCheckValidityWithErrors, sec, "SecCodeCheckValidityWithErrors"},
+		{&secCodeCopySigningInformation, sec, "SecCodeCopySigningInformation"},
+	} {
+		if _, err := purego.Dlsym(fn.lib, fn.name); err != nil {
+			secErr = fmt.Errorf("trust: dlsym %s: %w", fn.name, err)
+			return
+		}
+		purego.RegisterLibFunc(fn.target, fn.lib, fn.name)
+	}
 
 	// kSecGuestAttributeAudit / kSecCodeInfo* / kCFBooleanFalse are CF-object
 	// DATA symbols: dlsym returns the symbol's address, which must be

@@ -2,12 +2,17 @@
 
 package trust
 
-import "github.com/yasyf/daemonkit/wire"
+import (
+	"fmt"
 
-// verifyRequirement accepts any peer that passed the same-UID floor. This build
-// exists ONLY for local unsigned test runs (the daemonkit_unsigned tag); release
-// CI must reject any distributed artifact built with it. A configured
-// Requirement is intentionally not enforced here — the tag is the opt-in.
+	"github.com/yasyf/daemonkit/wire"
+)
+
+// verifyRequirement fails closed: the daemonkit_unsigned tag drops the darwin
+// Security.framework verifier (for building without the purego/codesign path),
+// so a configured Requirement can never be satisfied and is denied rather than
+// downgraded to the UID floor. UID-only trust is requested explicitly with a nil
+// Requirement, never implied by a build tag.
 func verifyRequirement(_ wire.Peer, _ Requirement) error {
-	return nil
+	return fmt.Errorf("%w (built with daemonkit_unsigned: no codesign verifier)", ErrNoVerifier)
 }

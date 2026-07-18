@@ -399,12 +399,15 @@ func (s *Server) errResp(msg string) Response {
 	return Response{Version: s.Version, Err: "wire: " + msg}
 }
 
+// trust enforces the same-effective-UID floor on every connection before any
+// stricter check, then runs the optional Trust callback. The floor is never
+// replaced by a non-nil callback — a callback augments it, never bypasses it.
 func (s *Server) trust(p Peer) error {
+	if p.UID != os.Geteuid() {
+		return fmt.Errorf("%w: uid %d != %d", ErrUntrustedPeer, p.UID, os.Geteuid())
+	}
 	if s.Trust != nil {
 		return s.Trust(p)
-	}
-	if p.UID != os.Getuid() {
-		return fmt.Errorf("%w: uid %d != %d", ErrUntrustedPeer, p.UID, os.Getuid())
 	}
 	return nil
 }
