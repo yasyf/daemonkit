@@ -37,25 +37,29 @@ func fixtureBin(t *testing.T, name string) string {
 }
 
 // peerOf spawns the signed fixture, dials back over a short-path unix socket, and
-// returns its OS-read wire.Peer. The returned release unblocks and reaps the
-// fixture; the peer stays alive until then so its SecCode resolves.
-func peerOf(t *testing.T, bin string) (wire.Peer, func()) {
+// returns its OS-read wire.Peer. The fixture stays alive until test cleanup so
+// its SecCode resolves.
+func peerOf(t *testing.T, bin string) wire.Peer {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "dk-tr")
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	sock := filepath.Join(dir, "s")
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+	t.Cleanup(func() { _ = ln.Close() })
 	cmd := exec.Command(bin, sock)
 	if err := cmd.Start(); err != nil {
-		ln.Close()
-		os.RemoveAll(dir)
 		t.Fatalf("start fixture: %v", err)
 	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
 
 	type accepted struct {
 		conn net.Conn
@@ -75,33 +79,23 @@ func peerOf(t *testing.T, bin string) (wire.Peer, func()) {
 		}
 		conn = a.conn
 	case <-time.After(5 * time.Second):
-		_ = cmd.Process.Kill()
 		t.Fatal("fixture never connected")
 	}
+	t.Cleanup(func() { _ = conn.Close() })
 
 	peer, err := wire.PeerFromConn(conn.(*net.UnixConn))
 	if err != nil {
-		conn.Close()
-		_ = cmd.Process.Kill()
 		t.Fatalf("PeerFromConn: %v", err)
 	}
 	if peer.PID != cmd.Process.Pid {
 		t.Fatalf("peer PID %d != fixture PID %d (audit token resolved the wrong process)", peer.PID, cmd.Process.Pid)
 	}
-	release := func() {
-		conn.Close()
-		ln.Close()
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		os.RemoveAll(dir)
-	}
-	return peer, release
+	return peer
 }
 
 func TestTrustAcceptsMatchingDeveloperID(t *testing.T) {
 	requireE2E(t)
-	peer, release := peerOf(t, fixtureBin(t, "fixture-devid-a"))
-	defer release()
+	peer := peerOf(t, fixtureBin(t, "fixture-devid-a"))
 	p := Policy{Requirement: &Requirement{TeamID: fixtureTeam, Identifier: "com.yasyf.daemonkit.fixture-a"}}
 	if err := p.Check(peer); err != nil {
 		t.Errorf("Check(matching devid) = %v, want nil", err)
@@ -110,8 +104,7 @@ func TestTrustAcceptsMatchingDeveloperID(t *testing.T) {
 
 func TestTrustRejectsWrongIdentifier(t *testing.T) {
 	requireE2E(t)
-	peer, release := peerOf(t, fixtureBin(t, "fixture-devid-a"))
-	defer release()
+	peer := peerOf(t, fixtureBin(t, "fixture-devid-a"))
 	p := Policy{Requirement: &Requirement{TeamID: fixtureTeam, Identifier: "com.yasyf.daemonkit.fixture-b"}}
 	if err := p.Check(peer); !errors.Is(err, ErrUntrustedPeer) {
 		t.Errorf("Check(wrong identifier) = %v, want ErrUntrustedPeer", err)
@@ -120,8 +113,7 @@ func TestTrustRejectsWrongIdentifier(t *testing.T) {
 
 func TestTrustRejectsAdHoc(t *testing.T) {
 	requireE2E(t)
-	peer, release := peerOf(t, fixtureBin(t, "fixture-adhoc"))
-	defer release()
+	peer := peerOf(t, fixtureBin(t, "fixture-adhoc"))
 	p := Policy{Requirement: &Requirement{TeamID: fixtureTeam, Identifier: "com.yasyf.daemonkit.fixture-adhoc"}}
 	if err := p.Check(peer); !errors.Is(err, ErrUntrustedPeer) {
 		t.Errorf("Check(ad-hoc) = %v, want ErrUntrustedPeer (no Developer ID anchor)", err)
@@ -130,8 +122,7 @@ func TestTrustRejectsAdHoc(t *testing.T) {
 
 func TestTrustRejectsUnhardened(t *testing.T) {
 	requireE2E(t)
-	peer, release := peerOf(t, fixtureBin(t, "fixture-devid-unhardened"))
-	defer release()
+	peer := peerOf(t, fixtureBin(t, "fixture-devid-unhardened"))
 	req := Requirement{TeamID: fixtureTeam, Identifier: "com.yasyf.daemonkit.fixture-unhardened"}
 	if err := (Policy{Requirement: &req}).Check(peer); !errors.Is(err, ErrUntrustedPeer) {
 		t.Errorf("Check(unhardened) = %v, want ErrUntrustedPeer (lacks CS_RUNTIME)", err)
@@ -144,8 +135,7 @@ func TestTrustRejectsUnhardened(t *testing.T) {
 
 func TestTrustRejectsDisabledLibraryValidation(t *testing.T) {
 	requireE2E(t)
-	peer, release := peerOf(t, fixtureBin(t, "fixture-devid-nolv"))
-	defer release()
+	peer := peerOf(t, fixtureBin(t, "fixture-devid-nolv"))
 	req := Requirement{TeamID: fixtureTeam, Identifier: "com.yasyf.daemonkit.fixture-nolv"}
 	if err := (Policy{Requirement: &req}).Check(peer); !errors.Is(err, ErrUntrustedPeer) {
 		t.Errorf("Check(disable-library-validation) = %v, want ErrUntrustedPeer", err)
@@ -158,8 +148,7 @@ func TestTrustRejectsDisabledLibraryValidation(t *testing.T) {
 
 func TestTrustRejectsGetTaskAllow(t *testing.T) {
 	requireE2E(t)
-	peer, release := peerOf(t, fixtureBin(t, "fixture-devid-gta"))
-	defer release()
+	peer := peerOf(t, fixtureBin(t, "fixture-devid-gta"))
 	req := Requirement{TeamID: fixtureTeam, Identifier: "com.yasyf.daemonkit.fixture-gta"}
 	if err := (Policy{Requirement: &req}).Check(peer); !errors.Is(err, ErrUntrustedPeer) {
 		t.Errorf("Check(get-task-allow) = %v, want ErrUntrustedPeer", err)
@@ -175,8 +164,7 @@ func TestTrustRejectsGetTaskAllow(t *testing.T) {
 // release leaks ~66 KB per call; 4000 calls would add ~250 MB).
 func TestTrustVerificationIsLeakFree(t *testing.T) {
 	requireE2E(t)
-	peer, release := peerOf(t, fixtureBin(t, "fixture-devid-a"))
-	defer release()
+	peer := peerOf(t, fixtureBin(t, "fixture-devid-a"))
 	p := Policy{Requirement: &Requirement{TeamID: fixtureTeam, Identifier: "com.yasyf.daemonkit.fixture-a"}}
 
 	for i := 0; i < 200; i++ { // warm up caches and one-time loads

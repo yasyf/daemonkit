@@ -24,7 +24,7 @@ ulimit -Su "$cap"
 # can never hang the cap in place indefinitely.
 case " $* " in
   *" -timeout"*) ;;
-  *) set -- -timeout 600s "$@" ;;
+  *) set -- -timeout 480s "$@" ;;
 esac
 
 echo "scripts/test.sh: RLIMIT_NPROC soft cap=$cap (uid procs ~$cur + headroom $headroom); go test $*" >&2

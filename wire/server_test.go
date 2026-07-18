@@ -170,6 +170,7 @@ func TestUnknownOpReplyErr(t *testing.T) {
 func TestConcurrentPoolRejectionProvesNonDispatch(t *testing.T) {
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
+	defer close(release)
 	var execs atomic.Int64
 	s := &wire.Server{Workers: 1, Backlog: 0}
 	s.RegisterConcurrent("work", func(context.Context, wire.Request) (any, error) {
@@ -186,7 +187,11 @@ func TestConcurrentPoolRejectionProvesNonDispatch(t *testing.T) {
 		defer c.Close()
 		_, _ = wire.Do(c, frameBytes(t, "work", ""))
 	}()
-	<-started
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first request was not admitted despite an idle worker")
+	}
 
 	// The pool is full: this request must be rejected without executing.
 	res := call(t, ts, "work", "")
@@ -202,7 +207,6 @@ func TestConcurrentPoolRejectionProvesNonDispatch(t *testing.T) {
 	if got := execs.Load(); got != 1 {
 		t.Errorf("handler executions = %d, want 1 (the rejected request must never run)", got)
 	}
-	close(release)
 }
 
 func TestExclusiveSerialization(t *testing.T) {

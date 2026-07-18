@@ -115,6 +115,7 @@ type Server struct {
 	cancelServe context.CancelFunc
 
 	queue       chan job
+	slots       chan struct{}
 	exclusiveMu sync.Mutex
 	tenants     *tenantGates
 
@@ -178,6 +179,7 @@ func (s *Server) Run(ctx context.Context) error {
 		workers = defaultWorkers
 	}
 	s.queue = make(chan job, s.Backlog)
+	s.slots = make(chan struct{}, workers+s.Backlog)
 	for range workers {
 		s.poolWG.Add(1)
 		go s.worker()
@@ -262,6 +264,7 @@ func (s *Server) worker() {
 	defer s.poolWG.Done()
 	for j := range s.queue {
 		val, err := s.invoke(j.ctx, j.req, j.h)
+		<-s.slots
 		j.done <- result{val: val, err: err}
 	}
 }
@@ -281,10 +284,6 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		_ = f.WriteJSON(s.errResp(fmt.Sprintf("peer: %v", err)))
 		return
 	}
-	if terr := s.trust(peer); terr != nil {
-		_ = f.WriteJSON(s.errResp(terr.Error()))
-		return
-	}
 	// Unblock the pre-frame read on shutdown: an idle connection would otherwise
 	// hold connWG until its read deadline, delaying teardown.
 	readDone := make(chan struct{})
@@ -298,6 +297,12 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	frame, err := f.ReadFrame()
 	close(readDone)
 	if err != nil {
+		return
+	}
+	// Trust gates the handler, checked after the frame read so a denial consumes
+	// the client's request and delivers the rejection instead of racing a close.
+	if terr := s.trust(peer); terr != nil {
+		_ = f.WriteJSON(s.errResp(terr.Error()))
 		return
 	}
 	op, tenant, rerr := s.Router(frame)
@@ -353,10 +358,12 @@ func (s *Server) dispatch(ctx context.Context, e entry, req Request) Response {
 	case classConcurrent:
 		j := job{ctx: ctx, req: req, h: e.h, done: make(chan result, 1)}
 		select {
-		case s.queue <- j:
+		case s.slots <- struct{}{}:
 		default:
 			return s.rejected("concurrent pool at capacity")
 		}
+		// Admitted work always enqueues and drains, ctx cancellation included.
+		s.queue <- j
 		r := <-j.done
 		return s.respond(r.val, r.err)
 	default:

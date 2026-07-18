@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -38,7 +39,8 @@ func TestCloseInheritedFDsReleasesParentLease(t *testing.T) {
 			defer h.Close()
 
 			cmd := exec.Command(os.Args[0], "-test.run", "^TestFDSweepHelperProcess$", "-test.v")
-			cmd.Env = append(os.Environ(),
+			cmd.Env = append(
+				os.Environ(),
 				"FDSWEEP_HELPER=1",
 				fmt.Sprintf("FDSWEEP_SWEEP=%v", tc.sweep),
 			)
@@ -50,13 +52,21 @@ func TestCloseInheritedFDsReleasesParentLease(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			cmd.Stderr = os.Stderr
+			devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer devNull.Close()
+			cmd.Stderr = devNull
 			if err := cmd.Start(); err != nil {
 				t.Fatal(err)
 			}
+			var waitOnce sync.Once
+			wait := func() { waitOnce.Do(func() { _ = cmd.Wait() }) }
 			t.Cleanup(func() {
-				stdin.Close()
-				_ = cmd.Wait()
+				_ = stdin.Close()
+				_ = cmd.Process.Kill()
+				wait()
 			})
 			waitHelperReady(t, stdout)
 
@@ -77,8 +87,8 @@ func TestCloseInheritedFDsReleasesParentLease(t *testing.T) {
 				t.Fatalf("Seize with unswept child = %v, want errLeaseBusy (the inherited fd must pin — otherwise this test cannot catch the leak)", err)
 			}
 			// The pin dies with the child's descriptor.
-			stdin.Close()
-			_ = cmd.Wait()
+			_ = stdin.Close()
+			wait()
 			f, err = leaseSeize(root, dir)
 			if err != nil {
 				t.Fatalf("Seize after child exit = %v, want free", err)
