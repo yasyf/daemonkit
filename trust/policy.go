@@ -33,9 +33,12 @@ type Requirement struct {
 	TeamID string
 	// Identifier is the signing identifier (bundle id) the peer must carry.
 	Identifier string
-	// AllowUnhardened skips the Hardened Runtime demand for a consumer that ships
-	// an audited third-party dylib it cannot library-validate (fusekit-holder
-	// with libfuse-t). Off by default; enabling it is a security decision.
+	// AllowUnhardened skips the Hardened Runtime, library-validation, and
+	// injection-entitlement demands for a consumer that ships an audited
+	// third-party dylib it cannot library-validate (fusekit-holder with
+	// libfuse-t). It is the ONE bypass, and it never relaxes the designated
+	// requirement or the same-UID floor. Off by default; enabling it is a
+	// security decision.
 	AllowUnhardened bool
 }
 
@@ -82,6 +85,13 @@ type Policy struct {
 // Check enforces the same-UID floor on every platform, then — when a Requirement
 // is configured — the designated requirement against the peer's audit token. A
 // configured Requirement with no verifier fails closed (ErrNoVerifier).
+//
+// The darwin code-identity check is time-of-check only: LOCAL_PEERTOKEN
+// identifies the process on the peer socket when Check runs, not the process
+// that connected, so a same-UID peer that execs or passes its fd onward after
+// Check keeps the connection's trust. Accepted: the same-UID floor confines
+// the window to the user's own processes. A surface needing per-message
+// identity uses XPC (setCodeSigningRequirement) instead.
 func (p Policy) Check(peer wire.Peer) error {
 	if peer.UID != os.Getuid() {
 		return fmt.Errorf("%w: uid %d != %d", ErrUntrustedPeer, peer.UID, os.Getuid())

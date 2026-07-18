@@ -142,6 +142,34 @@ func TestTrustRejectsUnhardened(t *testing.T) {
 	}
 }
 
+func TestTrustRejectsDisabledLibraryValidation(t *testing.T) {
+	requireE2E(t)
+	peer, release := peerOf(t, fixtureBin(t, "fixture-devid-nolv"))
+	defer release()
+	req := Requirement{TeamID: fixtureTeam, Identifier: "com.yasyf.daemonkit.fixture-nolv"}
+	if err := (Policy{Requirement: &req}).Check(peer); !errors.Is(err, ErrUntrustedPeer) {
+		t.Errorf("Check(disable-library-validation) = %v, want ErrUntrustedPeer", err)
+	}
+	req.AllowUnhardened = true
+	if err := (Policy{Requirement: &req}).Check(peer); err != nil {
+		t.Errorf("Check(disable-library-validation, AllowUnhardened) = %v, want nil", err)
+	}
+}
+
+func TestTrustRejectsGetTaskAllow(t *testing.T) {
+	requireE2E(t)
+	peer, release := peerOf(t, fixtureBin(t, "fixture-devid-gta"))
+	defer release()
+	req := Requirement{TeamID: fixtureTeam, Identifier: "com.yasyf.daemonkit.fixture-gta"}
+	if err := (Policy{Requirement: &req}).Check(peer); !errors.Is(err, ErrUntrustedPeer) {
+		t.Errorf("Check(get-task-allow) = %v, want ErrUntrustedPeer", err)
+	}
+	req.AllowUnhardened = true
+	if err := (Policy{Requirement: &req}).Check(peer); err != nil {
+		t.Errorf("Check(get-task-allow, AllowUnhardened) = %v, want nil", err)
+	}
+}
+
 // TestTrustVerificationIsLeakFree runs many validations against one live peer and
 // asserts RSS stays bounded — the CFRelease discipline is load-bearing (a missing
 // release leaks ~66 KB per call; 4000 calls would add ~250 MB).
