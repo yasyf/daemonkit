@@ -78,7 +78,7 @@ type fakeResources struct {
 	seize   func(Key) (Fence, error)
 	attest  func(Key) (IdleVerdict, error)
 	yield   func(Key, Fence) error
-	restore func(Key, Fence) error
+	restore func(context.Context, Key, Fence) error
 	log     []string
 }
 
@@ -123,10 +123,10 @@ func (r *fakeResources) Yield(_ context.Context, key Key, fence Fence) error {
 	return nil
 }
 
-func (r *fakeResources) Restore(_ context.Context, key Key, fence Fence) error {
+func (r *fakeResources) Restore(ctx context.Context, key Key, fence Fence) error {
 	r.record("restore", key)
 	if r.restore != nil {
-		return r.restore(key, fence)
+		return r.restore(ctx, key, fence)
 	}
 	return nil
 }

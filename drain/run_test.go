@@ -109,6 +109,37 @@ func TestRunBusyAttestAbortsAndRestores(t *testing.T) {
 	}
 }
 
+func TestRunCanceledAttestRestoresWithLiveContext(t *testing.T) {
+	e, cfg := newRunEnv(t, Row{Key: "k1", Seq: 1, State: RowPending})
+	ctx, cancel := context.WithCancel(context.Background())
+	fence := &fakeFence{held: true}
+	e.res.seize = func(Key) (Fence, error) { return fence, nil }
+	e.res.attest = func(Key) (IdleVerdict, error) {
+		cancel()
+		return IdleUndetermined, ctx.Err()
+	}
+	e.res.restore = func(ctx context.Context, _ Key, fence Fence) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return fence.Release()
+	}
+
+	yielded, err := cfg.sweepKey(ctx, "k1", Row{Key: "k1", Seq: 1, State: RowPending})
+	if err != nil {
+		t.Fatalf("sweepKey: %v", err)
+	}
+	if yielded {
+		t.Error("sweepKey yielded after canceled idle attestation")
+	}
+	if !fence.released {
+		t.Error("fence not released by Restore after sweep context cancellation")
+	}
+	if row := mustRows(t, e.gen.Journal())["k1"]; row != (Row{Key: "k1", Seq: 1, State: RowPending}) {
+		t.Errorf("row = %+v, want pending seq 1", row)
+	}
+}
+
 func TestRunLostFenceRestoresWithoutAdvance(t *testing.T) {
 	e, cfg := newRunEnv(t, Row{Key: "k1", Seq: 1, State: RowPending})
 	e.res.seize = func(Key) (Fence, error) { return &fakeFence{held: false}, nil }
@@ -149,6 +180,76 @@ func TestRunWedgedYieldRestoresBeforeNextAttempt(t *testing.T) {
 	indexOf(t, log, "seize k1", r1) // the retry seizes only after Restore ran
 	if _, err := os.Stat(e.gen.Dir()); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("generation dir not removed after retry succeeded: %v", err)
+	}
+}
+
+func TestRunCanceledAfterYieldRecordsAndReleases(t *testing.T) {
+	e, cfg := newRunEnv(t, Row{Key: "k1", Seq: 1, State: RowPending})
+	ctx, cancel := context.WithCancel(context.Background())
+	fence := &fakeFence{held: true}
+	e.res.seize = func(Key) (Fence, error) { return fence, nil }
+
+	journal := e.gen.Journal()
+	lock, err := proc.Flock(context.Background(), journal.lockPath())
+	if err != nil {
+		t.Fatalf("hold journal lock: %v", err)
+	}
+	released := make(chan struct{})
+	e.res.yield = func(Key, Fence) error {
+		cancel()
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			lock.Release()
+			close(released)
+		}()
+		return nil
+	}
+
+	yielded, err := cfg.sweepKey(ctx, "k1", Row{Key: "k1", Seq: 1, State: RowPending})
+	<-released
+	if err != nil {
+		t.Fatalf("sweepKey: %v", err)
+	}
+	if !yielded {
+		t.Error("sweepKey did not report the committed handoff")
+	}
+	if !fence.released {
+		t.Error("fence not released after committed handoff")
+	}
+	want := Row{Key: "k1", Seq: 2, State: RowYielded}
+	if row := mustRows(t, journal)["k1"]; row != want {
+		t.Errorf("row = %+v, want %+v", row, want)
+	}
+}
+
+func TestRunPostYieldJournalFailureReleasesFence(t *testing.T) {
+	e, cfg := newRunEnv(t, Row{Key: "k1", Seq: 1, State: RowPending})
+	fence := &fakeFence{held: true}
+	e.res.seize = func(Key) (Fence, error) { return fence, nil }
+
+	journal := e.gen.Journal()
+	if err := os.Remove(journal.lockPath()); err != nil {
+		t.Fatalf("remove journal lock: %v", err)
+	}
+	if err := os.Mkdir(journal.lockPath(), 0o700); err != nil {
+		t.Fatalf("wedge journal lock: %v", err)
+	}
+
+	yielded, err := cfg.sweepKey(context.Background(), "k1", Row{Key: "k1", Seq: 1, State: RowPending})
+	if err == nil {
+		t.Fatal("sweepKey succeeded after the journal write was wedged, want error")
+	}
+	if yielded {
+		t.Error("sweepKey reported yielded after the journal write failed")
+	}
+	if !fence.released {
+		t.Error("fence not released after committed handoff and journal failure")
+	}
+	if err := os.Remove(journal.lockPath()); err != nil {
+		t.Fatalf("remove wedged journal lock: %v", err)
+	}
+	if row := mustRows(t, journal)["k1"]; row != (Row{Key: "k1", Seq: 1, State: RowPending}) {
+		t.Errorf("row = %+v, want recoverable pending seq 1", row)
 	}
 }
 

@@ -218,19 +218,53 @@ func TestTransitionSnapshotRefusesStaleGenerationJournal(t *testing.T) {
 	}
 }
 
-func TestSnapshotCrashBetweenOwnerAndRows(t *testing.T) {
+func TestTransitionSnapshotRefusesDisjointForeignGenerationJournal(t *testing.T) {
+	e, cfg := newTransitionEnv(t, seedRows()...)
+	foreign := proc.Identity{PID: 999, StartTime: "333.444", Comm: "foreign"}
+	if err := e.gen.WriteOwner(foreign); err != nil {
+		t.Fatalf("WriteOwner: %v", err)
+	}
+	mustApply(t, e.gen.Journal(), Row{Key: "foreign", Seq: 1, State: RowPending})
+
+	err := Transition(context.Background(), cfg)
+	if err == nil {
+		t.Error("Transition succeeded over a disjoint foreign generation row, want error")
+	}
+	owner, ownerErr := e.gen.ReadOwner()
+	if ownerErr != nil {
+		t.Fatalf("ReadOwner: %v", ownerErr)
+	}
+	if owner != foreign {
+		t.Errorf("generation owner = %+v, want foreign owner %+v unchanged", owner, foreign)
+	}
+	rows := mustRows(t, e.canonical)
+	for _, want := range seedRows() {
+		if rows[want.Key] != want {
+			t.Errorf("canonical row %s = %+v, want %+v intact", want.Key, rows[want.Key], want)
+		}
+	}
+}
+
+func TestSnapshotCrashBetweenRowsAndOwner(t *testing.T) {
 	e, cfg := newTransitionEnv(t, seedRows()...)
 	cfg.midSnapshot = func() error {
-		if _, err := e.gen.ReadOwner(); err != nil {
-			t.Errorf("owner not written before the rows: %v", err)
+		if _, err := e.gen.ReadOwner(); err == nil {
+			t.Error("owner written before the row snapshot completed")
 		}
-		requireOwnerCoversRows(t, e.gen)
+		gen := mustRows(t, e.gen.Journal())
+		for _, want := range seedRows() {
+			if gen[want.Key] != want {
+				t.Errorf("generation row %s = %+v, want %+v", want.Key, gen[want.Key], want)
+			}
+		}
 		return errCrash
 	}
 	if err := Transition(context.Background(), cfg); !errors.Is(err, errCrash) {
 		t.Fatalf("Transition err = %v, want injected crash", err)
 	}
-	requireOwnerCoversRows(t, e.gen)
+	if _, err := e.gen.ReadOwner(); err == nil {
+		t.Error("failed snapshot wrote the generation owner")
+	}
 	rows := mustRows(t, e.canonical)
 	if len(rows) != len(seedRows()) {
 		t.Errorf("canonical rows = %v, want the seeds intact", rows)

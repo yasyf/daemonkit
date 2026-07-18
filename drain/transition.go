@@ -195,27 +195,33 @@ func (cfg TransitionConfig) snapshot(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("drain: read canonical: %w", err)
 	}
-	// WriteOwner strictly precedes the rows: rows without an owner record are
-	// permanently Undetermined.
-	if err := cfg.Generation.WriteOwner(cfg.Self); err != nil {
-		return fmt.Errorf("drain: record generation owner: %w", err)
+	generation := cfg.Generation.Journal()
+	existing, err := generation.Rows(ctx)
+	if err != nil {
+		return fmt.Errorf("drain: read generation journal: %w", err)
 	}
-	if cfg.midSnapshot != nil {
-		if err := cfg.midSnapshot(); err != nil {
-			return err
-		}
+	if len(existing) != 0 {
+		return fmt.Errorf("drain: snapshot generation %s: stale journal is not empty", cfg.Generation.Name())
 	}
 	ordered := make([]Row, 0, len(rows))
 	for _, r := range rows {
 		ordered = append(ordered, r)
 	}
 	sort.Slice(ordered, func(a, b int) bool { return ordered[a].Key < ordered[b].Key })
-	applied, err := cfg.Generation.Journal().Apply(ctx, ordered...)
+	applied, err := generation.Apply(ctx, ordered...)
 	if err != nil {
 		return fmt.Errorf("drain: snapshot generation: %w", err)
 	}
 	if applied != len(ordered) {
 		return fmt.Errorf("drain: snapshot generation %s: applied %d of %d rows: stale journal", cfg.Generation.Name(), applied, len(ordered))
+	}
+	if cfg.midSnapshot != nil {
+		if err := cfg.midSnapshot(); err != nil {
+			return err
+		}
+	}
+	if err := cfg.Generation.WriteOwner(cfg.Self); err != nil {
+		return fmt.Errorf("drain: record generation owner: %w", err)
 	}
 	return nil
 }

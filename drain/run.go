@@ -358,7 +358,10 @@ func (cfg RunConfig) sweepKey(ctx context.Context, key Key, row Row) (bool, erro
 		return false, nil
 	}
 	// Handed off: the row must advance, and Restore must never run past here.
-	if _, err := cfg.Generation.Journal().Apply(ctx, Row{Key: key, Seq: row.Seq + 1, State: RowYielded}); err != nil {
+	if _, err := cfg.Generation.Journal().Apply(context.WithoutCancel(ctx), Row{Key: key, Seq: row.Seq + 1, State: RowYielded}); err != nil {
+		if releaseErr := fence.Release(); releaseErr != nil {
+			log.Warn("drain: release fence", "key", key, "err", releaseErr)
+		}
 		return false, fmt.Errorf("drain: advance %s: %w", key, err)
 	}
 	if err := fence.Release(); err != nil {
@@ -368,7 +371,7 @@ func (cfg RunConfig) sweepKey(ctx context.Context, key Key, row Row) (bool, erro
 }
 
 func (cfg RunConfig) restore(ctx context.Context, key Key, fence Fence) {
-	if err := cfg.Resources.Restore(ctx, key, fence); err != nil {
+	if err := cfg.Resources.Restore(context.WithoutCancel(ctx), key, fence); err != nil {
 		cfg.log().Error("drain: restore", "key", key, "err", err)
 	}
 }
