@@ -131,10 +131,13 @@ func (cfg ScanConfig) assess(g Generation) Liveness {
 }
 
 // AdoptDead replays g's pending rows into canonical at the next seq — a stale
-// replay no-ops per CAS — then removes g. The canonical write is admitted
-// through intake, so a draining canonical refuses with ErrDraining and leaves g
-// intact for the successor. Callers must hold death proof; ScanPeers gates it
-// on a revalidated identity.
+// replay no-ops per CAS — then removes g only once every pending row is durably
+// represented in canonical at or above its generation seq. A row that failed to
+// land (a seq that wrapped, or a canonical mutated out from under the adoption)
+// leaves g intact for retry rather than deleting the row's only other copy. The
+// canonical write is admitted through intake, so a draining canonical refuses
+// with ErrDraining and leaves g intact for the successor. Callers must hold
+// death proof; ScanPeers gates it on a revalidated identity.
 func AdoptDead(ctx context.Context, intake *Intake, canonical Journal, g Generation) error {
 	done, err := intake.Admit()
 	if err != nil {
@@ -145,17 +148,29 @@ func AdoptDead(ctx context.Context, intake *Intake, canonical Journal, g Generat
 	if err != nil {
 		return fmt.Errorf("drain: read %s journal: %w", g.Name(), err)
 	}
-	adopt := make([]Row, 0, len(rows))
+	pending := make([]Row, 0, len(rows))
 	for _, r := range rows {
-		if r.State != RowPending {
-			continue
+		if r.State == RowPending {
+			pending = append(pending, r)
 		}
-		adopt = append(adopt, Row{Key: r.Key, Seq: r.Seq + 1, State: RowPending})
 	}
-	sort.Slice(adopt, func(a, b int) bool { return adopt[a].Key < adopt[b].Key })
+	sort.Slice(pending, func(a, b int) bool { return pending[a].Key < pending[b].Key })
+	adopt := make([]Row, len(pending))
+	for i, r := range pending {
+		adopt[i] = Row{Key: r.Key, Seq: r.Seq + 1, State: RowPending}
+	}
 	if len(adopt) > 0 {
 		if _, err := canonical.Apply(ctx, adopt...); err != nil {
 			return fmt.Errorf("drain: adopt %s: %w", g.Name(), err)
+		}
+	}
+	current, err := canonical.Rows(ctx)
+	if err != nil {
+		return fmt.Errorf("drain: reread canonical after adopt %s: %w", g.Name(), err)
+	}
+	for _, r := range pending {
+		if current[r.Key].Seq < r.Seq {
+			return fmt.Errorf("drain: adopt %s: row %q not durably applied (canonical seq %d < generation seq %d); generation retained", g.Name(), r.Key, current[r.Key].Seq, r.Seq)
 		}
 	}
 	if err := g.Remove(); err != nil {

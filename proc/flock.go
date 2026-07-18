@@ -18,11 +18,19 @@ type FlockHandle struct {
 	f *os.File
 }
 
-// Release drops the lock; the lock file is left on disk on purpose: unlinking
+// Release drops the lock and closes the handle, returning the first of the
+// unlock or close failures. The lock file is left on disk on purpose: unlinking
 // under flock races other processes that have it open.
-func (h *FlockHandle) Release() {
-	_ = unix.Flock(int(h.f.Fd()), unix.LOCK_UN)
-	_ = h.f.Close()
+func (h *FlockHandle) Release() error {
+	unlockErr := unix.Flock(int(h.f.Fd()), unix.LOCK_UN)
+	closeErr := h.f.Close()
+	if unlockErr != nil {
+		return fmt.Errorf("unlock %s: %w", h.f.Name(), unlockErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close lock %s: %w", h.f.Name(), closeErr)
+	}
+	return nil
 }
 
 // TryLock takes an exclusive advisory lock on path without blocking, returning

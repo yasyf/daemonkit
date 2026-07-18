@@ -122,7 +122,8 @@ func TestRunCanceledAttestRestoresWithLiveContext(t *testing.T) {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		return fence.Release()
+		fence.Release()
+		return nil
 	}
 
 	yielded, err := cfg.sweepKey(ctx, "k1", Row{Key: "k1", Seq: 1, State: RowPending})
@@ -244,6 +245,9 @@ func TestRunPostYieldJournalFailureReleasesFence(t *testing.T) {
 	}
 	if !fence.released {
 		t.Error("fence not released after committed handoff and journal failure")
+	}
+	if fence.Held() {
+		t.Error("fence still held after release on the post-yield journal-failure path")
 	}
 	if err := os.Remove(journal.lockPath()); err != nil {
 		t.Fatalf("remove wedged journal lock: %v", err)

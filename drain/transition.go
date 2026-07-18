@@ -13,6 +13,11 @@ import (
 // ErrDraining refuses admission and registration once the drain flag is set.
 var ErrDraining = errors.New("drain: draining")
 
+// ErrDrainInProgress refuses a second drain transition while one already holds
+// the drain flag, so concurrent transitions never snapshot the same canonical
+// rows into two generations.
+var ErrDrainInProgress = errors.New("drain: transition already in progress")
+
 // Intake gates canonical admission: Admit tracks in-flight work, Close sets the
 // drain flag refusing new work, Settle blocks until admitted work settles.
 type Intake struct {
@@ -42,11 +47,26 @@ func (i *Intake) Admit() (done func(), err error) {
 	}, nil
 }
 
-// Close sets the drain flag; admissions and registrations refuse from now on.
+// Close idempotently sets the drain flag; admissions and registrations refuse
+// from now on. Use BeginDrain where a second setter must be refused.
 func (i *Intake) Close() {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	i.draining = true
+}
+
+// BeginDrain compare-and-sets the drain flag: the first caller sets it and wins,
+// a caller that finds it already set refuses with ErrDrainInProgress. Admissions
+// and registrations refuse once the flag is set. The flag is committed before
+// the caller returns, so a concurrent transition observes it before snapshotting.
+func (i *Intake) BeginDrain() error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.draining {
+		return ErrDrainInProgress
+	}
+	i.draining = true
+	return nil
 }
 
 // Draining reports whether the drain flag is set.
@@ -127,7 +147,9 @@ type TransitionConfig struct {
 	// BindDrainListener binds the generation drain listener (f).
 	BindDrainListener func(ctx context.Context) error
 	// ReleaseLock releases the canonical flock (g); wire proc.FlockHandle.Release.
-	ReleaseLock func()
+	// A release failure fails the transition before the successor spawns, so no
+	// successor comes up behind a canonical lock this process still holds.
+	ReleaseLock func() error
 	// SpawnSuccessor spawns the successor (h); wire proc.Spawn.EnsureRunning.
 	SpawnSuccessor func(ctx context.Context) error
 
@@ -146,7 +168,9 @@ func (cfg TransitionConfig) step(s Step) error {
 // returns nil, the generation journal owns every row and the successor is
 // spawned; the caller then drives Run until the journal drains to zero.
 func Transition(ctx context.Context, cfg TransitionConfig) error {
-	cfg.Intake.Close()
+	if err := cfg.Intake.BeginDrain(); err != nil {
+		return err
+	}
 	if err := cfg.step(StepDrainFlag); err != nil {
 		return err
 	}
@@ -180,7 +204,9 @@ func Transition(ctx context.Context, cfg TransitionConfig) error {
 	if err := cfg.step(StepBindListener); err != nil {
 		return err
 	}
-	cfg.ReleaseLock()
+	if err := cfg.ReleaseLock(); err != nil {
+		return fmt.Errorf("drain: release canonical lock: %w", err)
+	}
 	if err := cfg.step(StepReleaseLock); err != nil {
 		return err
 	}
@@ -195,33 +221,24 @@ func (cfg TransitionConfig) snapshot(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("drain: read canonical: %w", err)
 	}
-	generation := cfg.Generation.Journal()
-	existing, err := generation.Rows(ctx)
-	if err != nil {
-		return fmt.Errorf("drain: read generation journal: %w", err)
-	}
-	if len(existing) != 0 {
-		return fmt.Errorf("drain: snapshot generation %s: stale journal is not empty", cfg.Generation.Name())
-	}
 	ordered := make([]Row, 0, len(rows))
 	for _, r := range rows {
 		ordered = append(ordered, r)
 	}
 	sort.Slice(ordered, func(a, b int) bool { return ordered[a].Key < ordered[b].Key })
-	applied, err := generation.Apply(ctx, ordered...)
-	if err != nil {
-		return fmt.Errorf("drain: snapshot generation: %w", err)
-	}
-	if applied != len(ordered) {
-		return fmt.Errorf("drain: snapshot generation %s: applied %d of %d rows: stale journal", cfg.Generation.Name(), applied, len(ordered))
-	}
-	if cfg.midSnapshot != nil {
-		if err := cfg.midSnapshot(); err != nil {
-			return err
+	claim := func() error {
+		if cfg.midSnapshot != nil {
+			if err := cfg.midSnapshot(); err != nil {
+				return err
+			}
 		}
+		if err := cfg.Generation.WriteOwner(cfg.Self); err != nil {
+			return fmt.Errorf("drain: record generation owner: %w", err)
+		}
+		return nil
 	}
-	if err := cfg.Generation.WriteOwner(cfg.Self); err != nil {
-		return fmt.Errorf("drain: record generation owner: %w", err)
+	if err := cfg.Generation.Journal().ClaimSnapshot(ctx, ordered, claim); err != nil {
+		return fmt.Errorf("drain: snapshot generation %s: %w", cfg.Generation.Name(), err)
 	}
 	return nil
 }

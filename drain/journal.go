@@ -5,12 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 
 	"github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/proc"
 )
+
+// ErrStaleJournal refuses a snapshot into a generation journal that already
+// holds a row: a reused or foreign generation name must never double-own a key.
+var ErrStaleJournal = errors.New("stale journal is not empty")
 
 // RowState is a journal row's drain state.
 type RowState string
@@ -120,9 +125,9 @@ func (j Journal) Bump(ctx context.Context, key Key, state RowState) (Row, error)
 			if err != nil {
 				return err
 			}
-			next := stored.Seq + 1
+			next := nextSeq(stored.Seq)
 			if next <= high {
-				next = high + 1
+				next = nextSeq(high)
 			}
 			out = Row{Key: key, Seq: next, State: state}
 			b, err := json.Marshal(out)
@@ -137,6 +142,35 @@ func (j Journal) Bump(ctx context.Context, key Key, state RowState) (Row, error)
 		return Row{}, err
 	}
 	return out, nil
+}
+
+// ClaimSnapshot applies rows into the journal and runs claim before releasing
+// the journal flock, so the row snapshot and the ownership claim it guards land
+// atomically against any concurrent journal writer. It refuses with
+// ErrStaleJournal — without applying or claiming — when the journal already
+// holds a row, closing the check-then-apply window a disjoint foreign row could
+// otherwise slip through.
+func (j Journal) ClaimSnapshot(ctx context.Context, rows []Row, claim func() error) error {
+	return withFlock(ctx, j.lockPath(), func() error {
+		if err := j.file.UpdateUnlocked(func(state map[string]json.RawMessage) error {
+			for k := range state {
+				if k != seqKey {
+					return ErrStaleJournal
+				}
+			}
+			for _, r := range rows {
+				b, err := json.Marshal(r)
+				if err != nil {
+					return err
+				}
+				state[string(r.Key)] = b
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		return claim()
+	})
 }
 
 // Truncate deletes every row: after the generation snapshot, each row must live
@@ -170,6 +204,15 @@ func (j Journal) Truncate(ctx context.Context) error {
 			return nil
 		})
 	})
+}
+
+// nextSeq returns s+1, saturating at math.MaxUint64 so an exhausted seq space
+// never wraps to a low, already-issued value that CAS would then suppress.
+func nextSeq(s uint64) uint64 {
+	if s == math.MaxUint64 {
+		return s
+	}
+	return s + 1
 }
 
 func decodeSeq(raw json.RawMessage) (uint64, error) {
@@ -282,17 +325,15 @@ func (g Generation) Journal() Journal {
 
 func (g Generation) ownerPath() string { return filepath.Join(g.dir, "owner.json") }
 
-// WriteOwner records id as the generation's owning process; a torn write reads
-// back unreadable, which scans treat as Undetermined (never adopted).
+// WriteOwner records id as the generation's owning process through an atomic
+// durable rename, so a crash leaves either the previous owner or the new one,
+// never a torn record; an unreadable record scans treat as Undetermined.
 func (g Generation) WriteOwner(id proc.Identity) error {
-	if err := os.MkdirAll(g.dir, 0o700); err != nil {
-		return fmt.Errorf("create generation dir: %w", err)
-	}
 	b, err := json.Marshal(ownerRecord{PID: id.PID, StartTime: id.StartTime, Comm: id.Comm})
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(g.ownerPath(), b, 0o600); err != nil {
+	if err := daemon.WriteFileDurable(g.ownerPath(), b, 0o600); err != nil {
 		return fmt.Errorf("write owner %s: %w", g.ownerPath(), err)
 	}
 	return nil

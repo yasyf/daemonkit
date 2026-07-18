@@ -26,8 +26,11 @@ const (
 type Fence interface {
 	// Held reports whether the fence is still held; false mid-sweep aborts.
 	Held() bool
-	// Release drops the fence after the journal row has advanced.
-	Release() error
+	// Release drops the fence after the journal row has advanced. It is
+	// infallible and idempotent: an implementation that cannot release must
+	// panic rather than leave the fence held, since a stuck fence renders the
+	// resource permanently unretryable.
+	Release()
 }
 
 // Resources is the consumer seam the sweep drives. Every method blocks on I/O,

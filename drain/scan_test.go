@@ -3,6 +3,7 @@ package drain
 import (
 	"context"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -174,7 +175,9 @@ func TestScanAdoptStaleReplayNoOps(t *testing.T) {
 func TestAdoptDeadRefusedWhileDraining(t *testing.T) {
 	prb := &fakeProber{results: map[int]proberResult{deadPID: {err: proc.ErrNoProcess}}}
 	cfg, g := newScanEnv(t, prb, Row{Key: "k1", Seq: 3, State: RowPending})
-	cfg.Intake.Close()
+	if err := cfg.Intake.BeginDrain(); err != nil {
+		t.Fatalf("BeginDrain: %v", err)
+	}
 	if err := AdoptDead(context.Background(), cfg.Intake, cfg.Canonical, g); !errors.Is(err, ErrDraining) {
 		t.Fatalf("AdoptDead err = %v, want ErrDraining", err)
 	}
@@ -194,6 +197,27 @@ func TestAdoptDeadRefusedWhileDraining(t *testing.T) {
 	}
 	if !dirExists(t, g.Dir()) {
 		t.Error("draining scan removed the generation")
+	}
+}
+
+func TestAdoptDeadMaxSeqRowNotSilentlyLost(t *testing.T) {
+	prb := &fakeProber{results: map[int]proberResult{deadPID: {err: proc.ErrNoProcess}}}
+	cfg, g := newScanEnv(t, prb, Row{Key: "k1", Seq: math.MaxUint64, State: RowPending})
+	// The adopt seq (MaxUint64+1) wraps to 0 and CAS-suppresses; AdoptDead must
+	// refuse to remove the generation rather than delete the row's only copy.
+	err := AdoptDead(context.Background(), cfg.Intake, cfg.Canonical, g)
+	if err == nil {
+		t.Fatal("AdoptDead removed a generation whose max-seq row never applied")
+	}
+	if rows := mustRows(t, cfg.Canonical); len(rows) != 0 {
+		t.Errorf("canonical holds a wrapped row: %v", rows)
+	}
+	if !dirExists(t, g.Dir()) {
+		t.Error("generation with an unapplied max-seq row was removed; the row is lost")
+	}
+	want := Row{Key: "k1", Seq: math.MaxUint64, State: RowPending}
+	if rows := mustRows(t, g.Journal()); rows["k1"] != want {
+		t.Errorf("generation row = %+v, want %+v retained for retry", rows["k1"], want)
 	}
 }
 

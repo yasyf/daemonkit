@@ -64,11 +64,11 @@ func (f *fakeFence) Held() bool {
 	return f.held
 }
 
-func (f *fakeFence) Release() error {
+func (f *fakeFence) Release() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.held = false
 	f.released = true
-	return nil
 }
 
 type fakeResources struct {

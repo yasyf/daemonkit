@@ -34,6 +34,10 @@ linters:
         - (io.Closer).Close
         - syscall.Close
         - os.RemoveAll
+        # Deferred flock release is teardown with no caller remedy either; the one
+        # integrity-critical release (the drain transition's canonical lock) is
+        # checked explicitly through TransitionConfig.ReleaseLock, not deferred.
+        - (*github.com/yasyf/daemonkit/proc.FlockHandle).Release
   exclusions:
     rules:
       # daemonkit's whole job is spawning processes (launchctl, brew, open,

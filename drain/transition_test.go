@@ -49,7 +49,7 @@ func newTransitionEnv(t *testing.T, seed ...Row) (*transitionEnv, TransitionConf
 		Generation:        e.gen,
 		Self:              proc.Identity{PID: 4242, StartTime: "111.222", Comm: "old"},
 		BindDrainListener: func(context.Context) error { e.record("bind"); return nil },
-		ReleaseLock:       func() { e.record("release-lock") },
+		ReleaseLock:       func() error { e.record("release-lock"); return nil },
 		SpawnSuccessor:    func(context.Context) error { e.record("spawn"); return nil },
 	}
 	return e, cfg
@@ -251,10 +251,20 @@ func TestSnapshotCrashBetweenRowsAndOwner(t *testing.T) {
 		if _, err := e.gen.ReadOwner(); err == nil {
 			t.Error("owner written before the row snapshot completed")
 		}
-		gen := mustRows(t, e.gen.Journal())
+		// The snapshot holds the generation journal flock here; read the file
+		// directly rather than through Rows, which would re-enter the
+		// non-reentrant flock and deadlock.
+		state, err := readState(e.gen.Journal().Path())
+		if err != nil {
+			t.Fatalf("read generation journal: %v", err)
+		}
 		for _, want := range seedRows() {
-			if gen[want.Key] != want {
-				t.Errorf("generation row %s = %+v, want %+v", want.Key, gen[want.Key], want)
+			row, err := decodeRow(state[string(want.Key)])
+			if err != nil {
+				t.Fatalf("decode row %s: %v", want.Key, err)
+			}
+			if row != want {
+				t.Errorf("generation row %s = %+v, want %+v", want.Key, row, want)
 			}
 		}
 		return errCrash
@@ -366,7 +376,9 @@ func TestIntakeAdmitAndRegister(t *testing.T) {
 	if row.Seq != 1 || row.State != RowPending {
 		t.Errorf("registered row = %+v, want seq 1 pending", row)
 	}
-	in.Close()
+	if err := in.BeginDrain(); err != nil {
+		t.Fatalf("BeginDrain: %v", err)
+	}
 	if _, err := in.Admit(); !errors.Is(err, ErrDraining) {
 		t.Errorf("Admit after Close err = %v, want ErrDraining", err)
 	}
@@ -385,10 +397,172 @@ func TestIntakeSettleHonorsContext(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer done()
-	in.Close()
+	if err := in.BeginDrain(); err != nil {
+		t.Fatalf("BeginDrain: %v", err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := in.Settle(ctx); !errors.Is(err, context.Canceled) {
 		t.Errorf("Settle err = %v, want context.Canceled", err)
+	}
+}
+
+// generationHasRows reports whether g's journal holds rows, and fails the test
+// if it does without a readable owner (a snapshot must claim ownership atomically).
+func generationHasRows(t *testing.T, g Generation) bool {
+	t.Helper()
+	rows := mustRows(t, g.Journal())
+	if len(rows) == 0 {
+		return false
+	}
+	if _, err := g.ReadOwner(); err != nil {
+		t.Errorf("generation %s holds %d rows without a readable owner: %v", g.Name(), len(rows), err)
+	}
+	return true
+}
+
+func TestTransitionConcurrentDifferentGenerationsSingleOwner(t *testing.T) {
+	e, cfg1 := newTransitionEnv(t, seedRows()...)
+	g2 := NewGeneration(e.dotdir, "g2")
+	cfg2 := TransitionConfig{
+		Intake:            cfg1.Intake, // shared: BeginDrain's CAS serializes the two
+		CloseIntake:       func(context.Context) error { return nil },
+		Canonical:         e.canonical,
+		Generation:        g2,
+		Self:              proc.Identity{PID: 7777, StartTime: "222.333", Comm: "other"},
+		BindDrainListener: func(context.Context) error { return nil },
+		ReleaseLock:       func() error { return nil },
+		SpawnSuccessor:    func(context.Context) error { return nil },
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	wg.Add(2)
+	go func() { defer wg.Done(); errs[0] = Transition(context.Background(), cfg1) }()
+	go func() { defer wg.Done(); errs[1] = Transition(context.Background(), cfg2) }()
+	wg.Wait()
+
+	wins, refusals := 0, 0
+	for _, err := range errs {
+		switch {
+		case err == nil:
+			wins++
+		case errors.Is(err, ErrDrainInProgress):
+			refusals++
+		default:
+			t.Fatalf("unexpected Transition error: %v", err)
+		}
+	}
+	if wins != 1 || refusals != 1 {
+		t.Fatalf("wins=%d refusals=%d, want exactly one winner and one ErrDrainInProgress", wins, refusals)
+	}
+	if g1Owned, g2Owned := generationHasRows(t, e.gen), generationHasRows(t, g2); g1Owned == g2Owned {
+		t.Fatalf("ownership split g1=%v g2=%v, want exactly one generation to own the rows", g1Owned, g2Owned)
+	}
+	if rows := mustRows(t, e.canonical); len(rows) != 0 {
+		t.Errorf("winner did not truncate canonical: %v", rows)
+	}
+}
+
+func TestSnapshotHoldsGenerationLockAcrossClaim(t *testing.T) {
+	e, cfg := newTransitionEnv(t, seedRows()...)
+	landed := make(chan struct{})
+	cfg.midSnapshot = func() error {
+		// The generation journal flock is held across the empty-check, the apply,
+		// and this claim: a concurrent journal writer must block until it releases.
+		go func() {
+			_, _ = e.gen.Journal().Apply(context.Background(), Row{Key: "foreign", Seq: 1, State: RowPending})
+			close(landed)
+		}()
+		select {
+		case <-landed:
+			t.Error("a concurrent Apply landed while the snapshot held the journal flock")
+		case <-time.After(100 * time.Millisecond):
+		}
+		return nil
+	}
+	if err := Transition(context.Background(), cfg); err != nil {
+		t.Fatalf("Transition: %v", err)
+	}
+	<-landed // the foreign Apply lands only once the snapshot released the flock
+}
+
+func TestTransitionFailedLockReleaseDoesNotSpawn(t *testing.T) {
+	e, cfg := newTransitionEnv(t, seedRows()...)
+	relErr := errors.New("flock release failed")
+	cfg.ReleaseLock = func() error { e.record("release-lock"); return relErr }
+	if err := Transition(context.Background(), cfg); !errors.Is(err, relErr) {
+		t.Fatalf("Transition err = %v, want the canonical lock release error", err)
+	}
+	for _, c := range e.calls() {
+		if c == "spawn" {
+			t.Fatalf("successor spawned after a failed canonical lock release: %v", e.calls())
+		}
+	}
+}
+
+func TestTransitionDrainFlagPrecedesCloseIntake(t *testing.T) {
+	e, cfg := newTransitionEnv(t, seedRows()...)
+	cfg.CloseIntake = func(context.Context) error {
+		if !cfg.Intake.Draining() {
+			t.Error("CloseIntake ran before the drain flag was set")
+		}
+		e.record("close-intake")
+		return nil
+	}
+	if err := Transition(context.Background(), cfg); err != nil {
+		t.Fatalf("Transition: %v", err)
+	}
+}
+
+func TestTransitionBindFollowsTruncate(t *testing.T) {
+	e, cfg := newTransitionEnv(t, seedRows()...)
+	cfg.BindDrainListener = func(ctx context.Context) error {
+		rows, err := e.canonical.Rows(ctx)
+		if err != nil {
+			t.Fatalf("read canonical: %v", err)
+		}
+		if len(rows) != 0 {
+			t.Errorf("bind ran before canonical truncate: %v", rows)
+		}
+		e.record("bind")
+		return nil
+	}
+	if err := Transition(context.Background(), cfg); err != nil {
+		t.Fatalf("Transition: %v", err)
+	}
+}
+
+func TestTransitionTruncateFollowsOwnerClaim(t *testing.T) {
+	e, cfg := newTransitionEnv(t, seedRows()...)
+	ctx := context.Background()
+	canonicalRows := func(at string) map[Key]Row {
+		rows, err := e.canonical.Rows(ctx)
+		if err != nil {
+			t.Fatalf("read canonical at %s: %v", at, err)
+		}
+		return rows
+	}
+	cfg.afterStep = func(s Step) error {
+		switch s {
+		case StepSnapshot:
+			if _, err := e.gen.ReadOwner(); err != nil {
+				t.Errorf("owner not claimed at snapshot completion: %v", err)
+			}
+			if len(canonicalRows("snapshot")) == 0 {
+				t.Error("canonical truncated before the generation owned the rows")
+			}
+		case StepTruncate:
+			if _, err := e.gen.ReadOwner(); err != nil {
+				t.Errorf("owner missing at truncate: %v", err)
+			}
+			if rows := canonicalRows("truncate"); len(rows) != 0 {
+				t.Errorf("canonical not truncated at StepTruncate: %v", rows)
+			}
+		}
+		return nil
+	}
+	if err := Transition(ctx, cfg); err != nil {
+		t.Fatalf("Transition: %v", err)
 	}
 }

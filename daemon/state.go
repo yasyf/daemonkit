@@ -81,26 +81,61 @@ func (s StateFile) write(state map[string]json.RawMessage) error {
 	if err != nil {
 		return fmt.Errorf("encode state: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(s.Path), 0o700); err != nil {
-		return fmt.Errorf("create state dir: %w", err)
+	return WriteFileDurable(s.Path, data, 0o600)
+}
+
+// WriteFileDurable writes data to path through the atomic-durable-rename idiom:
+// a temp file in the same directory is written, fsynced, and renamed over path,
+// then the containing directory is fsynced so a power loss after the call leaves
+// either the previous contents or data, never a truncated or lost file.
+func WriteFileDurable(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create dir %s: %w", dir, err)
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(s.Path), ".state-*")
+	tmp, err := os.CreateTemp(dir, ".durable-*")
 	if err != nil {
-		return fmt.Errorf("create temp state: %w", err)
+		return fmt.Errorf("create temp %s: %w", path, err)
 	}
 	tmpName := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
 		_ = os.Remove(tmpName)
-		return fmt.Errorf("write temp state: %w", err)
+		return fmt.Errorf("write temp %s: %w", path, err)
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("chmod temp %s: %w", path, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("fsync temp %s: %w", path, err)
 	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmpName)
-		return fmt.Errorf("close temp state: %w", err)
+		return fmt.Errorf("close temp %s: %w", path, err)
 	}
-	if err := os.Rename(tmpName, s.Path); err != nil {
+	if err := os.Rename(tmpName, path); err != nil {
 		_ = os.Remove(tmpName)
-		return fmt.Errorf("rename state into place: %w", err)
+		return fmt.Errorf("rename %s into place: %w", path, err)
+	}
+	return fsyncDir(dir)
+}
+
+// fsyncDir fsyncs a directory so a rename into it survives a power loss.
+func fsyncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open dir %s: %w", dir, err)
+	}
+	if err := d.Sync(); err != nil {
+		d.Close()
+		return fmt.Errorf("fsync dir %s: %w", dir, err)
+	}
+	if err := d.Close(); err != nil {
+		return fmt.Errorf("close dir %s: %w", dir, err)
 	}
 	return nil
 }
