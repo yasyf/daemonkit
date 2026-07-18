@@ -2,12 +2,16 @@ package drain
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 
 	"github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/proc"
@@ -16,6 +20,22 @@ import (
 // ErrStaleJournal refuses a snapshot into a generation journal that already
 // holds a row: a reused or foreign generation name must never double-own a key.
 var ErrStaleJournal = errors.New("stale journal is not empty")
+
+// ErrStaleGeneration means a bound Generation handle outlived its incarnation:
+// the directory was removed (and possibly re-created under the same name) since
+// the handle captured its incarnation token, so the op must not land.
+var ErrStaleGeneration = errors.New("stale generation handle")
+
+// ErrSeqExhausted refuses to advance a key into the reserved seq
+// math.MaxUint64: a row at the reserved seq could byte-collide with a
+// truncated snapshot row, which a retried scoped truncate would then delete —
+// a silently lost admission. Sequence exhaustion (2^64 admissions on one key)
+// is terminal for that key and surfaces as this error rather than wrapping.
+var ErrSeqExhausted = errors.New("seq space exhausted")
+
+// rootLockName is the never-unlinked drain-root lock's basename; generation
+// names must not collide with it (NewGeneration rejects dot-prefixed names).
+const rootLockName = ".lock"
 
 // RowState is a journal row's drain state.
 type RowState string
@@ -31,6 +51,16 @@ const (
 // Truncate, so a new epoch never re-issues an already-issued seq.
 const seqKey = "~seq"
 
+// transitionKey is the reserved state key persisting the active drain
+// transition across process restart.
+const transitionKey = "~transition"
+
+// completeKey is the reserved generation-journal key marking the transition
+// a..h complete before the canonical claim releases: a retry that finds a
+// fresh claim but this marker knows the prior attempt finished and only its
+// release fsync failed.
+const completeKey = "~complete"
+
 // Row is one journal row; Seq is the monotonic transition seq CAS updates key on.
 type Row struct {
 	Key   Key      `json:"key"`
@@ -42,38 +72,64 @@ type Row struct {
 // Writes go through daemon.StateFile, so untouched rows survive byte-for-byte.
 type Journal struct {
 	file daemon.StateFile
+	lock string
+	// genDir, when set, is the generation directory this journal lives in:
+	// every op re-checks it exists under the lock and fails with
+	// os.ErrNotExist when it is gone, so a late writer can never resurrect a
+	// removed generation by re-creating its files.
+	genDir string
+	// inc, when set, is the incarnation token the owning Generation handle was
+	// bound to; every op revalidates it under the lock and fails with
+	// ErrStaleGeneration when the directory was removed and re-created since.
+	inc       string
+	ownerPath string
 }
 
-// NewJournal opens the journal at path; the file need not exist yet.
+// NewJournal opens the canonical journal at path; the file need not exist yet,
+// and locking creates its lock layout on demand. Generation journals are
+// package-internal — they share the drain root lock and bind to an incarnation.
 func NewJournal(path string) Journal {
-	return Journal{file: daemon.StateFile{Path: path}}
+	return Journal{file: daemon.StateFile{Path: path}, lock: path + ".lock"}
+}
+
+// withLock runs fn holding the journal's flock. Generation journals lock the
+// drain root (see Generation) and refuse a removed generation with
+// os.ErrNotExist rather than resurrecting its directory.
+func (j Journal) withLock(ctx context.Context, fn func() error) error {
+	lock, err := proc.Flock(ctx, j.lock)
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
+	if j.genDir != "" {
+		if _, err := os.Stat(j.genDir); err != nil {
+			return fmt.Errorf("generation %s: %w", filepath.Base(j.genDir), err)
+		}
+		if j.inc != "" {
+			inc, err := readOwnerInc(j.ownerPath)
+			if err != nil {
+				return fmt.Errorf("%w: generation %s owner: %w", ErrStaleGeneration, filepath.Base(j.genDir), err)
+			}
+			if inc != j.inc {
+				return fmt.Errorf("%w: generation %s was re-created", ErrStaleGeneration, filepath.Base(j.genDir))
+			}
+		}
+	}
+	return fn()
 }
 
 // Path returns the journal file path.
 func (j Journal) Path() string { return j.file.Path }
 
-func (j Journal) lockPath() string { return j.file.Path + ".lock" }
+func (j Journal) lockPath() string { return j.lock }
 
 // Rows returns every row keyed by resource key; a missing file is empty.
 func (j Journal) Rows(ctx context.Context) (map[Key]Row, error) {
 	var rows map[Key]Row
-	err := withFlock(ctx, j.lockPath(), func() error {
-		state, err := readState(j.file.Path)
-		if err != nil {
-			return err
-		}
-		rows = make(map[Key]Row, len(state))
-		for k, raw := range state {
-			if k == seqKey {
-				continue
-			}
-			row, err := decodeRow(raw)
-			if err != nil {
-				return fmt.Errorf("row %q: %w", k, err)
-			}
-			rows[Key(k)] = row
-		}
-		return nil
+	err := j.withLock(ctx, func() error {
+		var err error
+		rows, err = j.rowsUnlocked()
+		return err
 	})
 	if err != nil {
 		return nil, err
@@ -81,11 +137,32 @@ func (j Journal) Rows(ctx context.Context) (map[Key]Row, error) {
 	return rows, nil
 }
 
-// Apply CAS-applies rows: each lands only when its Seq exceeds the stored row's,
+func (j Journal) rowsUnlocked() (map[Key]Row, error) {
+	state, err := readState(j.file.Path)
+	if err != nil {
+		return nil, err
+	}
+	rows := make(map[Key]Row, len(state))
+	for k, raw := range state {
+		if isJournalMetadata(k) {
+			continue
+		}
+		row, err := decodeRow(raw)
+		if err != nil {
+			return nil, fmt.Errorf("row %q: %w", k, err)
+		}
+		rows[Key(k)] = row
+	}
+	return rows, nil
+}
+
+// apply CAS-applies rows: each lands only when its Seq exceeds the stored row's,
 // so a stale replay (Seq <= stored) is a no-op. Returns the applied row count.
-func (j Journal) Apply(ctx context.Context, rows ...Row) (int, error) {
+// Unexported: canonical seq advancement must route through advanceSeq (Bump,
+// adopt); a caller-supplied seq bypassing it could reconstitute truncated rows.
+func (j Journal) apply(ctx context.Context, rows ...Row) (int, error) {
 	applied := 0
-	err := withFlock(ctx, j.lockPath(), func() error {
+	err := j.withLock(ctx, func() error {
 		return j.file.UpdateUnlocked(func(state map[string]json.RawMessage) error {
 			for _, r := range rows {
 				stored, err := decodeRow(state[string(r.Key)])
@@ -115,7 +192,7 @@ func (j Journal) Apply(ctx context.Context, rows ...Row) (int, error) {
 // row; the seq never falls below the Truncate-preserved high-water mark.
 func (j Journal) Bump(ctx context.Context, key Key, state RowState) (Row, error) {
 	var out Row
-	err := withFlock(ctx, j.lockPath(), func() error {
+	err := j.withLock(ctx, func() error {
 		return j.file.UpdateUnlocked(func(st map[string]json.RawMessage) error {
 			stored, err := decodeRow(st[string(key)])
 			if err != nil {
@@ -125,9 +202,9 @@ func (j Journal) Bump(ctx context.Context, key Key, state RowState) (Row, error)
 			if err != nil {
 				return err
 			}
-			next := nextSeq(stored.Seq)
-			if next <= high {
-				next = nextSeq(high)
+			next, ok := advanceSeq(stored.Seq, high)
+			if !ok {
+				return fmt.Errorf("%w: key %q", ErrSeqExhausted, key)
 			}
 			out = Row{Key: key, Seq: next, State: state}
 			b, err := json.Marshal(out)
@@ -144,19 +221,77 @@ func (j Journal) Bump(ctx context.Context, key Key, state RowState) (Row, error)
 	return out, nil
 }
 
-// ClaimSnapshot applies rows into the journal and runs claim before releasing
+// adopt replays generation rows into canonical: each key advances strictly
+// above the generation row, the stored canonical row, AND the
+// Truncate-preserved high-water mark — the advancement rule shared with Bump —
+// so an adopted row can never reconstitute a truncated snapshot row and a
+// retried scoped Truncate can never delete it. A stored row already strictly
+// newer than the generation's is left untouched (a stale replay is a no-op).
+func (j Journal) adopt(ctx context.Context, rows []Row) error {
+	return j.withLock(ctx, func() error {
+		return j.file.UpdateUnlocked(func(st map[string]json.RawMessage) error {
+			high, err := decodeSeq(st[seqKey])
+			if err != nil {
+				return err
+			}
+			for _, r := range rows {
+				stored, err := decodeRow(st[string(r.Key)])
+				if err != nil {
+					return fmt.Errorf("row %q: %w", r.Key, err)
+				}
+				if stored.Seq > r.Seq {
+					continue
+				}
+				next, ok := advanceSeq(r.Seq, stored.Seq, high)
+				if !ok {
+					return fmt.Errorf("%w: key %q", ErrSeqExhausted, r.Key)
+				}
+				b, err := json.Marshal(Row{Key: r.Key, Seq: next, State: RowPending})
+				if err != nil {
+					return err
+				}
+				st[string(r.Key)] = b
+			}
+			return nil
+		})
+	})
+}
+
+// claimSnapshot applies rows into the journal and runs claim before releasing
 // the journal flock, so the row snapshot and the ownership claim it guards land
-// atomically against any concurrent journal writer. It refuses with
-// ErrStaleJournal — without applying or claiming — when the journal already
-// holds a row, closing the check-then-apply window a disjoint foreign row could
-// otherwise slip through.
-func (j Journal) ClaimSnapshot(ctx context.Context, rows []Row, claim func() error) error {
-	return withFlock(ctx, j.lockPath(), func() error {
-		if err := j.file.UpdateUnlocked(func(state map[string]json.RawMessage) error {
-			for k := range state {
-				if k != seqKey {
+// atomically against any concurrent journal writer. An exact replay resumes;
+// any other non-empty journal returns ErrStaleJournal without mutation.
+// Unexported: it copies caller-supplied seqs verbatim, which is correct only
+// for the transition's snapshot of canonical rows into a generation journal.
+func (j Journal) claimSnapshot(ctx context.Context, rows []Row, claim func() error) error {
+	return j.withLock(ctx, func() error {
+		return j.file.UpdateUnlocked(func(state map[string]json.RawMessage) error {
+			stored := make(map[Key]Row, len(state))
+			for k, raw := range state {
+				if isJournalMetadata(k) {
+					continue
+				}
+				r, err := decodeRow(raw)
+				if err != nil {
+					return fmt.Errorf("row %q: %w", k, err)
+				}
+				stored[Key(k)] = r
+			}
+			if len(stored) > 0 {
+				if len(stored) != len(rows) {
 					return ErrStaleJournal
 				}
+				for _, r := range rows {
+					if stored[r.Key] != r {
+						return ErrStaleJournal
+					}
+				}
+			}
+			if err := claim(); err != nil {
+				return err
+			}
+			if len(stored) > 0 {
+				return nil
 			}
 			for _, r := range rows {
 				b, err := json.Marshal(r)
@@ -166,35 +301,34 @@ func (j Journal) ClaimSnapshot(ctx context.Context, rows []Row, claim func() err
 				state[string(r.Key)] = b
 			}
 			return nil
-		}); err != nil {
-			return err
-		}
-		return claim()
+		})
 	})
 }
 
-// Truncate deletes every row: after the generation snapshot, each row must live
-// in exactly one authoritative journal. The seq high-water mark survives, so a
-// later Bump never re-issues a seq from before the truncate.
-func (j Journal) Truncate(ctx context.Context) error {
-	return withFlock(ctx, j.lockPath(), func() error {
+// Truncate deletes exactly the snapshotted rows: a stored row is deleted only
+// when it still matches its scope row byte-for-value, so a row admitted or
+// bumped after the snapshot survives — the truncate can never delete state the
+// generation snapshot does not hold. The seq high-water mark absorbs deleted
+// seqs, so a later Bump never re-issues one.
+func (j Journal) Truncate(ctx context.Context, scope map[Key]Row) error {
+	return j.withLock(ctx, func() error {
 		return j.file.UpdateUnlocked(func(state map[string]json.RawMessage) error {
 			high, err := decodeSeq(state[seqKey])
 			if err != nil {
 				return err
 			}
-			for k, raw := range state {
-				if k == seqKey {
+			for key, want := range scope {
+				stored, err := decodeRow(state[string(key)])
+				if err != nil {
+					return fmt.Errorf("row %q: %w", key, err)
+				}
+				if stored != want {
 					continue
 				}
-				row, err := decodeRow(raw)
-				if err != nil {
-					return fmt.Errorf("row %q: %w", k, err)
+				if stored.Seq > high {
+					high = stored.Seq
 				}
-				if row.Seq > high {
-					high = row.Seq
-				}
-				delete(state, k)
+				delete(state, string(key))
 			}
 			b, err := json.Marshal(high)
 			if err != nil {
@@ -206,6 +340,80 @@ func (j Journal) Truncate(ctx context.Context) error {
 	})
 }
 
+func isJournalMetadata(key string) bool {
+	return key == seqKey || key == transitionKey || key == completeKey
+}
+
+// markComplete durably records the transition complete for this incarnation:
+// the marker carries the handle's incarnation token, so residue a partial
+// removal leaves for a reused name never reads as the new claim's completion.
+// Idempotent.
+func (j Journal) markComplete(ctx context.Context) error {
+	if j.inc == "" {
+		return errors.New("complete marker requires an incarnation-bound journal")
+	}
+	return j.withLock(ctx, func() error {
+		return j.file.UpdateUnlocked(func(state map[string]json.RawMessage) error {
+			b, err := json.Marshal(j.inc)
+			if err != nil {
+				return err
+			}
+			state[completeKey] = b
+			return nil
+		})
+	})
+}
+
+// isComplete reports whether markComplete ran for this handle's incarnation.
+func (j Journal) isComplete(ctx context.Context) (bool, error) {
+	var complete bool
+	err := j.withLock(ctx, func() error {
+		state, err := readState(j.file.Path)
+		if err != nil {
+			return err
+		}
+		raw := state[completeKey]
+		if len(raw) == 0 {
+			return nil
+		}
+		var tok string
+		if err := json.Unmarshal(raw, &tok); err != nil {
+			return fmt.Errorf("parse complete marker: %w", err)
+		}
+		complete = j.inc != "" && tok == j.inc
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return complete, nil
+}
+
+func (j Journal) terminalize(ctx context.Context, row Row) error {
+	return j.withLock(ctx, func() error {
+		return j.terminalizeUnlocked(row)
+	})
+}
+
+func (j Journal) terminalizeUnlocked(row Row) error {
+	return j.file.UpdateUnlocked(func(state map[string]json.RawMessage) error {
+		stored, err := decodeRow(state[string(row.Key)])
+		if err != nil {
+			return fmt.Errorf("row %q: %w", row.Key, err)
+		}
+		if stored != row {
+			return fmt.Errorf("terminalize row %q: stored %+v does not match expected %+v", row.Key, stored, row)
+		}
+		out := Row{Key: row.Key, Seq: nextSeq(row.Seq), State: RowYielded}
+		b, err := json.Marshal(out)
+		if err != nil {
+			return err
+		}
+		state[string(row.Key)] = b
+		return nil
+	})
+}
+
 // nextSeq returns s+1, saturating at math.MaxUint64 so an exhausted seq space
 // never wraps to a low, already-issued value that CAS would then suppress.
 func nextSeq(s uint64) uint64 {
@@ -213,6 +421,22 @@ func nextSeq(s uint64) uint64 {
 		return s
 	}
 	return s + 1
+}
+
+// advanceSeq returns the smallest seq strictly above every floor; ok is false
+// when that seq would reach the reserved math.MaxUint64 (see ErrSeqExhausted).
+// Every canonical seq advancement — Bump and adoption — routes here.
+func advanceSeq(floors ...uint64) (uint64, bool) {
+	var next uint64
+	for _, f := range floors {
+		if n := nextSeq(f); n > next {
+			next = n
+		}
+	}
+	if next == math.MaxUint64 {
+		return 0, false
+	}
+	return next, true
 }
 
 func decodeSeq(raw json.RawMessage) (uint64, error) {
@@ -299,17 +523,171 @@ type ownerRecord struct {
 	PID       int    `json:"pid"`
 	StartTime string `json:"start_time"`
 	Comm      string `json:"comm"`
+	Boot      string `json:"boot,omitempty"`
+}
+
+type transitionRecord struct {
+	Generation string      `json:"generation"`
+	Owner      ownerRecord `json:"owner"`
+	Step       Step        `json:"step"`
+}
+
+func newOwnerRecord(id proc.Identity) ownerRecord {
+	return ownerRecord{PID: id.PID, StartTime: id.StartTime, Comm: id.Comm, Boot: id.Boot}
+}
+
+func (r ownerRecord) identity() proc.Identity {
+	return proc.Identity{PID: r.PID, StartTime: r.StartTime, Comm: r.Comm, Boot: r.Boot}
+}
+
+// ownerFile is the on-disk owner.json shape: the owner identity plus the
+// incarnation token minted when the generation layout was created.
+type ownerFile struct {
+	ownerRecord
+	Inc string `json:"inc"`
+}
+
+func decodeTransition(raw json.RawMessage) (transitionRecord, bool, error) {
+	if len(raw) == 0 {
+		return transitionRecord{}, false, nil
+	}
+	var rec transitionRecord
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		return transitionRecord{}, false, fmt.Errorf("parse active transition: %w", err)
+	}
+	if rec.Generation == "" || rec.Owner.PID <= 0 || rec.Owner.StartTime == "" {
+		return transitionRecord{}, false, errors.New("active transition: incomplete record")
+	}
+	if rec.Step < 0 || rec.Step > StepSpawn {
+		return transitionRecord{}, false, fmt.Errorf("active transition: invalid step %d", rec.Step)
+	}
+	return rec, true, nil
+}
+
+func (j Journal) claimTransition(ctx context.Context, generation string, owner proc.Identity) (Step, error) {
+	want := transitionRecord{Generation: generation, Owner: newOwnerRecord(owner)}
+	var phase Step
+	err := j.withLock(ctx, func() error {
+		return j.file.UpdateUnlocked(func(state map[string]json.RawMessage) error {
+			current, ok, err := decodeTransition(state[transitionKey])
+			if err != nil {
+				return err
+			}
+			if ok {
+				if current.Generation != want.Generation || current.Owner != want.Owner {
+					return ErrDrainInProgress
+				}
+				phase = current.Step
+				return nil
+			}
+			b, err := json.Marshal(want)
+			if err != nil {
+				return err
+			}
+			state[transitionKey] = b
+			return nil
+		})
+	})
+	return phase, err
+}
+
+func (j Journal) advanceTransition(ctx context.Context, generation string, owner proc.Identity, step Step) error {
+	wantOwner := newOwnerRecord(owner)
+	return j.withLock(ctx, func() error {
+		return j.file.UpdateUnlocked(func(state map[string]json.RawMessage) error {
+			current, ok, err := decodeTransition(state[transitionKey])
+			if err != nil {
+				return err
+			}
+			if !ok || current.Generation != generation || current.Owner != wantOwner {
+				return ErrDrainInProgress
+			}
+			if current.Step >= step {
+				return nil
+			}
+			if step != current.Step+1 {
+				return fmt.Errorf("active transition: advance from step %d to %d", current.Step, step)
+			}
+			current.Step = step
+			b, err := json.Marshal(current)
+			if err != nil {
+				return err
+			}
+			state[transitionKey] = b
+			return nil
+		})
+	})
+}
+
+func (j Journal) activeTransition(ctx context.Context) (transitionRecord, bool, error) {
+	var rec transitionRecord
+	var ok bool
+	err := j.withLock(ctx, func() error {
+		state, err := readState(j.file.Path)
+		if err != nil {
+			return err
+		}
+		rec, ok, err = decodeTransition(state[transitionKey])
+		return err
+	})
+	return rec, ok, err
+}
+
+func (j Journal) releaseTransition(ctx context.Context, generation string, owner proc.Identity) error {
+	wantOwner := newOwnerRecord(owner)
+	return j.withLock(ctx, func() error {
+		return j.file.UpdateUnlocked(func(state map[string]json.RawMessage) error {
+			current, ok, err := decodeTransition(state[transitionKey])
+			if err != nil {
+				return err
+			}
+			if !ok || current.Generation != generation {
+				return nil
+			}
+			if current.Owner != wantOwner {
+				return fmt.Errorf("active transition %s owner %+v does not match %+v", generation, current.Owner.identity(), owner)
+			}
+			delete(state, transitionKey)
+			return nil
+		})
+	})
 }
 
 // Generation is one drain generation's on-disk record under
 // <dotdir>/drain/<gen>: its owner identity and its ownership journal.
+//
+// All generation-layout mutation — owner claims, adoption, ownerless
+// reclamation, removal, and generation-journal writes — serializes on ONE
+// drain-root lock (<dotdir>/drain/.lock) that is never unlinked. This is
+// load-bearing: a lock file inside a removable directory is unsound (flock
+// identity is the inode, so removal plus re-creation splits waiters across two
+// inodes that both "hold" the same path), so no removable path is ever a
+// synchronization point. Lock order: the root lock nests OUTSIDE the canonical
+// journal flock; the strike-store flock never nests with either.
 type Generation struct {
 	dir string
+	// inc, when set, binds the handle to one incarnation of the directory;
+	// locked journal ops fail with ErrStaleGeneration once it no longer
+	// matches the owner record's token.
+	inc string
 }
 
-// NewGeneration addresses generation gen under dotdir's drain layout.
-func NewGeneration(dotdir, gen string) Generation {
-	return Generation{dir: filepath.Join(dotdir, "drain", gen)}
+// genName allowlists generation names: one alnum-led segment, no separators,
+// no leading dot. filepath cleaning is not a guard — Base("/") is "/", so a
+// blocklist would let a name alias the drain root and Remove delete it.
+var genName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+// NewGeneration addresses generation gen under dotdir's drain layout; dotdir
+// must be absolute, and gen must match the genName allowlist so it can never
+// alias the drain root, escape it, or shadow the root lock.
+func NewGeneration(dotdir, gen string) (Generation, error) {
+	if !filepath.IsAbs(dotdir) {
+		return Generation{}, fmt.Errorf("dotdir %q is not absolute", dotdir)
+	}
+	if !genName.MatchString(gen) {
+		return Generation{}, fmt.Errorf("invalid generation name %q", gen)
+	}
+	return Generation{dir: filepath.Join(dotdir, "drain", gen)}, nil
 }
 
 // Dir returns the generation directory.
@@ -318,18 +696,31 @@ func (g Generation) Dir() string { return g.dir }
 // Name returns the generation's identifier (the directory basename).
 func (g Generation) Name() string { return filepath.Base(g.dir) }
 
-// Journal returns the generation's ownership journal.
-func (g Generation) Journal() Journal {
-	return NewJournal(filepath.Join(g.dir, "journal.json"))
+// journal returns the generation's ownership journal, guarded by the drain
+// root lock; ops on a removed generation fail with os.ErrNotExist instead of
+// resurrecting its directory (only claimOwner creates the layout).
+func (g Generation) journal() Journal {
+	return Journal{
+		file:      daemon.StateFile{Path: filepath.Join(g.dir, "journal.json")},
+		lock:      g.rootLock(),
+		genDir:    g.dir,
+		inc:       g.inc,
+		ownerPath: g.ownerPath(),
+	}
+}
+
+// rootLock is the never-unlinked drain-root lock at <dotdir>/drain/.lock.
+func (g Generation) rootLock() string {
+	return filepath.Join(filepath.Dir(g.dir), rootLockName)
 }
 
 func (g Generation) ownerPath() string { return filepath.Join(g.dir, "owner.json") }
 
-// WriteOwner records id as the generation's owning process through an atomic
-// durable rename, so a crash leaves either the previous owner or the new one,
-// never a torn record; an unreadable record scans treat as Undetermined.
-func (g Generation) WriteOwner(id proc.Identity) error {
-	b, err := json.Marshal(ownerRecord{PID: id.PID, StartTime: id.StartTime, Comm: id.Comm})
+// writeOwnerUnlocked records id and the incarnation token through an atomic
+// durable rename; the caller holds the drain root lock — an unlocked owner
+// write is how a live generation gets torn down under its owner.
+func (g Generation) writeOwnerUnlocked(id proc.Identity, inc string) error {
+	b, err := json.Marshal(ownerFile{ownerRecord: newOwnerRecord(id), Inc: inc})
 	if err != nil {
 		return err
 	}
@@ -339,29 +730,184 @@ func (g Generation) WriteOwner(id proc.Identity) error {
 	return nil
 }
 
+// claimOwner installs id as the generation's owner under the drain root lock
+// and returns the incarnation-bound handle. A fresh claim mints the token; a
+// matching retry keeps it and rewrites through the full durable chain, since a
+// readable record can still be undurable (rename landed, dir fsync failed).
+func (g Generation) claimOwner(ctx context.Context, id proc.Identity) (Generation, error) {
+	var bound Generation
+	err := withFlock(ctx, g.rootLock(), func() error {
+		// A preseeded symlink would route the owner write outside the layout.
+		if fi, err := os.Lstat(g.dir); err == nil {
+			if fi.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("generation %s: %s is a symlink", g.Name(), g.dir)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		rec, err := readOwnerFile(g.ownerPath())
+		if err == nil {
+			if rec.identity() != id {
+				return fmt.Errorf("%w: generation %s is owned by %+v", ErrStaleJournal, g.Name(), rec.identity())
+			}
+			inc := rec.Inc
+			if inc == "" {
+				inc, err = mintInc()
+				if err != nil {
+					return err
+				}
+				if err := g.clearStaleMarker(); err != nil {
+					return err
+				}
+			}
+			bound = Generation{dir: g.dir, inc: inc}
+			return g.writeOwnerUnlocked(id, inc)
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		state, err := readState(filepath.Join(g.dir, "journal.json"))
+		if err != nil {
+			return err
+		}
+		for key := range state {
+			if !isJournalMetadata(key) {
+				return ErrStaleJournal
+			}
+		}
+		inc, err := mintInc()
+		if err != nil {
+			return err
+		}
+		if err := g.clearStaleMarker(); err != nil {
+			return err
+		}
+		bound = Generation{dir: g.dir, inc: inc}
+		return g.writeOwnerUnlocked(id, inc)
+	})
+	if err != nil {
+		return Generation{}, err
+	}
+	return bound, nil
+}
+
+// clearStaleMarker drops a completion marker left by a prior incarnation; the
+// caller holds the root lock and is minting a new token the marker cannot match.
+func (g Generation) clearStaleMarker() error {
+	path := filepath.Join(g.dir, "journal.json")
+	state, err := readState(path)
+	if err != nil {
+		return err
+	}
+	if len(state[completeKey]) == 0 {
+		return nil
+	}
+	return daemon.StateFile{Path: path}.UpdateUnlocked(func(st map[string]json.RawMessage) error {
+		delete(st, completeKey)
+		return nil
+	})
+}
+
+// bind captures the generation's current incarnation under the root lock, so
+// every later journal op on the returned handle refuses with
+// ErrStaleGeneration once the directory is removed or re-created.
+func (g Generation) bind(ctx context.Context) (Generation, error) {
+	var bound Generation
+	err := withFlock(ctx, g.rootLock(), func() error {
+		rec, err := readOwnerFile(g.ownerPath())
+		if err != nil {
+			return err
+		}
+		bound = Generation{dir: g.dir, inc: rec.Inc}
+		return nil
+	})
+	if err != nil {
+		return Generation{}, err
+	}
+	return bound, nil
+}
+
 // ReadOwner returns the recorded owner identity; any read, parse, or validity
 // failure is an error the caller treats as Undetermined.
 func (g Generation) ReadOwner() (proc.Identity, error) {
-	data, err := os.ReadFile(g.ownerPath())
+	rec, err := readOwnerFile(g.ownerPath())
 	if err != nil {
-		return proc.Identity{}, fmt.Errorf("read owner %s: %w", g.ownerPath(), err)
+		return proc.Identity{}, err
 	}
-	var rec ownerRecord
-	if err := json.Unmarshal(data, &rec); err != nil {
-		return proc.Identity{}, fmt.Errorf("parse owner %s: %w", g.ownerPath(), err)
-	}
-	if rec.PID <= 0 || rec.StartTime == "" {
-		return proc.Identity{}, fmt.Errorf("owner %s: incomplete identity", g.ownerPath())
-	}
-	return proc.Identity{PID: rec.PID, StartTime: rec.StartTime, Comm: rec.Comm}, nil
+	return rec.identity(), nil
 }
 
-// Remove deletes the generation directory once its rows are terminal or adopted.
-func (g Generation) Remove() error { return os.RemoveAll(g.dir) }
+func readOwnerFile(path string) (ownerFile, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ownerFile{}, fmt.Errorf("read owner %s: %w", path, err)
+	}
+	var rec ownerFile
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return ownerFile{}, fmt.Errorf("parse owner %s: %w", path, err)
+	}
+	if rec.PID <= 0 || rec.StartTime == "" {
+		return ownerFile{}, fmt.Errorf("owner %s: incomplete identity", path)
+	}
+	return rec, nil
+}
 
-// Generations lists every drain generation under dotdir; a missing layout is
-// empty, but an unreadable one errors (an enumeration failure proves nothing).
+func readOwnerInc(path string) (string, error) {
+	rec, err := readOwnerFile(path)
+	if err != nil {
+		return "", err
+	}
+	return rec.Inc, nil
+}
+
+func mintInc() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("mint incarnation token: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+// Remove durably deletes the generation directory once its rows are terminal
+// or adopted, holding the drain root lock so no claim, adoption, or journal
+// write can interleave with the removal; the removal is fsynced through the
+// drain root so a reboot cannot resurrect an already-removed generation. A
+// bound handle refuses with ErrStaleGeneration when the name was re-created
+// by a newer incarnation.
+func (g Generation) Remove(ctx context.Context) error {
+	return withFlock(ctx, g.rootLock(), func() error {
+		if g.inc != "" {
+			inc, err := readOwnerInc(g.ownerPath())
+			if err == nil && inc != g.inc {
+				return fmt.Errorf("%w: generation %s was re-created", ErrStaleGeneration, g.Name())
+			}
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+		return g.removeUnlocked()
+	})
+}
+
+// removeUnlocked is Remove's body for callers already holding the root lock.
+func (g Generation) removeUnlocked() error {
+	if err := os.RemoveAll(g.dir); err != nil {
+		return err
+	}
+	err := daemon.SyncDir(filepath.Dir(g.dir))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+// Generations lists every drain generation under dotdir (absolute); a missing
+// layout is empty, but an unreadable one errors (an enumeration failure proves
+// nothing).
 func Generations(dotdir string) ([]Generation, error) {
+	if !filepath.IsAbs(dotdir) {
+		return nil, fmt.Errorf("dotdir %q is not absolute", dotdir)
+	}
 	root := filepath.Join(dotdir, "drain")
 	entries, err := os.ReadDir(root)
 	if errors.Is(err, os.ErrNotExist) {
@@ -372,7 +918,7 @@ func Generations(dotdir string) ([]Generation, error) {
 	}
 	gens := make([]Generation, 0, len(entries))
 	for _, e := range entries {
-		if !e.IsDir() {
+		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
 		gens = append(gens, Generation{dir: filepath.Join(root, e.Name())})

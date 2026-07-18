@@ -42,6 +42,8 @@ type proberResult struct {
 
 type fakeProber struct {
 	results map[int]proberResult
+	bootID  string
+	bootErr error
 }
 
 func (p *fakeProber) probe(pid int) (proc.Identity, error) {
@@ -50,6 +52,31 @@ func (p *fakeProber) probe(pid int) (proc.Identity, error) {
 		return proc.Identity{}, proc.ErrNoProcess
 	}
 	return r.id, r.err
+}
+
+func (p *fakeProber) boot() (string, error) {
+	return p.bootID, p.bootErr
+}
+
+const seedInc = "seed-inc"
+
+func newGen(t *testing.T, dotdir, name string) Generation {
+	t.Helper()
+	g, err := NewGeneration(dotdir, name)
+	if err != nil {
+		t.Fatalf("NewGeneration %q: %v", name, err)
+	}
+	return g
+}
+
+// seedOwner installs id as g's owner with a fixed test incarnation token, as
+// claimOwner would, and returns the bound handle.
+func seedOwner(t *testing.T, g Generation, id proc.Identity) Generation {
+	t.Helper()
+	if err := g.writeOwnerUnlocked(id, seedInc); err != nil {
+		t.Fatalf("writeOwnerUnlocked: %v", err)
+	}
+	return Generation{dir: g.dir, inc: seedInc}
 }
 
 type fakeFence struct {
@@ -133,12 +160,12 @@ func (r *fakeResources) Restore(ctx context.Context, key Key, fence Fence) error
 
 func mustApply(t *testing.T, j Journal, rows ...Row) {
 	t.Helper()
-	n, err := j.Apply(context.Background(), rows...)
+	n, err := j.apply(context.Background(), rows...)
 	if err != nil {
-		t.Fatalf("Apply: %v", err)
+		t.Fatalf("apply: %v", err)
 	}
 	if n != len(rows) {
-		t.Fatalf("Apply applied %d rows, want %d", n, len(rows))
+		t.Fatalf("apply applied %d rows, want %d", n, len(rows))
 	}
 }
 

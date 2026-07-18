@@ -3,7 +3,9 @@ package proc
 // Identity is a live process's revalidation identity: its PID plus the prober's
 // opaque, platform-native start stamp and OS-truncated comm. A PID paired with a
 // matching StartTime is the only safe kill authority — a reused PID gets a fresh
-// StartTime, so callers compare {PID, StartTime} before they signal.
+// StartTime, so callers compare {PID, StartTime} before they signal. Within one
+// boot session start stamps are monotonic across process creations, which keeps
+// a recorded identity collision-resistant against PID reuse.
 type Identity struct {
 	// PID is the probed process id.
 	PID int
@@ -11,6 +13,11 @@ type Identity struct {
 	StartTime string
 	// Comm is the OS-reported (truncated) process name.
 	Comm string
+	// Boot is the host boot session the identity was probed in (BootID). Start
+	// stamps are only unique within one boot on linux (ticks since boot), so a
+	// recorded identity whose Boot differs from the current session belongs to
+	// a process that cannot have survived — liveness checks read it as dead.
+	Boot string
 }
 
 // ErrNoProcess means a probed PID has no live process — a definitive "gone",
@@ -28,5 +35,9 @@ func Probe(pid int) (Identity, error) {
 	if err != nil {
 		return Identity{}, err
 	}
-	return Identity{PID: pid, StartTime: info.startTime, Comm: info.comm}, nil
+	boot, err := BootID()
+	if err != nil {
+		return Identity{}, err
+	}
+	return Identity{PID: pid, StartTime: info.startTime, Comm: info.comm, Boot: boot}, nil
 }

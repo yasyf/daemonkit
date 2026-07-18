@@ -1,0 +1,104 @@
+{
+  "comment": "Shared cross-language golden fixture for the lifeproto FLAT lifecycle envelope. The Go suite (wire/lifeproto) and the Swift suite (Tests/DaemonKitTests/LifecycleWireTests.swift) both load THIS file and assert both directions: build each case from `fields` and encode it to `bytes`, and decode `bytes` and re-encode it back to `bytes`. `bytes` are frozen - a change here is a wire break. The final case pins string escaping (quotes, backslash, HTML bytes, slash, control short forms) so the Swift binding matches Go's encoding/json byte for byte.",
+  "version": 1,
+  "cases": [
+    {
+      "name": "health request",
+      "op": "health",
+      "kind": "request",
+      "fields": {},
+      "bytes": "{\"v\":1,\"op\":\"health\"}"
+    },
+    {
+      "name": "health response",
+      "op": "health",
+      "kind": "response",
+      "fields": {
+        "version": "1.2.3",
+        "pid": 4242,
+        "state": "healthy",
+        "draining": false,
+        "busy": false,
+        "features": ["handoff"]
+      },
+      "bytes": "{\"v\":1,\"op\":\"health\",\"version\":\"1.2.3\",\"pid\":4242,\"state\":\"healthy\",\"draining\":false,\"busy\":false,\"features\":[\"handoff\"]}"
+    },
+    {
+      "name": "health response draining busy degraded",
+      "op": "health",
+      "kind": "response",
+      "fields": {
+        "version": "9999.42.0-dev",
+        "pid": 7,
+        "state": "degraded",
+        "draining": true,
+        "busy": true,
+        "features": ["handoff", "drain"]
+      },
+      "bytes": "{\"v\":1,\"op\":\"health\",\"version\":\"9999.42.0-dev\",\"pid\":7,\"state\":\"degraded\",\"draining\":true,\"busy\":true,\"features\":[\"handoff\",\"drain\"]}"
+    },
+    {
+      "name": "shutdown request",
+      "op": "shutdown",
+      "kind": "request",
+      "fields": {},
+      "bytes": "{\"v\":1,\"op\":\"shutdown\"}"
+    },
+    {
+      "name": "shutdown response",
+      "op": "shutdown",
+      "kind": "response",
+      "fields": { "ok": true },
+      "bytes": "{\"v\":1,\"op\":\"shutdown\",\"ok\":true}"
+    },
+    {
+      "name": "hello request",
+      "op": "hello",
+      "kind": "request",
+      "fields": {},
+      "bytes": "{\"v\":1,\"op\":\"hello\"}"
+    },
+    {
+      "name": "hello response",
+      "op": "hello",
+      "kind": "response",
+      "fields": { "features": ["handoff", "drain"] },
+      "bytes": "{\"v\":1,\"op\":\"hello\",\"features\":[\"handoff\",\"drain\"]}"
+    },
+    {
+      "name": "hello response empty features",
+      "op": "hello",
+      "kind": "response",
+      "fields": { "features": [] },
+      "bytes": "{\"v\":1,\"op\":\"hello\",\"features\":[]}"
+    },
+    {
+      "name": "handoff request",
+      "op": "handoff",
+      "kind": "request",
+      "fields": {},
+      "bytes": "{\"v\":1,\"op\":\"handoff\"}"
+    },
+    {
+      "name": "handoff response",
+      "op": "handoff",
+      "kind": "response",
+      "fields": { "ok": true },
+      "bytes": "{\"v\":1,\"op\":\"handoff\",\"ok\":true}"
+    },
+    {
+      "name": "health response special characters",
+      "op": "health",
+      "kind": "response",
+      "fields": {
+        "version": "a\"b\\c<d>e&f/\n\r\tgz",
+        "pid": 512,
+        "state": "healthy",
+        "draining": true,
+        "busy": false,
+        "features": ["a<b", "c\"d"]
+      },
+      "bytes": "{\"v\":1,\"op\":\"health\",\"version\":\"a\\\"b\\\\c\\u003cd\\u003ee\\u0026f/\\n\\r\\tgz\",\"pid\":512,\"state\":\"healthy\",\"draining\":true,\"busy\":false,\"features\":[\"a\\u003cb\",\"c\\\"d\"]}"
+    }
+  ]
+}

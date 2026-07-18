@@ -194,3 +194,64 @@ func TestTryLockBusyThenFree(t *testing.T) {
 	}
 	h2.Release()
 }
+
+func TestFlockReleaseIsIdempotent(t *testing.T) {
+	h, err := Flock(context.Background(), filepath.Join(t.TempDir(), "idempotent.lock"))
+	if err != nil {
+		t.Fatalf("Flock: %v", err)
+	}
+	if err := h.Release(); err != nil {
+		t.Fatalf("first Release: %v", err)
+	}
+	if err := h.Release(); err != nil {
+		t.Fatalf("second Release: %v", err)
+	}
+}
+
+func TestMkdirAllDurableSyncsEveryCreatedLink(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "drain", "g1")
+	var synced []string
+	if err := mkdirAllDurable(dir, 0o700, func(path string) error {
+		synced = append(synced, path)
+		return nil
+	}); err != nil {
+		t.Fatalf("mkdirAllDurable: %v", err)
+	}
+	want := []string{filepath.Dir(root), root, filepath.Join(root, "drain")}
+	if len(synced) != len(want) {
+		t.Fatalf("synced directories = %v, want %v", synced, want)
+	}
+	for i := range want {
+		if synced[i] != want[i] {
+			t.Errorf("synced[%d] = %q, want %q", i, synced[i], want[i])
+		}
+	}
+}
+
+func TestMkdirAllDurableRetriesFailedParentSync(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "drain", "g1")
+	syncErr := errors.New("sync failed")
+	failed := false
+	err := mkdirAllDurable(dir, 0o700, func(path string) error {
+		if path == root && !failed {
+			failed = true
+			return syncErr
+		}
+		return nil
+	})
+	if !errors.Is(err, syncErr) {
+		t.Fatalf("first mkdirAllDurable err = %v, want sync failure", err)
+	}
+	var synced []string
+	if err := mkdirAllDurable(dir, 0o700, func(path string) error {
+		synced = append(synced, path)
+		return nil
+	}); err != nil {
+		t.Fatalf("mkdirAllDurable retry: %v", err)
+	}
+	if len(synced) == 0 || synced[0] != root {
+		t.Fatalf("retry synced directories = %v, want %q first", synced, root)
+	}
+}

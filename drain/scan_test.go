@@ -3,7 +3,6 @@ package drain
 import (
 	"context"
 	"errors"
-	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -31,12 +30,9 @@ func newScanEnv(t *testing.T, prb prober, rows ...Row) (ScanConfig, Generation) 
 		Log:       discardLog(),
 		prober:    prb,
 	}
-	g := NewGeneration(dotdir, "g1")
-	if err := g.WriteOwner(deadOwner()); err != nil {
-		t.Fatal(err)
-	}
+	g := seedOwner(t, newGen(t, dotdir, "g1"), deadOwner())
 	if len(rows) > 0 {
-		mustApply(t, g.Journal(), rows...)
+		mustApply(t, g.journal(), rows...)
 	}
 	return cfg, g
 }
@@ -178,7 +174,7 @@ func TestAdoptDeadRefusedWhileDraining(t *testing.T) {
 	if err := cfg.Intake.BeginDrain(); err != nil {
 		t.Fatalf("BeginDrain: %v", err)
 	}
-	if err := AdoptDead(context.Background(), cfg.Intake, cfg.Canonical, g); !errors.Is(err, ErrDraining) {
+	if err := AdoptDead(context.Background(), cfg, g, deadOwner()); !errors.Is(err, ErrDraining) {
 		t.Fatalf("AdoptDead err = %v, want ErrDraining", err)
 	}
 	if rows := mustRows(t, cfg.Canonical); len(rows) != 0 {
@@ -188,7 +184,7 @@ func TestAdoptDeadRefusedWhileDraining(t *testing.T) {
 		t.Fatal("refused adoption removed the generation")
 	}
 	want := Row{Key: "k1", Seq: 3, State: RowPending}
-	if rows := mustRows(t, g.Journal()); rows["k1"] != want {
+	if rows := mustRows(t, g.journal()); rows["k1"] != want {
 		t.Errorf("generation row disturbed: %+v, want %+v", rows["k1"], want)
 	}
 	// ScanPeers treats the refusal as a skip, not a scan failure.
@@ -200,24 +196,182 @@ func TestAdoptDeadRefusedWhileDraining(t *testing.T) {
 	}
 }
 
-func TestAdoptDeadMaxSeqRowNotSilentlyLost(t *testing.T) {
-	prb := &fakeProber{results: map[int]proberResult{deadPID: {err: proc.ErrNoProcess}}}
-	cfg, g := newScanEnv(t, prb, Row{Key: "k1", Seq: math.MaxUint64, State: RowPending})
-	// The adopt seq (MaxUint64+1) wraps to 0 and CAS-suppresses; AdoptDead must
-	// refuse to remove the generation rather than delete the row's only copy.
-	err := AdoptDead(context.Background(), cfg.Intake, cfg.Canonical, g)
-	if err == nil {
-		t.Fatal("AdoptDead removed a generation whose max-seq row never applied")
+func TestScanRetainsGenerationWhenTransitionOwnerMismatches(t *testing.T) {
+	owner1 := proc.Identity{PID: 3131, StartTime: "111.222", Comm: "live"}
+	owner2 := proc.Identity{PID: 4242, StartTime: "333.444", Comm: "dead"}
+	prb := &fakeProber{results: map[int]proberResult{
+		owner1.PID: {id: owner1},
+		owner2.PID: {err: proc.ErrNoProcess},
+	}}
+	cfg, g := newScanEnv(t, prb, Row{Key: "k1", Seq: 3, State: RowPending})
+	seedOwner(t, g, owner1)
+	if _, err := cfg.Canonical.claimTransition(context.Background(), g.Name(), owner1); err != nil {
+		t.Fatalf("claimTransition: %v", err)
 	}
-	if rows := mustRows(t, cfg.Canonical); len(rows) != 0 {
-		t.Errorf("canonical holds a wrapped row: %v", rows)
+	seedOwner(t, g, owner2)
+	if err := ScanPeers(context.Background(), cfg); err != nil {
+		t.Fatalf("ScanPeers: %v", err)
 	}
 	if !dirExists(t, g.Dir()) {
-		t.Error("generation with an unapplied max-seq row was removed; the row is lost")
+		t.Fatal("owner-mismatched generation was removed")
 	}
-	want := Row{Key: "k1", Seq: math.MaxUint64, State: RowPending}
-	if rows := mustRows(t, g.Journal()); rows["k1"] != want {
-		t.Errorf("generation row = %+v, want %+v retained for retry", rows["k1"], want)
+	if rows := mustRows(t, cfg.Canonical); len(rows) != 0 {
+		t.Errorf("owner-mismatched generation was adopted: %v", rows)
+	}
+	active, ok, err := cfg.Canonical.activeTransition(context.Background())
+	if err != nil || !ok || active.Owner.identity() != owner1 {
+		t.Errorf("active transition = %+v, %v, %v; want owner1 retained", active, ok, err)
+	}
+}
+
+func TestAdoptDeadRequiresStrictlyNewerCanonical(t *testing.T) {
+	generation := Row{Key: "k1", Seq: 7, State: RowPending}
+	if provesAdoption(generation, generation) {
+		t.Fatal("equal ordinary seq treated as proven newer")
+	}
+	canonical := generation
+	canonical.Seq++
+	if !provesAdoption(canonical, generation) {
+		t.Fatal("strictly newer canonical row was not recognized")
+	}
+}
+
+func TestAdoptDeadSecondAdoptionDoesNotResurrect(t *testing.T) {
+	prb := &fakeProber{results: map[int]proberResult{deadPID: {err: proc.ErrNoProcess}}}
+	cfg, g := newScanEnv(t, prb, Row{Key: "k1", Seq: 1, State: RowPending})
+	if err := AdoptDead(context.Background(), cfg, g, deadOwner()); err != nil {
+		t.Fatalf("AdoptDead: %v", err)
+	}
+	if dirExists(t, g.Dir()) {
+		t.Fatal("adopted generation not removed")
+	}
+	// A late second adopter must fail cleanly on the removed generation, and
+	// must not resurrect its directory by creating the lock layout.
+	if err := AdoptDead(context.Background(), cfg, g, deadOwner()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("second AdoptDead err = %v, want os.ErrNotExist", err)
+	}
+	if dirExists(t, g.Dir()) {
+		t.Error("late adoption resurrected the removed generation directory")
+	}
+}
+
+func TestScanReclaimsOwnerlessGeneration(t *testing.T) {
+	cfg, g := newScanEnv(t, &fakeProber{}, Row{Key: "k1", Seq: 4, State: RowYielded})
+	// Model a crashed partial removal: owner.json unlinked, journal surviving.
+	if err := os.Remove(filepath.Join(g.Dir(), "owner.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ScanPeers(context.Background(), cfg); err != nil {
+		t.Fatalf("ScanPeers: %v", err)
+	}
+	if dirExists(t, g.Dir()) {
+		t.Fatal("ownerless generation not reclaimed")
+	}
+	if rows := mustRows(t, cfg.Canonical); len(rows) != 0 {
+		t.Errorf("reclaim adopted rows: %v", rows)
+	}
+	// The reclaimed name is reusable: a fresh claim owns it cleanly instead of
+	// hitting the surviving journal's ErrStaleJournal forever.
+	if _, err := g.claimOwner(context.Background(), deadOwner()); err != nil {
+		t.Fatalf("claimOwner on reclaimed name: %v", err)
+	}
+	// The fresh claim is not re-reclaimed: its owner record is back.
+	prb := cfg.prober.(*fakeProber)
+	prb.results = map[int]proberResult{deadPID: {id: deadOwner()}}
+	if err := ScanPeers(context.Background(), cfg); err != nil {
+		t.Fatalf("ScanPeers after re-claim: %v", err)
+	}
+	if !dirExists(t, g.Dir()) {
+		t.Error("re-claimed generation was reclaimed out from under its owner")
+	}
+}
+
+func TestScanReclaimSerializesOnRootLock(t *testing.T) {
+	cfg, g := newScanEnv(t, &fakeProber{})
+	if err := os.Remove(filepath.Join(g.Dir(), "owner.json")); err != nil {
+		t.Fatal(err)
+	}
+	// The root lock serializes reclamation against claims and adoptions: while
+	// held, the reclaim cannot proceed and the bounded scan errors out.
+	lock, err := proc.Flock(context.Background(), g.rootLock())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := ScanPeers(ctx, cfg); err == nil {
+		t.Fatal("ScanPeers succeeded while the root lock was held, want a lock timeout error")
+	}
+	if !dirExists(t, g.Dir()) {
+		t.Fatal("locked-out reclaim removed the generation")
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if err := ScanPeers(context.Background(), cfg); err != nil {
+		t.Fatalf("ScanPeers after release: %v", err)
+	}
+	if dirExists(t, g.Dir()) {
+		t.Error("released ownerless generation not reclaimed")
+	}
+}
+
+func TestScanReclaimFailurePropagates(t *testing.T) {
+	cfg, g := newScanEnv(t, &fakeProber{})
+	if err := os.Remove(filepath.Join(g.Dir(), "owner.json")); err != nil {
+		t.Fatal(err)
+	}
+	// Wedge the removal: an unreadable subdirectory fails RemoveAll. The scan
+	// must surface the failure, not swallow it as a clean pass.
+	sub := filepath.Join(g.Dir(), "wedge")
+	if err := os.Mkdir(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "f"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sub, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(sub, 0o700) })
+	if err := ScanPeers(context.Background(), cfg); err == nil {
+		t.Fatal("ScanPeers swallowed a failed reclamation, want error")
+	}
+}
+
+func TestAdoptDeadReprovesDeathUnderLock(t *testing.T) {
+	// The advisory scan proved the old owner dead, but by adoption time the
+	// generation name was reused by a live owner: the locked re-assessment
+	// must refuse instead of tearing down the live owner's generation.
+	prb := &fakeProber{results: map[int]proberResult{deadPID: {id: deadOwner()}}}
+	cfg, g := newScanEnv(t, prb, Row{Key: "k1", Seq: 3, State: RowPending})
+	if err := AdoptDead(context.Background(), cfg, g, deadOwner()); !errors.Is(err, errAdoptionRaced) {
+		t.Fatalf("AdoptDead err = %v, want errAdoptionRaced", err)
+	}
+	if !dirExists(t, g.Dir()) {
+		t.Fatal("raced adoption removed a live owner's generation")
+	}
+	if rows := mustRows(t, cfg.Canonical); len(rows) != 0 {
+		t.Errorf("raced adoption reached canonical: %v", rows)
+	}
+}
+
+func TestJournalWriteCannotResurrectRemovedGeneration(t *testing.T) {
+	prb := &fakeProber{results: map[int]proberResult{deadPID: {err: proc.ErrNoProcess}}}
+	cfg, g := newScanEnv(t, prb, Row{Key: "k1", Seq: 3, State: RowPending})
+	if err := AdoptDead(context.Background(), cfg, g, deadOwner()); err != nil {
+		t.Fatalf("AdoptDead: %v", err)
+	}
+	if dirExists(t, g.Dir()) {
+		t.Fatal("adopted generation not removed")
+	}
+	// A late writer against the removed generation's journal must fail with
+	// os.ErrNotExist, not re-create the directory through its own write.
+	if _, err := g.journal().apply(context.Background(), Row{Key: "k9", Seq: 1, State: RowPending}); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("late Apply err = %v, want os.ErrNotExist", err)
+	}
+	if dirExists(t, g.Dir()) {
+		t.Error("late journal write resurrected the removed generation")
 	}
 }
 
@@ -225,10 +379,10 @@ func TestScanBreakerSpacesFailingPeer(t *testing.T) {
 	prb := &fakeProber{results: map[int]proberResult{deadPID: {err: proc.ErrNoProcess}}}
 	cfg, g := newScanEnv(t, prb, Row{Key: "k1", Seq: 1, State: RowPending})
 	// Wedge adoption: an unreadable generation journal fails the adopt.
-	if err := os.RemoveAll(g.Journal().Path()); err != nil {
+	if err := os.RemoveAll(g.journal().Path()); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Join(g.Journal().Path(), "sub"), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Join(g.journal().Path(), "sub"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	brk := NewBreakers(proc.Backoff{Base: time.Minute, Cap: time.Hour})
@@ -243,5 +397,54 @@ func TestScanBreakerSpacesFailingPeer(t *testing.T) {
 	// After the backoff it is retried and fails again.
 	if err := scanOnce(context.Background(), cfg, brk, now.Add(2*time.Minute)); err == nil {
 		t.Fatal("peer not retried after backoff elapsed")
+	}
+}
+
+func TestAdoptDeadRefusesChangedOwnerIdentity(t *testing.T) {
+	// The advisory scan proved deadOwner dead, but by adoption time the name
+	// was reused by a different owner: the locked owner re-read mismatches the
+	// scanned identity and must refuse, even though the new owner is dead too.
+	reuser := proc.Identity{PID: 5353, StartTime: "555.666", Comm: "new-daemon"}
+	prb := &fakeProber{results: map[int]proberResult{
+		deadPID:    {err: proc.ErrNoProcess},
+		reuser.PID: {err: proc.ErrNoProcess},
+	}}
+	cfg, g := newScanEnv(t, prb, Row{Key: "k1", Seq: 3, State: RowPending})
+	seedOwner(t, g, reuser)
+	if err := AdoptDead(context.Background(), cfg, g, deadOwner()); !errors.Is(err, errAdoptionRaced) {
+		t.Fatalf("AdoptDead err = %v, want errAdoptionRaced", err)
+	}
+	if !dirExists(t, g.Dir()) {
+		t.Fatal("identity-mismatched adoption removed the generation")
+	}
+	if rows := mustRows(t, cfg.Canonical); len(rows) != 0 {
+		t.Errorf("identity-mismatched adoption reached canonical: %v", rows)
+	}
+}
+
+func TestAdoptedRowSurvivesRetriedTruncate(t *testing.T) {
+	// A truncated snapshot row {k1,2} leaves high-water 2. Adoption of a dead
+	// generation's {k1,1} must land strictly above the high-water mark, so an
+	// interrupted transition's retried scoped truncate cannot delete it.
+	prb := &fakeProber{results: map[int]proberResult{deadPID: {err: proc.ErrNoProcess}}}
+	cfg, g := newScanEnv(t, prb, Row{Key: "k1", Seq: 1, State: RowPending})
+	ctx := context.Background()
+	scope := map[Key]Row{"k1": {Key: "k1", Seq: 2, State: RowPending}}
+	mustApply(t, cfg.Canonical, scope["k1"])
+	if err := cfg.Canonical.Truncate(ctx, scope); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+	if err := AdoptDead(ctx, cfg, g, deadOwner()); err != nil {
+		t.Fatalf("AdoptDead: %v", err)
+	}
+	want := Row{Key: "k1", Seq: 3, State: RowPending}
+	if rows := mustRows(t, cfg.Canonical); rows["k1"] != want {
+		t.Fatalf("adopted row = %+v, want %+v", rows["k1"], want)
+	}
+	if err := cfg.Canonical.Truncate(ctx, scope); err != nil {
+		t.Fatalf("retried Truncate: %v", err)
+	}
+	if rows := mustRows(t, cfg.Canonical); rows["k1"] != want {
+		t.Errorf("retried truncate deleted the adopted row: got %+v", rows["k1"])
 	}
 }

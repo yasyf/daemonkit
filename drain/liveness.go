@@ -59,6 +59,17 @@ func AllowForce(p ForcePolicy, l Liveness) bool {
 func Assess(id proc.Identity) Liveness { return assess(sysProber{}, id) }
 
 func assess(p prober, id proc.Identity) Liveness {
+	if id.Boot != "" {
+		boot, err := p.boot()
+		if err != nil {
+			return Undetermined
+		}
+		// A different boot session proves death outright: no process survives
+		// reboot, and linux start stamps are only unique within one boot.
+		if boot != id.Boot {
+			return Dead
+		}
+	}
 	cur, err := p.probe(id.PID)
 	switch {
 	case errors.Is(err, proc.ErrNoProcess):

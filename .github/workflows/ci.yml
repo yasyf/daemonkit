@@ -33,6 +33,16 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Codegen drift gate
+        # Both lifeproto bindings (Go + Swift) are generated from one schema
+        # (wire/lifeproto/gen). Regenerating must be a no-op against the committed
+        # files; a diff means a generated file was hand-edited or the schema
+        # changed without a regenerate. Run once, on Linux — the output is
+        # host-independent and needs no Swift toolchain.
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          go generate ./wire/...
+          git diff --exit-code -- wire/lifeproto/lifeproto.go Sources/DaemonKit/LifecycleWire.swift
       - name: Vet
         # -unsafeptr=false: trust/ and appgroup/ deref dlsym'd C data symbols
         # (fixed dyld addresses) — legitimate FFI vet's unsafeptr can't tell from

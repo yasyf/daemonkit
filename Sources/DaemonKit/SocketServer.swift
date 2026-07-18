@@ -27,6 +27,10 @@ public enum SocketServerError: Error, Sendable {
 /// receives the request `Data` (newline stripped) and returns the reply `Data`
 /// (the framing `\n` is appended by the server).
 ///
+/// Every accepted connection is verified by a ``PeerTrust`` before any frame is
+/// processed; a peer that fails the check has its connection closed with no reply
+/// and the handler is never invoked.
+///
 /// The **accept loop runs on a serial `DispatchQueue`** — never a concurrent one.
 /// A blocking `accept(2)` on a concurrent queue makes GCD spawn a fresh worker
 /// thread per pending block, exploding the thread pool; the serial queue holds
@@ -56,6 +60,7 @@ public final class SocketServer: @unchecked Sendable {
 
     private let path: String
     private let configuration: Configuration
+    private let trust: PeerTrust
     private let handler: @Sendable (Data) -> Data
     private let acceptQueue = DispatchQueue(label: "com.yasyf.daemonkit.SocketServer.accept")
     private let handlerQueue = DispatchQueue(
@@ -72,14 +77,20 @@ public final class SocketServer: @unchecked Sendable {
     /// - Parameters:
     ///   - path: Filesystem path to bind the unix socket at.
     ///   - configuration: Line cap and read timeout.
+    ///   - trust: Peer verification applied to every accepted connection before
+    ///     any frame is processed. The default enforces the same-effective-UID
+    ///     floor alone; pass a ``PeerTrust`` with a requirement to also pin the
+    ///     peer's code signature.
     ///   - handler: Maps one request line to one reply line.
     public init(
         path: String,
         configuration: Configuration = .init(),
+        trust: PeerTrust = PeerTrust(),
         handler: @escaping @Sendable (Data) -> Data
     ) {
         self.path = path
         self.configuration = configuration
+        self.trust = trust
         self.handler = handler
     }
 
@@ -221,6 +232,12 @@ public final class SocketServer: @unchecked Sendable {
     private func serve(_ descriptor: Int32) {
         defer { close(descriptor) }
         configureConnection(descriptor)
+        do {
+            try trust.check(descriptor: descriptor)
+        } catch {
+            log.notice("peer rejected, closing: \(String(describing: error), privacy: .public)")
+            return
+        }
         guard let request = readLine(descriptor: descriptor, cap: configuration.maxLineBytes) else { return }
         var reply = handler(request)
         reply.append(0x0A)

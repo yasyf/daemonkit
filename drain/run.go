@@ -3,6 +3,7 @@ package drain
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -84,11 +85,25 @@ func (s StrikeStore) Parked(ctx context.Context, now time.Time) (bool, time.Time
 	return now.Before(st.ParkedUntil), st.ParkedUntil, nil
 }
 
-// Strike records one respawn attempt at now; when the attempt trips the window
-// it advances the persisted ladder and parks, reporting the park deadline.
-func (s StrikeStore) Strike(ctx context.Context, now time.Time) (parked bool, until time.Time, err error) {
+// Gate admits one respawn attempt at now in a single locked transaction: a
+// parked breaker refuses without recording, and an admitted attempt's strike
+// lands durably before Gate returns, so the caller spawns only behind a
+// recorded strike. Tripping the window still admits the threshold attempt but
+// parks the breaker for later ones; a nonzero until reports the park deadline
+// either way. A crash between the durable strike and the launch it admitted
+// costs one unconsumed strike; the park ladder must tolerate that over-count.
+func (s StrikeStore) Gate(ctx context.Context, now time.Time) (allowed bool, until time.Time, err error) {
 	file := daemon.StateFile{Path: s.Path}
 	err = withFlock(ctx, s.Path+".lock", func() error {
+		st, err := s.load()
+		if err != nil {
+			return err
+		}
+		if now.Before(st.ParkedUntil) {
+			until = st.ParkedUntil
+			return nil
+		}
+		allowed = true
 		return file.UpdateUnlocked(func(state map[string]json.RawMessage) error {
 			st, err := decodeStrikes(state["strikes"])
 			if err != nil {
@@ -103,7 +118,6 @@ func (s StrikeStore) Strike(ctx context.Context, now time.Time) (parked bool, un
 				}
 				st.ParkedUntil = now.Add(lad.Next())
 				st.Level++
-				parked = true
 				until = st.ParkedUntil
 			}
 			st.Times = strikes.Times()
@@ -118,7 +132,24 @@ func (s StrikeStore) Strike(ctx context.Context, now time.Time) (parked bool, un
 	if err != nil {
 		return false, time.Time{}, err
 	}
-	return parked, until, nil
+	return allowed, until, nil
+}
+
+// SpawnGate adapts the store to proc.Spawn.Gate: each actual child launch
+// lands a durable strike first, and a parked breaker refuses with
+// ErrSpawnParked. Wiring it into every Spawn is what makes an unaccounted
+// launch unrepresentable — transition and babysit share one launch-site gate.
+func (s StrikeStore) SpawnGate() func(ctx context.Context) error {
+	return func(ctx context.Context) error {
+		allowed, until, err := s.Gate(ctx, time.Now())
+		if err != nil {
+			return fmt.Errorf("drain: record launch strike: %w", err)
+		}
+		if !allowed {
+			return fmt.Errorf("%w until %s", ErrSpawnParked, until)
+		}
+		return nil
+	}
 }
 
 func (s StrikeStore) load() (strikeState, error) {
@@ -178,6 +209,10 @@ func (b *Breakers) OK(id string) {
 type RunConfig struct {
 	// Generation is the drain generation whose journal Run sweeps.
 	Generation Generation
+	// Canonical is the canonical ownership journal; sweep skips (and
+	// terminalizes) rows canonical owns with a proven-newer seq, so a retried
+	// transition never yields a resource the canonical re-admitted. Required.
+	Canonical Journal
 	// Resources is the consumer resource seam. Required.
 	Resources Resources
 	// CanonicalAlive probes the canonical per tick; only Dead triggers respawn,
@@ -186,10 +221,10 @@ type RunConfig struct {
 	// Ready reports the successor can receive handoffs; false skips the sweep,
 	// never the babysit. Required.
 	Ready func(ctx context.Context) bool
-	// Spawn respawns the canonical; must be idempotent (proc.Spawn.EnsureRunning).
+	// Spawn respawns the canonical; must be idempotent and launch-gated: wire
+	// proc.Spawn.EnsureRunning with Spawn.Gate set to StrikeStore.SpawnGate,
+	// so every actual launch lands a durable strike first. Required.
 	Spawn func(ctx context.Context) error
-	// Strikes is the disk-backed respawn breaker. Required.
-	Strikes *StrikeStore
 	// Backoff spaces per-key sweep retries; the zero value uses a default.
 	Backoff proc.Backoff
 	// Tick is the loop cadence; zero means DefaultTick.
@@ -221,19 +256,27 @@ func (cfg RunConfig) perKeyBackoff() proc.Backoff {
 	return defaultBackoff
 }
 
-// Run babysits the canonical (probe per tick, strike-gated respawn) and sweeps
+// Run babysits the canonical (probe per tick, launch-gated respawn) and sweeps
 // the generation journal, removing the generation and returning at zero pending.
+// It binds to the generation's current incarnation at entry: a generation
+// removed or re-created mid-run fails with ErrStaleGeneration instead of
+// touching the new incarnation's state.
 func Run(ctx context.Context, cfg RunConfig) error {
+	gen, err := cfg.Generation.bind(ctx)
+	if err != nil {
+		return fmt.Errorf("drain: bind generation: %w", err)
+	}
+	cfg.Generation = gen
 	clk := clockOrReal(cfg.clock)
 	brk := NewBreakers(cfg.perKeyBackoff())
 	for {
-		cfg.babysit(ctx, clk.Now())
+		cfg.babysit(ctx)
 		pending, err := cfg.sweep(ctx, brk, clk)
 		if err != nil {
 			return err
 		}
 		if pending == 0 {
-			if err := cfg.Generation.Remove(); err != nil {
+			if err := cfg.Generation.Remove(ctx); err != nil {
 				return fmt.Errorf("drain: remove generation: %w", err)
 			}
 			return nil
@@ -246,35 +289,21 @@ func Run(ctx context.Context, cfg RunConfig) error {
 	}
 }
 
-func (cfg RunConfig) babysit(ctx context.Context, now time.Time) {
+func (cfg RunConfig) babysit(ctx context.Context) {
 	if cfg.CanonicalAlive(ctx) != Dead {
 		return
 	}
-	log := cfg.log()
-	parked, until, err := cfg.Strikes.Parked(ctx, now)
-	if err != nil {
-		log.Error("drain: strike store unreadable; respawn withheld", "err", err)
-		return
-	}
-	if parked {
-		log.Error("drain: canonical respawn parked", "until", until)
-		return
-	}
 	if err := cfg.Spawn(ctx); err != nil {
-		log.Error("drain: respawn canonical", "err", err)
-	}
-	tripped, until, err := cfg.Strikes.Strike(ctx, now)
-	if err != nil {
-		log.Error("drain: record respawn strike", "err", err)
-		return
-	}
-	if tripped {
-		log.Error("drain: respawn breaker tripped; parking", "until", until)
+		if errors.Is(err, ErrSpawnParked) {
+			cfg.log().Error("drain: canonical respawn parked", "err", err)
+			return
+		}
+		cfg.log().Error("drain: respawn canonical", "err", err)
 	}
 }
 
 func (cfg RunConfig) sweep(ctx context.Context, brk *Breakers, clk clock) (int, error) {
-	rows, err := cfg.Generation.Journal().Rows(ctx)
+	rows, err := cfg.Generation.journal().Rows(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("drain: read generation journal: %w", err)
 	}
@@ -288,6 +317,32 @@ func (cfg RunConfig) sweep(ctx context.Context, brk *Breakers, clk clock) (int, 
 	if pending == 0 {
 		return 0, nil
 	}
+	canonical, err := cfg.Canonical.Rows(ctx)
+	if err != nil {
+		return pending, fmt.Errorf("drain: read canonical: %w", err)
+	}
+	superseded := make([]Key, 0)
+	kept := keys[:0]
+	for _, k := range keys {
+		if ResolveOwner(canonical, rows, k) == OwnedByCanonical {
+			superseded = append(superseded, k)
+			continue
+		}
+		kept = append(kept, k)
+	}
+	for _, k := range superseded {
+		// Canonical re-owns the key with a proven-newer seq: the generation's
+		// row is stale and must never be yielded.
+		if err := cfg.Generation.journal().terminalize(ctx, rows[k]); err != nil {
+			return pending, fmt.Errorf("drain: advance superseded %s: %w", k, err)
+		}
+		pending--
+		brk.OK(string(k))
+	}
+	keys = kept
+	if pending == 0 {
+		return 0, nil
+	}
 	if !cfg.Ready(ctx) {
 		return pending, nil
 	}
@@ -296,7 +351,7 @@ func (cfg RunConfig) sweep(ctx context.Context, brk *Breakers, clk clock) (int, 
 	for _, k := range keys {
 		if scanned && !known[k] {
 			// A complete successful Keys scan proves the resource absent: terminal.
-			if _, err := cfg.Generation.Journal().Apply(ctx, Row{Key: k, Seq: rows[k].Seq + 1, State: RowYielded}); err != nil {
+			if err := cfg.Generation.journal().terminalize(ctx, rows[k]); err != nil {
 				return pending, fmt.Errorf("drain: advance absent %s: %w", k, err)
 			}
 			pending--
@@ -306,11 +361,11 @@ func (cfg RunConfig) sweep(ctx context.Context, brk *Breakers, clk clock) (int, 
 		if !brk.Allow(string(k), clk.Now()) {
 			continue
 		}
-		yielded, err := cfg.sweepKey(ctx, k, rows[k])
+		settled, err := cfg.sweepKey(ctx, k, rows[k])
 		if err != nil {
 			return pending, err
 		}
-		if yielded {
+		if settled {
 			pending--
 			brk.OK(string(k))
 		} else {
@@ -352,13 +407,30 @@ func (cfg RunConfig) sweepKey(ctx context.Context, key Key, row Row) (bool, erro
 		cfg.restore(ctx, key, fence)
 		return false, nil
 	}
+	// A registration that landed after the sweep classified this key re-owns it;
+	// yielding the stale row would double-apply. The held fence excludes later ones.
+	canonical, err := cfg.Canonical.Rows(ctx)
+	if err != nil {
+		cfg.restore(ctx, key, fence)
+		return false, fmt.Errorf("drain: reread canonical for %s: %w", key, err)
+	}
+	if c, ok := canonical[key]; ok && c.Seq > row.Seq {
+		restoreErr := cfg.Resources.Restore(context.WithoutCancel(ctx), key, fence)
+		if err := cfg.Generation.journal().terminalize(context.WithoutCancel(ctx), row); err != nil {
+			return false, errors.Join(fmt.Errorf("drain: advance superseded %s: %w", key, err), restoreErr)
+		}
+		if restoreErr != nil {
+			return true, fmt.Errorf("drain: restore superseded %s: %w", key, restoreErr)
+		}
+		return true, nil
+	}
 	if err := cfg.Resources.Yield(ctx, key, fence); err != nil {
 		log.Warn("drain: yield", "key", key, "err", err)
 		cfg.restore(ctx, key, fence)
 		return false, nil
 	}
 	// Handed off: the row must advance, and Restore must never run past here.
-	if _, err := cfg.Generation.Journal().Apply(context.WithoutCancel(ctx), Row{Key: key, Seq: row.Seq + 1, State: RowYielded}); err != nil {
+	if err := cfg.Generation.journal().terminalize(context.WithoutCancel(ctx), row); err != nil {
 		fence.Release()
 		return false, fmt.Errorf("drain: advance %s: %w", key, err)
 	}

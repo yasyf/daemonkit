@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -113,6 +114,43 @@ func TestRegisterDuplicateOpPanics(t *testing.T) {
 		}
 	}()
 	s.RegisterConcurrent("ping", h)
+}
+
+func TestRunBootHooksInOrder(t *testing.T) {
+	calls := make(chan string, 3)
+	s := &wire.Server{
+		OpenStore: func() error {
+			calls <- "OpenStore"
+			return nil
+		},
+		BootReconcile: func(context.Context) error {
+			calls <- "BootReconcile"
+			return nil
+		},
+		StartRealtimePlanes: func() error {
+			calls <- "StartRealtimePlanes"
+			return nil
+		},
+	}
+	s.RegisterControl("ping", func(context.Context, wire.Request) (any, error) { return nil, nil })
+	ts := startServer(t, s)
+
+	if res := call(t, ts, "ping", ""); res.Outcome != wire.Delivered {
+		t.Fatalf("Outcome = %v, want Delivered", res.Outcome)
+	}
+	ts.cancel()
+	if err := ts.wait(); err != nil {
+		t.Fatalf("Run returned %v, want nil", err)
+	}
+
+	close(calls)
+	var got []string
+	for call := range calls {
+		got = append(got, call)
+	}
+	if want := []string{"OpenStore", "BootReconcile", "StartRealtimePlanes"}; !slices.Equal(got, want) {
+		t.Errorf("boot hook order = %v, want %v", got, want)
+	}
 }
 
 func TestTrustRejectionShortCircuits(t *testing.T) {

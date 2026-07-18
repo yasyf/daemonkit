@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -16,34 +17,44 @@ import (
 func discardLog() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
 type runEnv struct {
-	dotdir string
-	gen    Generation
-	res    *fakeResources
-	spawns atomic.Int32
+	dotdir  string
+	gen     Generation
+	res     *fakeResources
+	strikes *StrikeStore
+	spawns  atomic.Int32
 }
 
 func newRunEnv(t *testing.T, rows ...Row) (*runEnv, *RunConfig) {
 	t.Helper()
 	e := &runEnv{dotdir: t.TempDir()}
-	e.gen = NewGeneration(e.dotdir, "g1")
+	e.gen = seedOwner(t, newGen(t, e.dotdir, "g1"), deadOwner())
 	keys := make([]Key, 0, len(rows))
 	for _, r := range rows {
 		keys = append(keys, r.Key)
 	}
 	if len(rows) > 0 {
-		mustApply(t, e.gen.Journal(), rows...)
+		mustApply(t, e.gen.journal(), rows...)
 	}
 	e.res = &fakeResources{keys: keys}
+	e.strikes = &StrikeStore{Path: filepath.Join(e.dotdir, "strikes.json")}
 	cfg := &RunConfig{
 		Generation:     e.gen,
+		Canonical:      NewJournal(filepath.Join(e.dotdir, "canonical.json")),
 		Resources:      e.res,
 		CanonicalAlive: func(context.Context) Liveness { return Alive },
 		Ready:          func(context.Context) bool { return true },
-		Spawn:          func(context.Context) error { e.spawns.Add(1); return nil },
-		Strikes:        &StrikeStore{Path: filepath.Join(e.dotdir, "strikes.json")},
-		Backoff:        proc.Backoff{Base: time.Nanosecond, Cap: time.Nanosecond},
-		Log:            discardLog(),
-		clock:          newAutoClock(),
+		// Launch-site accounting, as proc.Spawn wires it: the gate admits
+		// before anything launches.
+		Spawn: func(ctx context.Context) error {
+			if err := e.strikes.SpawnGate()(ctx); err != nil {
+				return err
+			}
+			e.spawns.Add(1)
+			return nil
+		},
+		Backoff: proc.Backoff{Base: time.Nanosecond, Cap: time.Nanosecond},
+		Log:     discardLog(),
+		clock:   newAutoClock(),
 	}
 	return e, cfg
 }
@@ -103,7 +114,7 @@ func TestRunBusyAttestAbortsAndRestores(t *testing.T) {
 			t.Error("busy resource was yielded")
 		}
 	}
-	row := mustRows(t, e.gen.Journal())["k1"]
+	row := mustRows(t, e.gen.journal())["k1"]
 	if row.State != RowPending || row.Seq != 1 {
 		t.Errorf("row advanced despite busy attest: %+v", row)
 	}
@@ -136,7 +147,7 @@ func TestRunCanceledAttestRestoresWithLiveContext(t *testing.T) {
 	if !fence.released {
 		t.Error("fence not released by Restore after sweep context cancellation")
 	}
-	if row := mustRows(t, e.gen.Journal())["k1"]; row != (Row{Key: "k1", Seq: 1, State: RowPending}) {
+	if row := mustRows(t, e.gen.journal())["k1"]; row != (Row{Key: "k1", Seq: 1, State: RowPending}) {
 		t.Errorf("row = %+v, want pending seq 1", row)
 	}
 }
@@ -156,7 +167,7 @@ func TestRunLostFenceRestoresWithoutAdvance(t *testing.T) {
 			t.Error("lost fence still yielded")
 		}
 	}
-	row := mustRows(t, e.gen.Journal())["k1"]
+	row := mustRows(t, e.gen.journal())["k1"]
 	if row.State != RowPending || row.Seq != 1 {
 		t.Errorf("row advanced despite lost fence: %+v", row)
 	}
@@ -190,7 +201,7 @@ func TestRunCanceledAfterYieldRecordsAndReleases(t *testing.T) {
 	fence := &fakeFence{held: true}
 	e.res.seize = func(Key) (Fence, error) { return fence, nil }
 
-	journal := e.gen.Journal()
+	journal := e.gen.journal()
 	lock, err := proc.Flock(context.Background(), journal.lockPath())
 	if err != nil {
 		t.Fatalf("hold journal lock: %v", err)
@@ -228,7 +239,7 @@ func TestRunPostYieldJournalFailureReleasesFence(t *testing.T) {
 	fence := &fakeFence{held: true}
 	e.res.seize = func(Key) (Fence, error) { return fence, nil }
 
-	journal := e.gen.Journal()
+	journal := e.gen.journal()
 	if err := os.Remove(journal.lockPath()); err != nil {
 		t.Fatalf("remove journal lock: %v", err)
 	}
@@ -298,7 +309,7 @@ func TestRunKeysErrorNeverZeroCandidates(t *testing.T) {
 	if err := Run(ctx, *cfg); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run err = %v, want context.Canceled", err)
 	}
-	row := mustRows(t, e.gen.Journal())["k1"]
+	row := mustRows(t, e.gen.journal())["k1"]
 	if row.State != RowPending {
 		t.Errorf("enumeration error treated as zero candidates: %+v", row)
 	}
@@ -323,7 +334,7 @@ func TestRunProvenAbsentKeyIsTerminal(t *testing.T) {
 func TestRunRespawnStrikeGatedThenParks(t *testing.T) {
 	e, cfg := newRunEnv(t, Row{Key: "k1", Seq: 1, State: RowPending})
 	cfg.Ready = func(context.Context) bool { return false }
-	cfg.Strikes.Ladder = []time.Duration{time.Hour}
+	e.strikes.Ladder = []time.Duration{time.Hour}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancelAfterTicks(cfg, 6, cancel, Dead)
 	if err := Run(ctx, *cfg); !errors.Is(err, context.Canceled) {
@@ -331,6 +342,59 @@ func TestRunRespawnStrikeGatedThenParks(t *testing.T) {
 	}
 	if got := e.spawns.Load(); got != 3 {
 		t.Errorf("spawns = %d, want exactly 3 before the breaker parks", got)
+	}
+}
+
+func TestRunRecordsStrikeBeforeSpawn(t *testing.T) {
+	e, cfg := newRunEnv(t, Row{Key: "k1", Seq: 1, State: RowPending})
+	cfg.CanonicalAlive = func(context.Context) Liveness { return Dead }
+	launched := false
+	cfg.Spawn = func(ctx context.Context) error {
+		if err := e.strikes.SpawnGate()(ctx); err != nil {
+			return err
+		}
+		launched = true
+		state, err := e.strikes.load()
+		if err != nil {
+			t.Fatalf("load strikes at launch: %v", err)
+		}
+		if len(state.Times) != 1 {
+			t.Fatalf("durable strikes at launch = %d, want 1", len(state.Times))
+		}
+		return nil
+	}
+	cfg.babysit(context.Background())
+	if !launched {
+		t.Fatal("launch never happened")
+	}
+}
+
+func TestSweepSkipsCanonicalOwnedRows(t *testing.T) {
+	e, cfg := newRunEnv(t,
+		Row{Key: "stale", Seq: 5, State: RowPending},
+		Row{Key: "mine", Seq: 3, State: RowPending},
+	)
+	// Canonical re-admitted "stale" with a proven-newer seq after the snapshot:
+	// the generation's row must terminalize, never yield.
+	mustApply(t, cfg.Canonical, Row{Key: "stale", Seq: 9, State: RowPending})
+	if _, err := cfg.sweep(context.Background(), NewBreakers(cfg.perKeyBackoff()), cfg.clock); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	for _, call := range e.res.calls() {
+		if call == "seize stale" || call == "yield stale" {
+			t.Fatalf("canonical-owned key swept: %v", e.res.calls())
+		}
+	}
+	rows := mustRows(t, e.gen.journal())
+	if rows["stale"].State != RowYielded {
+		t.Errorf("stale row = %+v, want terminalized", rows["stale"])
+	}
+	if canonical := mustRows(t, cfg.Canonical)["stale"]; canonical != (Row{Key: "stale", Seq: 9, State: RowPending}) {
+		t.Errorf("canonical row disturbed: %+v", canonical)
+	}
+	// The generation's own row still swept normally.
+	if got := indexOf(t, e.res.calls(), "yield mine", 0); got < 0 {
+		t.Errorf("generation-owned key not swept: %v", e.res.calls())
 	}
 }
 
@@ -345,7 +409,7 @@ func TestRunUndeterminedCanonicalNeverRespawns(t *testing.T) {
 	if got := e.spawns.Load(); got != 0 {
 		t.Errorf("spawns = %d, want 0 on Undetermined", got)
 	}
-	st, err := cfg.Strikes.load()
+	st, err := e.strikes.load()
 	if err != nil {
 		t.Fatalf("load strikes: %v", err)
 	}
@@ -361,17 +425,17 @@ func TestStrikeStorePersistsAcrossRestart(t *testing.T) {
 	s1 := StrikeStore{Path: path, Limit: 3, Window: 10 * time.Minute, Ladder: []time.Duration{time.Minute, 5 * time.Minute}}
 
 	for i := range 2 {
-		parked, _, err := s1.Strike(ctx, t0.Add(time.Duration(i)*time.Second))
-		if err != nil || parked {
-			t.Fatalf("strike %d: parked=%v err=%v", i, parked, err)
+		allowed, until, err := s1.Gate(ctx, t0.Add(time.Duration(i)*time.Second))
+		if err != nil || !allowed || !until.IsZero() {
+			t.Fatalf("gate %d: allowed=%v until=%v err=%v", i, allowed, until, err)
 		}
 	}
-	parked, until, err := s1.Strike(ctx, t0.Add(2*time.Second))
+	allowed, until, err := s1.Gate(ctx, t0.Add(2*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !parked || !until.Equal(t0.Add(2*time.Second).Add(time.Minute)) {
-		t.Fatalf("third strike: parked=%v until=%v, want park to +1m", parked, until)
+	if !allowed || !until.Equal(t0.Add(2*time.Second).Add(time.Minute)) {
+		t.Fatalf("third gate: allowed=%v until=%v, want the threshold attempt admitted with park to +1m", allowed, until)
 	}
 
 	// A fresh store on the same path sees the park and the ladder level.
@@ -383,12 +447,73 @@ func TestStrikeStorePersistsAcrossRestart(t *testing.T) {
 	if !parked || !until2.Equal(until) {
 		t.Errorf("restart lost the park: parked=%v until=%v want %v", parked, until2, until)
 	}
-	parked, until3, err := s2.Strike(ctx, t0.Add(2*time.Minute))
+	allowed, until3, err := s2.Gate(ctx, t0.Add(2*time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !parked || !until3.Equal(t0.Add(2*time.Minute).Add(5*time.Minute)) {
-		t.Errorf("ladder level lost across restart: parked=%v until=%v, want +5m step", parked, until3)
+	if !allowed || !until3.Equal(t0.Add(2*time.Minute).Add(5*time.Minute)) {
+		t.Errorf("ladder level lost across restart: allowed=%v until=%v, want +5m step", allowed, until3)
+	}
+}
+
+func TestStrikeGateRefusesWhileParkedWithoutRecording(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "strikes.json")
+	ctx := context.Background()
+	t0 := time.Unix(1_700_000_000, 0)
+	s := StrikeStore{Path: path, Limit: 1, Window: 10 * time.Minute, Ladder: []time.Duration{time.Hour}}
+	allowed, until, err := s.Gate(ctx, t0)
+	if err != nil || !allowed || !until.Equal(t0.Add(time.Hour)) {
+		t.Fatalf("threshold gate: allowed=%v until=%v err=%v, want admitted with park to +1h", allowed, until, err)
+	}
+	st, err := s.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorded := len(st.Times)
+	allowed, until2, err := s.Gate(ctx, t0.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allowed || !until2.Equal(until) {
+		t.Fatalf("parked gate: allowed=%v until=%v, want refusal until %v", allowed, until2, until)
+	}
+	st, err = s.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Times) != recorded {
+		t.Errorf("refused attempt recorded a strike: %d -> %d", recorded, len(st.Times))
+	}
+}
+
+func TestStrikeGateSerializesConcurrentCallers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "strikes.json")
+	s := StrikeStore{Path: path, Limit: 1, Window: 10 * time.Minute, Ladder: []time.Duration{time.Hour}}
+	t0 := time.Unix(1_700_000_000, 0)
+	results := make(chan bool, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			allowed, _, err := s.Gate(context.Background(), t0)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			results <- allowed
+		}()
+	}
+	wg.Wait()
+	close(results)
+	admitted := 0
+	for a := range results {
+		if a {
+			admitted++
+		}
+	}
+	if admitted != 1 {
+		t.Errorf("admitted = %d, want exactly 1: concurrent gates must serialize on the parked state", admitted)
 	}
 }
 
@@ -414,5 +539,75 @@ func TestBreakersPerPeerIsolation(t *testing.T) {
 	b.OK("a")
 	if !b.Allow("a", now) {
 		t.Error("peer a not allowed after OK reset")
+	}
+}
+
+func TestSweepRevalidatesOwnershipBeforeYield(t *testing.T) {
+	// A successor registration lands after the sweep classified k1 as
+	// generation-owned: the pre-yield recheck must terminalize, never yield.
+	e, cfg := newRunEnv(t, Row{Key: "k1", Seq: 2, State: RowPending})
+	snap := map[Key]Row{"k1": {Key: "k1", Seq: 2, State: RowPending}}
+	mustApply(t, cfg.Canonical, snap["k1"])
+	if err := cfg.Canonical.Truncate(context.Background(), snap); err != nil {
+		t.Fatal(err)
+	}
+	registered := false
+	e.res.attest = func(Key) (IdleVerdict, error) {
+		if !registered {
+			registered = true
+			if _, err := cfg.Canonical.Bump(context.Background(), "k1", RowPending); err != nil {
+				t.Errorf("Bump: %v", err)
+			}
+		}
+		return IdleConfirmed, nil
+	}
+	if err := Run(context.Background(), *cfg); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	calls := e.res.calls()
+	for _, c := range calls {
+		if c == "yield k1" {
+			t.Fatalf("superseded row was yielded; calls = %v", calls)
+		}
+	}
+	if calls[len(calls)-1] != "restore k1" {
+		t.Errorf("calls = %v, want trailing restore", calls)
+	}
+	row := mustRows(t, cfg.Canonical)["k1"]
+	if row.Seq <= 2 || row.State != RowPending {
+		t.Errorf("canonical row = %+v, want the post-classification registration intact", row)
+	}
+	if _, err := os.Stat(e.gen.Dir()); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("generation dir not removed after supersession: %v", err)
+	}
+}
+
+func TestSweepPropagatesSupersededRestoreFailure(t *testing.T) {
+	// The superseded row still terminalizes, but a failed Restore surfaces in
+	// the sweep's error instead of being swallowed.
+	e, cfg := newRunEnv(t, Row{Key: "k1", Seq: 2, State: RowPending})
+	snap := map[Key]Row{"k1": {Key: "k1", Seq: 2, State: RowPending}}
+	mustApply(t, cfg.Canonical, snap["k1"])
+	if err := cfg.Canonical.Truncate(context.Background(), snap); err != nil {
+		t.Fatal(err)
+	}
+	registered := false
+	e.res.attest = func(Key) (IdleVerdict, error) {
+		if !registered {
+			registered = true
+			if _, err := cfg.Canonical.Bump(context.Background(), "k1", RowPending); err != nil {
+				t.Errorf("Bump: %v", err)
+			}
+		}
+		return IdleConfirmed, nil
+	}
+	restoreFailed := errors.New("restore down")
+	e.res.restore = func(context.Context, Key, Fence) error { return restoreFailed }
+	_, err := cfg.sweep(context.Background(), NewBreakers(cfg.perKeyBackoff()), newAutoClock())
+	if !errors.Is(err, restoreFailed) {
+		t.Fatalf("sweep error = %v, want the wrapped restore failure", err)
+	}
+	if row := mustRows(t, e.gen.journal())["k1"]; row.State != RowYielded {
+		t.Errorf("superseded row not terminalized: %+v", row)
 	}
 }

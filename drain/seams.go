@@ -28,11 +28,14 @@ func clockOrReal(c clock) clock {
 // prober is the process-table seam, backed by proc.Probe in production.
 type prober interface {
 	probe(pid int) (proc.Identity, error)
+	boot() (string, error)
 }
 
 type sysProber struct{}
 
 func (sysProber) probe(pid int) (proc.Identity, error) { return proc.Probe(pid) }
+
+func (sysProber) boot() (string, error) { return proc.BootID() }
 
 func proberOrSys(p prober) prober {
 	if p == nil {

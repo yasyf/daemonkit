@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"sort"
 	"time"
 
@@ -87,22 +88,65 @@ func scanOnce(ctx context.Context, cfg ScanConfig, brk *Breakers, now time.Time)
 	if err != nil {
 		return fmt.Errorf("drain: %w", err)
 	}
+	active, activeOK, err := cfg.Canonical.activeTransition(ctx)
+	if err != nil {
+		return err
+	}
+	if activeOK {
+		found := false
+		for _, g := range gens {
+			if g.Name() == active.Generation {
+				found = true
+				break
+			}
+		}
+		if !found && assess(proberOrSys(cfg.prober), active.Owner.identity()) == Dead {
+			if err := cfg.Canonical.releaseTransition(ctx, active.Generation, active.Owner.identity()); err != nil {
+				return fmt.Errorf("drain: release abandoned transition %s: %w", active.Generation, err)
+			}
+			activeOK = false
+		}
+	}
 	log := cfg.log()
+	probe := proberOrSys(cfg.prober)
 	var errs []error
 	for _, g := range gens {
 		if brk != nil && !brk.Allow(g.Name(), now) {
 			continue
 		}
-		switch cfg.assess(g) {
+		owner, err := g.ReadOwner()
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				reclaimed, rerr := reclaimOwnerless(ctx, cfg, g)
+				switch {
+				case rerr != nil:
+					errs = append(errs, fmt.Errorf("drain: reclaim ownerless %s: %w", g.Name(), rerr))
+				case reclaimed:
+					log.Info("drain: reclaimed ownerless generation", "gen", g.Name())
+				}
+				continue
+			}
+			log.Warn("drain: peer undetermined; not adopting", "gen", g.Name())
+			continue
+		}
+		if activeOK && active.Generation == g.Name() && active.Owner.identity() != owner {
+			log.Warn("drain: transition owner mismatch; not adopting", "gen", g.Name())
+			continue
+		}
+		switch assess(probe, owner) {
 		case Alive:
 			continue
 		case Undetermined:
 			log.Warn("drain: peer undetermined; not adopting", "gen", g.Name())
 			continue
 		case Dead:
-			if err := AdoptDead(ctx, cfg.Intake, cfg.Canonical, g); err != nil {
+			if err := AdoptDead(ctx, cfg, g, owner); err != nil {
 				if errors.Is(err, ErrDraining) {
 					log.Info("drain: draining; adoption deferred", "gen", g.Name())
+					continue
+				}
+				if errors.Is(err, errAdoptionRaced) {
+					log.Info("drain: adoption raced a reused generation; skipped", "gen", g.Name())
 					continue
 				}
 				errs = append(errs, err)
@@ -120,31 +164,49 @@ func scanOnce(ctx context.Context, cfg ScanConfig, brk *Breakers, now time.Time)
 	return errors.Join(errs...)
 }
 
-// assess maps a generation to its owner's liveness; an unreadable owner record
-// is Undetermined, never Dead.
-func (cfg ScanConfig) assess(g Generation) Liveness {
-	id, err := g.ReadOwner()
-	if err != nil {
-		return Undetermined
-	}
-	return assess(proberOrSys(cfg.prober), id)
-}
+// errAdoptionRaced means the owner re-read under the root lock is no longer
+// proven dead: a reused generation name changed owners between the advisory
+// scan and the locked adoption.
+var errAdoptionRaced = errors.New("adoption raced a live owner")
 
-// AdoptDead replays g's pending rows into canonical at the next seq — a stale
-// replay no-ops per CAS — then removes g only once every pending row is durably
-// represented in canonical at or above its generation seq. A row that failed to
-// land (a seq that wrapped, or a canonical mutated out from under the adoption)
-// leaves g intact for retry rather than deleting the row's only other copy. The
-// canonical write is admitted through intake, so a draining canonical refuses
-// with ErrDraining and leaves g intact for the successor. Callers must hold
-// death proof; ScanPeers gates it on a revalidated identity.
-func AdoptDead(ctx context.Context, intake *Intake, canonical Journal, g Generation) error {
-	done, err := intake.Admit()
+// AdoptDead proves g's owner dead and adopts it in one critical section under
+// the drain root lock: the owner is re-read under the lock and must match
+// expected — the identity the advisory scan proved dead — then is re-assessed,
+// so a generation name reused by a different owner between the advisory scan
+// and the adoption is refused instead of torn down; the handle binds to the
+// observed incarnation for every subsequent op. Pending rows replay into
+// canonical strictly above every issued seq (Bump's advancement rule); g is
+// removed only once canonical is proven strictly newer. At sequence saturation, death proof transfers the exact row
+// and deletes the generation's representation before removal. The canonical
+// write is admitted through intake, so a draining canonical refuses with
+// ErrDraining and leaves g intact for the successor. A second adopter arriving
+// after removal fails with os.ErrNotExist rather than resurrecting the
+// directory.
+func AdoptDead(ctx context.Context, cfg ScanConfig, g Generation, expected proc.Identity) error {
+	done, err := cfg.Intake.Admit()
 	if err != nil {
 		return fmt.Errorf("drain: adopt %s: %w", g.Name(), err)
 	}
 	defer done()
-	rows, err := g.Journal().Rows(ctx)
+	canonical := cfg.Canonical
+	lock, err := proc.Flock(ctx, g.rootLock())
+	if err != nil {
+		return fmt.Errorf("drain: lock drain root for %s: %w", g.Name(), err)
+	}
+	defer lock.Release()
+	rec, err := readOwnerFile(g.ownerPath())
+	if err != nil {
+		return fmt.Errorf("drain: read %s owner: %w", g.Name(), err)
+	}
+	owner := rec.identity()
+	if owner != expected {
+		return fmt.Errorf("drain: adopt %s: owner changed since scan: %w", g.Name(), errAdoptionRaced)
+	}
+	if assess(proberOrSys(cfg.prober), owner) != Dead {
+		return fmt.Errorf("drain: adopt %s: %w", g.Name(), errAdoptionRaced)
+	}
+	g.inc = rec.Inc
+	rows, err := g.journal().rowsUnlocked()
 	if err != nil {
 		return fmt.Errorf("drain: read %s journal: %w", g.Name(), err)
 	}
@@ -155,12 +217,8 @@ func AdoptDead(ctx context.Context, intake *Intake, canonical Journal, g Generat
 		}
 	}
 	sort.Slice(pending, func(a, b int) bool { return pending[a].Key < pending[b].Key })
-	adopt := make([]Row, len(pending))
-	for i, r := range pending {
-		adopt[i] = Row{Key: r.Key, Seq: r.Seq + 1, State: RowPending}
-	}
-	if len(adopt) > 0 {
-		if _, err := canonical.Apply(ctx, adopt...); err != nil {
+	if len(pending) > 0 {
+		if err := canonical.adopt(ctx, pending); err != nil {
 			return fmt.Errorf("drain: adopt %s: %w", g.Name(), err)
 		}
 	}
@@ -169,12 +227,50 @@ func AdoptDead(ctx context.Context, intake *Intake, canonical Journal, g Generat
 		return fmt.Errorf("drain: reread canonical after adopt %s: %w", g.Name(), err)
 	}
 	for _, r := range pending {
-		if current[r.Key].Seq < r.Seq {
-			return fmt.Errorf("drain: adopt %s: row %q not durably applied (canonical seq %d < generation seq %d); generation retained", g.Name(), r.Key, current[r.Key].Seq, r.Seq)
+		if !provesAdoption(current[r.Key], r) {
+			return fmt.Errorf("drain: adopt %s: row %q not durably fenced (canonical %+v, generation %+v); generation retained", g.Name(), r.Key, current[r.Key], r)
 		}
 	}
-	if err := g.Remove(); err != nil {
+	if err := canonical.releaseTransition(ctx, g.Name(), owner); err != nil {
+		return fmt.Errorf("drain: release transition %s: %w", g.Name(), err)
+	}
+	if err := g.removeUnlocked(); err != nil {
 		return fmt.Errorf("drain: remove %s: %w", g.Name(), err)
 	}
 	return nil
+}
+
+// reclaimOwnerless removes a generation directory that has no owner record: a
+// crashed partial removal, or a claim that died before writing its owner. The
+// root lock serializes it against claims and adoptions, and the owner recheck
+// under the lock catches a claim that completed since the enumeration. An
+// ownerless directory named by a live-owner transition claim is a mid-setup
+// generation whose owner write was lost undurably — its owner re-fences it on
+// retry, so the reclaim leaves it alone.
+func reclaimOwnerless(ctx context.Context, cfg ScanConfig, g Generation) (bool, error) {
+	lock, err := proc.Flock(ctx, g.rootLock())
+	if err != nil {
+		return false, err
+	}
+	defer lock.Release()
+	if _, err := g.ReadOwner(); err == nil {
+		return false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	active, ok, err := cfg.Canonical.activeTransition(ctx)
+	if err != nil {
+		return false, err
+	}
+	if ok && active.Generation == g.Name() && assess(proberOrSys(cfg.prober), active.Owner.identity()) == Alive {
+		return false, nil
+	}
+	if err := g.removeUnlocked(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func provesAdoption(canonical, generation Row) bool {
+	return canonical.Seq > generation.Seq
 }

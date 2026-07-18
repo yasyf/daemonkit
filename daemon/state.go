@@ -86,11 +86,16 @@ func (s StateFile) write(state map[string]json.RawMessage) error {
 
 // WriteFileDurable writes data to path through the atomic-durable-rename idiom:
 // a temp file in the same directory is written, fsynced, and renamed over path,
-// then the containing directory is fsynced so a power loss after the call leaves
-// either the previous contents or data, never a truncated or lost file.
+// then the containing directory and every newly created ancestor link are
+// fsynced so a power loss after the call leaves either the previous contents or
+// data, never a truncated or lost file.
 func WriteFileDurable(path string, data []byte, perm os.FileMode) error {
+	return writeFileDurable(path, data, perm, SyncDir)
+}
+
+func writeFileDurable(path string, data []byte, perm os.FileMode, syncDir func(string) error) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := mkdirAllDurable(dir, 0o700, syncDir); err != nil {
 		return fmt.Errorf("create dir %s: %w", dir, err)
 	}
 	tmp, err := os.CreateTemp(dir, ".durable-*")
@@ -121,11 +126,34 @@ func WriteFileDurable(path string, data []byte, perm os.FileMode) error {
 		_ = os.Remove(tmpName)
 		return fmt.Errorf("rename %s into place: %w", path, err)
 	}
-	return fsyncDir(dir)
+	return syncDir(dir)
 }
 
-// fsyncDir fsyncs a directory so a rename into it survives a power loss.
-func fsyncDir(dir string) error {
+func mkdirAllDurable(path string, perm os.FileMode, syncDir func(string) error) error {
+	if _, err := os.Stat(path); err == nil {
+		if err := syncDir(filepath.Dir(path)); err != nil {
+			return fmt.Errorf("fsync parent of %s: %w", path, err)
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	parent := filepath.Dir(path)
+	if err := mkdirAllDurable(parent, perm, syncDir); err != nil {
+		return err
+	}
+	if err := os.Mkdir(path, perm); err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	if err := syncDir(parent); err != nil {
+		return fmt.Errorf("fsync parent of %s: %w", path, err)
+	}
+	return nil
+}
+
+// SyncDir fsyncs a directory so entry creations, renames, and removals in it
+// survive a power loss.
+func SyncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
 		return fmt.Errorf("open dir %s: %w", dir, err)

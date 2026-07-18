@@ -21,6 +21,6 @@ repos:
         types: [swift]
       - id: swiftlint
         name: swiftlint
-        entry: swiftlint --quiet
+        entry: swiftlint --quiet --force-exclude
         language: system
         types: [swift]

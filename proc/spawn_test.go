@@ -159,6 +159,53 @@ func TestEnsureRunningCanHostRefusalUnwrapped(t *testing.T) {
 	}
 }
 
+func TestEnsureRunningGateAdmitsEveryLaunchOnly(t *testing.T) {
+	t.Run("gate refusal withholds the launch", func(t *testing.T) {
+		parked := errors.New("launch parked")
+		socket := filepath.Join(shortSockDir(t), "m.sock") // nothing listening
+		logPath := filepath.Join(t.TempDir(), "holder.log")
+		gates := 0
+		err := Spawn{
+			Socket:    socket,
+			LogPath:   logPath,
+			Args:      childArgs(socket),
+			Timeout:   time.Second,
+			Available: dialAvailable(socket),
+			CanHost:   alwaysHost,
+			Gate:      func(context.Context) error { gates++; return parked },
+		}.EnsureRunning(context.Background())
+		if !errors.Is(err, parked) {
+			t.Errorf("error = %v, want the gate refusal returned as-is", err)
+		}
+		if gates != 1 {
+			t.Errorf("gate calls = %d, want 1", gates)
+		}
+		if _, statErr := os.Stat(logPath); !os.IsNotExist(statErr) {
+			t.Errorf("log file stat = %v, want not-exist (no launch behind a refused gate)", statErr)
+		}
+	})
+	t.Run("available skips the gate", func(t *testing.T) {
+		socket := filepath.Join(shortSockDir(t), "m.sock")
+		ln, err := net.Listen("unix", socket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+		err = Spawn{
+			Socket:    socket,
+			LogPath:   filepath.Join(t.TempDir(), "holder.log"),
+			Args:      childArgs(socket),
+			Timeout:   time.Second,
+			Available: dialAvailable(socket),
+			CanHost:   alwaysHost,
+			Gate:      func(context.Context) error { t.Fatal("gate consulted despite a live socket"); return nil },
+		}.EnsureRunning(context.Background())
+		if err != nil {
+			t.Fatalf("EnsureRunning with a live socket = %v, want nil", err)
+		}
+	})
+}
+
 func TestEnsureRunningSpawnFailureClassifiedHolderUnavailable(t *testing.T) {
 	socket := filepath.Join(shortSockDir(t), "m.sock") // nothing listening
 	logPath := filepath.Join(t.TempDir(), "missing", "holder.log")

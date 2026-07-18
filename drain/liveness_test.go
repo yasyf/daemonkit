@@ -34,6 +34,33 @@ func TestAllowForce(t *testing.T) {
 
 func TestAssess(t *testing.T) {
 	id := proc.Identity{PID: 42, StartTime: "111.222", Comm: "daemon"}
+	t.Run("boot session", func(t *testing.T) {
+		booted := id
+		booted.Boot = "boot-a"
+		alive := proberResult{id: proc.Identity{PID: 42, StartTime: "111.222", Comm: "daemon"}}
+		tests := []struct {
+			name    string
+			bootID  string
+			bootErr error
+			want    Liveness
+		}{
+			{"mismatched boot is dead despite a matching probe", "boot-b", nil, Dead},
+			{"matching boot falls through to the probe", "boot-a", nil, Alive},
+			{"boot read failure is undetermined", "", errors.New("sysctl failed"), Undetermined},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				p := &fakeProber{
+					results: map[int]proberResult{42: alive},
+					bootID:  tt.bootID,
+					bootErr: tt.bootErr,
+				}
+				if got := assess(p, booted); got != tt.want {
+					t.Errorf("assess = %v, want %v", got, tt.want)
+				}
+			})
+		}
+	})
 	tests := []struct {
 		name string
 		res  proberResult

@@ -13,18 +13,23 @@ import (
 // ErrDraining refuses admission and registration once the drain flag is set.
 var ErrDraining = errors.New("drain: draining")
 
-// ErrDrainInProgress refuses a second drain transition while one already holds
-// the drain flag, so concurrent transitions never snapshot the same canonical
-// rows into two generations.
+// ErrDrainInProgress refuses a second drain transition while an in-memory or
+// durable transition claim is active, so two generations never snapshot the
+// same canonical rows.
 var ErrDrainInProgress = errors.New("drain: transition already in progress")
+
+// ErrSpawnParked refuses a successor spawn while the strike breaker is parked;
+// retry the transition after the reported deadline.
+var ErrSpawnParked = errors.New("drain: successor spawn parked")
 
 // Intake gates canonical admission: Admit tracks in-flight work, Close sets the
 // drain flag refusing new work, Settle blocks until admitted work settles.
 type Intake struct {
-	mu       sync.Mutex
-	draining bool
-	inflight int
-	settled  chan struct{}
+	mu            sync.Mutex
+	draining      bool
+	transitioning bool
+	inflight      int
+	settled       chan struct{}
 }
 
 // Admit admits one unit of work, returning ErrDraining once the flag is set.
@@ -53,20 +58,30 @@ func (i *Intake) Close() {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	i.draining = true
+	i.transitioning = true
 }
 
-// BeginDrain compare-and-sets the drain flag: the first caller sets it and wins,
-// a caller that finds it already set refuses with ErrDrainInProgress. Admissions
-// and registrations refuse once the flag is set. The flag is committed before
-// the caller returns, so a concurrent transition observes it before snapshotting.
+// BeginDrain compare-and-sets the transition attempt: the first caller wins and
+// closes admission, while a concurrent caller gets ErrDrainInProgress. A failed
+// Transition releases the attempt without reopening admission so it can retry.
 func (i *Intake) BeginDrain() error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.draining {
+	if i.transitioning {
 		return ErrDrainInProgress
 	}
+	i.transitioning = true
 	i.draining = true
 	return nil
+}
+
+func (i *Intake) abortTransition(reopen bool) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.transitioning = false
+	if reopen {
+		i.draining = false
+	}
 }
 
 // Draining reports whether the drain flag is set.
@@ -97,7 +112,8 @@ func (i *Intake) Settle(ctx context.Context) error {
 }
 
 // Register CAS-appends key to j as one admitted unit; once the drain flag is
-// set it refuses, so no handler can create an untracked row post-snapshot.
+// set it refuses. A row that lands after the snapshot survives the scoped
+// truncate and stays canonical-owned.
 func (i *Intake) Register(ctx context.Context, j Journal, key Key) (Row, error) {
 	done, err := i.Admit()
 	if err != nil {
@@ -130,6 +146,14 @@ const (
 )
 
 // TransitionConfig drives one drain transition; every field is required.
+//
+// Every callback can run more than once: a crash or write failure between a
+// step's effect and its durable phase record replays the step on the next
+// attempt, so CloseIntake, BindDrainListener, ReleaseLock, and SpawnSuccessor
+// must all be idempotent. Retries of a failed Transition must reuse the same
+// Generation: the durable transition claim pins it, and a different generation
+// is refused with ErrDrainInProgress until the claimed one completes or is
+// adopted.
 type TransitionConfig struct {
 	// Intake is the canonical admission gate; Transition closes it (a) and
 	// settles it (c).
@@ -146,11 +170,16 @@ type TransitionConfig struct {
 	Self proc.Identity
 	// BindDrainListener binds the generation drain listener (f).
 	BindDrainListener func(ctx context.Context) error
-	// ReleaseLock releases the canonical flock (g); wire proc.FlockHandle.Release.
-	// A release failure fails the transition before the successor spawns, so no
-	// successor comes up behind a canonical lock this process still holds.
+	// ReleaseLock idempotently releases the canonical flock (g); wire
+	// proc.FlockHandle.Release. A release failure fails the transition before the
+	// successor spawns, so no successor comes up behind a reported lock failure.
 	ReleaseLock func() error
-	// SpawnSuccessor spawns the successor (h); wire proc.Spawn.EnsureRunning.
+	// SpawnSuccessor spawns the successor (h): wire proc.Spawn.EnsureRunning
+	// with Spawn.Gate set to StrikeStore.SpawnGate, the same store Run's
+	// babysit spawns through, so every actual launch lands a durable strike
+	// first (launch-site accounting) and a parked breaker surfaces
+	// ErrSpawnParked. An already-serving successor launches nothing and is
+	// never refused by its own park.
 	SpawnSuccessor func(ctx context.Context) error
 
 	afterStep   func(Step) error
@@ -167,56 +196,126 @@ func (cfg TransitionConfig) step(s Step) error {
 // Transition runs the normative drain transition a..h in order. After it
 // returns nil, the generation journal owns every row and the successor is
 // spawned; the caller then drives Run until the journal drains to zero.
-func Transition(ctx context.Context, cfg TransitionConfig) error {
+func Transition(ctx context.Context, cfg TransitionConfig) (err error) {
+	gen, err := cfg.Generation.claimOwner(ctx, cfg.Self)
+	if err != nil {
+		return fmt.Errorf("drain: claim generation owner: %w", err)
+	}
 	if err := cfg.Intake.BeginDrain(); err != nil {
 		return err
 	}
-	if err := cfg.step(StepDrainFlag); err != nil {
+	phase, err := cfg.Canonical.claimTransition(ctx, gen.Name(), cfg.Self)
+	if err != nil {
+		// A conflicting durable claim means this attempt is not the drainer:
+		// reopen admission. Rows admitted from here can never be lost — the
+		// truncate is scoped to the snapshot, so it only ever deletes rows the
+		// generation provably holds.
+		cfg.Intake.abortTransition(true)
+		return fmt.Errorf("drain: claim active transition: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			cfg.Intake.abortTransition(false)
+		}
+	}()
+	if phase == 0 {
+		complete, err := gen.journal().isComplete(ctx)
+		if err != nil {
+			return fmt.Errorf("drain: read generation journal: %w", err)
+		}
+		if complete {
+			// The prior attempt completed a..h and its release landed; only a
+			// late fsync failure was reported. Drop the re-claim: done.
+			if err := cfg.Canonical.releaseTransition(context.WithoutCancel(ctx), gen.Name(), cfg.Self); err != nil {
+				return fmt.Errorf("drain: release re-claimed transition: %w", err)
+			}
+			return nil
+		}
+	}
+	advance := func(step Step) error {
+		if err := cfg.Canonical.advanceTransition(context.WithoutCancel(ctx), gen.Name(), cfg.Self, step); err != nil {
+			return fmt.Errorf("drain: record transition step %d: %w", step, err)
+		}
+		if step > phase {
+			phase = step
+		}
+		return cfg.step(step)
+	}
+	// a..c replay on every attempt, regardless of the durable phase: admission
+	// may have reopened between attempts (a conflicting claim aborts with
+	// reopen), so the settle barrier must re-join anything admitted since. The
+	// durable phase record only gates the effectful steps d..h.
+	if err := advance(StepDrainFlag); err != nil {
 		return err
 	}
 	if err := cfg.CloseIntake(ctx); err != nil {
 		return fmt.Errorf("drain: close intake: %w", err)
 	}
-	if err := cfg.step(StepCloseIntake); err != nil {
+	if err := advance(StepCloseIntake); err != nil {
 		return err
 	}
 	if err := cfg.Intake.Settle(ctx); err != nil {
 		return fmt.Errorf("drain: settle admitted work: %w", err)
 	}
-	if err := cfg.step(StepSettle); err != nil {
+	if err := advance(StepSettle); err != nil {
 		return err
 	}
-	if err := cfg.snapshot(ctx); err != nil {
-		return err
+	if phase < StepSnapshot {
+		if err := cfg.snapshot(ctx, gen); err != nil {
+			return err
+		}
+		if err := advance(StepSnapshot); err != nil {
+			return err
+		}
 	}
-	if err := cfg.step(StepSnapshot); err != nil {
-		return err
+	if phase < StepTruncate {
+		scope, err := gen.journal().Rows(ctx)
+		if err != nil {
+			return fmt.Errorf("drain: read generation snapshot: %w", err)
+		}
+		if err := cfg.Canonical.Truncate(ctx, scope); err != nil {
+			return fmt.Errorf("drain: truncate canonical: %w", err)
+		}
+		if err := advance(StepTruncate); err != nil {
+			return err
+		}
 	}
-	if err := cfg.Canonical.Truncate(ctx); err != nil {
-		return fmt.Errorf("drain: truncate canonical: %w", err)
+	if phase < StepBindListener {
+		if err := cfg.BindDrainListener(ctx); err != nil {
+			return fmt.Errorf("drain: bind drain listener: %w", err)
+		}
+		if err := advance(StepBindListener); err != nil {
+			return err
+		}
 	}
-	if err := cfg.step(StepTruncate); err != nil {
-		return err
+	if phase < StepReleaseLock {
+		if err := cfg.ReleaseLock(); err != nil {
+			return fmt.Errorf("drain: release canonical lock: %w", err)
+		}
+		if err := advance(StepReleaseLock); err != nil {
+			return err
+		}
 	}
-	if err := cfg.BindDrainListener(ctx); err != nil {
-		return fmt.Errorf("drain: bind drain listener: %w", err)
+	if phase < StepSpawn {
+		if err := cfg.SpawnSuccessor(ctx); err != nil {
+			return fmt.Errorf("drain: spawn successor: %w", err)
+		}
+		if err := advance(StepSpawn); err != nil {
+			return err
+		}
 	}
-	if err := cfg.step(StepBindListener); err != nil {
-		return err
+	// The completion marker lands before the release, so a release whose
+	// rename landed but whose fsync failed reads as done on retry.
+	if err := gen.journal().markComplete(context.WithoutCancel(ctx)); err != nil {
+		return fmt.Errorf("drain: mark transition complete: %w", err)
 	}
-	if err := cfg.ReleaseLock(); err != nil {
-		return fmt.Errorf("drain: release canonical lock: %w", err)
+	if err := cfg.Canonical.releaseTransition(context.WithoutCancel(ctx), gen.Name(), cfg.Self); err != nil {
+		return fmt.Errorf("drain: release active transition: %w", err)
 	}
-	if err := cfg.step(StepReleaseLock); err != nil {
-		return err
-	}
-	if err := cfg.SpawnSuccessor(ctx); err != nil {
-		return fmt.Errorf("drain: spawn successor: %w", err)
-	}
-	return cfg.step(StepSpawn)
+	return nil
 }
 
-func (cfg TransitionConfig) snapshot(ctx context.Context) error {
+func (cfg TransitionConfig) snapshot(ctx context.Context, gen Generation) error {
 	rows, err := cfg.Canonical.Rows(ctx)
 	if err != nil {
 		return fmt.Errorf("drain: read canonical: %w", err)
@@ -232,13 +331,17 @@ func (cfg TransitionConfig) snapshot(ctx context.Context) error {
 				return err
 			}
 		}
-		if err := cfg.Generation.WriteOwner(cfg.Self); err != nil {
-			return fmt.Errorf("drain: record generation owner: %w", err)
+		owner, err := gen.ReadOwner()
+		if err != nil {
+			return fmt.Errorf("drain: read generation owner: %w", err)
+		}
+		if owner != cfg.Self {
+			return fmt.Errorf("drain: generation owner %+v does not match self %+v", owner, cfg.Self)
 		}
 		return nil
 	}
-	if err := cfg.Generation.Journal().ClaimSnapshot(ctx, ordered, claim); err != nil {
-		return fmt.Errorf("drain: snapshot generation %s: %w", cfg.Generation.Name(), err)
+	if err := gen.journal().claimSnapshot(ctx, ordered, claim); err != nil {
+		return fmt.Errorf("drain: snapshot generation %s: %w", gen.Name(), err)
 	}
 	return nil
 }

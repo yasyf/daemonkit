@@ -3,9 +3,12 @@ package daemon
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
+	"os/exec"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/yasyf/daemonkit/proc"
 )
@@ -92,6 +95,107 @@ func TestTakeoverHandoffPathNoSignals(t *testing.T) {
 	}
 	if calls := sig.calls(); len(calls) != 0 {
 		t.Errorf("signals = %v, want none on the handoff path", calls)
+	}
+}
+
+// TestTakeoverHandoffWaitModes pins whether handoff completion follows socket
+// release or the predecessor process exiting.
+func TestTakeoverHandoffWaitModes(t *testing.T) {
+	tests := []struct {
+		name  string
+		mode  WaitMode
+		check func(*testing.T, TakeoverConfig, *fakePeer, *blockedProcess)
+	}{
+		{
+			name: "pid exit waits for predecessor",
+			mode: PIDExit,
+			check: func(t *testing.T, cfg TakeoverConfig, peer *fakePeer, predecessor *blockedProcess) {
+				prober := newGatedProcessProber()
+				t.Cleanup(prober.unblock)
+				cfg.prober = prober
+				ctx, cancel := context.WithCancel(context.Background())
+				t.Cleanup(cancel)
+				result := make(chan takeoverResult, 1)
+				go func() {
+					outcome, err := Run(ctx, cfg)
+					result <- takeoverResult{outcome: outcome, err: err}
+				}()
+
+				select {
+				case <-prober.entered:
+				case got := <-result:
+					t.Fatalf("Run returned before waiting on live pid: outcome=%s err=%v", got.outcome, got.err)
+				case <-time.After(5 * time.Second):
+					t.Fatal("Run did not continue polling the live predecessor")
+				}
+				assertProcessAlive(t, predecessor.pid())
+				select {
+				case got := <-result:
+					t.Fatalf("Run returned while PID probe was blocked: outcome=%s err=%v", got.outcome, got.err)
+				default:
+				}
+
+				predecessor.exit(t)
+				if _, err := proc.Probe(predecessor.pid()); !errors.Is(err, proc.ErrNoProcess) {
+					t.Fatalf("Probe(exited pid) error = %v, want ErrNoProcess", err)
+				}
+				prober.unblock()
+				select {
+				case got := <-result:
+					if got.err != nil {
+						t.Fatalf("Run: %v", got.err)
+					}
+					if got.outcome != Bind {
+						t.Errorf("outcome = %s, want bind", got.outcome)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("Run did not return after predecessor exited")
+				}
+				if prober.calls != 3 {
+					t.Errorf("PID probes = %d, want 3", prober.calls)
+				}
+				if calls := peer.healthCalls(); calls != 1 {
+					t.Errorf("Health calls = %d, want 1", calls)
+				}
+			},
+		},
+		{
+			name: "socket release does not wait for predecessor",
+			mode: SocketRelease,
+			check: func(t *testing.T, cfg TakeoverConfig, peer *fakePeer, predecessor *blockedProcess) {
+				cfg.prober = &fakeProber{results: []proberResult{{err: errors.New("unexpected PID probe")}}}
+				got, err := Run(context.Background(), cfg)
+				if err != nil {
+					t.Fatalf("Run: %v", err)
+				}
+				if got != Bind {
+					t.Errorf("outcome = %s, want bind", got)
+				}
+				assertProcessAlive(t, predecessor.pid())
+				if calls := peer.healthCalls(); calls != 2 {
+					t.Errorf("Health calls = %d, want 2", calls)
+				}
+				predecessor.exit(t)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			predecessor := startBlockedProcess(t)
+			peer := &fakePeer{health: []healthResult{
+				{h: Health{Version: "1.0.0", PID: predecessor.pid(), Features: []string{FeatureHandoff}}},
+				{err: errors.New("socket released")},
+			}}
+			cfg := TakeoverConfig{
+				Self: "2.0.0", Peer: peer, WaitMode: tt.mode,
+				WaitTimeout: 5 * time.Second, clock: newAutoClock(),
+			}
+
+			tt.check(t, cfg, peer, predecessor)
+			if shutdowns, handoffs := peer.counts(); shutdowns != 0 || handoffs != 1 {
+				t.Errorf("calls: shutdowns=%d handoffs=%d, want 0/1", shutdowns, handoffs)
+			}
+		})
 	}
 }
 
@@ -311,4 +415,90 @@ func equalSignals(got, want []signalRec) bool {
 		}
 	}
 	return true
+}
+
+type blockedProcess struct {
+	cmd   *exec.Cmd
+	stdin io.WriteCloser
+}
+
+func startBlockedProcess(t *testing.T) *blockedProcess {
+	t.Helper()
+	cmd := exec.Command("/bin/sh", "-c", "read _")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("create predecessor stdin: %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		t.Fatalf("start predecessor: %v", err)
+	}
+	p := &blockedProcess{cmd: cmd, stdin: stdin}
+	t.Cleanup(func() {
+		_ = p.stdin.Close()
+		_ = p.cmd.Process.Kill()
+		_ = p.cmd.Wait()
+	})
+	return p
+}
+
+func (p *blockedProcess) pid() int {
+	return p.cmd.Process.Pid
+}
+
+func (p *blockedProcess) exit(t *testing.T) {
+	t.Helper()
+	if _, err := io.WriteString(p.stdin, "\n"); err != nil {
+		t.Fatalf("release predecessor: %v", err)
+	}
+	if err := p.stdin.Close(); err != nil {
+		t.Fatalf("close predecessor stdin: %v", err)
+	}
+	if err := p.cmd.Wait(); err != nil {
+		t.Fatalf("wait for predecessor: %v", err)
+	}
+}
+
+func assertProcessAlive(t *testing.T, pid int) {
+	t.Helper()
+	id, err := proc.Probe(pid)
+	if err != nil {
+		t.Fatalf("Probe(live pid): %v", err)
+	}
+	if id.PID != pid {
+		t.Errorf("Probe(live pid).PID = %d, want %d", id.PID, pid)
+	}
+}
+
+type takeoverResult struct {
+	outcome Outcome
+	err     error
+}
+
+type gatedProcessProber struct {
+	calls     int
+	entered   chan struct{}
+	release   chan struct{}
+	unblocked bool
+}
+
+func newGatedProcessProber() *gatedProcessProber {
+	return &gatedProcessProber{entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (p *gatedProcessProber) probe(pid int) (proc.Identity, error) {
+	p.calls++
+	if p.calls == 3 {
+		close(p.entered)
+		<-p.release
+	}
+	return proc.Probe(pid)
+}
+
+func (p *gatedProcessProber) unblock() {
+	if p.unblocked {
+		return
+	}
+	p.unblocked = true
+	close(p.release)
 }

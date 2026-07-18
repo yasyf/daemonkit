@@ -2,6 +2,8 @@ package drain
 
 import (
 	"context"
+	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,9 +30,9 @@ func TestJournalCASRejectsStaleReplay(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			n, err := j.Apply(ctx, tt.row)
+			n, err := j.apply(ctx, tt.row)
 			if err != nil {
-				t.Fatalf("Apply: %v", err)
+				t.Fatalf("apply: %v", err)
 			}
 			if n != tt.want {
 				t.Errorf("applied = %d, want %d", n, tt.want)
@@ -50,12 +52,12 @@ func TestJournalApplyCountsPerRow(t *testing.T) {
 	j := NewJournal(filepath.Join(t.TempDir(), "journal.json"))
 	mustApply(t, j, Row{Key: "a", Seq: 5, State: RowPending})
 
-	n, err := j.Apply(context.Background(),
+	n, err := j.apply(context.Background(),
 		Row{Key: "a", Seq: 4, State: RowYielded}, // stale
 		Row{Key: "b", Seq: 1, State: RowPending}, // fresh
 	)
 	if err != nil {
-		t.Fatalf("Apply: %v", err)
+		t.Fatalf("apply: %v", err)
 	}
 	if n != 1 {
 		t.Errorf("applied = %d, want 1", n)
@@ -110,11 +112,12 @@ func TestJournalBumpAdvancesSeq(t *testing.T) {
 func TestJournalTruncate(t *testing.T) {
 	j := NewJournal(filepath.Join(t.TempDir(), "journal.json"))
 	ctx := context.Background()
-	mustApply(t, j,
-		Row{Key: "a", Seq: 1, State: RowPending},
-		Row{Key: "b", Seq: 2, State: RowPending},
-	)
-	if err := j.Truncate(ctx); err != nil {
+	seed := []Row{
+		{Key: "a", Seq: 1, State: RowPending},
+		{Key: "b", Seq: 2, State: RowPending},
+	}
+	mustApply(t, j, seed...)
+	if err := j.Truncate(ctx, rowsByKey(seed...)); err != nil {
 		t.Fatalf("Truncate: %v", err)
 	}
 	if rows := mustRows(t, j); len(rows) != 0 {
@@ -122,14 +125,42 @@ func TestJournalTruncate(t *testing.T) {
 	}
 }
 
+func TestJournalTruncateSparesRowsOutsideSnapshot(t *testing.T) {
+	j := NewJournal(filepath.Join(t.TempDir(), "journal.json"))
+	ctx := context.Background()
+	snapshotted := Row{Key: "a", Seq: 3, State: RowPending}
+	mustApply(t, j, snapshotted)
+	scope := rowsByKey(snapshotted)
+	// Post-snapshot activity: a bumped snapshotted key and a brand-new key.
+	bumped, err := j.Bump(ctx, "a", RowPending)
+	if err != nil {
+		t.Fatalf("Bump: %v", err)
+	}
+	late, err := j.Bump(ctx, "c", RowPending)
+	if err != nil {
+		t.Fatalf("Bump: %v", err)
+	}
+	if err := j.Truncate(ctx, scope); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+	rows := mustRows(t, j)
+	if rows["a"] != bumped {
+		t.Errorf("bumped row = %+v, want %+v surviving the scoped truncate", rows["a"], bumped)
+	}
+	if rows["c"] != late {
+		t.Errorf("late row = %+v, want %+v surviving the scoped truncate", rows["c"], late)
+	}
+}
+
 func TestJournalTruncatePreservesSeqEpoch(t *testing.T) {
 	j := NewJournal(filepath.Join(t.TempDir(), "journal.json"))
 	ctx := context.Background()
-	mustApply(t, j,
-		Row{Key: "a", Seq: 5, State: RowPending},
-		Row{Key: "b", Seq: 2, State: RowPending},
-	)
-	if err := j.Truncate(ctx); err != nil {
+	seed := []Row{
+		{Key: "a", Seq: 5, State: RowPending},
+		{Key: "b", Seq: 2, State: RowPending},
+	}
+	mustApply(t, j, seed...)
+	if err := j.Truncate(ctx, rowsByKey(seed...)); err != nil {
 		t.Fatalf("Truncate: %v", err)
 	}
 	fresh, err := j.Bump(ctx, "a", RowPending)
@@ -139,7 +170,7 @@ func TestJournalTruncatePreservesSeqEpoch(t *testing.T) {
 	if fresh.Seq != 6 {
 		t.Errorf("post-truncate seq = %d, want 6 (above the pre-truncate max 5)", fresh.Seq)
 	}
-	if err := j.Truncate(ctx); err != nil {
+	if err := j.Truncate(ctx, rowsByKey(fresh)); err != nil {
 		t.Fatalf("second Truncate: %v", err)
 	}
 	again, err := j.Bump(ctx, "b", RowPending)
@@ -149,6 +180,14 @@ func TestJournalTruncatePreservesSeqEpoch(t *testing.T) {
 	if again.Seq != 7 {
 		t.Errorf("second-epoch seq = %d, want 7 (above %d)", again.Seq, fresh.Seq)
 	}
+}
+
+func rowsByKey(rows ...Row) map[Key]Row {
+	m := make(map[Key]Row, len(rows))
+	for _, r := range rows {
+		m[r.Key] = r
+	}
+	return m
 }
 
 func TestResolveOwner(t *testing.T) {
@@ -175,11 +214,9 @@ func TestResolveOwner(t *testing.T) {
 }
 
 func TestGenerationOwnerRoundTrip(t *testing.T) {
-	g := NewGeneration(t.TempDir(), "g1")
+	g := newGen(t, t.TempDir(), "g1")
 	id := proc.Identity{PID: 4242, StartTime: "111.222", Comm: "daemon"}
-	if err := g.WriteOwner(id); err != nil {
-		t.Fatalf("WriteOwner: %v", err)
-	}
+	seedOwner(t, g, id)
 	got, err := g.ReadOwner()
 	if err != nil {
 		t.Fatalf("ReadOwner: %v", err)
@@ -215,12 +252,63 @@ func TestGenerationOwnerUnreadable(t *testing.T) {
 	}
 	for i, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			g := NewGeneration(dotdir, "g"+string(rune('a'+i)))
+			g := newGen(t, dotdir, "g"+string(rune('a'+i)))
 			tt.prep(t, g)
 			if _, err := g.ReadOwner(); err == nil {
 				t.Error("ReadOwner succeeded, want error")
 			}
 		})
+	}
+}
+
+func TestNewGenerationRejectsUnsafeNames(t *testing.T) {
+	for _, name := range []string{"", "/", "//", ".", "..", "a/b", "a/", "../escape", ".lock", ".hidden", "a b", "-x"} {
+		if _, err := NewGeneration(t.TempDir(), name); err == nil {
+			t.Errorf("NewGeneration(%q) succeeded, want error", name)
+		}
+	}
+	if _, err := NewGeneration(t.TempDir(), "v1.2.3"); err != nil {
+		t.Errorf("NewGeneration(v1.2.3): %v", err)
+	}
+}
+
+func TestStaleBoundHandleCannotWriteReusedGeneration(t *testing.T) {
+	ctx := context.Background()
+	g := newGen(t, t.TempDir(), "g1")
+	id1 := proc.Identity{PID: 4242, StartTime: "111.222", Comm: "one"}
+	id2 := proc.Identity{PID: 7777, StartTime: "333.444", Comm: "two"}
+	bound1, err := g.claimOwner(ctx, id1)
+	if err != nil {
+		t.Fatalf("claimOwner incarnation 1: %v", err)
+	}
+	if err := bound1.Remove(ctx); err != nil {
+		t.Fatalf("Remove incarnation 1: %v", err)
+	}
+	bound2, err := g.claimOwner(ctx, id2)
+	if err != nil {
+		t.Fatalf("claimOwner incarnation 2: %v", err)
+	}
+	// The stale incarnation-1 handle must refuse, not write into incarnation 2.
+	if _, err := bound1.journal().apply(ctx, Row{Key: "stale", Seq: 9, State: RowPending}); !errors.Is(err, ErrStaleGeneration) {
+		t.Fatalf("stale Apply err = %v, want ErrStaleGeneration", err)
+	}
+	rows, err := bound2.journal().Rows(ctx)
+	if err != nil {
+		t.Fatalf("Rows incarnation 2: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("incarnation 2 journal contaminated: %v", rows)
+	}
+	if _, err := bound2.journal().apply(ctx, Row{Key: "fresh", Seq: 1, State: RowPending}); err != nil {
+		t.Errorf("incarnation 2 apply: %v", err)
+	}
+	// The stale handle's Remove must refuse too — a finished Run whose
+	// generation was reclaimed and reused must not delete the new incarnation.
+	if err := bound1.Remove(ctx); !errors.Is(err, ErrStaleGeneration) {
+		t.Fatalf("stale Remove err = %v, want ErrStaleGeneration", err)
+	}
+	if _, err := bound2.ReadOwner(); err != nil {
+		t.Errorf("incarnation 2 owner gone after stale Remove: %v", err)
 	}
 }
 
@@ -243,5 +331,52 @@ func TestGenerations(t *testing.T) {
 	}
 	if len(got) != 2 || got[0].Name() != "g1" || got[1].Name() != "g2" {
 		t.Errorf("generations = %v, want [g1 g2]", got)
+	}
+}
+
+func TestBumpRefusesSaturatedSeq(t *testing.T) {
+	ctx := context.Background()
+	j := NewJournal(filepath.Join(t.TempDir(), "canonical.json"))
+	// math.MaxUint64 is reserved: a bump whose next seq would reach it refuses.
+	mustApply(t, j, Row{Key: "k1", Seq: math.MaxUint64 - 1, State: RowPending})
+	if _, err := j.Bump(ctx, "k1", RowPending); !errors.Is(err, ErrSeqExhausted) {
+		t.Fatalf("Bump err = %v, want ErrSeqExhausted", err)
+	}
+	// A high-water at the reserved boundary refuses fresh keys too.
+	if err := j.Truncate(ctx, map[Key]Row{"k1": {Key: "k1", Seq: math.MaxUint64 - 1, State: RowPending}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Bump(ctx, "k2", RowPending); !errors.Is(err, ErrSeqExhausted) {
+		t.Fatalf("Bump fresh key err = %v, want ErrSeqExhausted", err)
+	}
+}
+
+func TestClaimOwnerRefusesSymlinkedGeneration(t *testing.T) {
+	dotdir := t.TempDir()
+	target := filepath.Join(dotdir, "elsewhere")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dotdir, "drain"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	g := newGen(t, dotdir, "g1")
+	if err := os.Symlink(target, g.Dir()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.claimOwner(context.Background(), deadOwner()); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("claimOwner err = %v, want symlink refusal", err)
+	}
+	if _, err := os.Lstat(filepath.Join(target, "owner.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("owner write escaped through the symlink: %v", err)
+	}
+}
+
+func TestGenerationConstructorsRequireAbsoluteDotdir(t *testing.T) {
+	if _, err := NewGeneration("rel/dotdir", "g1"); err == nil {
+		t.Error("NewGeneration accepted a relative dotdir")
+	}
+	if _, err := Generations("rel/dotdir"); err == nil {
+		t.Error("Generations accepted a relative dotdir")
 	}
 }

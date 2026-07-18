@@ -1,6 +1,11 @@
 // Package drain is the drain-on-upgrade engine: a draining daemon hands its
 // resources to a strictly-newer successor with every row in exactly one journal,
 // and never force-clears without ForcePolicyConfirmedDead death proof.
+//
+// The engine defends against crashes, power loss, and concurrent cooperating
+// processes sharing the state dir. A hostile same-UID actor staging symlinks or
+// mutating the dotdir out-of-band is out of scope; per-message identity
+// hardening is a later phase.
 package drain
 
 import "context"
@@ -22,7 +27,10 @@ const (
 )
 
 // Fence is a held exclusion over one resource, from busy-check through teardown
-// and handoff. fusekit's *lease.Fence satisfies it.
+// and handoff. While held, the successor must be unable to produce new canonical
+// registrations for the key: the sweep re-reads canonical under the fence and
+// yields on what it sees, so a non-exclusive fence reopens a double-apply.
+// fusekit's *lease.Fence satisfies it.
 type Fence interface {
 	// Held reports whether the fence is still held; false mid-sweep aborts.
 	Held() bool
@@ -44,7 +52,9 @@ type Resources interface {
 	// Seize takes key's fence exclusively; failure aborts that key's sweep.
 	Seize(ctx context.Context, key Key) (Fence, error)
 	// Yield tears down the local hold and hands key to the successor, keeping
-	// fence held throughout; any error aborts and restores.
+	// fence held throughout; any error aborts and restores. It runs at least
+	// once: a crash between a successful Yield and the durable journal advance
+	// replays it on restart, so implementations must be idempotent.
 	Yield(ctx context.Context, key Key, fence Fence) error
 	// Restore reinstates a partially-swept key after an aborted attempt.
 	Restore(ctx context.Context, key Key, fence Fence) error

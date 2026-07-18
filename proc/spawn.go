@@ -38,6 +38,12 @@ type Spawn struct {
 	// CanHost gates the spawn: a non-nil error is a permanent refusal, returned
 	// unwrapped by EnsureRunning. Required.
 	CanHost func() error
+	// Gate, when set, admits each actual child launch, running only when
+	// EnsureRunning is about to start a child — never when Available already
+	// holds. It records the attempt durably before the launch (launch-site
+	// accounting: wire drain.StrikeStore.SpawnGate); an error withholds the
+	// launch and is returned unwrapped.
+	Gate func(ctx context.Context) error
 	// Launch selects how the child is started; nil means ExecLaunch (direct
 	// exec). No strategy bypasses the Available/CanHost gates, the RLIMIT_NPROC
 	// child cap, or reaping.
@@ -71,6 +77,11 @@ func (s Spawn) EnsureRunning(ctx context.Context) error {
 	}
 	if err := s.CanHost(); err != nil {
 		return err
+	}
+	if s.Gate != nil {
+		if err := s.Gate(ctx); err != nil {
+			return err
+		}
 	}
 	cmd, logFile, err := s.strategy().launch(s)
 	if errors.Is(err, ErrAppLaunchUnsupported) {
