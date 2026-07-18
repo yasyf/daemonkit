@@ -8,6 +8,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// prioDarwinProcess is PRIO_DARWIN_PROCESS, which x/sys/unix does not export:
+// the per-process Darwin QoS band Nice deliberately leaves untouched.
+const prioDarwinProcess = 4
+
 // Nice lowers the calling process's scheduling priority to n — classic
 // nice(2), inherited by children, deliberately NOT the Darwin background band
 // (its I/O tier starves a data-plane server; a self-set band cannot be

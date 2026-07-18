@@ -28,7 +28,7 @@ func TestNice(t *testing.T) {
 		t.Fatalf("getpriority after Nice(5) = %d; want 5", got)
 	}
 
-	if band, err := unix.Getpriority(4, 0); err != nil || band != 0 {
+	if band, err := unix.Getpriority(prioDarwinProcess, 0); err != nil || band != 0 {
 		t.Fatalf("darwin band after Nice(5) = %#x, %v; want foreground (0)", band, err)
 	}
 
