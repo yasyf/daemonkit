@@ -218,6 +218,9 @@ private func peerDynamicStatus(descriptor: Int32) throws -> UInt32 {
     return try #require((info[kSecCodeInfoStatus] as? NSNumber)?.uint32Value)
 }
 
+/// Gates the live signed-peer E2E tests behind `DAEMONKIT_TRUST_E2E=1` (mirrors Go's `requireE2E`).
+private let trustE2EEnabled = ProcessInfo.processInfo.environment["DAEMONKIT_TRUST_E2E"] == "1"
+
 @Suite(.serialized, .timeLimit(.minutes(1)))
 struct PeerTrustTests {
     @Test func selfConnectionPassesTheEUIDFloor() throws {
@@ -321,7 +324,7 @@ struct PeerTrustTests {
         }
     }
 
-    @Test func hardenedSignedPeerPasses() throws {
+    @Test(.enabled(if: trustE2EEnabled, "set DAEMONKIT_TRUST_E2E=1 to run the live signed-peer E2E")) func hardenedSignedPeerPasses() throws {
         let dir = try shortSocketDir()
         defer { try? FileManager.default.removeItem(at: dir) }
         let peer = try spawnSignedPeer(in: dir, options: "runtime")
@@ -330,7 +333,7 @@ struct PeerTrustTests {
         try PeerTrust(requirement: peer.requirement).check(descriptor: peer.server)
     }
 
-    @Test func unhardenedSignedPeerRejected() throws {
+    @Test(.enabled(if: trustE2EEnabled, "set DAEMONKIT_TRUST_E2E=1 to run the live signed-peer E2E")) func unhardenedSignedPeerRejected() throws {
         let dir = try shortSocketDir()
         defer { try? FileManager.default.removeItem(at: dir) }
         let peer = try spawnSignedPeer(in: dir, options: nil)
@@ -348,7 +351,7 @@ struct PeerTrustTests {
         try PeerTrust(requirement: peer.requirement, allowUnhardened: true).check(descriptor: peer.server)
     }
 
-    @Test func jitEntitledPeerRejectedEvenUnderForcedLibraryValidation() throws {
+    @Test(.enabled(if: trustE2EEnabled, "set DAEMONKIT_TRUST_E2E=1 to run the live signed-peer E2E")) func jitEntitledPeerRejectedEvenUnderForcedLibraryValidation() throws {
         let dir = try shortSocketDir()
         defer { try? FileManager.default.removeItem(at: dir) }
         let peer = try spawnSignedPeer(
@@ -371,7 +374,7 @@ struct PeerTrustTests {
         try PeerTrust(requirement: peer.requirement, allowUnhardened: true).check(descriptor: peer.server)
     }
 
-    @Test func disableLibraryValidationPeerRejected() throws {
+    @Test(.enabled(if: trustE2EEnabled, "set DAEMONKIT_TRUST_E2E=1 to run the live signed-peer E2E")) func disableLibraryValidationPeerRejected() throws {
         let dir = try shortSocketDir()
         defer { try? FileManager.default.removeItem(at: dir) }
         let peer = try spawnSignedPeer(
