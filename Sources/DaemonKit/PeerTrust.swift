@@ -5,6 +5,28 @@ import Security
 
 private let log = Logger(subsystem: DaemonKit.loggingSubsystem, category: "PeerTrust")
 
+// Dynamic code-signing status bits, verified against xnu's cs_blobs.h.
+private let csGetTaskAllow: UInt32 = 0x0000_0004 // CS_GET_TASK_ALLOW: get-task-allow entitlement
+private let csForcedLV: UInt32 = 0x0000_0010 // CS_FORCED_LV: library validation forced by system policy
+private let csRequireLV: UInt32 = 0x0000_2000 // CS_REQUIRE_LV: library validation required
+private let csRuntime: UInt32 = 0x0001_0000 // CS_RUNTIME: Hardened Runtime (codesign --options runtime)
+private let csDebugged: UInt32 = 0x1000_0000 // CS_DEBUGGED: ran with invalid pages under a debugger
+
+/// entDisableLV turns off library validation unless CS_REQUIRE_LV/CS_FORCED_LV
+/// enforce it dynamically anyway.
+private let entDisableLV = "com.apple.security.cs.disable-library-validation"
+
+/// injectionEntitlements re-open code injection or debugger attachment on a
+/// Hardened Runtime binary; a peer signed with any of them is untrusted.
+private let injectionEntitlements = [
+    entDisableLV,
+    "com.apple.security.cs.allow-dyld-environment-variables",
+    "com.apple.security.cs.allow-unsigned-executable-memory",
+    "com.apple.security.cs.allow-jit",
+    "com.apple.security.cs.disable-executable-page-protection",
+    "com.apple.security.get-task-allow",
+]
+
 /// Verifies the code-signing identity of a connected unix-socket peer.
 ///
 /// Every check enforces a **same-effective-UID floor**: the accepted peer's euid
@@ -19,13 +41,19 @@ private let log = Logger(subsystem: DaemonKit.loggingSubsystem, category: "PeerT
 /// or a requirement that will not compile — fails closed with a throw, never a
 /// silent downgrade to UID-only.
 ///
+/// A configured requirement also demands injection-resistant signing state:
+/// the Hardened Runtime (`CS_RUNTIME`), no `CS_GET_TASK_ALLOW`/`CS_DEBUGGED`,
+/// and no injection-enabling entitlements — `allow-jit` included, rejected even
+/// under enforced library validation. `allowUnhardened` relaxes only this gate,
+/// never the requirement or the UID floor.
+///
 /// `LOCAL_PEERTOKEN` is a query-time binding, not connect-frozen: it is
 /// known-unsound against same-UID fork/exec identity substitution, so a surface
 /// needing a real per-message identity guarantee uses XPC. That hardening is a
 /// later phase.
 public struct PeerTrust: Sendable {
     /// Every failure path is fail-closed; the caller maps any throw to a refusal.
-    public enum TrustError: Error, Sendable {
+    public enum TrustError: Error, Equatable, Sendable {
         /// `getpeereid` on the connection fd failed.
         case peerCredentialsUnavailable(errno: Int32)
         /// The peer's euid does not equal this process's euid.
@@ -38,16 +66,41 @@ public struct PeerTrust: Sendable {
         case requirementInvalid(OSStatus)
         /// The peer's code did not satisfy the designated requirement.
         case untrustedPeer(OSStatus)
+        /// `SecCodeCopySigningInformation` on the peer's code failed.
+        case signingInfoUnavailable(OSStatus)
+        /// The peer's signing information carries no dynamic code-signing status.
+        case signingStatusUnavailable
+        /// The peer was signed without the Hardened Runtime.
+        case hardenedRuntimeMissing(status: UInt32)
+        /// The peer permits debugger attachment (`CS_GET_TASK_ALLOW`).
+        case debuggable(status: UInt32)
+        /// The peer ran with invalid pages under a debugger (`CS_DEBUGGED`).
+        case debugged(status: UInt32)
+        /// The peer's entitlements are not in dictionary form, so they cannot
+        /// be proven free of injection entitlements.
+        case entitlementsUndecodable
+        /// The peer is signed with an injection-enabling entitlement.
+        case injectionEntitled(String)
     }
 
     /// The designated requirement the peer must satisfy, or `nil` for UID-only
     /// trust (the same-effective-UID floor alone).
     public let requirement: String?
 
-    /// - Parameter requirement: A designated requirement string; `nil` enforces
-    ///   the same-effective-UID floor alone.
-    public init(requirement: String? = nil) {
+    /// Skips the Hardened Runtime and injection-entitlement gate for a peer
+    /// that legitimately cannot be library-validated (one loading an audited
+    /// third-party dylib). The requirement and the UID floor still apply. Off
+    /// by default; enabling it is a security decision.
+    public let allowUnhardened: Bool
+
+    /// - Parameters:
+    ///   - requirement: A designated requirement string; `nil` enforces the
+    ///     same-effective-UID floor alone.
+    ///   - allowUnhardened: Relaxes the injection-resistance gate that
+    ///     otherwise accompanies a requirement; inert without one.
+    public init(requirement: String? = nil, allowUnhardened: Bool = false) {
         self.requirement = requirement
+        self.allowUnhardened = allowUnhardened
     }
 
     /// Throws unless the peer on `descriptor` passes the same-effective-UID floor
@@ -95,6 +148,63 @@ public struct PeerTrust: Sendable {
         guard validity == errSecSuccess else {
             log.error("peer rejected: OSStatus \(validity, privacy: .public)")
             throw TrustError.untrustedPeer(validity)
+        }
+
+        if allowUnhardened {
+            return
+        }
+        try enforceHardenedRuntime(code)
+    }
+
+    private func enforceHardenedRuntime(_ code: SecCode) throws {
+        // The audit-token guest is what SecCodeCopySigningInformation needs for
+        // live status flags; Swift imports SecCode/SecStaticCode as unrelated: bit cast.
+        let staticCode = unsafeBitCast(code, to: SecStaticCode.self)
+        var info: CFDictionary?
+        let flags = SecCSFlags(rawValue: kSecCSDynamicInformation | kSecCSRequirementInformation)
+        let status = SecCodeCopySigningInformation(staticCode, flags, &info)
+        guard status == errSecSuccess, let info else {
+            throw TrustError.signingInfoUnavailable(status)
+        }
+        try Self.enforceHardenedRuntime(info: info as NSDictionary)
+    }
+
+    static func enforceHardenedRuntime(info: NSDictionary) throws {
+        guard let signingStatus = (info[kSecCodeInfoStatus] as? NSNumber)?.uint32Value else {
+            throw TrustError.signingStatusUnavailable
+        }
+        guard signingStatus & csRuntime != 0 else {
+            throw TrustError.hardenedRuntimeMissing(status: signingStatus)
+        }
+        guard signingStatus & csGetTaskAllow == 0 else {
+            throw TrustError.debuggable(status: signingStatus)
+        }
+        guard signingStatus & csDebugged == 0 else {
+            throw TrustError.debugged(status: signingStatus)
+        }
+        let lvProven = signingStatus & (csRequireLV | csForcedLV) != 0
+        let entitlementsValue = info[kSecCodeInfoEntitlementsDict]
+        guard let entitlements = entitlementsValue as? NSDictionary else {
+            // Only both keys ABSENT is clean; a present-but-undecodable value
+            // under either key cannot be proven free of injection entitlements.
+            guard entitlementsValue == nil, info[kSecCodeInfoEntitlements] == nil else {
+                throw TrustError.entitlementsUndecodable
+            }
+            return
+        }
+        for entitlement in injectionEntitlements {
+            // Inert when the kernel enforces library validation regardless.
+            if lvProven, entitlement == entDisableLV {
+                continue
+            }
+            guard let value = entitlements[entitlement] else { continue }
+            // Only a genuine CFBoolean false is clean: CFEqual alone also matches
+            // CFNumber(0) through NSNumber bridging, and Go compares the
+            // kCFBooleanFalse singleton by identity.
+            let ref = value as CFTypeRef
+            guard CFGetTypeID(ref) == CFBooleanGetTypeID(), CFEqual(ref, kCFBooleanFalse) else {
+                throw TrustError.injectionEntitled(entitlement)
+            }
         }
     }
 

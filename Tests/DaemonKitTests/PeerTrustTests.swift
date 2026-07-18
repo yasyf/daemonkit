@@ -112,6 +112,112 @@ private func sendLine(to path: String, _ payload: Data, timeout: TimeInterval = 
     return reply
 }
 
+private func entitlementsXML(_ entitlements: [String]) -> String {
+    let entries = entitlements.map { "<key>\($0)</key><true/>" }.joined()
+    return """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0"><dict>\(entries)</dict></plist>
+    """
+}
+
+/// Re-signs `binary` ad hoc with the given codesign options and entitlements.
+private func codesign(_ binary: URL, options: String?, entitlements: [String]?, scratch: URL) throws {
+    var arguments = ["-f", "-s", "-"]
+    if let options {
+        arguments += ["--options", options]
+    }
+    if let entitlements {
+        let plist = scratch.appendingPathComponent("entitlements.plist")
+        try entitlementsXML(entitlements).write(to: plist, atomically: true, encoding: .utf8)
+        arguments += ["--entitlements", plist.path]
+    }
+    arguments.append(binary.path)
+    let sign = Process()
+    sign.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+    sign.arguments = arguments
+    sign.standardError = FileHandle.nullDevice
+    try sign.run()
+    sign.waitUntilExit()
+    try #require(sign.terminationStatus == 0, "codesign \(arguments.joined(separator: " ")) failed")
+}
+
+/// A live re-signed `nc` peer: the accepted server fd, the copy's own
+/// designated requirement, and the process to reap.
+private struct SignedPeer {
+    let server: Int32
+    let requirement: String
+    let process: Process
+
+    func close() {
+        Darwin.close(server)
+        process.terminate()
+        process.waitUntilExit()
+    }
+}
+
+/// Spawns a copy of `nc` re-signed ad hoc with the given options/entitlements
+/// as a live unix-socket peer. Ad-hoc signing needs no identity, so these
+/// peers build anywhere; Developer-ID anchors are the Go trust E2E's domain.
+private func spawnSignedPeer(
+    in dir: URL, options: String?, entitlements: [String]? = nil
+) throws -> SignedPeer {
+    let binary = dir.appendingPathComponent("peer")
+    try FileManager.default.copyItem(at: URL(fileURLWithPath: "/usr/bin/nc"), to: binary)
+    try codesign(binary, options: options, entitlements: entitlements, scratch: dir)
+
+    var staticCodeRef: SecStaticCode?
+    try #require(SecStaticCodeCreateWithPath(binary as CFURL, [], &staticCodeRef) == errSecSuccess)
+    let staticCode = try #require(staticCodeRef)
+    var designatedRef: SecRequirement?
+    try #require(SecCodeCopyDesignatedRequirement(staticCode, [], &designatedRef) == errSecSuccess)
+    let designated = try #require(designatedRef)
+    var requirementRef: CFString?
+    try #require(SecRequirementCopyString(designated, [], &requirementRef) == errSecSuccess)
+    let requirement = try #require(requirementRef) as String
+
+    let path = dir.appendingPathComponent("s.sock").path
+    var addr = try #require(makeAddress(path: path))
+    let listener = socket(AF_UNIX, SOCK_STREAM, 0)
+    try #require(listener >= 0)
+    defer { close(listener) }
+    try #require(withAddress(&addr) { Darwin.bind(listener, $0, $1) } == 0)
+    try #require(listen(listener, 1) == 0)
+
+    let peer = Process()
+    peer.executableURL = binary
+    peer.arguments = ["-U", path]
+    peer.standardInput = Pipe()
+    peer.standardOutput = FileHandle.nullDevice
+    peer.standardError = FileHandle.nullDevice
+    try peer.run()
+
+    var poller = pollfd(fd: listener, events: Int16(POLLIN), revents: 0)
+    try #require(poll(&poller, 1, 5000) == 1, "signed peer never connected")
+    let server = accept(listener, nil, nil)
+    try #require(server >= 0)
+    return SignedPeer(server: server, requirement: requirement, process: peer)
+}
+
+/// The peer's dynamic code-signing status, read through the same system APIs
+/// the gate uses — ground truth for asserting live status bits.
+private func peerDynamicStatus(descriptor: Int32) throws -> UInt32 {
+    var token = audit_token_t()
+    var length = socklen_t(MemoryLayout<audit_token_t>.size)
+    try #require(getsockopt(descriptor, SOL_LOCAL, LOCAL_PEERTOKEN, &token, &length) == 0)
+    let tokenData = withUnsafeBytes(of: &token) { Data($0) }
+    var codeRef: SecCode?
+    let attributes = [kSecGuestAttributeAudit: tokenData] as CFDictionary
+    try #require(SecCodeCopyGuestWithAttributes(nil, attributes, [], &codeRef) == errSecSuccess)
+    let code = try #require(codeRef)
+    var infoRef: CFDictionary?
+    let staticCode = unsafeBitCast(code, to: SecStaticCode.self)
+    let flags = SecCSFlags(rawValue: kSecCSDynamicInformation)
+    try #require(SecCodeCopySigningInformation(staticCode, flags, &infoRef) == errSecSuccess)
+    let info = try #require(infoRef) as NSDictionary
+    return try #require((info[kSecCodeInfoStatus] as? NSNumber)?.uint32Value)
+}
+
 @Suite(.serialized, .timeLimit(.minutes(1)))
 struct PeerTrustTests {
     @Test func selfConnectionPassesTheEUIDFloor() throws {
@@ -123,14 +229,16 @@ struct PeerTrustTests {
         try PeerTrust().check(descriptor: server)
     }
 
-    @Test func matchingRequirementPasses() throws {
+    @Test func matchingRequirementPassesWithAllowUnhardened() throws {
         let dir = try shortSocketDir()
         defer { try? FileManager.default.removeItem(at: dir) }
         let (server, client) = acceptedConnection(at: dir.appendingPathComponent("s.sock").path)
         defer { close(server); close(client) }
 
+        // The test host is not hardened-runtime signed, so the requirement path
+        // needs the gate relaxed; hardenedSignedPeerPasses covers the strict path.
         let requirement = try selfDesignatedRequirement()
-        try PeerTrust(requirement: requirement).check(descriptor: server)
+        try PeerTrust(requirement: requirement, allowUnhardened: true).check(descriptor: server)
     }
 
     @Test func nonMatchingRequirementRejects() throws {
@@ -194,5 +302,89 @@ struct PeerTrustTests {
         defer { server.stop() }
 
         #expect(sendLine(to: path, Data("hello".utf8))?.isEmpty == true)
+    }
+
+    @Test func allowUnhardenedStillEnforcesTheRequirement() throws {
+        let dir = try shortSocketDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let (server, client) = acceptedConnection(at: dir.appendingPathComponent("s.sock").path)
+        defer { close(server); close(client) }
+
+        do {
+            try PeerTrust(requirement: unsatisfiableRequirement, allowUnhardened: true).check(descriptor: server)
+            Issue.record("expected allowUnhardened to leave the requirement enforced")
+        } catch let error as PeerTrust.TrustError {
+            guard case .untrustedPeer = error else {
+                Issue.record("expected .untrustedPeer, got \(error)")
+                return
+            }
+        }
+    }
+
+    @Test func hardenedSignedPeerPasses() throws {
+        let dir = try shortSocketDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let peer = try spawnSignedPeer(in: dir, options: "runtime")
+        defer { peer.close() }
+
+        try PeerTrust(requirement: peer.requirement).check(descriptor: peer.server)
+    }
+
+    @Test func unhardenedSignedPeerRejected() throws {
+        let dir = try shortSocketDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let peer = try spawnSignedPeer(in: dir, options: nil)
+        defer { peer.close() }
+
+        do {
+            try PeerTrust(requirement: peer.requirement).check(descriptor: peer.server)
+            Issue.record("expected the unhardened peer to be rejected")
+        } catch let error as PeerTrust.TrustError {
+            guard case .hardenedRuntimeMissing = error else {
+                Issue.record("expected .hardenedRuntimeMissing, got \(error)")
+                return
+            }
+        }
+        try PeerTrust(requirement: peer.requirement, allowUnhardened: true).check(descriptor: peer.server)
+    }
+
+    @Test func jitEntitledPeerRejectedEvenUnderForcedLibraryValidation() throws {
+        let dir = try shortSocketDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let peer = try spawnSignedPeer(
+            in: dir, options: "runtime,library", entitlements: [allowJIT]
+        )
+        defer { peer.close() }
+
+        let status = try peerDynamicStatus(descriptor: peer.server)
+        #expect(
+            status & (csRequireLV | csForcedLV) != 0,
+            "the peer must actually run under enforced library validation"
+        )
+
+        do {
+            try PeerTrust(requirement: peer.requirement).check(descriptor: peer.server)
+            Issue.record("expected the allow-jit peer to be rejected")
+        } catch let error as PeerTrust.TrustError {
+            #expect(error == .injectionEntitled(allowJIT))
+        }
+        try PeerTrust(requirement: peer.requirement, allowUnhardened: true).check(descriptor: peer.server)
+    }
+
+    @Test func disableLibraryValidationPeerRejected() throws {
+        let dir = try shortSocketDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let peer = try spawnSignedPeer(
+            in: dir, options: "runtime", entitlements: [disableLV]
+        )
+        defer { peer.close() }
+
+        do {
+            try PeerTrust(requirement: peer.requirement).check(descriptor: peer.server)
+            Issue.record("expected the disable-library-validation peer to be rejected")
+        } catch let error as PeerTrust.TrustError {
+            #expect(error == .injectionEntitled(disableLV))
+        }
+        try PeerTrust(requirement: peer.requirement, allowUnhardened: true).check(descriptor: peer.server)
     }
 }
