@@ -111,6 +111,17 @@ func TestTrustRejectsWrongIdentifier(t *testing.T) {
 	}
 }
 
+// TestTrustRejectsWrongTeam pins the Team ID (OU) clause: fixture-devid-a (team
+// SXKCTF23Q2) is rejected by a Requirement naming a different team.
+func TestTrustRejectsWrongTeam(t *testing.T) {
+	requireE2E(t)
+	peer := peerOf(t, fixtureBin(t, "fixture-devid-a"))
+	p := Policy{Requirement: &Requirement{TeamID: "ZZ0FAKE9TX", Identifier: "com.yasyf.daemonkit.fixture-a"}}
+	if err := p.Check(peer); !errors.Is(err, ErrUntrustedPeer) {
+		t.Errorf("Check(wrong team) = %v, want ErrUntrustedPeer", err)
+	}
+}
+
 func TestTrustRejectsAdHoc(t *testing.T) {
 	requireE2E(t)
 	peer := peerOf(t, fixtureBin(t, "fixture-adhoc"))
