@@ -14,20 +14,15 @@ const DefaultSkewInterval = 30 * time.Second
 
 // SkewConfig drives a SkewWatch.
 type SkewConfig struct {
-	// Running reports the daemon's own running version; consumers wire version.Running.
-	Running func() string
-	// Installed reports the on-disk artifact version; consumers wire bundle.ShortVersion.
+	Running   func() string
 	Installed func() (string, error)
-	// OnSkew fires once a newer artifact is confirmed installed; the drain engine
-	// wires in here. Required.
+	// OnSkew fires once a newer artifact is confirmed installed. Required.
 	OnSkew func(ctx context.Context) error
 	// Interval is the tick cadence; zero means DefaultSkewInterval.
 	Interval time.Duration
-	// Confirmations is the consecutive skew observations required before firing;
-	// zero or one fires on the first observation.
+	// Confirmations is the consecutive skew observations before firing; zero or one fires on the first.
 	Confirmations int
-	// Strikes, when set, storm-gates firing: once the strike budget is spent
-	// within its window, OnSkew is suppressed until the window rolls off.
+	// Strikes, when set, storm-gates firing until the strike window rolls off.
 	Strikes *proc.Strikes
 
 	clock clock
@@ -42,10 +37,8 @@ type SkewWatch struct {
 // NewSkewWatch builds a SkewWatch from cfg.
 func NewSkewWatch(cfg SkewConfig) *SkewWatch { return &SkewWatch{cfg: cfg} }
 
-// Run ticks on the clock seam, comparing the running version against the
-// installed artifact, and fires OnSkew once a newer artifact is confirmed the
-// required number of consecutive ticks and the strike budget allows. It blocks
-// until ctx is done or OnSkew returns an error.
+// Run ticks on the clock seam and fires OnSkew once a newer artifact is confirmed,
+// blocking until ctx is done or OnSkew returns an error.
 func (w *SkewWatch) Run(ctx context.Context) error {
 	clk := clockOrReal(w.cfg.clock)
 	interval := w.cfg.Interval
@@ -64,9 +57,6 @@ func (w *SkewWatch) Run(ctx context.Context) error {
 	}
 }
 
-// tick evaluates one skew observation at now, firing OnSkew when a newer
-// artifact has been confirmed enough consecutive ticks and the strike budget
-// permits.
 func (w *SkewWatch) tick(ctx context.Context, now time.Time) error {
 	run := w.cfg.Running()
 	inst, err := w.cfg.Installed()

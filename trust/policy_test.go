@@ -52,14 +52,14 @@ func TestCheckUIDFloorRejectsForeignUID(t *testing.T) {
 }
 
 func TestCheckUIDOnlyPassesSameUID(t *testing.T) {
-	p := Policy{} // no Requirement → UID-only
+	p := Policy{}
 	if err := p.Check(wire.Peer{UID: os.Getuid()}); err != nil {
 		t.Errorf("Check(same uid, no requirement) = %v, want nil", err)
 	}
 }
 
 func TestCheckConfiguredRequirementValidatesFields(t *testing.T) {
-	p := Policy{Requirement: &Requirement{TeamID: "SXKCTF23Q2"}} // missing Identifier
+	p := Policy{Requirement: &Requirement{TeamID: "SXKCTF23Q2"}}
 	err := p.Check(wire.Peer{UID: os.Getuid()})
 	if err == nil {
 		t.Fatal("Check with an invalid Requirement = nil, want an error")
@@ -69,13 +69,9 @@ func TestCheckConfiguredRequirementValidatesFields(t *testing.T) {
 	}
 }
 
-// TestCheckFailsClosedWithoutVerifier: a valid Requirement against a peer with no
-// audit token (no verifier can run) is denied with ErrNoVerifier — never a silent
-// downgrade to the UID floor. On non-darwin builds no verifier exists at all;
-// both paths must fail closed.
 func TestCheckFailsClosedWithoutVerifier(t *testing.T) {
 	p := Policy{Requirement: &Requirement{TeamID: "SXKCTF23Q2", Identifier: "com.yasyf.daemonkit.x"}}
-	err := p.Check(wire.Peer{UID: os.Getuid()}) // same uid, but no Audit token
+	err := p.Check(wire.Peer{UID: os.Getuid()})
 	if !errors.Is(err, ErrNoVerifier) {
 		t.Errorf("Check(no verifier) = %v, want ErrNoVerifier (fail closed)", err)
 	}

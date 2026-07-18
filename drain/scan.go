@@ -17,17 +17,12 @@ const DefaultScanInterval = time.Minute
 
 // ScanConfig drives the canonical daemon's death scans over drain generations.
 type ScanConfig struct {
-	// Dotdir roots the drain layout; generations live at Dotdir/drain/<gen>.
-	Dotdir string
-	// Canonical is the ownership journal adopted rows land in.
+	Dotdir    string
 	Canonical Journal
-	// Intake gates adoptions against a concurrent drain transition: AdoptDead
-	// admits through it and refuses with ErrDraining once it closes. Required.
-	Intake *Intake
+	Intake    *Intake
 	// Interval is ScanLoop's cadence; zero means DefaultScanInterval.
 	Interval time.Duration
-	// Backoff spaces per-generation retries after a failed adoption; the zero
-	// value uses a default.
+	// Backoff spaces per-generation retries after a failed adoption; the zero value uses a default.
 	Backoff proc.Backoff
 	// Log receives scan diagnostics; nil uses slog.Default.
 	Log *slog.Logger
@@ -57,15 +52,12 @@ func (cfg ScanConfig) log() *slog.Logger {
 	return slog.Default()
 }
 
-// ScanPeers runs one complete death scan, adopting every proven-dead
-// generation. The canonical daemon runs it before accepting registrations
-// (e.g. wire.Server.BootReconcile) — the cold-start hole — and periodically after.
+// ScanPeers runs one complete death scan, adopting every proven-dead generation.
 func ScanPeers(ctx context.Context, cfg ScanConfig) error {
 	return scanOnce(ctx, cfg, nil, time.Time{})
 }
 
-// ScanLoop runs ScanPeers on Interval with per-generation breakers, so one
-// failing peer never suppresses another's adoption. It blocks until ctx ends.
+// ScanLoop runs ScanPeers on Interval with per-generation breakers; it blocks until ctx ends.
 func ScanLoop(ctx context.Context, cfg ScanConfig) error {
 	clk := clockOrReal(cfg.clock)
 	brk := NewBreakers(cfg.backoff())
@@ -81,8 +73,6 @@ func ScanLoop(ctx context.Context, cfg ScanConfig) error {
 	}
 }
 
-// scanOnce adopts only on a complete successful death scan: an enumeration
-// error adopts nothing, and an Undetermined peer stays unadopted.
 func scanOnce(ctx context.Context, cfg ScanConfig, brk *Breakers, now time.Time) error {
 	gens, err := Generations(cfg.Dotdir)
 	if err != nil {
@@ -164,24 +154,13 @@ func scanOnce(ctx context.Context, cfg ScanConfig, brk *Breakers, now time.Time)
 	return errors.Join(errs...)
 }
 
-// errAdoptionRaced means the owner re-read under the root lock is no longer
-// proven dead: a reused generation name changed owners between the advisory
-// scan and the locked adoption.
 var errAdoptionRaced = errors.New("adoption raced a live owner")
 
 // AdoptDead proves g's owner dead and adopts it in one critical section under
-// the drain root lock: the owner is re-read under the lock and must match
-// expected — the identity the advisory scan proved dead — then is re-assessed,
-// so a generation name reused by a different owner between the advisory scan
-// and the adoption is refused instead of torn down; the handle binds to the
-// observed incarnation for every subsequent op. Pending rows replay into
-// canonical strictly above every issued seq (Bump's advancement rule); g is
-// removed only once canonical is proven strictly newer. At sequence saturation, death proof transfers the exact row
-// and deletes the generation's representation before removal. The canonical
-// write is admitted through intake, so a draining canonical refuses with
-// ErrDraining and leaves g intact for the successor. A second adopter arriving
-// after removal fails with os.ErrNotExist rather than resurrecting the
-// directory.
+// the drain root lock: the owner is re-read and re-assessed under the lock,
+// so a generation name reused between the advisory scan and the adoption is
+// refused instead of torn down. The canonical write is admitted through
+// intake; g is removed only once canonical is proven strictly newer.
 func AdoptDead(ctx context.Context, cfg ScanConfig, g Generation, expected proc.Identity) error {
 	done, err := cfg.Intake.Admit()
 	if err != nil {
@@ -240,13 +219,7 @@ func AdoptDead(ctx context.Context, cfg ScanConfig, g Generation, expected proc.
 	return nil
 }
 
-// reclaimOwnerless removes a generation directory that has no owner record: a
-// crashed partial removal, or a claim that died before writing its owner. The
-// root lock serializes it against claims and adoptions, and the owner recheck
-// under the lock catches a claim that completed since the enumeration. An
-// ownerless directory named by a live-owner transition claim is a mid-setup
-// generation whose owner write was lost undurably — its owner re-fences it on
-// retry, so the reclaim leaves it alone.
+// An ownerless dir named by a live transition claim is mid-setup (owner write lost undurably); leave it alone.
 func reclaimOwnerless(ctx context.Context, cfg ScanConfig, g Generation) (bool, error) {
 	lock, err := proc.Flock(ctx, g.rootLock())
 	if err != nil {

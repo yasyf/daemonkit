@@ -16,11 +16,6 @@ import (
 	"time"
 )
 
-// TestCloseInheritedFDsReleasesParentLease pins P-11: a detached child
-// spawned while the parent holds a session lease inherits the non-CLOEXEC
-// lease descriptor; after CloseInheritedFDs the child no longer pins it. The
-// no-sweep case is the negative control proving the leak (and this test)
-// is real.
 func TestCloseInheritedFDsReleasesParentLease(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -70,8 +65,6 @@ func TestCloseInheritedFDsReleasesParentLease(t *testing.T) {
 			})
 			waitHelperReady(t, stdout)
 
-			// The parent's own share is gone; only the child's inherited fd
-			// (if any survived the sweep) can keep the lease held.
 			if err := h.Close(); err != nil {
 				t.Fatal(err)
 			}
@@ -86,7 +79,6 @@ func TestCloseInheritedFDsReleasesParentLease(t *testing.T) {
 			if !errors.Is(err, errLeaseBusy) {
 				t.Fatalf("Seize with unswept child = %v, want errLeaseBusy (the inherited fd must pin — otherwise this test cannot catch the leak)", err)
 			}
-			// The pin dies with the child's descriptor.
 			_ = stdin.Close()
 			wait()
 			f, err = leaseSeize(root, dir)
@@ -121,9 +113,6 @@ func waitHelperReady(t *testing.T, stdout io.Reader) {
 	}
 }
 
-// TestFDSweepHelperProcess is the re-exec'd child body, inert unless
-// FDSWEEP_HELPER=1: optionally sweep, report ready, then hold all inherited
-// state until stdin closes.
 func TestFDSweepHelperProcess(t *testing.T) {
 	if os.Getenv("FDSWEEP_HELPER") != "1" {
 		t.Skip("helper body; runs only re-exec'd")
@@ -137,8 +126,6 @@ func TestFDSweepHelperProcess(t *testing.T) {
 	_, _ = io.Copy(io.Discard, os.Stdin)
 }
 
-// errLeaseBusy stands in for the session-lease busy sentinel this test used to
-// import from fusekit.
 var errLeaseBusy = errors.New("lease is held")
 
 type leaseHandle struct{ fd int }
@@ -154,10 +141,6 @@ func leasePath(root, dir string) string {
 	return filepath.Join(root, hex.EncodeToString(sum[:])[:16]+".lease")
 }
 
-// leaseAcquire takes a shared lease over a descriptor opened WITHOUT O_CLOEXEC
-// (raw syscall.Open — os.OpenFile force-adds O_CLOEXEC on Darwin), so a
-// fork+exec child inherits and pins it. That inheritance is exactly what
-// CloseInheritedFDs must undo, so it is load-bearing for this test.
 func leaseAcquire(root, dir string) (*leaseHandle, error) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, err

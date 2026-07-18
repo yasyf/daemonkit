@@ -17,24 +17,17 @@ import (
 	"github.com/yasyf/daemonkit/proc"
 )
 
-// ErrStaleJournal refuses a snapshot into a generation journal that already
-// holds a row: a reused or foreign generation name must never double-own a key.
+// ErrStaleJournal refuses a snapshot into a generation journal that already holds a row.
 var ErrStaleJournal = errors.New("stale journal is not empty")
 
-// ErrStaleGeneration means a bound Generation handle outlived its incarnation:
-// the directory was removed (and possibly re-created under the same name) since
-// the handle captured its incarnation token, so the op must not land.
+// ErrStaleGeneration means a bound Generation handle outlived its incarnation.
 var ErrStaleGeneration = errors.New("stale generation handle")
 
 // ErrSeqExhausted refuses to advance a key into the reserved seq
-// math.MaxUint64: a row at the reserved seq could byte-collide with a
-// truncated snapshot row, which a retried scoped truncate would then delete —
-// a silently lost admission. Sequence exhaustion (2^64 admissions on one key)
-// is terminal for that key and surfaces as this error rather than wrapping.
+// math.MaxUint64: a row there could byte-collide with a truncated snapshot
+// row, which a retried scoped truncate would then delete.
 var ErrSeqExhausted = errors.New("seq space exhausted")
 
-// rootLockName is the never-unlinked drain-root lock's basename; generation
-// names must not collide with it (NewGeneration rejects dot-prefixed names).
 const rootLockName = ".lock"
 
 // RowState is a journal row's drain state.
@@ -47,18 +40,10 @@ const (
 	RowYielded RowState = "yielded"
 )
 
-// seqKey is the reserved state key persisting the seq high-water mark across
-// Truncate, so a new epoch never re-issues an already-issued seq.
 const seqKey = "~seq"
 
-// transitionKey is the reserved state key persisting the active drain
-// transition across process restart.
 const transitionKey = "~transition"
 
-// completeKey is the reserved generation-journal key marking the transition
-// a..h complete before the canonical claim releases: a retry that finds a
-// fresh claim but this marker knows the prior attempt finished and only its
-// release fsync failed.
 const completeKey = "~complete"
 
 // Row is one journal row; Seq is the monotonic transition seq CAS updates key on.
@@ -69,32 +54,19 @@ type Row struct {
 }
 
 // Journal is a flock-guarded JSON ownership journal, one row per resource key.
-// Writes go through daemon.StateFile, so untouched rows survive byte-for-byte.
 type Journal struct {
-	file daemon.StateFile
-	lock string
-	// genDir, when set, is the generation directory this journal lives in:
-	// every op re-checks it exists under the lock and fails with
-	// os.ErrNotExist when it is gone, so a late writer can never resurrect a
-	// removed generation by re-creating its files.
-	genDir string
-	// inc, when set, is the incarnation token the owning Generation handle was
-	// bound to; every op revalidates it under the lock and fails with
-	// ErrStaleGeneration when the directory was removed and re-created since.
+	file      daemon.StateFile
+	lock      string
+	genDir    string
 	inc       string
 	ownerPath string
 }
 
-// NewJournal opens the canonical journal at path; the file need not exist yet,
-// and locking creates its lock layout on demand. Generation journals are
-// package-internal — they share the drain root lock and bind to an incarnation.
+// NewJournal opens the canonical journal at path.
 func NewJournal(path string) Journal {
 	return Journal{file: daemon.StateFile{Path: path}, lock: path + ".lock"}
 }
 
-// withLock runs fn holding the journal's flock. Generation journals lock the
-// drain root (see Generation) and refuse a removed generation with
-// os.ErrNotExist rather than resurrecting its directory.
 func (j Journal) withLock(ctx context.Context, fn func() error) error {
 	lock, err := proc.Flock(ctx, j.lock)
 	if err != nil {
@@ -156,10 +128,7 @@ func (j Journal) rowsUnlocked() (map[Key]Row, error) {
 	return rows, nil
 }
 
-// apply CAS-applies rows: each lands only when its Seq exceeds the stored row's,
-// so a stale replay (Seq <= stored) is a no-op. Returns the applied row count.
-// Unexported: canonical seq advancement must route through advanceSeq (Bump,
-// adopt); a caller-supplied seq bypassing it could reconstitute truncated rows.
+// Unexported: canonical seq advancement must route through advanceSeq; a caller-supplied seq could reconstitute truncated rows.
 func (j Journal) apply(ctx context.Context, rows ...Row) (int, error) {
 	applied := 0
 	err := j.withLock(ctx, func() error {
@@ -188,8 +157,7 @@ func (j Journal) apply(ctx context.Context, rows ...Row) (int, error) {
 	return applied, nil
 }
 
-// Bump atomically advances key to state at the next seq and returns the new
-// row; the seq never falls below the Truncate-preserved high-water mark.
+// Bump atomically advances key to state at the next seq and returns the new row.
 func (j Journal) Bump(ctx context.Context, key Key, state RowState) (Row, error) {
 	var out Row
 	err := j.withLock(ctx, func() error {
@@ -221,12 +189,6 @@ func (j Journal) Bump(ctx context.Context, key Key, state RowState) (Row, error)
 	return out, nil
 }
 
-// adopt replays generation rows into canonical: each key advances strictly
-// above the generation row, the stored canonical row, AND the
-// Truncate-preserved high-water mark — the advancement rule shared with Bump —
-// so an adopted row can never reconstitute a truncated snapshot row and a
-// retried scoped Truncate can never delete it. A stored row already strictly
-// newer than the generation's is left untouched (a stale replay is a no-op).
 func (j Journal) adopt(ctx context.Context, rows []Row) error {
 	return j.withLock(ctx, func() error {
 		return j.file.UpdateUnlocked(func(st map[string]json.RawMessage) error {
@@ -257,12 +219,8 @@ func (j Journal) adopt(ctx context.Context, rows []Row) error {
 	})
 }
 
-// claimSnapshot applies rows into the journal and runs claim before releasing
-// the journal flock, so the row snapshot and the ownership claim it guards land
-// atomically against any concurrent journal writer. An exact replay resumes;
-// any other non-empty journal returns ErrStaleJournal without mutation.
-// Unexported: it copies caller-supplied seqs verbatim, which is correct only
-// for the transition's snapshot of canonical rows into a generation journal.
+// Copies caller-supplied seqs verbatim — only correct for the transition's
+// canonical→generation snapshot; must not be exported.
 func (j Journal) claimSnapshot(ctx context.Context, rows []Row, claim func() error) error {
 	return j.withLock(ctx, func() error {
 		return j.file.UpdateUnlocked(func(state map[string]json.RawMessage) error {
@@ -305,11 +263,9 @@ func (j Journal) claimSnapshot(ctx context.Context, rows []Row, claim func() err
 	})
 }
 
-// Truncate deletes exactly the snapshotted rows: a stored row is deleted only
-// when it still matches its scope row byte-for-value, so a row admitted or
-// bumped after the snapshot survives — the truncate can never delete state the
-// generation snapshot does not hold. The seq high-water mark absorbs deleted
-// seqs, so a later Bump never re-issues one.
+// Truncate deletes exactly the snapshotted rows — a row admitted or bumped
+// after the snapshot survives — and the seq high-water mark absorbs deleted
+// seqs so a later Bump never re-issues one.
 func (j Journal) Truncate(ctx context.Context, scope map[Key]Row) error {
 	return j.withLock(ctx, func() error {
 		return j.file.UpdateUnlocked(func(state map[string]json.RawMessage) error {
@@ -344,10 +300,6 @@ func isJournalMetadata(key string) bool {
 	return key == seqKey || key == transitionKey || key == completeKey
 }
 
-// markComplete durably records the transition complete for this incarnation:
-// the marker carries the handle's incarnation token, so residue a partial
-// removal leaves for a reused name never reads as the new claim's completion.
-// Idempotent.
 func (j Journal) markComplete(ctx context.Context) error {
 	if j.inc == "" {
 		return errors.New("complete marker requires an incarnation-bound journal")
@@ -364,7 +316,6 @@ func (j Journal) markComplete(ctx context.Context) error {
 	})
 }
 
-// isComplete reports whether markComplete ran for this handle's incarnation.
 func (j Journal) isComplete(ctx context.Context) (bool, error) {
 	var complete bool
 	err := j.withLock(ctx, func() error {
@@ -414,8 +365,6 @@ func (j Journal) terminalizeUnlocked(row Row) error {
 	})
 }
 
-// nextSeq returns s+1, saturating at math.MaxUint64 so an exhausted seq space
-// never wraps to a low, already-issued value that CAS would then suppress.
 func nextSeq(s uint64) uint64 {
 	if s == math.MaxUint64 {
 		return s
@@ -423,9 +372,6 @@ func nextSeq(s uint64) uint64 {
 	return s + 1
 }
 
-// advanceSeq returns the smallest seq strictly above every floor; ok is false
-// when that seq would reach the reserved math.MaxUint64 (see ErrSeqExhausted).
-// Every canonical seq advancement — Bump and adoption — routes here.
 func advanceSeq(floors ...uint64) (uint64, bool) {
 	var next uint64
 	for _, f := range floors {
@@ -500,8 +446,7 @@ const (
 	OwnedByGeneration
 )
 
-// ResolveOwner applies the canonical-row-wins-only-when-proven-newer rule: the
-// generation owns every key it holds unless the canonical row's Seq is higher.
+// ResolveOwner applies the canonical-row-wins-only-when-proven-newer rule.
 func ResolveOwner(canonical, generation map[Key]Row, key Key) OwnedBy {
 	c, cok := canonical[key]
 	g, gok := generation[key]
@@ -540,8 +485,6 @@ func (r ownerRecord) identity() proc.Identity {
 	return proc.Identity{PID: r.PID, StartTime: r.StartTime, Comm: r.Comm, Boot: r.Boot}
 }
 
-// ownerFile is the on-disk owner.json shape: the owner identity plus the
-// incarnation token minted when the generation layout was created.
 type ownerFile struct {
 	ownerRecord
 	Inc string `json:"inc"`
@@ -654,32 +597,21 @@ func (j Journal) releaseTransition(ctx context.Context, generation string, owner
 }
 
 // Generation is one drain generation's on-disk record under
-// <dotdir>/drain/<gen>: its owner identity and its ownership journal.
-//
-// All generation-layout mutation — owner claims, adoption, ownerless
-// reclamation, removal, and generation-journal writes — serializes on ONE
-// drain-root lock (<dotdir>/drain/.lock) that is never unlinked. This is
-// load-bearing: a lock file inside a removable directory is unsound (flock
-// identity is the inode, so removal plus re-creation splits waiters across two
-// inodes that both "hold" the same path), so no removable path is ever a
-// synchronization point. Lock order: the root lock nests OUTSIDE the canonical
-// journal flock; the strike-store flock never nests with either.
+// <dotdir>/drain/<gen>. All generation-layout mutation serializes on the one
+// never-unlinked drain-root lock — flock identity is the inode, so no
+// removable path is ever a synchronization point. Lock order: the root lock
+// nests OUTSIDE the canonical journal flock; the strike-store flock never
+// nests with either.
 type Generation struct {
 	dir string
-	// inc, when set, binds the handle to one incarnation of the directory;
-	// locked journal ops fail with ErrStaleGeneration once it no longer
-	// matches the owner record's token.
 	inc string
 }
 
-// genName allowlists generation names: one alnum-led segment, no separators,
-// no leading dot. filepath cleaning is not a guard — Base("/") is "/", so a
-// blocklist would let a name alias the drain root and Remove delete it.
+// Allowlist, not blocklist: filepath cleaning is no guard (Base("/") is "/"),
+// so a blocklist would let a name alias the drain root and Remove delete it.
 var genName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
-// NewGeneration addresses generation gen under dotdir's drain layout; dotdir
-// must be absolute, and gen must match the genName allowlist so it can never
-// alias the drain root, escape it, or shadow the root lock.
+// NewGeneration addresses generation gen under dotdir's drain layout.
 func NewGeneration(dotdir, gen string) (Generation, error) {
 	if !filepath.IsAbs(dotdir) {
 		return Generation{}, fmt.Errorf("dotdir %q is not absolute", dotdir)
@@ -696,9 +628,6 @@ func (g Generation) Dir() string { return g.dir }
 // Name returns the generation's identifier (the directory basename).
 func (g Generation) Name() string { return filepath.Base(g.dir) }
 
-// journal returns the generation's ownership journal, guarded by the drain
-// root lock; ops on a removed generation fail with os.ErrNotExist instead of
-// resurrecting its directory (only claimOwner creates the layout).
 func (g Generation) journal() Journal {
 	return Journal{
 		file:      daemon.StateFile{Path: filepath.Join(g.dir, "journal.json")},
@@ -709,16 +638,12 @@ func (g Generation) journal() Journal {
 	}
 }
 
-// rootLock is the never-unlinked drain-root lock at <dotdir>/drain/.lock.
 func (g Generation) rootLock() string {
 	return filepath.Join(filepath.Dir(g.dir), rootLockName)
 }
 
 func (g Generation) ownerPath() string { return filepath.Join(g.dir, "owner.json") }
 
-// writeOwnerUnlocked records id and the incarnation token through an atomic
-// durable rename; the caller holds the drain root lock — an unlocked owner
-// write is how a live generation gets torn down under its owner.
 func (g Generation) writeOwnerUnlocked(id proc.Identity, inc string) error {
 	b, err := json.Marshal(ownerFile{ownerRecord: newOwnerRecord(id), Inc: inc})
 	if err != nil {
@@ -730,10 +655,7 @@ func (g Generation) writeOwnerUnlocked(id proc.Identity, inc string) error {
 	return nil
 }
 
-// claimOwner installs id as the generation's owner under the drain root lock
-// and returns the incarnation-bound handle. A fresh claim mints the token; a
-// matching retry keeps it and rewrites through the full durable chain, since a
-// readable record can still be undurable (rename landed, dir fsync failed).
+// A matching retry rewrites the full durable chain: a readable record can still be undurable (rename landed, dir fsync failed).
 func (g Generation) claimOwner(ctx context.Context, id proc.Identity) (Generation, error) {
 	var bound Generation
 	err := withFlock(ctx, g.rootLock(), func() error {
@@ -791,8 +713,6 @@ func (g Generation) claimOwner(ctx context.Context, id proc.Identity) (Generatio
 	return bound, nil
 }
 
-// clearStaleMarker drops a completion marker left by a prior incarnation; the
-// caller holds the root lock and is minting a new token the marker cannot match.
 func (g Generation) clearStaleMarker() error {
 	path := filepath.Join(g.dir, "journal.json")
 	state, err := readState(path)
@@ -808,9 +728,6 @@ func (g Generation) clearStaleMarker() error {
 	})
 }
 
-// bind captures the generation's current incarnation under the root lock, so
-// every later journal op on the returned handle refuses with
-// ErrStaleGeneration once the directory is removed or re-created.
 func (g Generation) bind(ctx context.Context) (Generation, error) {
 	var bound Generation
 	err := withFlock(ctx, g.rootLock(), func() error {
@@ -827,8 +744,7 @@ func (g Generation) bind(ctx context.Context) (Generation, error) {
 	return bound, nil
 }
 
-// ReadOwner returns the recorded owner identity; any read, parse, or validity
-// failure is an error the caller treats as Undetermined.
+// ReadOwner returns the recorded owner identity.
 func (g Generation) ReadOwner() (proc.Identity, error) {
 	rec, err := readOwnerFile(g.ownerPath())
 	if err != nil {
@@ -868,12 +784,7 @@ func mintInc() (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 
-// Remove durably deletes the generation directory once its rows are terminal
-// or adopted, holding the drain root lock so no claim, adoption, or journal
-// write can interleave with the removal; the removal is fsynced through the
-// drain root so a reboot cannot resurrect an already-removed generation. A
-// bound handle refuses with ErrStaleGeneration when the name was re-created
-// by a newer incarnation.
+// Remove durably deletes the generation directory once its rows are terminal or adopted.
 func (g Generation) Remove(ctx context.Context) error {
 	return withFlock(ctx, g.rootLock(), func() error {
 		if g.inc != "" {
@@ -889,7 +800,6 @@ func (g Generation) Remove(ctx context.Context) error {
 	})
 }
 
-// removeUnlocked is Remove's body for callers already holding the root lock.
 func (g Generation) removeUnlocked() error {
 	if err := os.RemoveAll(g.dir); err != nil {
 		return err
@@ -901,9 +811,7 @@ func (g Generation) removeUnlocked() error {
 	return err
 }
 
-// Generations lists every drain generation under dotdir (absolute); a missing
-// layout is empty, but an unreadable one errors (an enumeration failure proves
-// nothing).
+// Generations lists every drain generation under dotdir (absolute).
 func Generations(dotdir string) ([]Generation, error) {
 	if !filepath.IsAbs(dotdir) {
 		return nil, fmt.Errorf("dotdir %q is not absolute", dotdir)

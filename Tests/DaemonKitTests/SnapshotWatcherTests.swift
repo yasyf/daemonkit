@@ -197,9 +197,6 @@ struct SnapshotWatcherTests {
             return probe
         }
 
-        // Start-then-drop a watcher many times with no explicit stop(); deinit must
-        // cancel the source and close the O_EVTONLY fd, so the fd number a fresh
-        // open() returns cannot climb monotonically the way a per-iteration leak would.
         let baseline = probeFD()
         for _ in 0 ..< 64 {
             let watcher = SnapshotWatcher<Snap>(

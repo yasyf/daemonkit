@@ -16,16 +16,13 @@ const DefaultIdleTimeout = 2 * time.Hour
 // DefaultIdleInterval is IdleExit's idle-check cadence when Interval is unset.
 const DefaultIdleInterval = time.Minute
 
-// attachKey identifies one live attachment: a named consumer at a pid.
 type attachKey struct {
 	consumer string
 	pid      int
 }
 
-// IdleExit fires a callback after Timeout of no activity, unless a veto suppresses
-// it. Touch feeds from wire.Server.OnActivity; Attach/Detach track live consumers
-// whose presence vetoes, and an attachment whose process has died stops vetoing.
-// Exit is a callback, not os.Exit, so the timer is testable.
+// IdleExit fires Exit after Timeout of no activity, unless a veto or a live
+// attachment suppresses it.
 type IdleExit struct {
 	// Timeout is the inactivity window before exit; zero means DefaultIdleTimeout.
 	Timeout time.Duration
@@ -70,9 +67,8 @@ func (i *IdleExit) Detach(consumer string, pid int) {
 	i.mu.Unlock()
 }
 
-// Run checks idleness on the clock seam and calls Exit once the daemon has been
-// idle past Timeout with no live attachment and no veto. It blocks until Exit
-// fires or ctx is done.
+// Run calls Exit once the daemon has been idle past Timeout with no live
+// attachment and no veto, blocking until Exit fires or ctx is done.
 func (i *IdleExit) Run(ctx context.Context) {
 	i.mu.Lock()
 	if i.last.IsZero() {
@@ -93,9 +89,6 @@ func (i *IdleExit) Run(ctx context.Context) {
 	}
 }
 
-// idle reports whether the daemon may exit at now: no live attachment (a dead
-// consumer's attachment is pruned and stops vetoing), no veto, and the idle
-// window elapsed.
 func (i *IdleExit) idle(now time.Time) bool {
 	i.mu.Lock()
 	keys := make([]attachKey, 0, len(i.attached))

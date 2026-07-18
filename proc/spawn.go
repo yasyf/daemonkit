@@ -14,48 +14,31 @@ import (
 const DefaultSpawnTimeout = 5 * time.Second
 
 // Spawn ensures a detached child process is serving Socket, spawning one in
-// its own session when needed. Racing spawns are harmless: the child refuses
-// to start if the socket is already owned. HARD CONTRACT: the child inherits
-// every non-CLOEXEC parent descriptor (fork+exec), and pure Go offers no
-// fork hook to sweep them spawner-side — so any long-lived child binary MUST
-// call CloseInheritedFDs before any other work in main (fusekit's cmd/holder
-// complies); a leaked session-lease fd would otherwise stay pinned for the
-// child's lifetime.
+// its own session when needed; racing spawns lose to socket ownership.
+// Long-lived children MUST call CloseInheritedFDs first in main — fork+exec
+// leaks every non-CLOEXEC parent fd and Go has no spawner-side sweep.
 type Spawn struct {
-	// Socket is the child's unix socket path.
-	Socket string
-	// LogPath receives a spawned child's stdout and stderr.
+	Socket  string
 	LogPath string
-	// Args is the child's argv after the executable.
-	Args []string
-	// Timeout bounds waiting for a freshly spawned child's socket. Zero means
-	// DefaultSpawnTimeout.
+	Args    []string
+	// Timeout bounds the socket wait; zero means DefaultSpawnTimeout.
 	Timeout time.Duration
 	// ExecPath, when set, is the binary the child execs instead of os.Executable().
 	ExecPath string
 	// Available reports whether a child is already serving Socket. Required.
 	Available func() bool
-	// CanHost gates the spawn: a non-nil error is a permanent refusal, returned
-	// unwrapped by EnsureRunning. Required.
+	// CanHost gates the spawn; a non-nil error is a permanent refusal returned unwrapped. Required.
 	CanHost func() error
-	// Gate, when set, admits each actual child launch, running only when
-	// EnsureRunning is about to start a child — never when Available already
-	// holds. It records the attempt durably before the launch (launch-site
-	// accounting: wire drain.StrikeStore.SpawnGate); an error withholds the
-	// launch and is returned unwrapped.
+	// Gate, when set, admits each actual child launch and records it durably before the launch; an error withholds the launch and is returned unwrapped.
 	Gate func(ctx context.Context) error
-	// Launch selects how the child is started; nil means ExecLaunch (direct
-	// exec). No strategy bypasses the Available/CanHost gates, the RLIMIT_NPROC
-	// child cap, or reaping.
+	// Launch selects how the child is started; nil means ExecLaunch. No strategy bypasses the gates, the RLIMIT_NPROC cap, or reaping.
 	Launch LaunchStrategy
 
 	clock clock
 }
 
-// LaunchStrategy builds the detached child's command. EnsureRunning applies the
-// RLIMIT_NPROC cap, reaping, and socket poll to whatever it returns, so no
-// strategy can skip them. Sealed to the two package implementations, ExecLaunch
-// and AppLaunchNew.
+// LaunchStrategy builds the detached child's command; EnsureRunning applies the
+// RLIMIT_NPROC cap, reaping, and socket poll to whatever it returns.
 type LaunchStrategy interface {
 	launch(s Spawn) (*exec.Cmd, *os.File, error)
 }
@@ -66,11 +49,8 @@ type ExecLaunch struct{}
 
 func (ExecLaunch) launch(s Spawn) (*exec.Cmd, *os.File, error) { return s.childCmd() }
 
-// EnsureRunning ensures a child serves Socket, spawning a detached one and
-// waiting for its socket when needed. Every could-not-start-or-reach failure
-// wraps ErrChildUnavailable (transient; drivers retry); a CanHost refusal and a
-// strategy's ErrAppLaunchUnsupported are returned unwrapped (permanent). The
-// socket poll honors ctx; the detached child outlives it.
+// EnsureRunning ensures a child serves Socket, spawning a detached one when needed;
+// a CanHost refusal and ErrAppLaunchUnsupported return unwrapped, else wraps ErrChildUnavailable.
 func (s Spawn) EnsureRunning(ctx context.Context) error {
 	if s.Available() {
 		return nil
@@ -92,8 +72,7 @@ func (s Spawn) EnsureRunning(ctx context.Context) error {
 	}
 	// The child holds its own descriptor; this one is ours.
 	defer logFile.Close()
-	// Cap the child subtree's RLIMIT_NPROC across the fork so a runaway re-spawn
-	// loop starves at EAGAIN instead of fork-bombing the host (darwin only).
+	// Cap the child subtree's RLIMIT_NPROC so a runaway re-spawn loop starves at EAGAIN instead of fork-bombing the host (darwin only).
 	if err := withChildNprocCap(cmd.Start); err != nil {
 		return fmt.Errorf("%w: spawn child: %w", ErrChildUnavailable, err)
 	}
@@ -149,8 +128,7 @@ func (s Spawn) childCmd() (*exec.Cmd, *os.File, error) {
 	return cmd, logFile, nil
 }
 
-// reap waits out the child so its exit never strands a zombie: Setsid detaches
-// the session, not the parent-child link, and Process.Release would not reap.
+// Setsid detaches the session, not the parent-child link: without this wait the exit strands a zombie.
 func reap(cmd *exec.Cmd) {
 	go func() { _ = cmd.Wait() }()
 }

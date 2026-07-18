@@ -5,9 +5,6 @@ import (
 	"time"
 )
 
-// fakeClock is a deterministic clock for poll-loop tests: each After advances
-// Now by the requested duration and fires at once, so a bounded poll terminates
-// without real sleeps.
 type fakeClock struct {
 	mu  sync.Mutex
 	now time.Time

@@ -8,8 +8,6 @@ import (
 	"github.com/yasyf/daemonkit/proc"
 )
 
-// TestIdleVetoedByAttachment: a live attachment suppresses idle exit; dropping it
-// lets the daemon exit.
 func TestIdleVetoedByAttachment(t *testing.T) {
 	ac := newAutoClock()
 	base := ac.Now()
@@ -25,8 +23,6 @@ func TestIdleVetoedByAttachment(t *testing.T) {
 	}
 }
 
-// TestIdleDeadAttachmentStopsVetoing: an attachment whose process has died is
-// pruned and no longer vetoes.
 func TestIdleDeadAttachmentStopsVetoing(t *testing.T) {
 	ac := newAutoClock()
 	base := ac.Now()
@@ -41,7 +37,6 @@ func TestIdleDeadAttachmentStopsVetoing(t *testing.T) {
 	}
 }
 
-// TestIdleVetoFunc: a Veto callback suppresses exit independent of attachments.
 func TestIdleVetoFunc(t *testing.T) {
 	ac := newAutoClock()
 	base := ac.Now()
@@ -58,7 +53,6 @@ func TestIdleVetoFunc(t *testing.T) {
 	}
 }
 
-// TestIdleNotElapsed: within the timeout the daemon is not idle.
 func TestIdleNotElapsed(t *testing.T) {
 	ac := newAutoClock()
 	base := ac.Now()
@@ -73,8 +67,6 @@ func TestIdleNotElapsed(t *testing.T) {
 	}
 }
 
-// TestIdleRunFiresAfterTimeout: Run calls Exit once the idle window elapses, with
-// no attachment and no veto.
 func TestIdleRunFiresAfterTimeout(t *testing.T) {
 	fired := false
 	i := &IdleExit{
@@ -90,7 +82,6 @@ func TestIdleRunFiresAfterTimeout(t *testing.T) {
 	}
 }
 
-// TestIdleRunHonorsContext: a cancelled ctx stops Run without firing Exit.
 func TestIdleRunHonorsContext(t *testing.T) {
 	fired := false
 	i := &IdleExit{

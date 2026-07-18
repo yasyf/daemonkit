@@ -32,7 +32,6 @@ func dialAvailable(socket string) func() bool {
 	}
 }
 
-// shortSockDir avoids t.TempDir(), whose paths exceed macOS's 104-byte sun_path cap.
 func shortSockDir(t *testing.T) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "ccp-proc")
@@ -43,8 +42,6 @@ func shortSockDir(t *testing.T) string {
 	return dir
 }
 
-// TestMain doubles as the spawned child: childCmd execs THIS test binary;
-// fakeHolderEnv makes it fast-fail instead of re-running the suite (fork bomb).
 func TestMain(m *testing.M) {
 	if os.Getenv(fakeHolderEnv) == "1" {
 		fmt.Fprintln(os.Stderr, "fake holder: exiting without serving")
@@ -117,7 +114,6 @@ func TestEnsureRunningShortCircuitsWhenAvailable(t *testing.T) {
 	}
 	defer ln.Close()
 
-	// Unopenable log path makes a spawn fail loudly, so a nil return proves the short-circuit ran.
 	logPath := filepath.Join(t.TempDir(), "missing", "holder.log")
 	err = Spawn{
 		Socket:    socket,
@@ -137,7 +133,7 @@ func TestEnsureRunningShortCircuitsWhenAvailable(t *testing.T) {
 
 func TestEnsureRunningCanHostRefusalUnwrapped(t *testing.T) {
 	refusal := errors.New("this binary cannot host: install the fuse build")
-	socket := filepath.Join(shortSockDir(t), "m.sock") // nothing listening
+	socket := filepath.Join(shortSockDir(t), "m.sock")
 	logPath := filepath.Join(t.TempDir(), "holder.log")
 
 	err := Spawn{
@@ -162,7 +158,7 @@ func TestEnsureRunningCanHostRefusalUnwrapped(t *testing.T) {
 func TestEnsureRunningGateAdmitsEveryLaunchOnly(t *testing.T) {
 	t.Run("gate refusal withholds the launch", func(t *testing.T) {
 		parked := errors.New("launch parked")
-		socket := filepath.Join(shortSockDir(t), "m.sock") // nothing listening
+		socket := filepath.Join(shortSockDir(t), "m.sock")
 		logPath := filepath.Join(t.TempDir(), "holder.log")
 		gates := 0
 		err := Spawn{
@@ -207,7 +203,7 @@ func TestEnsureRunningGateAdmitsEveryLaunchOnly(t *testing.T) {
 }
 
 func TestEnsureRunningSpawnFailureClassifiedHolderUnavailable(t *testing.T) {
-	socket := filepath.Join(shortSockDir(t), "m.sock") // nothing listening
+	socket := filepath.Join(shortSockDir(t), "m.sock")
 	logPath := filepath.Join(t.TempDir(), "missing", "holder.log")
 
 	err := Spawn{
@@ -231,7 +227,6 @@ func TestEnsureRunningSpawnTimesOutOnFastFailingChild(t *testing.T) {
 	socket := filepath.Join(shortSockDir(t), "m.sock")
 	logPath := filepath.Join(t.TempDir(), "holder.log")
 
-	// A fake clock drives the socket poll to its deadline without a real wait.
 	err := Spawn{
 		Socket:    socket,
 		LogPath:   logPath,
@@ -253,7 +248,6 @@ func TestEnsureRunningSpawnTimesOutOnFastFailingChild(t *testing.T) {
 	if !strings.Contains(err.Error(), "check "+logPath) {
 		t.Errorf("error = %q, want it to point at the log %s", err, logPath)
 	}
-	// Poll for the fake child's stderr line: the detached child races us.
 	deadline := time.Now().Add(5 * time.Second)
 	var logData []byte
 	for time.Now().Before(deadline) {
@@ -268,8 +262,6 @@ func TestEnsureRunningSpawnTimesOutOnFastFailingChild(t *testing.T) {
 	}
 }
 
-// A zombie stays signalable: kill(pid, 0) reports ESRCH only once the child
-// is waited out.
 func TestSpawnedChildReaped(t *testing.T) {
 	t.Setenv(fakeHolderEnv, "1")
 	socket := filepath.Join(shortSockDir(t), "m.sock")
@@ -288,16 +280,13 @@ func TestSpawnedChildReaped(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
-			return // reaped
+			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("spawned child pid %d still in the process table: exited child not reaped (zombie)", pid)
 }
 
-// errStrategy is an in-package LaunchStrategy double that records invocation
-// and hands back a fixed error, so a test can observe the launch seam without
-// exec'ing a child.
 type errStrategy struct {
 	called *bool
 	err    error
@@ -340,7 +329,7 @@ func TestEnsureRunningLaunchStrategy(t *testing.T) {
 
 	t.Run("unavailable consults CanHost then the strategy, wrapping its error", func(t *testing.T) {
 		sentinel := errors.New("strategy drove the launch")
-		socket := filepath.Join(shortSockDir(t), "m.sock") // nothing listening
+		socket := filepath.Join(shortSockDir(t), "m.sock")
 		logPath := filepath.Join(t.TempDir(), "holder.log")
 
 		launched, canHostCalled := false, false

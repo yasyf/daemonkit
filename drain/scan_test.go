@@ -51,7 +51,8 @@ func dirExists(t *testing.T, dir string) bool {
 
 func TestScanColdStartAdoptsOrphan(t *testing.T) {
 	prb := &fakeProber{results: map[int]proberResult{deadPID: {err: proc.ErrNoProcess}}}
-	cfg, g := newScanEnv(t, prb,
+	cfg, g := newScanEnv(
+		t, prb,
 		Row{Key: "k1", Seq: 3, State: RowPending},
 		Row{Key: "k2", Seq: 2, State: RowYielded},
 	)
@@ -187,7 +188,6 @@ func TestAdoptDeadRefusedWhileDraining(t *testing.T) {
 	if rows := mustRows(t, g.journal()); rows["k1"] != want {
 		t.Errorf("generation row disturbed: %+v, want %+v", rows["k1"], want)
 	}
-	// ScanPeers treats the refusal as a skip, not a scan failure.
 	if err := ScanPeers(context.Background(), cfg); err != nil {
 		t.Fatalf("ScanPeers while draining: %v", err)
 	}
@@ -245,8 +245,6 @@ func TestAdoptDeadSecondAdoptionDoesNotResurrect(t *testing.T) {
 	if dirExists(t, g.Dir()) {
 		t.Fatal("adopted generation not removed")
 	}
-	// A late second adopter must fail cleanly on the removed generation, and
-	// must not resurrect its directory by creating the lock layout.
 	if err := AdoptDead(context.Background(), cfg, g, deadOwner()); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("second AdoptDead err = %v, want os.ErrNotExist", err)
 	}
@@ -257,7 +255,6 @@ func TestAdoptDeadSecondAdoptionDoesNotResurrect(t *testing.T) {
 
 func TestScanReclaimsOwnerlessGeneration(t *testing.T) {
 	cfg, g := newScanEnv(t, &fakeProber{}, Row{Key: "k1", Seq: 4, State: RowYielded})
-	// Model a crashed partial removal: owner.json unlinked, journal surviving.
 	if err := os.Remove(filepath.Join(g.Dir(), "owner.json")); err != nil {
 		t.Fatal(err)
 	}
@@ -270,12 +267,9 @@ func TestScanReclaimsOwnerlessGeneration(t *testing.T) {
 	if rows := mustRows(t, cfg.Canonical); len(rows) != 0 {
 		t.Errorf("reclaim adopted rows: %v", rows)
 	}
-	// The reclaimed name is reusable: a fresh claim owns it cleanly instead of
-	// hitting the surviving journal's ErrStaleJournal forever.
 	if _, err := g.claimOwner(context.Background(), deadOwner()); err != nil {
 		t.Fatalf("claimOwner on reclaimed name: %v", err)
 	}
-	// The fresh claim is not re-reclaimed: its owner record is back.
 	prb := cfg.prober.(*fakeProber)
 	prb.results = map[int]proberResult{deadPID: {id: deadOwner()}}
 	if err := ScanPeers(context.Background(), cfg); err != nil {
@@ -291,8 +285,6 @@ func TestScanReclaimSerializesOnRootLock(t *testing.T) {
 	if err := os.Remove(filepath.Join(g.Dir(), "owner.json")); err != nil {
 		t.Fatal(err)
 	}
-	// The root lock serializes reclamation against claims and adoptions: while
-	// held, the reclaim cannot proceed and the bounded scan errors out.
 	lock, err := proc.Flock(context.Background(), g.rootLock())
 	if err != nil {
 		t.Fatal(err)
@@ -321,8 +313,6 @@ func TestScanReclaimFailurePropagates(t *testing.T) {
 	if err := os.Remove(filepath.Join(g.Dir(), "owner.json")); err != nil {
 		t.Fatal(err)
 	}
-	// Wedge the removal: an unreadable subdirectory fails RemoveAll. The scan
-	// must surface the failure, not swallow it as a clean pass.
 	sub := filepath.Join(g.Dir(), "wedge")
 	if err := os.Mkdir(sub, 0o700); err != nil {
 		t.Fatal(err)
@@ -340,9 +330,6 @@ func TestScanReclaimFailurePropagates(t *testing.T) {
 }
 
 func TestAdoptDeadReprovesDeathUnderLock(t *testing.T) {
-	// The advisory scan proved the old owner dead, but by adoption time the
-	// generation name was reused by a live owner: the locked re-assessment
-	// must refuse instead of tearing down the live owner's generation.
 	prb := &fakeProber{results: map[int]proberResult{deadPID: {id: deadOwner()}}}
 	cfg, g := newScanEnv(t, prb, Row{Key: "k1", Seq: 3, State: RowPending})
 	if err := AdoptDead(context.Background(), cfg, g, deadOwner()); !errors.Is(err, errAdoptionRaced) {
@@ -365,8 +352,6 @@ func TestJournalWriteCannotResurrectRemovedGeneration(t *testing.T) {
 	if dirExists(t, g.Dir()) {
 		t.Fatal("adopted generation not removed")
 	}
-	// A late writer against the removed generation's journal must fail with
-	// os.ErrNotExist, not re-create the directory through its own write.
 	if _, err := g.journal().apply(context.Background(), Row{Key: "k9", Seq: 1, State: RowPending}); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("late Apply err = %v, want os.ErrNotExist", err)
 	}
@@ -378,7 +363,6 @@ func TestJournalWriteCannotResurrectRemovedGeneration(t *testing.T) {
 func TestScanBreakerSpacesFailingPeer(t *testing.T) {
 	prb := &fakeProber{results: map[int]proberResult{deadPID: {err: proc.ErrNoProcess}}}
 	cfg, g := newScanEnv(t, prb, Row{Key: "k1", Seq: 1, State: RowPending})
-	// Wedge adoption: an unreadable generation journal fails the adopt.
 	if err := os.RemoveAll(g.journal().Path()); err != nil {
 		t.Fatal(err)
 	}
@@ -390,20 +374,15 @@ func TestScanBreakerSpacesFailingPeer(t *testing.T) {
 	if err := scanOnce(context.Background(), cfg, brk, now); err == nil {
 		t.Fatal("scanOnce succeeded on wedged adoption, want error")
 	}
-	// Inside the backoff the failing peer is skipped, so the pass is clean.
 	if err := scanOnce(context.Background(), cfg, brk, now.Add(30*time.Second)); err != nil {
 		t.Fatalf("failing peer not spaced by its breaker: %v", err)
 	}
-	// After the backoff it is retried and fails again.
 	if err := scanOnce(context.Background(), cfg, brk, now.Add(2*time.Minute)); err == nil {
 		t.Fatal("peer not retried after backoff elapsed")
 	}
 }
 
 func TestAdoptDeadRefusesChangedOwnerIdentity(t *testing.T) {
-	// The advisory scan proved deadOwner dead, but by adoption time the name
-	// was reused by a different owner: the locked owner re-read mismatches the
-	// scanned identity and must refuse, even though the new owner is dead too.
 	reuser := proc.Identity{PID: 5353, StartTime: "555.666", Comm: "new-daemon"}
 	prb := &fakeProber{results: map[int]proberResult{
 		deadPID:    {err: proc.ErrNoProcess},
@@ -423,9 +402,6 @@ func TestAdoptDeadRefusesChangedOwnerIdentity(t *testing.T) {
 }
 
 func TestAdoptedRowSurvivesRetriedTruncate(t *testing.T) {
-	// A truncated snapshot row {k1,2} leaves high-water 2. Adoption of a dead
-	// generation's {k1,1} must land strictly above the high-water mark, so an
-	// interrupted transition's retried scoped truncate cannot delete it.
 	prb := &fakeProber{results: map[int]proberResult{deadPID: {err: proc.ErrNoProcess}}}
 	cfg, g := newScanEnv(t, prb, Row{Key: "k1", Seq: 1, State: RowPending})
 	ctx := context.Background()

@@ -5,10 +5,8 @@ import "time"
 // Backoff is an exponential backoff: the wait doubles per failure from Base up
 // to Cap.
 type Backoff struct {
-	// Base is the wait after the first failure.
 	Base time.Duration
-	// Cap is the ceiling the wait is clamped to.
-	Cap time.Duration
+	Cap  time.Duration
 }
 
 // After returns the wait after `failures` consecutive failures; a non-positive

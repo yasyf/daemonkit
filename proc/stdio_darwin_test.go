@@ -25,7 +25,6 @@ func TestRedirectDevNull(t *testing.T) {
 		t.Fatalf("redirectDevNull: %v", err)
 	}
 
-	// The fd now refers to /dev/null, not the pipe.
 	var st, nullSt unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
 		t.Fatalf("fstat redirected fd: %v", err)
@@ -37,8 +36,6 @@ func TestRedirectDevNull(t *testing.T) {
 		t.Errorf("redirected fd rdev/mode = %#x/%#o, want %s's %#x/S_IFCHR", st.Rdev, st.Mode&unix.S_IFMT, os.DevNull, nullSt.Rdev)
 	}
 
-	// Writes to the redirected fd land in the sink, never the old pipe: the
-	// reader must see immediate EOF (dup2 closed the pipe's only write end).
 	if _, err := unix.Write(fd, []byte("swallowed")); err != nil {
 		t.Errorf("write to redirected fd: %v", err)
 	}
@@ -55,8 +52,6 @@ func TestRedirectDevNullBadFd(t *testing.T) {
 	}
 }
 
-// TestLogOpenIsCloexec pins the holder's --log guarantee: a Go os.OpenFile fd
-// is O_CLOEXEC, so spawned go-nfsv4 servers can never inherit the log file.
 func TestLogOpenIsCloexec(t *testing.T) {
 	f, err := os.OpenFile(filepath.Join(t.TempDir(), "holder.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {

@@ -12,14 +12,8 @@ import (
 	"github.com/yasyf/daemonkit/proc"
 )
 
-// TestStateFilePreservesForeignKeys: an Update that touches one key leaves every
-// unrelated key byte-for-byte intact, including a foreign value's internal key
-// order (a RawMessage is never re-parsed).
 func TestStateFilePreservesForeignKeys(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
-	// A foreign value carrying HTML-escapable bytes (<, >, &), internal
-	// whitespace, and an out-of-order object — every drift json.Marshal of a
-	// RawMessage would introduce.
 	const foreign = `{"z": 1, "a": "x<y>&z"}`
 	if err := os.WriteFile(path, []byte(`{"foreign":`+foreign+`,"pid":1}`), 0o600); err != nil {
 		t.Fatal(err)
@@ -50,8 +44,6 @@ func TestStateFilePreservesForeignKeys(t *testing.T) {
 	}
 }
 
-// TestStateFileRejectsInvalidValue: a mutation that stores non-JSON bytes fails
-// the write rather than corrupting the file.
 func TestStateFileRejectsInvalidValue(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	sf := StateFile{Path: path}
@@ -67,8 +59,6 @@ func TestStateFileRejectsInvalidValue(t *testing.T) {
 	}
 }
 
-// TestStateFileCreatesMissing: Update on a missing file starts from an empty
-// object and writes the mutation.
 func TestStateFileCreatesMissing(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sub", "state.json")
 	sf := StateFile{Path: path}
@@ -137,8 +127,6 @@ func TestMkdirAllDurableRetriesFailedParentSync(t *testing.T) {
 	}
 }
 
-// TestStateFileUpdateLockBusy: Update fails with proc.ErrLockBusy while another
-// owner holds the state lock, and never writes.
 func TestStateFileUpdateLockBusy(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	held, err := proc.TryLock(path + ".lock")
@@ -160,9 +148,6 @@ func TestStateFileUpdateLockBusy(t *testing.T) {
 	}
 }
 
-// TestStateFileUpdateUnlocked: UpdateUnlocked writes without taking the flock, so
-// a caller already inside the critical section (the flock is non-reentrant) can
-// still mutate.
 func TestStateFileUpdateUnlocked(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	held, err := proc.TryLock(path + ".lock")
@@ -188,9 +173,6 @@ func TestStateFileUpdateUnlocked(t *testing.T) {
 	}
 }
 
-// TestStateFileReadErrorPropagates: a failing read (here the path is a
-// directory) aborts Update before mutate ever runs, so a transient read error
-// never rewrites the state file from empty.
 func TestStateFileReadErrorPropagates(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	if err := os.MkdirAll(path, 0o700); err != nil {
@@ -210,7 +192,6 @@ func TestStateFileReadErrorPropagates(t *testing.T) {
 	}
 }
 
-// TestStateFileMutateErrorAborts: a mutate error propagates and nothing is written.
 func TestStateFileMutateErrorAborts(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	boom := errors.New("bad mutation")

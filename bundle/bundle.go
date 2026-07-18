@@ -1,10 +1,7 @@
 // Package bundle reads a macOS .app's Info.plist and resolves the stable
-// bundle paths a daemon installs to.
-//
-// macOS keys TCC, notification, and Full Disk Access grants to a bundle's
-// identity — its identifier, signing team, and stable install path — and
-// changing any of them resets the user's existing grants. Consumers therefore
-// freeze their bundle identifier, team, and install path across releases.
+// bundle paths a daemon installs to. macOS keys TCC and notification grants
+// to bundle identity — identifier, team, install path — so consumers freeze
+// all three across releases.
 package bundle
 
 import "path/filepath"

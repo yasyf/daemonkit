@@ -36,10 +36,8 @@ var injectionEntitlements = []string{
 	"com.apple.security.get-task-allow",
 }
 
-// kCFStringEncodingUTF8 is CoreFoundation's UTF-8 encoding constant.
 const kCFStringEncodingUTF8 = 0x08000100
 
-// errSecSuccess is OSStatus 0; every nonzero status the verifier sees is untrusted.
 const errSecSuccess = 0
 
 var (
@@ -57,13 +55,13 @@ var (
 	secCodeCheckValidityWithErrors func(code uintptr, flags uint32, req uintptr, errs *uintptr) int32
 	secCodeCopySigningInformation  func(code uintptr, flags uint32, info *uintptr) int32
 
-	auditAttrKey    uintptr // kSecGuestAttributeAudit (a CFStringRef)
-	infoStatusKey   uintptr // kSecCodeInfoStatus (a CFStringRef)
-	infoEntsDictKey uintptr // kSecCodeInfoEntitlementsDict (a CFStringRef)
-	infoEntsKey     uintptr // kSecCodeInfoEntitlements (a CFStringRef)
-	cfBooleanFalse  uintptr // kCFBooleanFalse (a CFBooleanRef)
-	dictKeyCB       uintptr // &kCFTypeDictionaryKeyCallBacks
-	dictValCB       uintptr // &kCFTypeDictionaryValueCallBacks
+	auditAttrKey    uintptr
+	infoStatusKey   uintptr
+	infoEntsDictKey uintptr
+	infoEntsKey     uintptr
+	cfBooleanFalse  uintptr
+	dictKeyCB       uintptr
+	dictValCB       uintptr
 )
 
 func loadSecurity() {
@@ -77,8 +75,7 @@ func loadSecurity() {
 		secErr = fmt.Errorf("trust: dlopen Security: %w", err)
 		return
 	}
-	// purego.RegisterLibFunc panics on a missing symbol; probe with Dlsym first
-	// so framework skew fails closed through secErr instead of crashing.
+	// RegisterLibFunc panics on a missing symbol; probe with Dlsym first so framework skew fails closed through secErr.
 	for _, fn := range []struct {
 		target any
 		lib    uintptr
@@ -102,10 +99,8 @@ func loadSecurity() {
 		purego.RegisterLibFunc(fn.target, fn.lib, fn.name)
 	}
 
-	// kSecGuestAttributeAudit / kSecCodeInfo* / kCFBooleanFalse are CF-object
-	// DATA symbols: dlsym returns the symbol's address, which must be
-	// dereferenced. The dictionary callbacks are STRUCTs: the dlsym address is
-	// passed directly.
+	// CF-object DATA symbols: dlsym returns the address of the value — deref.
+	// The dictionary callbacks are STRUCTs: pass the dlsym address directly.
 	var derefErr error
 	auditAttrKey, derefErr = derefStringSym(sec, "kSecGuestAttributeAudit")
 	if derefErr != nil {
@@ -147,16 +142,12 @@ func derefStringSym(lib uintptr, name string) (uintptr, error) {
 	if err != nil {
 		return 0, fmt.Errorf("trust: dlsym %s: %w", name, err)
 	}
-	// A CF-object data symbol's value sits at its dlsym address; the address is
-	// a fixed dyld location, not a Go pointer (unsafeptr is disabled for FFI).
-	return *(*uintptr)(unsafe.Pointer(sym)), nil //nolint:gosec // G103: dereferencing a fixed dlsym data-symbol address
+	// A fixed dyld location, not a Go pointer (unsafeptr is disabled for FFI).
+	return *(*uintptr)(unsafe.Pointer(sym)), nil //nolint:gosec // G103: dereferencing a fixed dlsym address
 }
 
-// verifyRequirement resolves the peer's SecCode from its audit token, checks it
-// against req's designated requirement, and (unless AllowUnhardened) requires
-// injection-resistant signing state: Hardened Runtime with library validation
-// and no injection-enabling entitlements. Any failure is ErrUntrustedPeer; a
-// missing token or verifier is ErrNoVerifier (fail closed).
+// Any failure is ErrUntrustedPeer; a missing token or verifier is
+// ErrNoVerifier. Both fail closed.
 func verifyRequirement(peer wire.Peer, req Requirement) error {
 	if len(peer.Audit) != 32 {
 		return fmt.Errorf("%w: audit token is %d bytes, want 32", ErrNoVerifier, len(peer.Audit))
@@ -186,8 +177,6 @@ func verifyRequirement(peer wire.Peer, req Requirement) error {
 	return requireHardenedRuntime(guest)
 }
 
-// copyGuest builds a CFData over the audit token and resolves it to the peer's
-// SecCode. The token buffer is pinned only across CFDataCreate, which copies it.
 func copyGuest(token []byte) (uintptr, error) {
 	var pin runtime.Pinner
 	pin.Pin(&token[0])
@@ -217,7 +206,6 @@ func copyGuest(token []byte) (uintptr, error) {
 	return guest, nil
 }
 
-// checkValidity evaluates the designated requirement against the guest SecCode.
 func checkValidity(guest uintptr, dr string) error {
 	reqCF := cfStringCreateWithCString(0, dr+"\x00", kCFStringEncodingUTF8)
 	if reqCF == 0 {
@@ -242,11 +230,7 @@ func checkValidity(guest uintptr, dr string) error {
 	return nil
 }
 
-// requireHardenedRuntime rejects a guest whose dynamic signing status or signed
-// entitlements permit code injection or debugger attachment: CS_RUNTIME is
-// required, CS_GET_TASK_ALLOW and CS_DEBUGGED are rejected, and library
-// validation must hold — via CS_REQUIRE_LV/CS_FORCED_LV or, failing those, an
-// entitlements dictionary free of every injectionEntitlements key.
+// CS_RUNTIME required; CS_GET_TASK_ALLOW and CS_DEBUGGED rejected; LV must hold via flags or an entitlements dict proven clean.
 func requireHardenedRuntime(guest uintptr) error {
 	const kSecCSDynamicInformation = 1 << 3
 	const kCFNumberSInt64Type = 4
@@ -276,11 +260,6 @@ func requireHardenedRuntime(guest uintptr) error {
 	return rejectInjectionEntitlements(info, status&(csRequireLV|csForcedLV) != 0)
 }
 
-// rejectInjectionEntitlements scans the peer's signed entitlements (a generic
-// key of the signing info dict) for injectionEntitlements, skipping only the
-// inert entDisableLV when lvProven says the kernel enforces library validation
-// anyway. Entitlements that exist but are not in dictionary form are rejected:
-// they cannot be proven clean.
 func rejectInjectionEntitlements(info uintptr, lvProven bool) error {
 	dict := cfDictionaryGetValue(info, infoEntsDictKey)
 	if dict == 0 {

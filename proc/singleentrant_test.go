@@ -63,7 +63,6 @@ func TestSingleEntrantBindsWhenFree(t *testing.T) {
 
 func TestSingleEntrantRefusesLivePeer(t *testing.T) {
 	socket := filepath.Join(shortSockDir(t), "m.sock")
-	// flock contends between open file descriptions: an in-process fd models a peer.
 	held, err := os.OpenFile(socket+".lock", os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		t.Fatal(err)
@@ -78,7 +77,6 @@ func TestSingleEntrantRefusesLivePeer(t *testing.T) {
 	if !errors.Is(err, refusal) {
 		t.Fatalf("Listen against a refused live peer = %v, want the Evict refusal", err)
 	}
-	// A loser's os.Remove of a believed-stale socket is the hazard the lock prevents.
 	if _, statErr := os.Stat(socket); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("a refused bind must not create the socket; stat err = %v", statErr)
 	}
@@ -113,7 +111,6 @@ func TestSingleEntrantEvictsAndReacquires(t *testing.T) {
 	if err := syscall.Flock(int(held.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		t.Fatal(err)
 	}
-	// Delayed Close models the evictee's process exit releasing its flock.
 	released := make(chan struct{})
 	evict := func() (bool, error) {
 		go func() {
@@ -147,7 +144,6 @@ func TestSingleEntrantEvictTimesOut(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A fake clock drives the poll to its deadline without a real 200ms wait.
 	_, _, err = SingleEntrant{Socket: socket, Evict: makeWay, Timeout: 200 * time.Millisecond, clock: newFakeClock()}.Listen(context.Background())
 	if !errors.Is(err, ErrLockStillHeld) {
 		t.Fatalf("Listen with an unreleased lock = %v, want ErrLockStillHeld", err)
@@ -223,8 +219,6 @@ func TestSingleEntrantListenHonorsContext(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The evict-poll bound (Timeout) is an hour; ctx cancellation must end the
-	// poll long before it, on the real clock.
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	start := time.Now()

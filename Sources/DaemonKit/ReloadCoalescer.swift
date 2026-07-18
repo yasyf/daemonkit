@@ -1,16 +1,9 @@
 import Foundation
 
-/// A state-triggered reload gate for WidgetKit consumers.
-///
-/// Widgets that reload on every state change quickly exhaust the WidgetKit
-/// refresh budget. ``record(trigger:)`` requests a reload, but actual
-/// fire-throughs coalesce to **at most one per** ``interval`` (default 5
-/// minutes): the first request in a window fires immediately (leading edge) and
-/// every later request in the same window is dropped.
-///
-/// This type does **not** import WidgetKit — the consumer supplies the closure
-/// that calls `WidgetCenter.shared.reloadTimelines(...)`. The `now` seam makes
-/// the coalescing window testable without a real clock.
+/// A state-triggered reload gate for WidgetKit consumers, coalescing
+/// fire-throughs to at most one per ``interval`` (leading edge) so widgets
+/// never exhaust the WidgetKit refresh budget. Does not import WidgetKit —
+/// the consumer supplies the reload closure.
 public final class ReloadCoalescer: @unchecked Sendable {
     /// The action run when a reload fires; receives the coalesced trigger.
     public typealias ReloadAction = @Sendable (_ trigger: String) -> Void
@@ -21,10 +14,6 @@ public final class ReloadCoalescer: @unchecked Sendable {
     private let lock = NSLock()
     private var lastFire: Date?
 
-    /// - Parameters:
-    ///   - interval: Minimum spacing between fire-throughs (default 5 minutes).
-    ///   - now: Clock seam; defaults to the wall clock.
-    ///   - reload: The consumer's WidgetKit reload call.
     public init(
         interval: TimeInterval = 300,
         now: @escaping @Sendable () -> Date = { Date() },

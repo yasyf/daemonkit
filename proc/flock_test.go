@@ -15,8 +15,6 @@ import (
 	"time"
 )
 
-// bumpUnderLock's Gosched widens the read-modify-write window so a missing lock
-// surfaces as a lost update.
 func bumpUnderLock(t *testing.T, lockPath, counterPath string) {
 	t.Helper()
 	h, err := Flock(context.Background(), lockPath)
@@ -37,9 +35,6 @@ func bumpUnderLock(t *testing.T, lockPath, counterPath string) {
 	}
 }
 
-// TestFlockSerializesCriticalSection proves the advisory lock serializes the
-// read→modify→write section. flock excludes between open file descriptions, so
-// two goroutines with their own fds exercise the same mechanism as two processes.
 func TestFlockSerializesCriticalSection(t *testing.T) {
 	dir := t.TempDir()
 	lockPath := filepath.Join(dir, "counter.lock")
@@ -72,8 +67,6 @@ func TestFlockSerializesCriticalSection(t *testing.T) {
 	}
 }
 
-// TestFlockRespectsContext verifies a contended acquire observes ctx
-// cancellation promptly instead of blocking in the syscall forever.
 func TestFlockRespectsContext(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ctx.lock")
 	held, err := Flock(context.Background(), path)
@@ -103,8 +96,6 @@ const (
 	flockChildHold     = 700 * time.Millisecond
 )
 
-// TestFlockChildHolds is the child half of TestFlockCrossProcess; without the
-// env handshake it is a no-op, so a normal `go test` run skips it.
 func TestFlockChildHolds(t *testing.T) {
 	lockPath := os.Getenv(flockChildLockEnv)
 	readyPath := os.Getenv(flockChildReadyEnv)
@@ -122,9 +113,6 @@ func TestFlockChildHolds(t *testing.T) {
 	h.Release()
 }
 
-// TestFlockCrossProcess is the real proof: a child PROCESS holds the lock while
-// this process blocks to acquire it. Re-execs the test binary running only
-// TestFlockChildHolds.
 func TestFlockCrossProcess(t *testing.T) {
 	dir := t.TempDir()
 	lockPath := filepath.Join(dir, "x.lock")
@@ -173,9 +161,6 @@ func TestFlockCrossProcess(t *testing.T) {
 	}
 }
 
-// TestTryLockBusyThenFree: a held lock refuses a second TryLock with ErrLockBusy,
-// and a fresh TryLock succeeds once the first releases. Separate open file
-// descriptions on one file exercise the same exclusion as two processes.
 func TestTryLockBusyThenFree(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "try.lock")
 

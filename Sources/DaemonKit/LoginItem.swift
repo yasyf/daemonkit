@@ -37,12 +37,8 @@ public protocol LoginItemService: Sendable {
     func openSettingsLoginItems()
 }
 
-/// The real ``LoginItemService`` backed by an agent plist
-/// (`SMAppService.agent(plistName:)`).
-///
-/// Only the `plistName` is stored (keeping the value `Sendable`); the
-/// non-`Sendable` `SMAppService` handle is re-derived per call — the handle is a
-/// thin wrapper over the name, so this is free.
+/// The real ``LoginItemService`` backed by an agent plist: only the `plistName`
+/// is stored (Sendable); the handle is re-derived per call.
 public struct AgentLoginItemService: LoginItemService {
     private let plistName: String
 
@@ -75,13 +71,9 @@ public struct AgentLoginItemService: LoginItemService {
     }
 }
 
-/// Reconciles a login item toward the registered/enabled state.
-///
-/// This is **reconciliation, not a one-shot flag**: ``reconcile()`` switches on
-/// the live status every call. A one-shot "have I registered?" boolean would
-/// wedge forever the first time the status reads `.notFound` (the item was never
-/// seen), because that boolean is never set — reconciling on the real status
-/// each time is the bug this design kills.
+/// Reconciles a login item toward the registered/enabled state — by switching
+/// on the live status every call, never a one-shot "have I registered?" flag,
+/// which would wedge forever the first time status reads `.notFound`.
 public struct LoginItem {
     private let service: LoginItemService
 
@@ -96,12 +88,6 @@ public struct LoginItem {
     }
 
     /// Drives the item toward enabled and reports the resulting state.
-    ///
-    /// - `.enabled` → ``LoginItemState/active``.
-    /// - `.requiresApproval` → opens the settings pane, returns
-    ///   ``LoginItemState/pendingApproval``.
-    /// - `.notFound` / `.notRegistered` → attempts `register()` and returns
-    ///   ``LoginItemState/registered`` (or throws ``LoginItemError``).
     public func reconcile() throws -> LoginItemState {
         switch service.status {
         case .enabled:

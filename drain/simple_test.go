@@ -62,7 +62,6 @@ func TestSimpleAdmissionCountsQueuedWork(t *testing.T) {
 	cfg.Deactivate = func(context.Context) error { rec.record("deactivate"); close(deactivated); return nil }
 	cfg.MarkClosing = func() { closing.Store(true); rec.record("mark-closing") }
 
-	// Two frames received: one handler running, one queued behind a mutex.
 	runningDone, err := s.Admit()
 	if err != nil {
 		t.Fatal(err)
@@ -75,7 +74,6 @@ func TestSimpleAdmissionCountsQueuedWork(t *testing.T) {
 	go func() { errCh <- s.Drain(context.Background(), cfg) }()
 	<-deactivated
 
-	// The running handler settles; the queued one still pins the drain open.
 	runningDone()
 	if closing.Load() {
 		t.Fatal("pools marked closing while admitted-queued work is in flight")
@@ -130,7 +128,7 @@ func TestStampsFailOpenOnFSError(t *testing.T) {
 	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	s := Stamps{Dir: filepath.Join(blocker, "stamps")} // parent is a file: every op fails
+	s := Stamps{Dir: filepath.Join(blocker, "stamps")}
 	for i := range 2 {
 		if !s.Claim("sha256:abcd") {
 			t.Errorf("claim %d blocked a request on FS error; must fail open", i)

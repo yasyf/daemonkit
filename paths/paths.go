@@ -1,8 +1,6 @@
 // Package paths owns the canonical state-directory layout under the user's home
-// directory: the daemon's unix socket, the http handshake file, per-subject
-// artifacts, and the lazy-start lock dir. The directory basename is fixed by
-// Paths.App (e.g. ".cc-review") and is never relocated by an environment
-// variable, so state stays stable regardless of CLAUDE_CONFIG_DIR.
+// directory and is never relocated by an environment variable, so state stays
+// stable regardless of CLAUDE_CONFIG_DIR.
 package paths
 
 import (
@@ -16,7 +14,6 @@ import (
 // Paths produces the state-directory layout for an application whose private
 // state lives at ~/<App>.
 type Paths struct {
-	// App is the state-dir basename, e.g. ".cc-review".
 	App string
 }
 
@@ -61,9 +58,8 @@ func (p Paths) SubjectsDir() string { return filepath.Join(p.StateDir(), "subjec
 // SubjectDir is the on-disk artifact directory for a single subject.
 func (p Paths) SubjectDir(id string) string { return filepath.Join(p.SubjectsDir(), id) }
 
-// ConsumerCursorPath is where a stream consumer (e.g. "watch" or "channel")
-// persists its last-delivered event seq, so a restart resumes without
-// re-delivering. Each consumer keeps its own cursor, so they never contend.
+// ConsumerCursorPath is where a stream consumer persists its last-delivered
+// event sequence.
 func (p Paths) ConsumerCursorPath(subjectID, consumer string) string {
 	return filepath.Join(p.SubjectDir(subjectID), consumer+".cursor")
 }

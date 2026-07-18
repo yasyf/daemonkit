@@ -16,9 +16,6 @@ func ShortVersion(appPath string) (string, error) {
 	return readShortVersion(filepath.Join(appPath, "Contents", "Info.plist"))
 }
 
-// readShortVersion extracts CFBundleShortVersionString from an XML Info.plist
-// (the format the release workflow writes). A binary plist — or a missing key —
-// is an error.
 func readShortVersion(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {

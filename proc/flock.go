@@ -22,8 +22,8 @@ type FlockHandle struct {
 }
 
 // Release idempotently drops the lock and closes the handle, returning the
-// first call's unlock or close failure. The lock file is left on disk on
-// purpose: unlinking under flock races other processes that have it open.
+// first call's failure. The lock file is left on disk on purpose: unlinking
+// under flock races other processes that have it open.
 func (h *FlockHandle) Release() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -43,13 +43,12 @@ func (h *FlockHandle) Release() error {
 }
 
 // TryLock takes an exclusive advisory lock on path without blocking, returning
-// ErrLockBusy when another owner already holds it. The caller Releases the
-// returned handle; the lock file is left on disk (see Release).
+// ErrLockBusy when another owner already holds it.
 func TryLock(path string) (*FlockHandle, error) {
-	if err := mkdirAllDurable(filepath.Dir(path), 0o700, fsyncDir); err != nil { //nolint:gosec // G703: callers pass lock paths they own, not user-tainted input
+	if err := mkdirAllDurable(filepath.Dir(path), 0o700, fsyncDir); err != nil { //nolint:gosec // G703: caller-owned lock paths
 		return nil, fmt.Errorf("create lock dir: %w", err)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // G304: callers pass lock paths they own, not user input
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // G304: caller-owned lock paths
 	if err != nil {
 		return nil, fmt.Errorf("open lock %s: %w", path, err)
 	}
@@ -64,15 +63,14 @@ func TryLock(path string) (*FlockHandle, error) {
 	return nil, fmt.Errorf("flock %s: %w", path, err)
 }
 
-// Flock takes an exclusive cross-process advisory lock on path. It polls
-// rather than blocking in the syscall so ctx cancellation is observed and no
-// goroutine leaks on a stuck holder.
+// Flock takes an exclusive cross-process advisory lock on path, polling so ctx
+// cancellation is observed without a goroutine leak on a stuck holder.
 func Flock(ctx context.Context, path string) (*FlockHandle, error) {
-	//nolint:gosec // G703: callers pass lock paths they own, not user-tainted input
+	//nolint:gosec // G703: caller-owned lock paths
 	if err := mkdirAllDurable(filepath.Dir(path), 0o700, fsyncDir); err != nil {
 		return nil, fmt.Errorf("create lock dir: %w", err)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // G304: callers pass lock paths they own, not user input
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // G304: caller-owned lock paths
 	if err != nil {
 		return nil, fmt.Errorf("open lock %s: %w", path, err)
 	}
@@ -99,7 +97,7 @@ func flockPoll(ctx context.Context, f *os.File, path string) (*FlockHandle, erro
 }
 
 func mkdirAllDurable(path string, perm os.FileMode, syncDir func(string) error) error {
-	if _, err := os.Stat(path); err == nil { //nolint:gosec // G703: callers pass validated state-dir paths, not user input
+	if _, err := os.Stat(path); err == nil { //nolint:gosec // G703: validated state-dir paths
 		if err := syncDir(filepath.Dir(path)); err != nil {
 			return fmt.Errorf("fsync parent of %s: %w", path, err)
 		}
@@ -111,7 +109,7 @@ func mkdirAllDurable(path string, perm os.FileMode, syncDir func(string) error) 
 	if err := mkdirAllDurable(parent, perm, syncDir); err != nil {
 		return err
 	}
-	if err := os.Mkdir(path, perm); err != nil && !errors.Is(err, os.ErrExist) { //nolint:gosec // G703: callers pass validated state-dir paths, not user input
+	if err := os.Mkdir(path, perm); err != nil && !errors.Is(err, os.ErrExist) { //nolint:gosec // G703: validated state-dir paths
 		return err
 	}
 	if err := syncDir(parent); err != nil {
@@ -121,7 +119,7 @@ func mkdirAllDurable(path string, perm os.FileMode, syncDir func(string) error) 
 }
 
 func fsyncDir(path string) error {
-	dir, err := os.Open(path) //nolint:gosec // G304: callers pass lock paths they own, not user input
+	dir, err := os.Open(path) //nolint:gosec // G304: caller-owned lock paths
 	if err != nil {
 		return fmt.Errorf("open dir %s: %w", path, err)
 	}

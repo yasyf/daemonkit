@@ -52,9 +52,10 @@ func TestJournalApplyCountsPerRow(t *testing.T) {
 	j := NewJournal(filepath.Join(t.TempDir(), "journal.json"))
 	mustApply(t, j, Row{Key: "a", Seq: 5, State: RowPending})
 
-	n, err := j.apply(context.Background(),
-		Row{Key: "a", Seq: 4, State: RowYielded}, // stale
-		Row{Key: "b", Seq: 1, State: RowPending}, // fresh
+	n, err := j.apply(
+		context.Background(),
+		Row{Key: "a", Seq: 4, State: RowYielded},
+		Row{Key: "b", Seq: 1, State: RowPending},
 	)
 	if err != nil {
 		t.Fatalf("apply: %v", err)
@@ -131,7 +132,6 @@ func TestJournalTruncateSparesRowsOutsideSnapshot(t *testing.T) {
 	snapshotted := Row{Key: "a", Seq: 3, State: RowPending}
 	mustApply(t, j, snapshotted)
 	scope := rowsByKey(snapshotted)
-	// Post-snapshot activity: a bumped snapshotted key and a brand-new key.
 	bumped, err := j.Bump(ctx, "a", RowPending)
 	if err != nil {
 		t.Fatalf("Bump: %v", err)
@@ -288,7 +288,6 @@ func TestStaleBoundHandleCannotWriteReusedGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("claimOwner incarnation 2: %v", err)
 	}
-	// The stale incarnation-1 handle must refuse, not write into incarnation 2.
 	if _, err := bound1.journal().apply(ctx, Row{Key: "stale", Seq: 9, State: RowPending}); !errors.Is(err, ErrStaleGeneration) {
 		t.Fatalf("stale Apply err = %v, want ErrStaleGeneration", err)
 	}
@@ -302,8 +301,6 @@ func TestStaleBoundHandleCannotWriteReusedGeneration(t *testing.T) {
 	if _, err := bound2.journal().apply(ctx, Row{Key: "fresh", Seq: 1, State: RowPending}); err != nil {
 		t.Errorf("incarnation 2 apply: %v", err)
 	}
-	// The stale handle's Remove must refuse too — a finished Run whose
-	// generation was reclaimed and reused must not delete the new incarnation.
 	if err := bound1.Remove(ctx); !errors.Is(err, ErrStaleGeneration) {
 		t.Fatalf("stale Remove err = %v, want ErrStaleGeneration", err)
 	}
@@ -337,12 +334,10 @@ func TestGenerations(t *testing.T) {
 func TestBumpRefusesSaturatedSeq(t *testing.T) {
 	ctx := context.Background()
 	j := NewJournal(filepath.Join(t.TempDir(), "canonical.json"))
-	// math.MaxUint64 is reserved: a bump whose next seq would reach it refuses.
 	mustApply(t, j, Row{Key: "k1", Seq: math.MaxUint64 - 1, State: RowPending})
 	if _, err := j.Bump(ctx, "k1", RowPending); !errors.Is(err, ErrSeqExhausted) {
 		t.Fatalf("Bump err = %v, want ErrSeqExhausted", err)
 	}
-	// A high-water at the reserved boundary refuses fresh keys too.
 	if err := j.Truncate(ctx, map[Key]Row{"k1": {Key: "k1", Seq: math.MaxUint64 - 1, State: RowPending}}); err != nil {
 		t.Fatal(err)
 	}

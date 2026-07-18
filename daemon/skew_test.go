@@ -8,15 +8,11 @@ import (
 	"github.com/yasyf/daemonkit/proc"
 )
 
-// neverClock's After never fires, so a Run loop's only ready select case is a
-// cancelled ctx.
 type neverClock struct{}
 
 func (neverClock) Now() time.Time                       { return time.Time{} }
 func (neverClock) After(time.Duration) <-chan time.Time { return make(chan time.Time) }
 
-// TestSkewNeedsConsecutiveConfirmations: OnSkew fires only after Confirmations
-// consecutive skew observations, and any non-skew tick resets the count.
 func TestSkewNeedsConsecutiveConfirmations(t *testing.T) {
 	installed := "2.0.0"
 	fires := 0
@@ -34,26 +30,25 @@ func TestSkewNeedsConsecutiveConfirmations(t *testing.T) {
 		}
 	}
 
-	tick() // c=1
-	tick() // c=2
+	tick()
+	tick()
 	if fires != 0 {
 		t.Fatalf("fires = %d after 2 confirmations, want 0", fires)
 	}
-	installed = "1.0.0" // artifact matches running: not a skew
-	tick()              // c reset to 0
+	installed = "1.0.0"
+	tick()
 	installed = "2.0.0"
-	tick() // c=1
-	tick() // c=2
+	tick()
+	tick()
 	if fires != 0 {
 		t.Fatalf("fires = %d, want 0 (reset must force a fresh streak)", fires)
 	}
-	tick() // c=3 -> fire
+	tick()
 	if fires != 1 {
 		t.Fatalf("fires = %d after 3 consecutive confirmations, want 1", fires)
 	}
 }
 
-// TestSkewStormBudget: the proc.Strikes budget caps firing within its window.
 func TestSkewStormBudget(t *testing.T) {
 	fires := 0
 	w := NewSkewWatch(SkewConfig{
@@ -75,8 +70,6 @@ func TestSkewStormBudget(t *testing.T) {
 	}
 }
 
-// TestSkewInstalledReadErrorIsNotSkew: a failing artifact read is not a skew and
-// resets the streak rather than firing.
 func TestSkewInstalledReadErrorIsNotSkew(t *testing.T) {
 	fires := 0
 	w := NewSkewWatch(SkewConfig{
@@ -92,8 +85,6 @@ func TestSkewInstalledReadErrorIsNotSkew(t *testing.T) {
 	}
 }
 
-// TestSkewOlderArtifactIsNotSkew: an installed artifact OLDER than the running
-// version never fires — skew is a NEWER artifact, so a drain never downgrades.
 func TestSkewOlderArtifactIsNotSkew(t *testing.T) {
 	fires := 0
 	w := NewSkewWatch(SkewConfig{
@@ -109,7 +100,6 @@ func TestSkewOlderArtifactIsNotSkew(t *testing.T) {
 	}
 }
 
-// TestSkewRunHonorsContext: Run returns the ctx error when cancelled.
 func TestSkewRunHonorsContext(t *testing.T) {
 	w := NewSkewWatch(SkewConfig{
 		Running:   func() string { return "1.0.0" },

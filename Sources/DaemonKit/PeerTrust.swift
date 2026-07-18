@@ -27,30 +27,13 @@ private let injectionEntitlements = [
     "com.apple.security.get-task-allow",
 ]
 
-/// Verifies the code-signing identity of a connected unix-socket peer.
+/// Verifies the code-signing identity of a connected unix-socket peer: an
+/// unconditional same-effective-UID floor plus an optional designated
+/// requirement resolved from the socket's audit token. The requirement
+/// augments the floor, never replaces it; every failure path fails closed.
 ///
-/// Every check enforces a **same-effective-UID floor**: the accepted peer's euid
-/// (`getpeereid` on the connection fd) must equal `geteuid()`. The floor is
-/// unconditional — no configuration disables or replaces it. When a designated
-/// requirement string is configured, the check additionally resolves the peer's
-/// code identity from the socket's audit token (`LOCAL_PEERTOKEN`, then
-/// `SecCodeCopyGuestWithAttributes` keyed on `kSecGuestAttributeAudit`) and
-/// validates it against the compiled `SecRequirement` with `SecCodeCheckValidity`.
-/// The requirement augments the floor; it never replaces it. A configured
-/// requirement that cannot be verified — audit token unavailable, no code object,
-/// or a requirement that will not compile — fails closed with a throw, never a
-/// silent downgrade to UID-only.
-///
-/// A configured requirement also demands injection-resistant signing state:
-/// the Hardened Runtime (`CS_RUNTIME`), no `CS_GET_TASK_ALLOW`/`CS_DEBUGGED`,
-/// and no injection-enabling entitlements — `allow-jit` included, rejected even
-/// under enforced library validation. `allowUnhardened` relaxes only this gate,
-/// never the requirement or the UID floor.
-///
-/// `LOCAL_PEERTOKEN` is a query-time binding, not connect-frozen: it is
-/// known-unsound against same-UID fork/exec identity substitution, so a surface
-/// needing a real per-message identity guarantee uses XPC. That hardening is a
-/// later phase.
+/// `LOCAL_PEERTOKEN` binds at query time — known-unsound against same-UID
+/// fork/exec identity substitution; a real per-message guarantee needs XPC.
 public struct PeerTrust: Sendable {
     /// Every failure path is fail-closed; the caller maps any throw to a refusal.
     public enum TrustError: Error, Equatable, Sendable {
@@ -87,17 +70,10 @@ public struct PeerTrust: Sendable {
     /// trust (the same-effective-UID floor alone).
     public let requirement: String?
 
-    /// Skips the Hardened Runtime and injection-entitlement gate for a peer
-    /// that legitimately cannot be library-validated (one loading an audited
-    /// third-party dylib). The requirement and the UID floor still apply. Off
-    /// by default; enabling it is a security decision.
+    /// Skips the Hardened Runtime and injection-entitlement gate. The requirement
+    /// and the UID floor still apply; enabling it is a security decision.
     public let allowUnhardened: Bool
 
-    /// - Parameters:
-    ///   - requirement: A designated requirement string; `nil` enforces the
-    ///     same-effective-UID floor alone.
-    ///   - allowUnhardened: Relaxes the injection-resistance gate that
-    ///     otherwise accompanies a requirement; inert without one.
     public init(requirement: String? = nil, allowUnhardened: Bool = false) {
         self.requirement = requirement
         self.allowUnhardened = allowUnhardened
@@ -198,9 +174,8 @@ public struct PeerTrust: Sendable {
                 continue
             }
             guard let value = entitlements[entitlement] else { continue }
-            // Only a genuine CFBoolean false is clean: CFEqual alone also matches
-            // CFNumber(0) through NSNumber bridging, and Go compares the
-            // kCFBooleanFalse singleton by identity.
+            // Only a genuine CFBoolean false is clean: CFEqual alone also
+            // matches CFNumber(0) through NSNumber bridging.
             let ref = value as CFTypeRef
             guard CFGetTypeID(ref) == CFBooleanGetTypeID(), CFEqual(ref, kCFBooleanFalse) else {
                 throw TrustError.injectionEntitled(entitlement)

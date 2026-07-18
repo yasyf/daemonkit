@@ -1,7 +1,5 @@
-// Command trustfixture is the peer binary the trust E2E signs and spawns:
-// given a unix socket path it dials and blocks until the server closes the
-// connection, so tests can inspect the live peer's code identity; with no
-// arguments it sleeps until killed.
+// Command trustfixture is the signed peer binary the trust E2E spawns: it dials
+// the given unix socket and blocks so tests can inspect its live code identity.
 package main
 
 import (

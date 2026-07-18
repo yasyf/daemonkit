@@ -6,8 +6,6 @@ import (
 	"testing"
 )
 
-// TestProbeSelf: the running process resolves to a non-empty start stamp and
-// comm under its own pid.
 func TestProbeSelf(t *testing.T) {
 	id, err := Probe(os.Getpid())
 	if err != nil {
@@ -24,10 +22,8 @@ func TestProbeSelf(t *testing.T) {
 	}
 }
 
-// TestProbeGone: a pid past the platform max resolves to ErrNoProcess, the
-// definitive "gone" the SIGKILL-authority caller branches on.
 func TestProbeGone(t *testing.T) {
-	const absent = 2_000_000 // above darwin's default pid_max and any live linux pid
+	const absent = 2_000_000
 	if _, err := Probe(absent); !errors.Is(err, ErrNoProcess) {
 		t.Fatalf("Probe(%d) err = %v, want ErrNoProcess", absent, err)
 	}

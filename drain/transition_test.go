@@ -54,8 +54,6 @@ func newTransitionEnv(t *testing.T, seed ...Row) (*transitionEnv, TransitionConf
 		Self:              proc.Identity{PID: 4242, StartTime: "111.222", Comm: "old"},
 		BindDrainListener: func(context.Context) error { e.record("bind"); return nil },
 		ReleaseLock:       func() error { e.record("release-lock"); return nil },
-		// Launch-site accounting, as proc.Spawn wires it via Spawn.Gate; the
-		// high limit keeps default envs clear of parking.
 		SpawnSuccessor: func(ctx context.Context) error {
 			if err := e.strikes.SpawnGate()(ctx); err != nil {
 				return err
@@ -74,8 +72,6 @@ func seedRows() []Row {
 	}
 }
 
-// requireOwnerCoversRows pins the snapshot ordering invariant: generation rows
-// exist only under a readable owner record.
 func requireOwnerCoversRows(t *testing.T, g Generation) {
 	t.Helper()
 	rows := mustRows(t, g.journal())
@@ -200,10 +196,6 @@ func TestTransitionCrashPointsPreserveSingleOwnership(t *testing.T) {
 
 func TestTransitionSnapshotRefusesStaleGenerationJournal(t *testing.T) {
 	e, cfg := newTransitionEnv(t, seedRows()...)
-	// A reused generation name left a stale ownerless higher-seq row: snapshot
-	// must fail loud before Truncate, never silently CAS-suppress the pending
-	// claim. Generation locks never create the layout, so the stale dir is
-	// staged explicitly.
 	if err := os.MkdirAll(e.gen.Dir(), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -257,9 +249,6 @@ func TestSnapshotFailureBeforeRowsIsRetryable(t *testing.T) {
 		if owner, err := e.gen.ReadOwner(); err != nil || owner != cfg.Self {
 			t.Errorf("generation owner = %+v, %v; want %+v before rows", owner, err, cfg.Self)
 		}
-		// The snapshot holds the generation journal flock here; read the file
-		// directly rather than through Rows, which would re-enter the
-		// non-reentrant flock and deadlock.
 		state, err := readState(e.gen.journal().Path())
 		if err != nil {
 			t.Fatalf("read generation journal: %v", err)
@@ -310,9 +299,6 @@ func TestTransitionJoinsInFlightAdoption(t *testing.T) {
 	}
 	adoptErr := make(chan error, 1)
 	go func() { adoptErr <- AdoptDead(ctx, scanCfg, peer, peerOwner) }()
-	// The adoption is admitted and holds the drain root lock, blocked on the
-	// held canonical flock; the concurrent transition blocks behind it at its
-	// owner claim, so the adopted row is ordered before the snapshot.
 	waitInflight(t, cfg.Intake)
 	transitionErr := make(chan error, 1)
 	go func() { transitionErr <- Transition(ctx, cfg) }()
@@ -356,7 +342,6 @@ func TestTransitionPausedHandlerCannotRegisterPostSnapshot(t *testing.T) {
 			t.Fatalf("step = %v, want %v", got, want)
 		}
 	}
-	// The paused handler still holds admission: the barrier blocks pre-snapshot.
 	if _, err := os.Stat(e.gen.journal().Path()); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("snapshot exists while a handler is paused: %v", err)
 	}
@@ -369,7 +354,6 @@ func TestTransitionPausedHandlerCannotRegisterPostSnapshot(t *testing.T) {
 	if err := <-errCh; err != nil {
 		t.Fatalf("Transition: %v", err)
 	}
-	// The handler wakes post-snapshot and tries to register: it must be refused.
 	if _, err := cfg.Intake.Register(context.Background(), e.canonical, "rogue"); !errors.Is(err, ErrDraining) {
 		t.Fatalf("Register err = %v, want ErrDraining", err)
 	}
@@ -421,8 +405,6 @@ func TestIntakeSettleHonorsContext(t *testing.T) {
 	}
 }
 
-// generationHasRows reports whether g's journal holds rows, and fails the test
-// if it does without a readable owner (a snapshot must claim ownership atomically).
 func generationHasRows(t *testing.T, g Generation) bool {
 	t.Helper()
 	rows := mustRows(t, g.journal())
@@ -439,7 +421,7 @@ func TestTransitionConcurrentDifferentGenerationsSingleOwner(t *testing.T) {
 	e, cfg1 := newTransitionEnv(t, seedRows()...)
 	g2 := newGen(t, e.dotdir, "g2")
 	cfg2 := TransitionConfig{
-		Intake:            cfg1.Intake, // shared: BeginDrain's CAS serializes the two
+		Intake:            cfg1.Intake,
 		CloseIntake:       func(context.Context) error { return nil },
 		Canonical:         e.canonical,
 		Generation:        g2,
@@ -482,8 +464,6 @@ func TestSnapshotHoldsGenerationLockAcrossClaim(t *testing.T) {
 	e, cfg := newTransitionEnv(t, seedRows()...)
 	landed := make(chan struct{})
 	cfg.midSnapshot = func() error {
-		// The generation journal flock is held across the empty-check, the apply,
-		// and this claim: a concurrent journal writer must block until it releases.
 		go func() {
 			_, _ = e.gen.journal().apply(context.Background(), Row{Key: "foreign", Seq: 1, State: RowPending})
 			close(landed)
@@ -498,7 +478,7 @@ func TestSnapshotHoldsGenerationLockAcrossClaim(t *testing.T) {
 	if err := Transition(context.Background(), cfg); err != nil {
 		t.Fatalf("Transition: %v", err)
 	}
-	<-landed // the foreign Apply lands only once the snapshot released the flock
+	<-landed
 }
 
 func TestTransitionFailedLockReleaseDoesNotSpawn(t *testing.T) {
@@ -622,11 +602,6 @@ func TestConflictReopenedIntakeRowSurvivesTruncate(t *testing.T) {
 	if err := Transition(context.Background(), cfg); !errors.Is(err, bindErr) {
 		t.Fatalf("first Transition err = %v, want bind failure", err)
 	}
-	// A conflicting attempt with a different generation is refused by the
-	// durable claim and reopens admission — it is not the drainer. A row
-	// registered in that window lands in canonical after the snapshot and must
-	// survive the pinned generation's retry: the truncate is scoped to the
-	// snapshot and can never delete state the generation does not hold.
 	cfg2 := cfg
 	cfg2.Generation = newGen(t, e.dotdir, "g2")
 	if err := Transition(context.Background(), cfg2); !errors.Is(err, ErrDrainInProgress) {
@@ -663,7 +638,6 @@ func TestTransitionSpawnFailuresStrikeAndPark(t *testing.T) {
 	strikes := &StrikeStore{Path: e.dotdir + "/strikes.json", Limit: 2, Ladder: []time.Duration{time.Hour}}
 	spawnErr := errors.New("spawn failed")
 	launches := 0
-	// The launch-site shape proc.Spawn wires: gate, then launch.
 	cfg.SpawnSuccessor = func(ctx context.Context) error {
 		if err := strikes.SpawnGate()(ctx); err != nil {
 			return err
@@ -690,7 +664,6 @@ func TestTransitionRetryResettlesReopenedAdmissions(t *testing.T) {
 	if err := Transition(context.Background(), cfg); !errors.Is(err, errCrash) {
 		t.Fatalf("first Transition err = %v, want injected crash", err)
 	}
-	// Conflict reopens admission with the durable phase already at StepSettle.
 	cfg2 := cfg
 	cfg2.Generation = newGen(t, e.dotdir, "g2")
 	if err := Transition(context.Background(), cfg2); !errors.Is(err, ErrDrainInProgress) {
@@ -700,8 +673,6 @@ func TestTransitionRetryResettlesReopenedAdmissions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Admit on the reopened intake: %v", err)
 	}
-	// The retry must re-run the settle barrier despite the durable StepSettle
-	// record: the reopen window admitted work the snapshot has to wait for.
 	cfg.midSnapshot = nil
 	retryErr := make(chan error, 1)
 	go func() { retryErr <- Transition(context.Background(), cfg) }()
@@ -730,8 +701,6 @@ func TestTransitionParkNeverBlocksLiveSuccessorCompletion(t *testing.T) {
 	var alive atomic.Bool
 	launches := 0
 	spawnCalls := 0
-	// EnsureRunning's shape: an already-serving successor launches nothing and
-	// never consults the gate.
 	cfg.SpawnSuccessor = func(ctx context.Context) error {
 		spawnCalls++
 		if alive.Load() {
@@ -743,14 +712,10 @@ func TestTransitionParkNeverBlocksLiveSuccessorCompletion(t *testing.T) {
 		launches++
 		return spawnErr
 	}
-	// The first launch strikes (tripping the one-strike breaker) and reports
-	// failure — but the successor actually came up after the timeout.
 	if err := Transition(context.Background(), cfg); !errors.Is(err, spawnErr) {
 		t.Fatalf("first Transition err = %v, want spawn failure", err)
 	}
 	alive.Store(true)
-	// Completing the transition behind a live successor must not be refused by
-	// the park its own strike raised; the spawn callback replays idempotently.
 	if err := Transition(context.Background(), cfg); err != nil {
 		t.Fatalf("Transition completion behind a live successor: %v", err)
 	}
@@ -769,8 +734,6 @@ func TestClaimOwnerRecommitsOwnerDurably(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A matching re-claim rewrites through the full durable chain: a readable
-	// record can be an undurable rename left by a failed prior attempt.
 	if _, err := e.gen.claimOwner(ctx, cfg.Self); err != nil {
 		t.Fatalf("claimOwner retry: %v", err)
 	}
@@ -826,9 +789,6 @@ func TestTransitionRestartFencesPreviousGeneration(t *testing.T) {
 	if err := Transition(context.Background(), cfg2); !errors.Is(err, ErrDrainInProgress) {
 		t.Fatalf("second Transition err = %v, want ErrDrainInProgress", err)
 	}
-	// The restarted daemon must keep serving behind the dead predecessor's
-	// claim: admission reopens, and the scoped truncate guarantees anything
-	// admitted here is never lost to the eventual drain.
 	if cfg2.Intake.Draining() {
 		t.Fatal("conflicting durable claim closed the restarted intake")
 	}
@@ -869,8 +829,6 @@ func TestTransitionRestartFencesPreviousGeneration(t *testing.T) {
 			t.Errorf("second generation row %s = %+v, want %+v", want.Key, rows[want.Key], want)
 		}
 	}
-	// The row admitted during the reopen window rode the restart into the
-	// second generation's snapshot: registered, adopted-over, never lost.
 	if row, ok := rows["k3"]; !ok || row.State != RowPending {
 		t.Errorf("post-restart registered row = %+v, %v; want pending in the second generation", row, ok)
 	}
@@ -882,11 +840,7 @@ func TestTransitionCompletedReleaseRetryIsIdempotent(t *testing.T) {
 		t.Fatalf("Transition: %v", err)
 	}
 	first := e.calls()
-	// Model the S2.4 window: the release rename landed but its dir fsync
-	// failed, so Transition reported an error and unwound the attempt CAS.
 	cfg.Intake.abortTransition(false)
-	// The retry must read the completion marker and finish without re-running
-	// any callback or wedging on ErrStaleJournal.
 	if err := Transition(context.Background(), cfg); err != nil {
 		t.Fatalf("Transition retry after completed release: %v", err)
 	}
@@ -965,9 +919,6 @@ func TestTransitionTruncateFollowsOwnerClaim(t *testing.T) {
 }
 
 func TestStaleCompleteMarkerDoesNotShortCircuitReusedName(t *testing.T) {
-	// Partial-removal residue: a reused name inherits the prior incarnation's
-	// journal with its completion marker and no owner. The fresh claim must
-	// run the full handoff, never report the foreign marker as its own.
 	e, cfg := newTransitionEnv(t, seedRows()...)
 	if err := os.MkdirAll(e.gen.Dir(), 0o755); err != nil {
 		t.Fatal(err)

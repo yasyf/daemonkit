@@ -9,8 +9,8 @@ func TestStrikesWindow(t *testing.T) {
 	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
 	cases := []struct {
 		name    string
-		offsets []time.Duration // strike offsets from base
-		at      time.Duration   // Struck evaluated at base+at
+		offsets []time.Duration
+		at      time.Duration
 		want    bool
 	}{
 		{name: "no strikes", offsets: nil, at: 0, want: false},
@@ -30,8 +30,6 @@ func TestStrikesWindow(t *testing.T) {
 			if got := s.Struck(base.Add(tc.at)); got != tc.want {
 				t.Fatalf("Struck = %v, want %v", got, tc.want)
 			}
-			// The final Strike's verdict at its own time must agree with a
-			// same-time Struck.
 			if len(tc.offsets) > 0 && tc.offsets[len(tc.offsets)-1] == tc.at && last != tc.want {
 				t.Fatalf("final Strike = %v, want %v", last, tc.want)
 			}
@@ -45,7 +43,6 @@ func TestStrikesPersistRoundTrip(t *testing.T) {
 	s1.Strike(base)
 	s1.Strike(base.Add(time.Minute))
 
-	// A "successor process" restores the window and its third strike trips.
 	s2 := &Strikes{Limit: 3, Window: 10 * time.Minute}
 	s2.Load(s1.Times())
 	if s2.Struck(base.Add(time.Minute)) {

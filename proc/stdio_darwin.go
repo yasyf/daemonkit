@@ -9,10 +9,9 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// SuppressStdio re-points stdout and stderr at /dev/null so processes spawned
-// from here — directly or by linked libraries, e.g. fuse-t's go-nfsv4 — inherit
-// a harmless sink instead of this process's log file. Route logging and
-// debug.SetCrashOutput at an O_CLOEXEC file first.
+// SuppressStdio re-points stdout and stderr at /dev/null so spawned processes
+// inherit a harmless sink. Route logging and debug.SetCrashOutput at an
+// O_CLOEXEC file first.
 func SuppressStdio() error { return redirectDevNull(1, 2) }
 
 func redirectDevNull(fds ...int) error {

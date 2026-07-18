@@ -10,20 +10,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// spawnNprocHeadroom is how far above the current per-UID process count the
-// spawned subtree may fork before EAGAIN: generous for a holder forking ~0
-// children, yet starves a runaway spawn loop before it exhausts the process
-// table and freezes the machine.
+// Generous for a holder forking ~0 children, yet starves a runaway spawn loop before it exhausts the process table.
 const spawnNprocHeadroom = 400
 
-// spawnRlimitMu serializes the lower/fork/restore window: no concurrent spawn
-// may fork while THIS process's RLIMIT_NPROC is lowered.
+// No concurrent spawn may fork while this process's RLIMIT_NPROC is lowered.
 var spawnRlimitMu sync.Mutex
 
-// withChildNprocCap runs spawn (which must perform the fork — exec.Cmd.Start)
-// with RLIMIT_NPROC temporarily lowered so the child inherits it. The limit is
-// per real UID: every descendant inherits it and a runaway re-spawn loop hits
-// EAGAIN instead of fork-bombing the host. It only ever LOWERS the limit.
+// Lowers RLIMIT_NPROC across the fork so the child subtree inherits it; only ever LOWERS the limit.
 func withChildNprocCap(spawn func() error) error {
 	spawnRlimitMu.Lock()
 	defer spawnRlimitMu.Unlock()

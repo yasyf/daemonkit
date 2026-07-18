@@ -43,8 +43,6 @@ func newRunEnv(t *testing.T, rows ...Row) (*runEnv, *RunConfig) {
 		Resources:      e.res,
 		CanonicalAlive: func(context.Context) Liveness { return Alive },
 		Ready:          func(context.Context) bool { return true },
-		// Launch-site accounting, as proc.Spawn wires it: the gate admits
-		// before anything launches.
 		Spawn: func(ctx context.Context) error {
 			if err := e.strikes.SpawnGate()(ctx); err != nil {
 				return err
@@ -59,7 +57,6 @@ func newRunEnv(t *testing.T, rows ...Row) (*runEnv, *RunConfig) {
 	return e, cfg
 }
 
-// cancelAfterTicks wires CanonicalAlive to cancel ctx on the nth tick.
 func cancelAfterTicks(cfg *RunConfig, n int, cancel context.CancelFunc, live Liveness) {
 	ticks := 0
 	cfg.CanonicalAlive = func(context.Context) Liveness {
@@ -189,7 +186,7 @@ func TestRunWedgedYieldRestoresBeforeNextAttempt(t *testing.T) {
 	log := e.res.calls()
 	y1 := indexOf(t, log, "yield k1", 0)
 	r1 := indexOf(t, log, "restore k1", y1)
-	indexOf(t, log, "seize k1", r1) // the retry seizes only after Restore ran
+	indexOf(t, log, "seize k1", r1)
 	if _, err := os.Stat(e.gen.Dir()); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("generation dir not removed after retry succeeded: %v", err)
 	}
@@ -317,7 +314,7 @@ func TestRunKeysErrorNeverZeroCandidates(t *testing.T) {
 
 func TestRunProvenAbsentKeyIsTerminal(t *testing.T) {
 	e, cfg := newRunEnv(t, Row{Key: "k1", Seq: 1, State: RowPending})
-	e.res.keys = nil // a COMPLETE successful scan with zero live resources
+	e.res.keys = nil
 	if err := Run(context.Background(), *cfg); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -370,12 +367,11 @@ func TestRunRecordsStrikeBeforeSpawn(t *testing.T) {
 }
 
 func TestSweepSkipsCanonicalOwnedRows(t *testing.T) {
-	e, cfg := newRunEnv(t,
+	e, cfg := newRunEnv(
+		t,
 		Row{Key: "stale", Seq: 5, State: RowPending},
 		Row{Key: "mine", Seq: 3, State: RowPending},
 	)
-	// Canonical re-admitted "stale" with a proven-newer seq after the snapshot:
-	// the generation's row must terminalize, never yield.
 	mustApply(t, cfg.Canonical, Row{Key: "stale", Seq: 9, State: RowPending})
 	if _, err := cfg.sweep(context.Background(), NewBreakers(cfg.perKeyBackoff()), cfg.clock); err != nil {
 		t.Fatalf("sweep: %v", err)
@@ -392,7 +388,6 @@ func TestSweepSkipsCanonicalOwnedRows(t *testing.T) {
 	if canonical := mustRows(t, cfg.Canonical)["stale"]; canonical != (Row{Key: "stale", Seq: 9, State: RowPending}) {
 		t.Errorf("canonical row disturbed: %+v", canonical)
 	}
-	// The generation's own row still swept normally.
 	if got := indexOf(t, e.res.calls(), "yield mine", 0); got < 0 {
 		t.Errorf("generation-owned key not swept: %v", e.res.calls())
 	}
@@ -438,7 +433,6 @@ func TestStrikeStorePersistsAcrossRestart(t *testing.T) {
 		t.Fatalf("third gate: allowed=%v until=%v, want the threshold attempt admitted with park to +1m", allowed, until)
 	}
 
-	// A fresh store on the same path sees the park and the ladder level.
 	s2 := StrikeStore{Path: path, Limit: 3, Window: 10 * time.Minute, Ladder: []time.Duration{time.Minute, 5 * time.Minute}}
 	parked, until2, err := s2.Parked(ctx, t0.Add(30*time.Second))
 	if err != nil {
@@ -543,8 +537,6 @@ func TestBreakersPerPeerIsolation(t *testing.T) {
 }
 
 func TestSweepRevalidatesOwnershipBeforeYield(t *testing.T) {
-	// A successor registration lands after the sweep classified k1 as
-	// generation-owned: the pre-yield recheck must terminalize, never yield.
 	e, cfg := newRunEnv(t, Row{Key: "k1", Seq: 2, State: RowPending})
 	snap := map[Key]Row{"k1": {Key: "k1", Seq: 2, State: RowPending}}
 	mustApply(t, cfg.Canonical, snap["k1"])
@@ -583,8 +575,6 @@ func TestSweepRevalidatesOwnershipBeforeYield(t *testing.T) {
 }
 
 func TestSweepPropagatesSupersededRestoreFailure(t *testing.T) {
-	// The superseded row still terminalizes, but a failed Restore surfaces in
-	// the sweep's error instead of being swallowed.
 	e, cfg := newRunEnv(t, Row{Key: "k1", Seq: 2, State: RowPending})
 	snap := map[Key]Row{"k1": {Key: "k1", Seq: 2, State: RowPending}}
 	mustApply(t, cfg.Canonical, snap["k1"])

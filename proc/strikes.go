@@ -2,14 +2,10 @@ package proc
 
 import "time"
 
-// Strikes is a sliding-window strike counter behind breaker decisions: Strike
-// records a failure, and the breaker trips once Limit strikes land within
-// Window. Times and Load expose the raw strike times so a caller can persist
-// the window across process generations. Not safe for concurrent use.
+// Strikes is a sliding-window strike counter: the breaker trips once Limit
+// strikes land within Window. Not safe for concurrent use.
 type Strikes struct {
-	// Limit is the strike count that trips the breaker.
-	Limit int
-	// Window is the sliding window strikes are counted within.
+	Limit  int
 	Window time.Duration
 
 	times []time.Time
@@ -52,9 +48,8 @@ func (s *Strikes) Load(times []time.Time) {
 // Reset clears the strike history.
 func (s *Strikes) Reset() { s.times = nil }
 
-// Ladder yields escalating durations across consecutive breaker trips: each
-// Next returns the current step and advances, the last step repeating; Reset
-// returns to the first. Not safe for concurrent use.
+// Ladder yields escalating durations across consecutive breaker trips; the
+// last step repeats. Not safe for concurrent use.
 type Ladder struct {
 	// Steps are the durations in escalation order; empty yields zero.
 	Steps []time.Duration

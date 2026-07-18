@@ -8,7 +8,6 @@ import (
 	"strings"
 )
 
-// bootSession reads the kernel's per-boot random UUID.
 func bootSession() (string, error) {
 	data, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
 	if err != nil {

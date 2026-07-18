@@ -13,17 +13,13 @@ import (
 	"github.com/yasyf/daemonkit/proc"
 )
 
-// StateFile is a JSON daemon-state file at a caller path, guarded by a proc
-// TryLock on Path+".lock". Update takes the lock; UpdateUnlocked skips it for a
-// caller already inside the critical section (the flock is non-reentrant). Both
-// preserve keys the mutate closure does not touch byte-for-byte.
+// StateFile is a JSON daemon-state file guarded by a proc TryLock on Path+".lock";
+// it preserves keys the mutate closure does not touch byte-for-byte.
 type StateFile struct {
-	// Path is the JSON state file.
 	Path string
 }
 
-// Mutate edits the decoded state in place; keys it leaves untouched survive the
-// write byte-for-byte.
+// Mutate edits the decoded state in place; untouched keys survive byte-for-byte.
 type Mutate func(state map[string]json.RawMessage) error
 
 // Update takes the state file's flock and applies mutate, returning
@@ -40,8 +36,8 @@ func (s StateFile) Update(ctx context.Context, mutate Mutate) error {
 	return s.UpdateUnlocked(mutate)
 }
 
-// UpdateUnlocked applies mutate WITHOUT taking the flock, for a caller already
-// holding it — the flock is non-reentrant, so a locked caller must use this.
+// UpdateUnlocked applies mutate WITHOUT taking the flock — the flock is
+// non-reentrant, so a caller already holding it must use this.
 func (s StateFile) UpdateUnlocked(mutate Mutate) error {
 	state, err := s.read()
 	if err != nil {
@@ -74,8 +70,6 @@ func (s StateFile) read() (map[string]json.RawMessage, error) {
 	return state, nil
 }
 
-// write re-encodes the whole map atomically via encodeState, which writes each
-// value's bytes verbatim so untouched foreign keys survive byte-for-byte.
 func (s StateFile) write(state map[string]json.RawMessage) error {
 	data, err := encodeState(state)
 	if err != nil {
@@ -84,11 +78,9 @@ func (s StateFile) write(state map[string]json.RawMessage) error {
 	return WriteFileDurable(s.Path, data, 0o600)
 }
 
-// WriteFileDurable writes data to path through the atomic-durable-rename idiom:
-// a temp file in the same directory is written, fsynced, and renamed over path,
-// then the containing directory and every newly created ancestor link are
-// fsynced so a power loss after the call leaves either the previous contents or
-// data, never a truncated or lost file.
+// WriteFileDurable writes data to path via write-temp, fsync, rename, then
+// fsyncs the directory and every new ancestor link: a power loss leaves the
+// previous contents or data, never a truncated or lost file.
 func WriteFileDurable(path string, data []byte, perm os.FileMode) error {
 	return writeFileDurable(path, data, perm, SyncDir)
 }
@@ -168,9 +160,7 @@ func SyncDir(dir string) error {
 	return nil
 }
 
-// encodeState serializes state under sorted keys with each value written
-// verbatim, so untouched keys round-trip byte-for-byte (json.Marshal of a
-// RawMessage HTML-escapes <>& and compacts whitespace). An invalid value errors.
+// Values are written verbatim: json.Marshal of a RawMessage HTML-escapes <>& and compacts whitespace.
 func encodeState(state map[string]json.RawMessage) ([]byte, error) {
 	keys := make([]string, 0, len(state))
 	for k := range state {

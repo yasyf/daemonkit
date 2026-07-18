@@ -1,19 +1,16 @@
 // Package proc holds consumer-agnostic process primitives: a flock
-// single-entrant socket bind, a detached-child spawn, an exponential backoff,
-// and sliding-window strike/ladder breakers. It never imports the root
-// fusekit package or cgofuse, so it compiles on every platform and build tag.
+// single-entrant socket bind, a detached-child spawn, exponential backoff,
+// and sliding-window strike/ladder breakers.
 package proc
 
 import "errors"
 
-// ErrChildUnavailable means a child process could not be reached or started —
-// an availability condition, never a domain verdict; drivers retry rather than
-// act irreversibly.
+// ErrChildUnavailable means a child process could not be reached or started;
+// an availability condition, never a domain verdict — drivers retry.
 var ErrChildUnavailable = errors.New("child process not running")
 
-// ErrSkipSpawn is the benign spawn refusal a Spawn CanHost returns to mean
-// there is intentionally nothing for a child to serve; callers treat it as a
-// no-op, never a failure.
+// ErrSkipSpawn is the benign spawn refusal a CanHost returns to mean there is
+// nothing for a child to serve; callers treat it as a no-op, never a failure.
 var ErrSkipSpawn = errors.New("nothing for the child to serve; spawn skipped")
 
 // ErrPeerStarting means the ".lock" file is held but its owner does not answer
@@ -24,7 +21,6 @@ var ErrPeerStarting = errors.New("a peer owns the socket lock but is not answeri
 // released within the post-evict poll deadline.
 var ErrLockStillHeld = errors.New("socket lock still held after eviction")
 
-// ErrLockBusy means TryLock found the lock already held by another owner. It is
-// the non-blocking counterpart to Flock's ctx-bounded wait; consumers alias it
-// (var ErrLockBusy = proc.ErrLockBusy) and match with errors.Is.
+// ErrLockBusy means TryLock found the lock already held by another owner;
+// consumers alias it and match with errors.Is.
 var ErrLockBusy = errors.New("proc: lock held by another owner")

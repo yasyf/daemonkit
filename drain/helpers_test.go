@@ -69,8 +69,6 @@ func newGen(t *testing.T, dotdir, name string) Generation {
 	return g
 }
 
-// seedOwner installs id as g's owner with a fixed test incarnation token, as
-// claimOwner would, and returns the bound handle.
 func seedOwner(t *testing.T, g Generation, id proc.Identity) Generation {
 	t.Helper()
 	if err := g.writeOwnerUnlocked(id, seedInc); err != nil {

@@ -9,8 +9,6 @@ import (
 	"github.com/yasyf/daemonkit/proc"
 )
 
-// autoClock advances Now by each After's duration and fires immediately, so a
-// bounded poll terminates without real sleeps (mirrors proc's test clock).
 type autoClock struct {
 	mu  sync.Mutex
 	now time.Time
@@ -36,14 +34,11 @@ func (c *autoClock) After(d time.Duration) <-chan time.Time {
 	return ch
 }
 
-// healthResult is one scripted Health return.
 type healthResult struct {
 	h   Health
 	err error
 }
 
-// fakePeer scripts Health returns (consumed in order, the last repeating) and
-// counts Shutdown/Handoff calls.
 type fakePeer struct {
 	mu          sync.Mutex
 	health      []healthResult
@@ -88,13 +83,11 @@ func (p *fakePeer) healthCalls() int {
 	return p.hi
 }
 
-// proberResult is one scripted probe return.
 type proberResult struct {
 	id  proc.Identity
 	err error
 }
 
-// fakeProber scripts probe returns (consumed in order, the last repeating).
 type fakeProber struct {
 	mu      sync.Mutex
 	results []proberResult
@@ -112,8 +105,6 @@ func (p *fakeProber) probe(pid int) (proc.Identity, error) {
 	return r.id, r.err
 }
 
-// constProber returns the same result for every pid; a nil err with a matching
-// pid is the default "alive".
 type constProber struct {
 	id  proc.Identity
 	err error
@@ -126,13 +117,11 @@ func (p constProber) probe(pid int) (proc.Identity, error) {
 	return p.id, p.err
 }
 
-// signalRec is one recorded signal delivery.
 type signalRec struct {
 	pid int
 	sig syscall.Signal
 }
 
-// fakeSignaler records every signal and returns err for each.
 type fakeSignaler struct {
 	mu   sync.Mutex
 	sent []signalRec

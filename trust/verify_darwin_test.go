@@ -36,9 +36,6 @@ func fixtureBin(t *testing.T, name string) string {
 	return p
 }
 
-// peerOf spawns the signed fixture, dials back over a short-path unix socket, and
-// returns its OS-read wire.Peer. The fixture stays alive until test cleanup so
-// its SecCode resolves.
 func peerOf(t *testing.T, bin string) wire.Peer {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "dk-tr")
@@ -111,8 +108,6 @@ func TestTrustRejectsWrongIdentifier(t *testing.T) {
 	}
 }
 
-// TestTrustRejectsWrongTeam pins the Team ID (OU) clause: fixture-devid-a (team
-// SXKCTF23Q2) is rejected by a Requirement naming a different team.
 func TestTrustRejectsWrongTeam(t *testing.T) {
 	requireE2E(t)
 	peer := peerOf(t, fixtureBin(t, "fixture-devid-a"))
@@ -170,15 +165,12 @@ func TestTrustRejectsGetTaskAllow(t *testing.T) {
 	}
 }
 
-// TestTrustVerificationIsLeakFree runs many validations against one live peer and
-// asserts RSS stays bounded — the CFRelease discipline is load-bearing (a missing
-// release leaks ~66 KB per call; 4000 calls would add ~250 MB).
 func TestTrustVerificationIsLeakFree(t *testing.T) {
 	requireE2E(t)
 	peer := peerOf(t, fixtureBin(t, "fixture-devid-a"))
 	p := Policy{Requirement: &Requirement{TeamID: fixtureTeam, Identifier: "com.yasyf.daemonkit.fixture-a"}}
 
-	for i := 0; i < 200; i++ { // warm up caches and one-time loads
+	for i := 0; i < 200; i++ {
 		_ = p.Check(peer)
 	}
 	before := maxRSS(t)
@@ -199,5 +191,5 @@ func maxRSS(t *testing.T) int64 {
 	if err := unix.Getrusage(unix.RUSAGE_SELF, &ru); err != nil {
 		t.Fatalf("getrusage: %v", err)
 	}
-	return int64(ru.Maxrss) // darwin reports bytes
+	return int64(ru.Maxrss)
 }

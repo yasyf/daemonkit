@@ -12,17 +12,13 @@ import (
 
 const defaultEvictPollTimeout = 30 * time.Second
 
-// SingleEntrant makes the stale-check/remove/bind of a unix socket single-entrant
-// across processes via an exclusive flock on Socket+".lock". The caller must hold the
-// returned lock for the listener's lifetime, else a losing starter unlinks the winner's
-// live socket (net.UnixListener.Close unlinks by path). The lock file is never removed:
-// unlinking a held lock would let a third process flock a fresh inode.
+// SingleEntrant makes the stale-check/remove/bind of a unix socket
+// single-entrant across processes via an exclusive flock on Socket+".lock",
+// held for the listener's lifetime. The lock file is never removed: unlinking
+// a held lock would let a third process flock a fresh inode.
 type SingleEntrant struct {
-	// Socket is the unix socket path to bind.
 	Socket string
-	// Evict decides what to do about a live peer; consulted at most once per
-	// Listen. Required. On a contended lock, evicted=true polls for the
-	// evictee's flock and evicted=false refuses with ErrPeerStarting.
+	// Evict decides what to do about a live peer, consulted at most once per Listen. Required.
 	Evict func() (evicted bool, err error)
 	// Timeout bounds the post-evict lock poll; zero means a sensible default.
 	Timeout time.Duration
@@ -70,8 +66,7 @@ func (se SingleEntrant) Listen(ctx context.Context) (net.Listener, *os.File, err
 	return ln, lock, nil
 }
 
-// pollLock polls rather than failing on the first refusal: the evictee's flock
-// is released only at its process exit, which can lag socket death by seconds.
+// Polls: the evictee's flock releases only at its process exit, which can lag socket death by seconds.
 func (se SingleEntrant) pollLock(ctx context.Context, lock *os.File) error {
 	timeout := se.Timeout
 	if timeout <= 0 {

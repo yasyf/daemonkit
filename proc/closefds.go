@@ -9,13 +9,9 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// CloseInheritedFDs closes every inherited descriptor ≥3 — one whose
-// FD_CLOEXEC flag is UNSET, which right after exec can only be a descriptor
-// the parent deliberately kept inheritable. A consumer session's lease fd is
-// exactly that: a lazily spawned holder inheriting it would pin the lease for
-// its whole lifetime. The process's own runtime descriptors are CLOEXEC and
-// untouched. Detached children spawned via Spawn MUST call this FIRST in
-// main, before opening anything non-CLOEXEC.
+// CloseInheritedFDs closes every inherited non-CLOEXEC descriptor ≥3.
+// Children spawned via Spawn call it FIRST in main, before opening anything
+// non-CLOEXEC — an inherited lease fd would stay pinned for the child's life.
 func CloseInheritedFDs() error {
 	dir := "/dev/fd"
 	if runtime.GOOS == "linux" {
