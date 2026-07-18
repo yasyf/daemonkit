@@ -53,23 +53,26 @@ A unix socket's permission bits say which UID connected, not which binary. On ma
 
 ## The packages
 
-One row per package; the Status column is the extraction's live state.
+One row per package; the Status column is each surface's live state.
 
 | Surface | Owns | Status |
 |---|---|---|
 | `proc` | Detached spawn, single-entrant sockets, process caps, child reaping | Landed |
-| `service` | LaunchAgent + keepalive-app reconciliation | Landed |
+| `service` | `Agent` LaunchAgent lifecycle (Label, Program, Args, Env, LogPath), installed in bootout, bootstrap, enable, kickstart order, plus the `AppKeepAlive` agent (`open -g -W`) for signed holder apps | Landed |
 | `version` | Release/dev version taxonomy, newest-wins skew | Landed |
-| `paths` | Per-app dotdir conventions | Landed |
-| `appgroup` | App Group container resolution, cgo-free | Landed |
+| `paths` | The `~/<app>` state layout: daemon socket, HTTP handshake file, per-subject artifacts, start lock, sqlite database, daemon log, turn-snapshot scratch dirs | Landed |
+| `appgroup` | App Group container resolution via `NSFileManager` (the prompt-free TCC path), cgo-free | Landed |
 | `bundle` | Info.plist reads, stable `.app` path conventions | Landed |
-| `wire` | LF-JSON framing, bounded serve loop, peer credentials | Designed |
-| `trust` | Codesign peer verification (audit-token designated requirements) | Designed |
-| `daemon` | Takeover ladder, skew watch, idle exit | Designed |
-| `drain` | Drain-on-upgrade: journals, fences, dead-peer adoption | Designed |
-| `supervise` | In-process child supervision with corroborated death | Porting from cc-orchestrate |
-| `Sources/DaemonKit` | Swift: socket server, XPC trust pinning, login items, snapshot watching | Skeleton |
+| `wire` | LF-JSON framing, bounded serve loop, peer credentials | Landed |
+| `wire/lifeproto` | The frozen lifecycle envelope (health, shutdown, hello, handoff) — Go and Swift bindings generated from one schema, pinned byte-identical by a shared golden fixture | Landed |
+| `trust` | Codesign peer verification (audit-token designated requirements) | Landed |
+| `daemon` | Takeover ladder, skew watch, idle exit | Landed |
+| `drain` | Drain-on-upgrade: journals, fences, dead-peer adoption | Landed |
+| `supervise` | In-process child supervision with corroborated death | Landed |
+| `Sources/DaemonKit` | Swift: socket serving, peer trust (same-UID floor + designated-requirement pinning), `SMAppService` login items, snapshot watching | Landed |
 
-Status: v0.x, mid-extraction — the API lands package-by-package and stabilizes at v1.0.0 when the last donor repo flips.
+The LaunchAgents `service` writes use no socket activation — the daemon binds and flocks its own socket (`proc`); launchd only keeps the process alive. `KeepAlive` is boolean-only: a consumer that wants `SuccessfulExit` semantics rewrites the plist itself. On the Swift side, `DaemonKit` reconciles `SMAppService` login items (opening the Login Items settings pane when the item needs approval), watches snapshot directories, and rides the signed `.app` bundle for a stable bundle + TCC identity.
+
+Status: v0.1.0 is tagged and consumed — cc-interact, cc-orchestrate, and claude-pool pin it; the table above carries each surface's state. The API stabilizes at v1.0.0.
 
 Licensed under [PolyForm-Noncommercial-1.0.0](LICENSE).
