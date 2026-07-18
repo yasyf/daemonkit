@@ -1,1 +1,1 @@
-{"v":1,"lamport":2,"session":"5dbcdecb-2d3f-4af6-bb2a-473a3d54ac93","ops":[{"kind":"verify_note","witness":null,"verified_commit":"e5763642593e2de9e2b79fcac9fa3a3b2bbc9cf5"}]}
+{"v":1,"lamport":3,"session":"5dbcdecb-2d3f-4af6-bb2a-473a3d54ac93","ops":[{"kind":"add_anchor","anchor":{"kind":"path","value":"drain/journal.go"}},{"kind":"add_anchor","anchor":{"kind":"path","value":"proc/flock.go"}},{"kind":"add_anchor","anchor":{"kind":"path","value":"proc/singleentrant.go"}}]}
