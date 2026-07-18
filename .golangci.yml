@@ -1,6 +1,5 @@
-# golangci-lint v2 config. CI and the prek commit hook run this, and you can run it
-# by hand whenever it helps. `golangci-lint fmt`
-# applies the formatters; `golangci-lint run` applies the linters.
+# golangci-lint v2: `fmt` applies the formatters, `run` the linters. CI and the
+# prek commit hook run both.
 version: "2"
 
 run:
@@ -22,41 +21,33 @@ linters:
     - unused
   settings:
     govet:
-      # unsafeptr: trust/ and appgroup/ deref dlsym'd C data symbols (fixed dyld
-      # addresses, not Go pointers) — legitimate FFI its heuristic can't tell from
-      # a bug. Kept in lockstep with the -unsafeptr=false vet step.
+      # unsafeptr: trust/verify_darwin.go derefs dlsym'd CF data symbols — fixed
+      # dyld addresses, not Go pointers (ccn 239201e). Lockstep with the
+      # -unsafeptr=false vet step in Taskfile.yml and ci.yml.
       disable:
         - unsafeptr
     errcheck:
-      # Best-effort teardown closes are the package idiom (ported from fusekit);
-      # a failed Close on these paths has no caller-visible remedy.
+      # Best-effort teardown closes are the package idiom; no caller remedy.
       exclude-functions:
         - (io.Closer).Close
         - syscall.Close
         - os.RemoveAll
-        # Deferred flock release is teardown with no caller remedy either; the one
-        # integrity-critical release (the drain transition's canonical lock) is
-        # checked explicitly through TransitionConfig.ReleaseLock, not deferred.
+        # The one integrity-critical release is checked via TransitionConfig.ReleaseLock.
         - (*github.com/yasyf/daemonkit/proc.FlockHandle).Release
   exclusions:
     rules:
-      # daemonkit's whole job is spawning processes (launchctl, brew, open,
-      # daemon binaries) with caller-fixed argv — G204 fires on every call site
-      # by design, not by defect.
+      # Spawning processes with caller-fixed argv is the package's whole job.
       - linters: [gosec]
         text: "G204"
-      # File-path and socket APIs (Info.plist readers, lock files, unix-socket
-      # dials) take caller-supplied paths by design.
+      # File and socket APIs take caller-supplied paths by design.
       - linters: [gosec]
         text: "G304"
       - linters: [gosec]
         text: "G704"
-      # Best-effort teardown closes are the package idiom (ported from fusekit);
-      # exclude-functions can't name every concrete Close method.
+      # Same teardown idiom; exclude-functions can't name every concrete Close.
       - linters: [errcheck]
         text: 'Error return value of `.*\.Close` is not checked'
-      # G104 duplicates errcheck verbatim; errcheck (with the idiom carve-outs
-      # above) owns unhandled-error reporting.
+      # G104 duplicates errcheck, which owns unhandled-error reporting.
       - linters: [gosec]
         text: "G104"
       # Test fixtures read/write their own temp paths and don't wrap errors.

@@ -18,9 +18,8 @@ tasks:
 
   vet:
     desc: Vet the module
-    # -unsafeptr=false: trust/ and appgroup/ deref dlsym'd C data symbols (fixed
-    # dyld addresses, not Go pointers) — a legitimate FFI pattern vet's unsafeptr
-    # heuristic can't distinguish from a bug. Every other analyzer stays on.
+    # -unsafeptr=false: dlsym data-symbol FFI in trust/ (ccn 239201e); lockstep
+    # with .golangci.yml and ci.yml.
     cmds:
       - go vet -unsafeptr=false ./...
 

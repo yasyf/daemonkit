@@ -5,10 +5,8 @@ on:
     branches: [main]
   pull_request:
 
-# Cancel superseded runs on PRs only. On main, an in-progress run always
-# finishes (new pushes queue; GitHub keeps just the newest pending run) —
-# cancel-in-progress here repeatedly killed the slow swift job under rapid
-# pushes, leaving commits with no complete CI verdict.
+# PRs only: cancel-in-progress on main repeatedly killed the slow swift job
+# mid-run, leaving commits with no CI verdict (ccn af9889a).
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -16,9 +14,8 @@ concurrency:
 permissions:
   contents: read
 
-# Every job is sub-minute when caches hit; the timeouts exist so a wedged
-# test dies in minutes with logs instead of running to the 6-hour kill
-# (a hung `swift test` once burned 4.9 idle hours).
+# Timeouts kill a wedged test in minutes instead of GitHub's 6-hour cap
+# (ccn af9889a).
 jobs:
   test:
     runs-on: ${{ matrix.os }}
@@ -34,19 +31,14 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Codegen drift gate
-        # Both lifeproto bindings (Go + Swift) are generated from one schema
-        # (wire/lifeproto/gen). Regenerating must be a no-op against the committed
-        # files; a diff means a generated file was hand-edited or the schema
-        # changed without a regenerate. Run once, on Linux — the output is
-        # host-independent and needs no Swift toolchain.
+        # Regenerating both lifeproto bindings must be a no-op against the
+        # committed files. Linux-only: the output is host-independent.
         if: matrix.os == 'ubuntu-latest'
         run: |
           go generate ./wire/...
           git diff --exit-code -- wire/lifeproto/lifeproto.go Sources/DaemonKit/LifecycleWire.swift
       - name: Vet
-        # -unsafeptr=false: trust/ and appgroup/ deref dlsym'd C data symbols
-        # (fixed dyld addresses) — legitimate FFI vet's unsafeptr can't tell from
-        # a bug. Every other analyzer stays on.
+        # -unsafeptr=false: dlsym data-symbol FFI in trust/ (ccn 239201e).
         run: go vet -unsafeptr=false ./...
       - name: Test (race, via the process-cap harness)
         run: ./scripts/test.sh -race ./...
@@ -81,9 +73,8 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...
 
-  # One Swift job, not a matrix: everything needs the same macOS runner, and
-  # macOS minutes bill 10x. macos-26 is pinned (not macos-latest) because the
-  # image ships Xcode 26.x — the Swift 6.2 toolchain Package.swift needs.
+  # One Swift job (macOS minutes bill 10x); macos-26 pinned — its image ships
+  # the Xcode 26.x / Swift 6.2 toolchain Package.swift needs.
   swift:
     runs-on: macos-26
     timeout-minutes: 15
