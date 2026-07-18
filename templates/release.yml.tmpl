@@ -1,0 +1,59 @@
+# Caller for yasyf/homebrew-tap's reusable release-app.yml, rendered by
+# repo-bootstrap's daemonkit layer. Proven shape: the daemonkit-release-rehearsal
+# runs (rc + stable) went green with exactly this wiring.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      marketing: ${{ steps.derive.outputs.marketing }}
+    steps:
+      - id: derive
+        shell: bash
+        # release-app.yml requires bare MAJOR.MINOR.PATCH; the tag carries a v
+        # prefix and, on rc tags, a prerelease suffix.
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          echo "marketing=${v%%-*}" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: version
+    # The reusable release job attaches the built .app to the GitHub release; a
+    # caller on a default-read repo must grant contents: write here — a called
+    # workflow can never exceed the caller's token permissions, and the run
+    # dies at startup_failure without it.
+    permissions:
+      contents: write
+    uses: yasyf/homebrew-tap/.github/workflows/release-app.yml@v1
+    with:
+      app_name: __APP_NAME__
+      project_dir: .
+      scheme: __APP_NAME__
+      bundle_id: __BUNDLE_ID__
+      marketing_version: ${{ needs.version.outputs.marketing }}
+      # The widget appex ships by default with project.yml.tmpl. appexes is a
+      # newline-separated list; app_groups and profile_names take newline-
+      # separated bundle=value pairs, and app_groups requires profile_names so
+      # every claim is profile-authorized before signing.
+      appexes: __APP_NAME__Widget
+      app_groups: |
+        __BUNDLE_ID__=__APP_GROUP__
+        __BUNDLE_ID__.widget=__APP_GROUP__
+      profile_names: |
+        __BUNDLE_ID__=__PROFILE_APP__
+        __BUNDLE_ID__.widget=__PROFILE_WIDGET__
+      cask_token: __CASK_TOKEN__
+      cask_template_path: templates/cask.rb.tmpl
+    secrets:
+      MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+      MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+      MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+      MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+      MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
