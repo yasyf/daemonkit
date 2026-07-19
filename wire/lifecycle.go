@@ -94,7 +94,11 @@ var _ daemon.Peer = (*LifecyclePeer)(nil)
 // Health returns the peer's exact build/protocol snapshot.
 func (p *LifecyclePeer) Health(ctx context.Context) (daemon.Health, error) {
 	var response lifeproto.HealthResponse
-	if err := p.call(ctx, Op(lifeproto.OpHealth), lifeproto.NewHealthRequest(), &response); err != nil {
+	err := p.call(ctx, Op(lifeproto.OpHealth), lifeproto.NewHealthRequest(), &response)
+	if err != nil && !errors.Is(err, daemon.ErrNoPeer) && p.disconnected() {
+		err = p.call(ctx, Op(lifeproto.OpHealth), lifeproto.NewHealthRequest(), &response)
+	}
+	if err != nil {
 		return daemon.Health{}, err
 	}
 	return daemon.Health{
@@ -105,6 +109,12 @@ func (p *LifecyclePeer) Health(ctx context.Context) (daemon.Health, error) {
 		Draining: response.Draining,
 		Busy:     response.Busy,
 	}, nil
+}
+
+func (p *LifecyclePeer) disconnected() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.client == nil
 }
 
 // Shutdown asks the peer to begin orderly shutdown.

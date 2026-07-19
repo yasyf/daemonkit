@@ -83,7 +83,7 @@ func startSessionServer(t *testing.T, server *wire.Server, admit func() (func(),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- server.Serve(ctx, listener, admit) }()
+	go func() { done <- server.Serve(ctx, listener, admit, admit) }()
 	running := &runningServer{path: path, cancel: cancel, done: done}
 	t.Cleanup(func() { running.stop(t) })
 	return running
@@ -161,7 +161,8 @@ func TestServerRejectsOversizedProtocolWindowBeforeStarting(t *testing.T) {
 	}
 	defer listener.Close()
 	server := &wire.Server{Build: "server-test", StreamQueue: window}
-	err = server.Serve(context.Background(), listener, func() (func(), error) { return func() {}, nil })
+	admit := func() (func(), error) { return func() {}, nil }
+	err = server.Serve(context.Background(), listener, admit, admit)
 	if err == nil || err.Error() != "wire: stream queue exceeds protocol window" {
 		t.Fatalf("Serve error = %v, want oversized-window rejection", err)
 	}

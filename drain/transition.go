@@ -30,9 +30,18 @@ type Intake struct {
 
 // Admit admits one unit of work, returning ErrDraining once the flag is set.
 func (i *Intake) Admit() (done func(), err error) {
+	return i.admit(false)
+}
+
+// AdmitLifecycle admits lifecycle observation after ordinary intake closes.
+func (i *Intake) AdmitLifecycle() (done func(), err error) {
+	return i.admit(true)
+}
+
+func (i *Intake) admit(lifecycle bool) (done func(), err error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.draining {
+	if i.draining && !lifecycle {
 		return nil, ErrDraining
 	}
 	i.inflight++

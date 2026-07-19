@@ -23,6 +23,7 @@ var errRuntimeExitSelf = errors.New("daemon: same-or-newer runtime already servi
 // Admission tracks admitted frames through their terminal responses.
 type Admission interface {
 	Admit() (done func(), err error)
+	AdmitLifecycle() (done func(), err error)
 	Close()
 	Draining() bool
 	Settle(ctx context.Context) error
@@ -30,7 +31,7 @@ type Admission interface {
 
 // SessionServer serves persistent sessions over a Runtime-owned listener.
 type SessionServer interface {
-	Serve(ctx context.Context, listener net.Listener, admit func() (func(), error)) error
+	Serve(ctx context.Context, listener net.Listener, admit, admitLifecycle func() (func(), error)) error
 	CloseIntake() error
 }
 
@@ -234,7 +235,14 @@ func (r *Runtime) Run(ctx context.Context) (err error) {
 	serveCtx, cancelServe := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelServe()
 	serveDone := make(chan error, 1)
-	go func() { serveDone <- r.cfg.Server.Serve(serveCtx, listener, r.cfg.Admission.Admit) }()
+	go func() {
+		serveDone <- r.cfg.Server.Serve(
+			serveCtx,
+			listener,
+			r.cfg.Admission.Admit,
+			r.cfg.Admission.AdmitLifecycle,
+		)
+	}()
 
 	signalCh, stopSignals := r.signalChannel()
 	defer stopSignals()

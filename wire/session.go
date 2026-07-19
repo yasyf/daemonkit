@@ -31,17 +31,18 @@ func (s *AcceptedSession) PushEvent(ctx context.Context, event Event) error {
 }
 
 type session struct {
-	server       *Server
-	conn         net.Conn
-	codec        *Codec
-	ctx          context.Context
-	cancel       context.CancelFunc
-	peer         Peer
-	build        string
-	admit        func() (func(), error)
-	accepted     *AcceptedSession
-	outbound     chan sessionOutbound
-	eventCredits *creditWindow
+	server         *Server
+	conn           net.Conn
+	codec          *Codec
+	ctx            context.Context
+	cancel         context.CancelFunc
+	peer           Peer
+	build          string
+	admit          func() (func(), error)
+	admitLifecycle func() (func(), error)
+	accepted       *AcceptedSession
+	outbound       chan sessionOutbound
+	eventCredits   *creditWindow
 
 	mu        sync.Mutex
 	active    map[uint64]*requestState
@@ -251,7 +252,11 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 			return
 		}
 	}
-	done, err := s.admit()
+	admit := s.admit
+	if entry.lifecycle {
+		admit = s.admitLifecycle
+	}
+	done, err := admit()
 	if err != nil {
 		if err := s.sendRejected(sessionCtx, frame.ID, err.Error()); err != nil {
 			s.close()

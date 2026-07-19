@@ -181,6 +181,132 @@ func TestRuntimeLifecycleAckPrecedesShutdownOrHandoff(t *testing.T) {
 	}
 }
 
+func TestResourceOwnerSocketReleaseKeepsLifecycleAvailableWhileDraining(t *testing.T) {
+	const (
+		incumbentBuild = "v1.0.0"
+		successorBuild = "v1.1.0"
+	)
+	dir, err := os.MkdirTemp("/tmp", "dkr-takeover-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	path := filepath.Join(dir, "runtime.sock")
+	server := &wire.Server{Build: incumbentBuild}
+	server.RegisterConcurrent("work", func(context.Context, wire.Request) (any, error) {
+		return true, nil
+	})
+	intake := &drain.Intake{}
+	handoffStarted := make(chan struct{})
+	releaseHandoff := make(chan struct{})
+	runtime, err := daemon.NewRuntime(daemon.RuntimeConfig{
+		Socket: path, Build: incumbentBuild, Protocol: int(wire.ProtocolVersion),
+		Peer: absentPeer{}, Contract: daemon.ResourceOwner, WaitMode: daemon.SocketRelease,
+		Admission: intake, Server: server, Workers: settledWorkers{},
+		State: lifecycleCloser{}, Resources: lifecycleCloser{},
+		Handoff: func(ctx context.Context) error {
+			close(handoffStarted)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-releaseHandoff:
+				return nil
+			}
+		},
+		ShutdownTimeout: 3 * time.Second,
+		Signals:         make(chan os.Signal),
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	server.RegisterLifecycle(runtime)
+	runDone := make(chan error, 1)
+	go func() { runDone <- runtime.Run(context.Background()) }()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = runtime.Close(ctx)
+	})
+
+	business := newRuntimeClient(t, path, incumbentBuild)
+	defer business.Close()
+	observer := &wire.LifecyclePeer{Config: wire.ClientConfig{
+		Dial: wire.UnixDialer(path), Build: successorBuild,
+	}}
+	defer observer.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	if _, err := observer.Health(ctx); err != nil {
+		cancel()
+		t.Fatalf("prime lifecycle session: %v", err)
+	}
+	cancel()
+
+	takeoverPeer := &wire.LifecyclePeer{Config: wire.ClientConfig{
+		Dial: wire.UnixDialer(path), Build: successorBuild,
+	}}
+	defer takeoverPeer.Close()
+	type takeoverResult struct {
+		outcome daemon.Outcome
+		err     error
+	}
+	takeoverDone := make(chan takeoverResult, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		outcome, err := daemon.Run(ctx, daemon.TakeoverConfig{
+			Self: successorBuild, Protocol: int(wire.ProtocolVersion), Peer: takeoverPeer,
+			Contract: daemon.ResourceOwner, WaitMode: daemon.SocketRelease,
+			WaitTimeout: time.Second,
+		})
+		takeoverDone <- takeoverResult{outcome: outcome, err: err}
+	}()
+
+	select {
+	case <-handoffStarted:
+	case <-time.After(time.Second):
+		t.Fatal("handoff did not reach resource settlement")
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	health, err := observer.Health(ctx)
+	cancel()
+	if err != nil {
+		t.Fatalf("Health while draining: %v", err)
+	}
+	if !health.Draining {
+		t.Fatal("Health while draining reported draining=false")
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	result, err := business.Call(ctx, "work", "", nil)
+	cancel()
+	if err != nil {
+		t.Fatalf("ordinary request while draining: %v", err)
+	}
+	if result.Outcome != wire.Rejected || result.Response.Reason != wire.ErrDraining.Error() {
+		t.Fatalf("ordinary result = %#v, want rejected draining", result)
+	}
+
+	close(releaseHandoff)
+	select {
+	case result := <-takeoverDone:
+		if result.err != nil {
+			t.Fatalf("takeover: %v", result.err)
+		}
+		if result.outcome != daemon.Bind {
+			t.Fatalf("takeover outcome = %v, want Bind", result.outcome)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("takeover did not observe socket release")
+	}
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Runtime.Run: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runtime did not exit after handoff")
+	}
+}
+
 func readNonWindowFrame(t *testing.T, codec *wire.Codec) wire.Frame {
 	t.Helper()
 	for {
@@ -207,6 +333,23 @@ func dialRuntime(t *testing.T, path string) net.Conn {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("runtime socket did not appear: %v", err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func newRuntimeClient(t *testing.T, path, build string) *wire.Client {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		client, err := wire.NewClient(ctx, wire.ClientConfig{Dial: wire.UnixDialer(path), Build: build})
+		cancel()
+		if err == nil {
+			return client
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("NewClient: %v", err)
 		}
 		time.Sleep(time.Millisecond)
 	}

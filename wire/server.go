@@ -153,12 +153,19 @@ func (s *Server) OnActivity(f func()) {
 // Serve accepts v3 sessions until ctx is cancelled. admit runs for every
 // request that clears the pre-admission checks; its done runs when the
 // request's execution settles, including cancellation and write-failure paths.
-func (s *Server) Serve(ctx context.Context, listener net.Listener, admit func() (func(), error)) error {
+func (s *Server) Serve(
+	ctx context.Context,
+	listener net.Listener,
+	admit, admitLifecycle func() (func(), error),
+) error {
 	if listener == nil {
 		return errors.New("wire: listener is required")
 	}
 	if admit == nil {
 		return errors.New("wire: admission callback is required")
+	}
+	if admitLifecycle == nil {
+		return errors.New("wire: lifecycle admission callback is required")
 	}
 	if s.Build == "" {
 		return errors.New("wire: Build is required")
@@ -200,7 +207,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener, admit func() 
 	}
 
 	acceptDone := make(chan error, 1)
-	go func() { acceptDone <- s.accept(ctx, admit) }()
+	go func() { acceptDone <- s.accept(ctx, admit, admitLifecycle) }()
 
 	var acceptErr error
 	select {
@@ -240,7 +247,7 @@ func (s *Server) CloseIntake() error {
 	return err
 }
 
-func (s *Server) accept(ctx context.Context, admit func() (func(), error)) error {
+func (s *Server) accept(ctx context.Context, admit, admitLifecycle func() (func(), error)) error {
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
@@ -258,14 +265,14 @@ func (s *Server) accept(ctx context.Context, admit func() (func(), error)) error
 				<-s.sessionSlots
 				s.sessionWG.Done()
 			}()
-			if err := s.serveConn(ctx, conn, admit); err != nil && !isDisconnect(err) {
+			if err := s.serveConn(ctx, conn, admit, admitLifecycle); err != nil && !isDisconnect(err) {
 				s.Log.Debug("wire: session ended", "err", err)
 			}
 		}()
 	}
 }
 
-func (s *Server) serveConn(ctx context.Context, conn net.Conn, admit func() (func(), error)) error {
+func (s *Server) serveConn(ctx context.Context, conn net.Conn, admit, admitLifecycle func() (func(), error)) error {
 	defer conn.Close()
 	unix, ok := conn.(*net.UnixConn)
 	if !ok {
@@ -294,18 +301,19 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn, admit func() (fun
 
 	sessCtx, cancel := context.WithCancel(ctx)
 	sess := &session{
-		server:       s,
-		conn:         conn,
-		codec:        codec,
-		ctx:          sessCtx,
-		cancel:       cancel,
-		peer:         peer,
-		build:        identity.Build,
-		admit:        admit,
-		outbound:     make(chan sessionOutbound, s.outboundQueue()),
-		eventCredits: newCreditWindow(),
-		active:       make(map[uint64]*requestState),
-		seen:         make(map[uint64]struct{}),
+		server:         s,
+		conn:           conn,
+		codec:          codec,
+		ctx:            sessCtx,
+		cancel:         cancel,
+		peer:           peer,
+		build:          identity.Build,
+		admit:          admit,
+		admitLifecycle: admitLifecycle,
+		outbound:       make(chan sessionOutbound, s.outboundQueue()),
+		eventCredits:   newCreditWindow(),
+		active:         make(map[uint64]*requestState),
+		seen:           make(map[uint64]struct{}),
 	}
 	sess.accepted = &AcceptedSession{s: sess}
 	s.addSession(sess)

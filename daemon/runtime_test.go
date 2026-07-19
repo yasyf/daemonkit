@@ -61,9 +61,17 @@ type runtimeAdmission struct {
 }
 
 func (a *runtimeAdmission) Admit() (func(), error) {
+	return a.admit(false)
+}
+
+func (a *runtimeAdmission) AdmitLifecycle() (func(), error) {
+	return a.admit(true)
+}
+
+func (a *runtimeAdmission) admit(lifecycle bool) (func(), error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.draining {
+	if a.draining && !lifecycle {
 		return nil, errors.New("draining")
 	}
 	a.inflight++
@@ -130,7 +138,11 @@ func newRuntimeServer(events *runtimeEvents) *runtimeServer {
 	return &runtimeServer{events: events, started: make(chan struct{})}
 }
 
-func (s *runtimeServer) Serve(ctx context.Context, listener net.Listener, _ func() (func(), error)) error {
+func (s *runtimeServer) Serve(
+	ctx context.Context,
+	listener net.Listener,
+	_, _ func() (func(), error),
+) error {
 	s.mu.Lock()
 	s.listener = listener
 	s.mu.Unlock()
