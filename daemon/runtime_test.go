@@ -3,14 +3,18 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/yasyf/daemonkit/proc"
 )
 
 type runtimeEvents struct {
@@ -221,7 +225,11 @@ func runtimeTestConfig(t *testing.T, peer Peer) (RuntimeConfig, *runtimeEvents, 
 		Workers:   workers,
 		State:     &runtimeCloser{events: events, event: "state-close"},
 		Resources: &runtimeCloser{events: events, event: "resources-close"},
-		Signals:   make(chan os.Signal),
+		Activate: func(context.Context) error {
+			events.add("activate")
+			return nil
+		},
+		Signals: make(chan os.Signal),
 	}, events, server, admission, workers
 }
 
@@ -272,6 +280,7 @@ func TestRuntimeShutdownOrderAndDoubleRunClose(t *testing.T) {
 		t.Fatalf("second Run = %v, want ErrRuntimeStarted", err)
 	}
 	want := []string{
+		"activate",
 		"serve",
 		"admission-close",
 		"server-close-intake",
@@ -363,7 +372,7 @@ func TestRuntimeTakeoverVersionOrdering(t *testing.T) {
 			if tt.serve {
 				peer.health = append(peer.health, healthResult{err: ErrNoPeer})
 			}
-			cfg, _, server, _, _ := runtimeTestConfig(t, peer)
+			cfg, events, server, _, _ := runtimeTestConfig(t, peer)
 			if tt.serve {
 				cfg.Contract = ResourceOwner
 				cfg.Handoff = func(context.Context) error { return nil }
@@ -381,6 +390,9 @@ func TestRuntimeTakeoverVersionOrdering(t *testing.T) {
 					t.Fatal("same-or-newer peer must prevent serving")
 				default:
 				}
+				if events.index("activate") >= 0 {
+					t.Fatalf("same-or-newer peer activated shared state: %v", events.snapshot())
+				}
 				return
 			}
 			runDone := startRuntime(context.Background(), t, runtime, server)
@@ -393,6 +405,190 @@ func TestRuntimeTakeoverVersionOrdering(t *testing.T) {
 			_, handoffs := peer.counts()
 			if handoffs != 1 {
 				t.Fatalf("handoffs = %d, want 1", handoffs)
+			}
+		})
+	}
+}
+
+func TestRuntimeActivatesAfterListenerOwnershipBeforeServing(t *testing.T) {
+	cfg, events, server, _, _ := runtimeTestConfig(t, absentRuntimePeer())
+	cfg.Activate = func(context.Context) error {
+		info, err := os.Lstat(cfg.Socket)
+		if err != nil {
+			return fmt.Errorf("activation listener: %w", err)
+		}
+		if info.Mode()&os.ModeSocket == 0 {
+			return errors.New("activation ran without listener ownership")
+		}
+		lock, lockErr := (proc.FileLockSpec{
+			Path: cfg.Socket + ".lock", Mode: proc.FileLockExclusive, Deadline: time.Second,
+		}).TryAcquire()
+		if lock != nil {
+			_ = lock.Close()
+		}
+		if !errors.Is(lockErr, proc.ErrLockBusy) {
+			return fmt.Errorf("activation listener lock was not held: %w", lockErr)
+		}
+		select {
+		case <-server.started:
+			return errors.New("session server started before activation")
+		default:
+		}
+		events.add("activate")
+		return nil
+	}
+	runtime, err := NewRuntime(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := startRuntime(context.Background(), t, runtime, server)
+	if err := runtime.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitRuntime(t, runDone); err != nil {
+		t.Fatal(err)
+	}
+	if events.index("activate") < 0 || events.index("activate") >= events.index("serve") {
+		t.Fatalf("activation order = %v", events.snapshot())
+	}
+}
+
+func TestRuntimeActivationFailureNeverServesAndClosesOwnedState(t *testing.T) {
+	want := errors.New("activate failed")
+	cfg, events, server, _, _ := runtimeTestConfig(t, absentRuntimePeer())
+	cfg.Activate = func(context.Context) error {
+		events.add("activate")
+		return want
+	}
+	runtime, err := NewRuntime(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = runtime.Run(context.Background())
+	if !errors.Is(err, want) {
+		t.Fatalf("Run = %v, want activation failure", err)
+	}
+	select {
+	case <-server.started:
+		t.Fatal("session server started after activation failure")
+	default:
+	}
+	wantEvents := []string{
+		"activate", "admission-close", "server-close-intake", "admission-settle",
+		"workers-close", "workers-wait", "state-close", "resources-close",
+	}
+	if got := events.snapshot(); !reflect.DeepEqual(got, wantEvents) {
+		t.Fatalf("activation failure events = %v, want %v", got, wantEvents)
+	}
+	if _, err := os.Lstat(cfg.Socket); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("activation failure retained listener socket: %v", err)
+	}
+}
+
+func TestRuntimeActivationPanicNeverServesAndClosesOwnedState(t *testing.T) {
+	cfg, events, server, _, _ := runtimeTestConfig(t, absentRuntimePeer())
+	cfg.Activate = func(context.Context) error {
+		events.add("activate")
+		panic("activation exploded")
+	}
+	runtime, err := NewRuntime(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = runtime.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "activation exploded") {
+		t.Fatalf("Run = %v, want recovered activation panic", err)
+	}
+	select {
+	case <-server.started:
+		t.Fatal("session server started after activation panic")
+	default:
+	}
+	wantEvents := []string{
+		"activate", "admission-close", "server-close-intake", "admission-settle",
+		"workers-close", "workers-wait", "state-close", "resources-close",
+	}
+	if got := events.snapshot(); !reflect.DeepEqual(got, wantEvents) {
+		t.Fatalf("activation panic events = %v, want %v", got, wantEvents)
+	}
+}
+
+func TestRuntimeInterruptionsCancelAndJoinActivationBeforeCleanup(t *testing.T) {
+	tests := []struct {
+		name    string
+		trigger func(*Runtime, context.CancelFunc, chan<- os.Signal) error
+		wantErr error
+	}{
+		{
+			name: "shutdown",
+			trigger: func(runtime *Runtime, _ context.CancelFunc, _ chan<- os.Signal) error {
+				return runtime.Shutdown(context.Background())
+			},
+		},
+		{
+			name: "parent context",
+			trigger: func(_ *Runtime, cancel context.CancelFunc, _ chan<- os.Signal) error {
+				cancel()
+				return nil
+			},
+			wantErr: context.Canceled,
+		},
+		{
+			name: "signal",
+			trigger: func(_ *Runtime, _ context.CancelFunc, signals chan<- os.Signal) error {
+				signals <- syscall.SIGTERM
+				return nil
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg, events, server, _, _ := runtimeTestConfig(t, absentRuntimePeer())
+			entered := make(chan struct{})
+			canceled := make(chan struct{})
+			release := make(chan struct{})
+			cfg.Activate = func(ctx context.Context) error {
+				events.add("activate")
+				close(entered)
+				<-ctx.Done()
+				close(canceled)
+				<-release
+				return ctx.Err()
+			}
+			parent, cancelParent := context.WithCancel(context.Background())
+			defer cancelParent()
+			signals := make(chan os.Signal, 1)
+			cfg.Signals = signals
+			runtime, err := NewRuntime(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			runDone := make(chan error, 1)
+			go func() { runDone <- runtime.Run(parent) }()
+			<-entered
+			if err := test.trigger(runtime, cancelParent, signals); err != nil {
+				t.Fatal(err)
+			}
+			<-canceled
+			if events.index("workers-close") >= 0 || events.index("state-close") >= 0 {
+				t.Fatalf("cleanup started before activation joined: %v", events.snapshot())
+			}
+			select {
+			case <-server.started:
+				t.Fatal("session server started during interrupted activation")
+			default:
+			}
+			close(release)
+			err = waitRuntime(t, runDone)
+			if test.wantErr == nil && err != nil {
+				t.Fatalf("Run = %v", err)
+			}
+			if test.wantErr != nil && !errors.Is(err, test.wantErr) {
+				t.Fatalf("Run = %v, want %v", err, test.wantErr)
+			}
+			if events.index("activate") >= events.index("workers-close") ||
+				events.index("workers-close") >= events.index("state-close") {
+				t.Fatalf("interrupted activation cleanup order = %v", events.snapshot())
 			}
 		})
 	}
@@ -507,7 +703,7 @@ func TestRuntimeWaitsForWorkerSettlementPastDeadline(t *testing.T) {
 	release := make(chan struct{})
 	workers.waitGate = release
 	workers.waitContext = true
-	cfg.ShutdownTimeout = time.Millisecond
+	cfg.ShutdownTimeout = 25 * time.Millisecond
 	runtime, err := NewRuntime(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -552,7 +748,7 @@ func TestRuntimeCloseUnstartedWaitsForWorkerSettlementPastDeadline(t *testing.T)
 	release := make(chan struct{})
 	workers.waitGate = release
 	workers.waitContext = true
-	cfg.ShutdownTimeout = time.Millisecond
+	cfg.ShutdownTimeout = 25 * time.Millisecond
 	runtime, err := NewRuntime(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -714,5 +910,13 @@ func TestRuntimeConfigRequiresExactHandoffContract(t *testing.T) {
 	cfg.Handoff = nil
 	if _, err := NewRuntime(cfg); err == nil {
 		t.Fatal("resource-owner runtime accepted no handoff callback")
+	}
+}
+
+func TestRuntimeConfigRequiresActivation(t *testing.T) {
+	cfg, _, _, _, _ := runtimeTestConfig(t, absentRuntimePeer())
+	cfg.Activate = nil
+	if _, err := NewRuntime(cfg); err == nil {
+		t.Fatal("runtime accepted no activation callback")
 	}
 }

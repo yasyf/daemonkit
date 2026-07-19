@@ -67,6 +67,10 @@ type RuntimeConfig struct {
 	Workers      Workers
 	State        io.Closer
 	Resources    Resources
+	// Activate constructs and publishes the generation's owned state only after
+	// listener acquisition and takeover have established exclusive ownership.
+	// Cancellation must not return until every activation-started operation is settled.
+	Activate func(context.Context) error
 
 	// Handoff transfers external ownership during an upgrade. It is required
 	// exactly for ResourceOwner and is never called for ordinary shutdown.
@@ -133,6 +137,8 @@ func validateRuntimeConfig(cfg RuntimeConfig) error {
 		return errors.New("daemon: runtime state is required")
 	case cfg.Resources == nil:
 		return errors.New("daemon: runtime resources are required")
+	case cfg.Activate == nil:
+		return errors.New("daemon: runtime activation is required")
 	}
 	switch cfg.Contract {
 	case RequestDaemon:
@@ -232,6 +238,14 @@ func (r *Runtime) Run(ctx context.Context) (err error) {
 		return errors.Join(listenErr, closeErr)
 	}
 
+	signalCh, stopSignals := r.signalChannel()
+	defer stopSignals()
+	activated, activationCause, activateErr := r.activate(ctx, signalCh)
+	if !activated {
+		closeErr := r.closeAcquired(ctx, listener, lock)
+		return errors.Join(activationCause, activateErr, closeErr)
+	}
+
 	serveCtx, cancelServe := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelServe()
 	serveDone := make(chan error, 1)
@@ -243,9 +257,6 @@ func (r *Runtime) Run(ctx context.Context) (err error) {
 			r.cfg.Admission.AdmitLifecycle,
 		)
 	}()
-
-	signalCh, stopSignals := r.signalChannel()
-	defer stopSignals()
 
 	var kind stopKind
 	var cause error
@@ -270,6 +281,59 @@ func (r *Runtime) Run(ctx context.Context) (err error) {
 
 	shutdownErr := r.shutdown(ctx, kind, listener, lock, cancelServe, serveDone, servedEarly)
 	return errors.Join(cause, shutdownErr)
+}
+
+func (r *Runtime) activate(parent context.Context, signalCh <-chan os.Signal) (bool, error, error) {
+	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
+	done := make(chan error, 1)
+	go func() { done <- runActivation(ctx, r.cfg.Activate) }()
+	defer cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return false, nil, fmt.Errorf("daemon: activate runtime: %w", err)
+		}
+		if err := parent.Err(); err != nil {
+			return false, err, nil
+		}
+		select {
+		case <-r.stop:
+			return false, nil, nil
+		default:
+		}
+		select {
+		case <-signalCh:
+			return false, nil, nil
+		default:
+		}
+		return true, nil, nil
+	case <-r.stop:
+		cancel()
+		return false, nil, interruptedActivationError(<-done)
+	case <-parent.Done():
+		cancel()
+		return false, parent.Err(), interruptedActivationError(<-done)
+	case <-signalCh:
+		cancel()
+		return false, nil, interruptedActivationError(<-done)
+	}
+}
+
+func runActivation(ctx context.Context, activate func(context.Context) error) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("daemon: activation panic: %v", recovered)
+		}
+	}()
+	return activate(ctx)
+}
+
+func interruptedActivationError(err error) error {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return fmt.Errorf("daemon: settle interrupted activation: %w", err)
 }
 
 func (r *Runtime) begin() bool {
@@ -380,6 +444,36 @@ func (r *Runtime) shutdown(
 		if err := <-serveDone; err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {
 			errs = append(errs, fmt.Errorf("daemon: join session server: %w", err))
 		}
+	}
+	if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		errs = append(errs, fmt.Errorf("daemon: close listener: %w", err))
+	}
+	if err := lock.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("daemon: close listener lock: %w", err))
+	}
+	if err := r.cfg.State.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("daemon: close state: %w", err))
+	}
+	if err := r.cfg.Resources.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("daemon: close resources: %w", err))
+	}
+	return errors.Join(errs...)
+}
+
+func (r *Runtime) closeAcquired(parent context.Context, listener net.Listener, lock *os.File) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), r.shutdownTimeout())
+	defer cancel()
+
+	var errs []error
+	r.cfg.Admission.Close()
+	if err := r.cfg.Server.CloseIntake(); err != nil && !errors.Is(err, net.ErrClosed) {
+		errs = append(errs, fmt.Errorf("daemon: close intake: %w", err))
+	}
+	if err := r.cfg.Admission.Settle(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("daemon: settle admission: %w", err))
+	}
+	if err := settleWorkers(ctx, r.cfg.Workers); err != nil {
+		errs = append(errs, fmt.Errorf("daemon: settle workers: %w", err))
 	}
 	if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 		errs = append(errs, fmt.Errorf("daemon: close listener: %w", err))
