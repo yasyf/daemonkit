@@ -238,10 +238,10 @@ struct PeerTrustTests {
         let directory = try shortSocketDir()
         defer { try? FileManager.default.removeItem(at: directory) }
         let path = directory.appendingPathComponent("s.sock").path
-        let server = SocketServer(
+        let server = try SocketServer(
             path: path,
             build: "server-test",
-            trust: PeerTrust(requirement: try fixtureRequirement())
+            trust: PeerTrust(requirement: fixtureRequirement())
         ) { _ in
             Issue.record("handler must not run for a rejected peer")
             return SocketResponse()

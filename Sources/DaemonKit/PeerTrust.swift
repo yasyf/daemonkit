@@ -244,7 +244,9 @@ public struct PeerTrust: Sendable {
         let lvProven = signingStatus & (csRequireLV | csForcedLV) != 0
         guard let entitlements = try decodedEntitlements(info: info) else { return }
         for entitlement in injectionEntitlements {
-            if lvProven, entitlement == entDisableLV { continue }
+            if lvProven, entitlement == entDisableLV {
+                continue
+            }
             guard let value = entitlements[entitlement] else { continue }
             let ref = value as CFTypeRef
             guard CFGetTypeID(ref) == CFBooleanGetTypeID(), CFEqual(ref, kCFBooleanFalse) else {
