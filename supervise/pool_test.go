@@ -68,6 +68,7 @@ func (f *fakeRegistry) TrackGroup(ctx context.Context, pid int) (proc.Record, er
 		Comm:         "worker",
 		Generation:   "test-generation",
 		ProcessGroup: true,
+		SessionID:    pid,
 	}
 	f.mu.Lock()
 	f.records[pid] = rec

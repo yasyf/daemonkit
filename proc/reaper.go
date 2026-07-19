@@ -23,15 +23,15 @@ const settlementPollInterval = 10 * time.Millisecond
 // errNoProc is a definitive "gone", distinct from a probe failure (Undetermined, fails closed).
 var errNoProc = errors.New("no such process")
 
-// Record identifies one spawned child across daemon generations; Reap
-// revalidates every identity field against the live process table before it
-// signals — a PID alone is never kill authority.
+// Record identifies one spawned child across daemon generations. Reap pairs
+// PID with the opaque kernel start stamp before signaling; PID alone is never
+// kill authority, while Comm remains informational across exec.
 type Record struct {
 	// PID is the spawned child's process id.
 	PID int `json:"pid"`
 	// StartTime is the prober's opaque, platform-native process start stamp.
 	StartTime string `json:"start_time"`
-	// Comm is the child's OS-reported (truncated) process name.
+	// Comm is the child's initial OS-reported (truncated) process name.
 	Comm string `json:"comm"`
 	// Generation tags the daemon instance that spawned the child.
 	Generation string `json:"generation"`
@@ -163,7 +163,7 @@ func (r *Reaper) Owns(rec Record) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("revalidate pid %d: %w", rec.PID, err)
 	}
-	if info.startTime != rec.StartTime || info.comm != rec.Comm {
+	if info.startTime != rec.StartTime {
 		return false, nil
 	}
 	if info.zombie {
@@ -219,7 +219,7 @@ func (r *Reaper) reapOne(ctx context.Context, rec Record) (bool, error) {
 		return true, nil // recorded process gone → stale record
 	case err != nil:
 		return false, err // Undetermined → fail closed, keep
-	case info.startTime != rec.StartTime || info.comm != rec.Comm:
+	case info.startTime != rec.StartTime:
 		return true, nil // pid reused: a different process holds it now → drop stale record
 	case info.zombie:
 		return true, nil
@@ -250,8 +250,8 @@ func (r *Reaper) reapOrphan(ctx context.Context, rec Record) (bool, error) {
 		return true, nil // exited during grace
 	case perr != nil:
 		return false, perr // Undetermined → do not escalate
-	case info.startTime != rec.StartTime || info.comm != rec.Comm:
-		return true, nil // pid reused or exec'd away during grace: no longer provably ours; never SIGKILL it
+	case info.startTime != rec.StartTime:
+		return true, nil // pid reused during grace: no longer provably ours; never SIGKILL it
 	case info.zombie:
 		return true, nil
 	}
@@ -269,7 +269,7 @@ func (r *Reaper) reapGroup(ctx context.Context, rec Record, leader procInfo, lea
 		return false, nil
 	}
 	switch {
-	case leaderErr == nil && (leader.startTime != rec.StartTime || leader.comm != rec.Comm):
+	case leaderErr == nil && leader.startTime != rec.StartTime:
 		return true, nil
 	case leaderErr == nil && (leader.groupID != rec.PID || leader.sessionID != rec.SessionID):
 		return false, errors.New("process-group leader left its recorded group or session")
@@ -322,7 +322,7 @@ func (r *Reaper) awaitProcessSettlement(ctx context.Context, rec Record) (bool, 
 			return true, nil
 		case err != nil:
 			return false, fmt.Errorf("prove killed process %d settled: %w", rec.PID, err)
-		case info.startTime != rec.StartTime || info.comm != rec.Comm || info.zombie:
+		case info.startTime != rec.StartTime || info.zombie:
 			return true, nil
 		case !clock.Now().Before(deadline):
 			return false, errors.New("killed process remained live through settlement deadline")
@@ -383,7 +383,7 @@ func (r *Reaper) verifiedGroupMembers(rec Record) ([]groupMember, error) {
 				changed = true
 			case err != nil:
 				return nil, fmt.Errorf("revalidate process-group member %d: %w", member.pid, err)
-			case info.startTime != member.info.startTime || info.comm != member.info.comm || info.groupID != rec.PID || info.sessionID != rec.SessionID:
+			case info.startTime != member.info.startTime || info.groupID != rec.PID || info.sessionID != rec.SessionID:
 				changed = true
 			case info.zombie:
 			default:

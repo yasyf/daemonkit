@@ -3,19 +3,35 @@ package wire
 import (
 	"fmt"
 	"net"
+
+	"github.com/yasyf/daemonkit/proc"
 )
 
 // Peer is the OS-authenticated identity of a connected unix-socket peer. Audit
 // is the raw 32-byte darwin audit_token_t, or nil on linux; wire captures it
 // verbatim and never interprets it (the trust layer does).
 type Peer struct {
-	PID   int
-	UID   int
-	Audit []byte
+	PID       int
+	UID       int
+	StartTime string
+	Comm      string
+	Boot      string
+	Audit     []byte
 }
 
-// PeerFromConn reads conn's peer credentials with one getsockopt. Call it once
-// per connection, right after accept.
+// ProcessIdentity returns the peer's kernel process identity captured at accept.
+func (p Peer) ProcessIdentity() proc.Identity {
+	return proc.Identity{PID: p.PID, StartTime: p.StartTime, Comm: p.Comm, Boot: p.Boot}
+}
+
+// MatchesProcess reports whether rec names the exact process instance that
+// opened the accepted socket. Comm is informational and may change across exec.
+func (p Peer) MatchesProcess(rec proc.Record) bool {
+	return p.PID == rec.PID && p.StartTime != "" && p.StartTime == rec.StartTime
+}
+
+// PeerFromConn reads conn's peer credentials and snapshots the corresponding
+// kernel process identity. Call it once per connection, right after accept.
 func PeerFromConn(conn *net.UnixConn) (Peer, error) {
 	raw, err := conn.SyscallConn()
 	if err != nil {
@@ -31,5 +47,12 @@ func PeerFromConn(conn *net.UnixConn) (Peer, error) {
 	if opErr != nil {
 		return Peer{}, opErr
 	}
+	identity, err := proc.Probe(peer.PID)
+	if err != nil {
+		return Peer{}, fmt.Errorf("wire: probe peer pid %d: %w", peer.PID, err)
+	}
+	peer.StartTime = identity.StartTime
+	peer.Comm = identity.Comm
+	peer.Boot = identity.Boot
 	return peer, nil
 }

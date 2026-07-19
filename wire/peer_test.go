@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"testing"
 
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/daemonkit/wire/wiretest"
 )
@@ -30,6 +31,18 @@ func TestPeerFromConnSelf(t *testing.T) {
 			}
 			if p.PID != os.Getpid() {
 				t.Errorf("PID = %d, want %d", p.PID, os.Getpid())
+			}
+			if p.StartTime == "" || p.Comm == "" || p.Boot == "" {
+				t.Errorf("process identity = %+v, want complete kernel identity", p.ProcessIdentity())
+			}
+			if !p.MatchesProcess(proc.Record{PID: p.PID, StartTime: p.StartTime}) {
+				t.Fatal("peer did not match its exact process record")
+			}
+			if p.MatchesProcess(proc.Record{PID: p.PID + 1, StartTime: p.StartTime}) {
+				t.Fatal("peer matched a different pid")
+			}
+			if p.MatchesProcess(proc.Record{PID: p.PID, StartTime: p.StartTime + "-reused"}) {
+				t.Fatal("peer matched a reused pid with a different start identity")
 			}
 			if runtime.GOOS == "darwin" {
 				if len(p.Audit) != 32 {

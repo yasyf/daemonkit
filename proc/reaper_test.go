@@ -229,7 +229,7 @@ func TestTrackGroupRejectsNonLeader(t *testing.T) {
 	}
 }
 
-func TestOwnsRevalidatesFullIdentity(t *testing.T) {
+func TestOwnsRevalidatesProcessInstance(t *testing.T) {
 	rec := matchingRecord(4242, "old-gen")
 	tests := []struct {
 		name    string
@@ -240,7 +240,7 @@ func TestOwnsRevalidatesFullIdentity(t *testing.T) {
 		{name: "match", result: probeResult{info: liveInfo()}, want: true},
 		{name: "vanished", result: probeResult{err: errNoProc}},
 		{name: "pid reused", result: probeResult{info: procInfo{startTime: "new", comm: rec.Comm}}},
-		{name: "exec changed comm", result: probeResult{info: procInfo{startTime: rec.StartTime, comm: "other"}}},
+		{name: "exec preserves identity", result: probeResult{info: procInfo{startTime: rec.StartTime, comm: "other"}}, want: true},
 		{name: "probe failure", result: probeResult{err: errors.New("probe failed")}, wantErr: true},
 	}
 	for _, tt := range tests {
@@ -495,7 +495,7 @@ func TestReapPIDReuseDuringGrace(t *testing.T) {
 	}
 }
 
-func TestReapCommMismatchDuringGrace(t *testing.T) {
+func TestReapExecWithStableStartIdentityStillEscalates(t *testing.T) {
 	ctx := context.Background()
 	store := &memStore{}
 	prober := &fakeProber{perProbe: []probeResult{
@@ -510,11 +510,11 @@ func TestReapCommMismatchDuringGrace(t *testing.T) {
 		t.Fatalf("Reap: %v", err)
 	}
 	calls := sig.calls()
-	if len(calls) != 1 || calls[0].sig != syscall.SIGTERM {
-		t.Errorf("signals = %v, want a single SIGTERM (no SIGKILL on comm mismatch)", calls)
+	if len(calls) != 2 || calls[0].sig != syscall.SIGTERM || calls[1].sig != syscall.SIGKILL {
+		t.Errorf("signals = %v, want SIGTERM then SIGKILL for the same process instance", calls)
 	}
 	if store.len() != 0 {
-		t.Errorf("store size = %d, want 0 (no longer provably ours)", store.len())
+		t.Errorf("store size = %d, want 0", store.len())
 	}
 }
 
