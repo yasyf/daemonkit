@@ -2,10 +2,13 @@ package proc
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -134,6 +137,26 @@ type recSignaler struct {
 	err      error
 }
 
+type cancelSignaler struct {
+	cancel context.CancelFunc
+	mu     sync.Mutex
+	sent   []signalCall
+}
+
+func (s *cancelSignaler) signal(pid int, sig syscall.Signal) error {
+	s.mu.Lock()
+	s.sent = append(s.sent, signalCall{pid: pid, sig: sig})
+	s.mu.Unlock()
+	s.cancel()
+	return nil
+}
+
+func (s *cancelSignaler) calls() []signalCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]signalCall(nil), s.sent...)
+}
+
 type signalCall struct {
 	pid int
 	sig syscall.Signal
@@ -160,6 +183,61 @@ func liveInfo() procInfo { return procInfo{startTime: "111.222", comm: "worker"}
 func matchingRecord(pid int, gen string) Record {
 	i := liveInfo()
 	return Record{PID: pid, StartTime: i.startTime, Boot: testBoot, Comm: i.comm, Generation: gen}
+}
+
+func auditTokenForPID(pid int, version uint32) AuditToken {
+	var token AuditToken
+	binary.NativeEndian.PutUint32(token[20:24], uint32(pid))
+	binary.NativeEndian.PutUint32(token[28:32], version)
+	return token
+}
+
+func TestRecordRejectsPresentIncompleteAuditToken(t *testing.T) {
+	rec := matchingRecord(4242, "generation")
+	rec.AuditToken = auditTokenForPID(rec.PID, 0)
+	if err := rec.Validate(); !errors.Is(err, ErrNoAuditToken) {
+		t.Fatalf("Validate error = %v, want ErrNoAuditToken", err)
+	}
+}
+
+func TestReapRetainedAuthenticatedAppRecordUsesAuditTokenAuthority(t *testing.T) {
+	const pid = 4242
+	token := auditTokenForPID(pid, 17)
+	rec := matchingRecord(pid, "stopped-daemon")
+	rec.Executable = "/Applications/Fixed.app/Contents/MacOS/Fixed"
+	rec.AuditToken = token
+	store := &memStore{recs: []Record{rec}}
+	pathCalls := 0
+	var signals []syscall.Signal
+	r := &Reaper{
+		Store: store, Generation: "restarted-daemon", prober: &fakeProber{info: liveInfo()}, clock: newFakeClock(),
+		auditPath: func(got AuditToken) (string, error) {
+			if got != token {
+				t.Fatalf("audit token = %v, want %v", got, token)
+			}
+			pathCalls++
+			if pathCalls > 1 {
+				return "", ErrNoProcess
+			}
+			return rec.Executable, nil
+		},
+		auditSignal: func(got AuditToken, sig syscall.Signal) (bool, error) {
+			if got != token {
+				t.Fatalf("audit token = %v, want %v", got, token)
+			}
+			signals = append(signals, sig)
+			return false, nil
+		},
+	}
+	if err := r.Reap(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(signals, []syscall.Signal{syscall.SIGTERM}) {
+		t.Fatalf("signals = %v, want TERM through audit-token authority", signals)
+	}
+	if store.len() != 0 {
+		t.Fatal("retained app record remained after exact process settlement")
+	}
 }
 
 func matchingGroupRecord(pid int, gen string) Record {
@@ -272,6 +350,113 @@ func TestOwnsRevalidatesProcessInstance(t *testing.T) {
 				t.Fatalf("Owns = %t, want %t", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestTrackIdentityRejectsMismatchAndAbsence(t *testing.T) {
+	identity := Identity{PID: 4242, StartTime: liveInfo().startTime, Comm: liveInfo().comm, Boot: testBoot}
+	tests := []struct {
+		name  string
+		probe probeResult
+		want  error
+	}{
+		{name: "pid reused", probe: probeResult{info: procInfo{startTime: "reused"}}, want: ErrIdentityChanged},
+		{name: "absent", probe: probeResult{err: errNoProc}, want: ErrNoProcess},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &memStore{}
+			reaper := &Reaper{Store: store, Generation: "stop", prober: &fakeProber{perProbe: []probeResult{test.probe}}}
+			if _, err := reaper.TrackIdentity(t.Context(), identity); !errors.Is(err, test.want) {
+				t.Fatalf("TrackIdentity error = %v, want %v", err, test.want)
+			}
+			if store.len() != 0 {
+				t.Fatalf("store size = %d, want no authority over mismatched process", store.len())
+			}
+		})
+	}
+}
+
+func TestTerminateTrackedIdentityEscalatesAndSettles(t *testing.T) {
+	store := &memStore{}
+	prober := &fakeProber{perProbe: []probeResult{
+		{info: liveInfo()}, // TrackIdentity.
+		{info: liveInfo()}, // Initial termination revalidation.
+		{info: liveInfo()}, // TERM-resistant grace expiry.
+		{err: errNoProc},   // KILL settlement.
+	}}
+	signaler := &recSignaler{}
+	reaper := &Reaper{
+		Store: store, Generation: "stop", prober: prober, signaler: signaler, clock: newFakeClock(),
+		Grace: time.Millisecond, Settlement: time.Millisecond,
+	}
+	identity := Identity{PID: 4242, StartTime: liveInfo().startTime, Comm: liveInfo().comm, Boot: testBoot}
+	record, err := reaper.TrackIdentity(t.Context(), identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reaper.Terminate(t.Context(), record); err != nil {
+		t.Fatal(err)
+	}
+	want := []signalCall{{pid: identity.PID, sig: syscall.SIGTERM}, {pid: identity.PID, sig: syscall.SIGKILL}}
+	if got := signaler.calls(); len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("signals = %v, want %v", got, want)
+	}
+	if store.len() != 0 {
+		t.Fatalf("store size = %d, want settled record removed", store.len())
+	}
+}
+
+func TestTerminateTrackedIdentityNeverKillsReusedPID(t *testing.T) {
+	store := &memStore{}
+	prober := &fakeProber{perProbe: []probeResult{
+		{info: liveInfo()},
+		{info: liveInfo()},
+		{info: procInfo{startTime: "reused", comm: "innocent"}},
+	}}
+	signaler := &recSignaler{}
+	reaper := &Reaper{Store: store, Generation: "stop", prober: prober, signaler: signaler, clock: newFakeClock()}
+	identity := Identity{PID: 4242, StartTime: liveInfo().startTime, Comm: liveInfo().comm, Boot: testBoot}
+	record, err := reaper.TrackIdentity(t.Context(), identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reaper.Terminate(t.Context(), record); err != nil {
+		t.Fatal(err)
+	}
+	if got := signaler.calls(); len(got) != 1 || got[0].sig != syscall.SIGTERM {
+		t.Fatalf("signals = %v, want TERM only before PID reuse", got)
+	}
+	if store.len() != 0 {
+		t.Fatalf("store size = %d, want stale identity removed", store.len())
+	}
+}
+
+func TestTerminateTrackedIdentityCancellationRetainsDurableRecord(t *testing.T) {
+	store := &memStore{}
+	record := matchingRecord(4242, "stop")
+	mustAdd(t, store, record)
+	ctx, cancel := context.WithCancel(context.Background())
+	signaler := &cancelSignaler{cancel: cancel}
+	reaper := &Reaper{Store: store, Generation: "stop", prober: &fakeProber{info: liveInfo()}, signaler: signaler}
+	if err := reaper.Terminate(ctx, record); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Terminate error = %v, want context canceled", err)
+	}
+	if calls := signaler.calls(); len(calls) != 1 || calls[0].sig != syscall.SIGTERM || store.len() != 1 {
+		t.Fatalf("signals = %v store size = %d, want TERM and retained record", calls, store.len())
+	}
+}
+
+func TestTerminateRefusesUntrackedIdentity(t *testing.T) {
+	signaler := &recSignaler{}
+	reaper := &Reaper{
+		Store: &memStore{}, Generation: "stop", prober: &fakeProber{info: liveInfo()}, signaler: signaler,
+	}
+	if err := reaper.Terminate(t.Context(), matchingRecord(4242, "stop")); err == nil {
+		t.Fatal("Terminate accepted an identity without durable ownership")
+	}
+	if calls := signaler.calls(); len(calls) != 0 {
+		t.Fatalf("signals = %v, want none", calls)
 	}
 }
 
@@ -822,6 +1007,127 @@ func TestFileStoreRoundTrip(t *testing.T) {
 	}
 }
 
+func TestFileStoreFsyncsBeforeRenameAndDirectoryAfterMutation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "records.json")
+	var events []string
+	ops := &recordFileOps{
+		syncTemp: func(file *os.File) error {
+			events = append(events, "sync-temp")
+			return file.Sync()
+		},
+		rename: func(oldPath, newPath string) error {
+			events = append(events, "rename")
+			return os.Rename(oldPath, newPath)
+		},
+		syncDir: func(path string) error {
+			events = append(events, "sync-dir")
+			return fsyncDir(path)
+		},
+	}
+	store := &FileStore{Path: path, ops: ops}
+	record := Record{
+		PID: 100, StartTime: "1.1", Boot: testBoot, Comm: "app", Generation: "stop",
+		Executable: "/Applications/Fixed.app/Contents/MacOS/Fixed", AuditToken: auditTokenForPID(100, 7),
+	}
+	assertMutation := func(operation string) {
+		t.Helper()
+		want := []string{"sync-temp", "rename", "sync-dir"}
+		if len(events) < len(want) || !slices.Equal(events[len(events)-len(want):], want) {
+			t.Fatalf("%s events = %v, want durability suffix %v", operation, events, want)
+		}
+		events = nil
+	}
+	if err := store.Add(t.Context(), record); err != nil {
+		t.Fatal(err)
+	}
+	assertMutation("add")
+	reopened, err := (&FileStore{Path: path}).Load(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reopened) != 1 || reopened[0] != record {
+		t.Fatalf("reopened records = %v, want %v", reopened, record)
+	}
+	if err := store.Remove(t.Context(), []Record{record}); err != nil {
+		t.Fatal(err)
+	}
+	assertMutation("remove")
+	reopened, err = (&FileStore{Path: path}).Load(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reopened) != 0 {
+		t.Fatalf("reopened records after remove = %v, want empty", reopened)
+	}
+}
+
+func TestTrackIdentityTempSyncFailureNeverPublishesAuthority(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "records.json")
+	syncErr := errors.New("temp sync failed")
+	store := &FileStore{Path: path, ops: &recordFileOps{syncTemp: func(*os.File) error { return syncErr }}}
+	token := auditTokenForPID(4242, 7)
+	executable := "/Applications/Fixed.app/Contents/MacOS/Fixed"
+	identity := Identity{
+		PID: 4242, StartTime: liveInfo().startTime, Comm: liveInfo().comm, Boot: testBoot,
+		Executable: executable, AuditToken: token,
+	}
+	reaper := &Reaper{
+		Store: store, Generation: "stop", prober: &fakeProber{info: liveInfo()},
+		auditPath: func(got AuditToken) (string, error) {
+			if got != token {
+				t.Fatalf("audit token = %v, want %v", got, token)
+			}
+			return executable, nil
+		},
+	}
+	if _, err := reaper.TrackIdentity(t.Context(), identity); !errors.Is(err, syncErr) {
+		t.Fatalf("TrackIdentity error = %v, want %v", err, syncErr)
+	}
+	if records, err := (&FileStore{Path: path}).Load(t.Context()); err != nil || len(records) != 0 {
+		t.Fatalf("reopened records after failed temp sync = %v, %v; want empty", records, err)
+	}
+	reaper.Store = &FileStore{Path: path}
+	record, err := reaper.TrackIdentity(t.Context(), identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := (&FileStore{Path: path}).Load(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reopened) != 1 || reopened[0] != record {
+		t.Fatalf("reopened authority = %v, want %v before terminate", reopened, record)
+	}
+}
+
+func TestFileStoreRemovalDirectorySyncFailureIsReopenRetryable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "records.json")
+	record := matchingRecord(4242, "stop")
+	if err := (&FileStore{Path: path}).Add(t.Context(), record); err != nil {
+		t.Fatal(err)
+	}
+	syncErr := errors.New("directory sync failed")
+	failed := false
+	store := &FileStore{Path: path, ops: &recordFileOps{syncDir: func(path string) error {
+		if path == dir && !failed {
+			failed = true
+			return syncErr
+		}
+		return fsyncDir(path)
+	}}}
+	if err := store.Remove(t.Context(), []Record{record}); !errors.Is(err, syncErr) {
+		t.Fatalf("Remove error = %v, want %v", err, syncErr)
+	}
+	reopened := &FileStore{Path: path}
+	if records, err := reopened.Load(t.Context()); err != nil || len(records) != 0 {
+		t.Fatalf("reopened records after ambiguous remove = %v, %v; want empty", records, err)
+	}
+	if err := reopened.Remove(t.Context(), []Record{record}); err != nil {
+		t.Fatalf("retry Remove: %v", err)
+	}
+}
+
 func TestFileStoreRemoveByInstance(t *testing.T) {
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("/tmp", "reaper")
@@ -860,9 +1166,23 @@ func TestFileStoreRejectsLegacySchema(t *testing.T) {
 	}
 }
 
+func TestFileStoreRejectsWrongSchemaVersion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "records.json")
+	data, err := json.Marshal(recordFile{Schema: recordSchemaVersion + 1, Records: []Record{matchingRecord(100, "old")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&FileStore{Path: path}).Load(t.Context()); !errors.Is(err, ErrRecordSchema) {
+		t.Fatalf("Load error = %v, want ErrRecordSchema", err)
+	}
+}
+
 func TestFileStoreRejectsCurrentSchemaRecordWithoutBoot(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "records.json")
-	incomplete := `{"schema":2,"records":[{"pid":100,"start_time":"1.1","comm":"worker","generation":"old"}]}`
+	incomplete := `{"schema":3,"records":[{"pid":100,"start_time":"1.1","comm":"worker","generation":"old"}]}`
 	if err := os.WriteFile(path, []byte(incomplete), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -871,4 +1191,58 @@ func TestFileStoreRejectsCurrentSchemaRecordWithoutBoot(t *testing.T) {
 	if !errors.Is(err, ErrInvalidRecord) {
 		t.Fatalf("Load error = %v, want ErrInvalidRecord", err)
 	}
+}
+
+func TestFileStoreRejectsMalformedAuditTokenRecords(t *testing.T) {
+	valid := auditTokenForPID(100, 7)
+	tests := []struct {
+		name   string
+		token  any
+		mutate func(map[string]any)
+		want   error
+	}{
+		{name: "short", token: byteValues(valid[:31]), want: ErrRecordSchema},
+		{name: "long", token: append(byteValues(valid[:]), byte(0)), want: ErrRecordSchema},
+		{name: "string element", token: append([]any{"bad"}, byteValues(valid[1:])...), want: ErrRecordSchema},
+		{name: "null element", token: append([]any{nil}, byteValues(valid[1:])...), want: ErrRecordSchema},
+		{name: "fractional element", token: append([]any{1.5}, byteValues(valid[1:])...), want: ErrRecordSchema},
+		{name: "overflow element", token: append([]any{256}, byteValues(valid[1:])...), want: ErrRecordSchema},
+		{name: "missing", mutate: func(record map[string]any) { delete(record, "audit_token") }, want: ErrInvalidRecord},
+		{name: "pid mismatch", token: auditTokenForPID(101, 7), want: ErrIdentityChanged},
+		{name: "missing pidversion", token: auditTokenForPID(100, 0), want: ErrNoAuditToken},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "records.json")
+			record := map[string]any{
+				"pid": 100, "start_time": "1.1", "boot": testBoot, "comm": "app",
+				"executable":  "/Applications/Fixed.app/Contents/MacOS/Fixed",
+				"audit_token": valid, "generation": "old", "process_group": false,
+			}
+			if test.token != nil {
+				record["audit_token"] = test.token
+			}
+			if test.mutate != nil {
+				test.mutate(record)
+			}
+			data, err := json.Marshal(map[string]any{"schema": recordSchemaVersion, "records": []any{record}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := (&FileStore{Path: path}).Load(t.Context()); !errors.Is(err, test.want) {
+				t.Fatalf("Load error = %v, want %v", err, test.want)
+			}
+		})
+	}
+}
+
+func byteValues(values []byte) []any {
+	out := make([]any, len(values))
+	for index, value := range values {
+		out[index] = value
+	}
+	return out
 }

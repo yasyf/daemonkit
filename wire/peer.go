@@ -11,17 +11,22 @@ import (
 // is the raw 32-byte darwin audit_token_t, or nil on linux; wire captures it
 // verbatim and never interprets it (the trust layer does).
 type Peer struct {
-	PID       int
-	UID       int
-	StartTime string
-	Comm      string
-	Boot      string
-	Audit     []byte
+	PID        int
+	UID        int
+	StartTime  string
+	Comm       string
+	Boot       string
+	Executable string
+	Audit      []byte
 }
 
 // ProcessIdentity returns the peer's kernel process identity captured at accept.
 func (p Peer) ProcessIdentity() proc.Identity {
-	return proc.Identity{PID: p.PID, StartTime: p.StartTime, Comm: p.Comm, Boot: p.Boot}
+	identity := proc.Identity{PID: p.PID, StartTime: p.StartTime, Comm: p.Comm, Boot: p.Boot, Executable: p.Executable}
+	if token, err := proc.AuditTokenFromBytes(p.Audit); err == nil {
+		identity.AuditToken = token
+	}
+	return identity
 }
 
 // MatchesProcess reports whether rec names the exact process instance that
@@ -48,12 +53,13 @@ func PeerFromConn(conn *net.UnixConn) (Peer, error) {
 	if opErr != nil {
 		return Peer{}, opErr
 	}
-	identity, err := proc.Probe(peer.PID)
+	identity, err := bindPeerIdentity(peer)
 	if err != nil {
-		return Peer{}, fmt.Errorf("wire: probe peer pid %d: %w", peer.PID, err)
+		return Peer{}, fmt.Errorf("wire: bind peer pid %d to audit token: %w", peer.PID, err)
 	}
 	peer.StartTime = identity.StartTime
 	peer.Comm = identity.Comm
 	peer.Boot = identity.Boot
+	peer.Executable = identity.Executable
 	return peer, nil
 }

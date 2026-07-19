@@ -8,9 +8,13 @@
 package trust
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/yasyf/daemonkit/wire"
@@ -50,6 +54,44 @@ type Requirement struct {
 	SigningIdentifier    string
 	RequiredAppGroup     string
 	RequiredEntitlements map[string]EntitlementRequirement
+}
+
+// ValidationDigest returns the opaque canonical identity of every code-signing
+// and entitlement predicate checked by this requirement.
+func (r Requirement) ValidationDigest() ([32]byte, error) {
+	if err := r.validate(); err != nil {
+		return [32]byte{}, err
+	}
+	h := sha256.New()
+	writeDigestString(h, r.TeamID)
+	writeDigestString(h, r.SigningIdentifier)
+	requirements := r.entitlementRequirements()
+	keys := make([]string, 0, len(requirements))
+	for key := range requirements {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		requirement := requirements[key]
+		writeDigestString(h, key)
+		_, _ = h.Write([]byte{byte(requirement.Match)})
+		if requirement.Boolean {
+			_, _ = h.Write([]byte{1})
+		} else {
+			_, _ = h.Write([]byte{0})
+		}
+		writeDigestString(h, requirement.String)
+	}
+	var digest [32]byte
+	copy(digest[:], h.Sum(nil))
+	return digest, nil
+}
+
+func writeDigestString(h hash.Hash, value string) {
+	var length [8]byte
+	binary.BigEndian.PutUint64(length[:], uint64(len(value)))
+	_, _ = h.Write(length[:])
+	_, _ = h.Write([]byte(value))
 }
 
 func (r Requirement) validate() error {

@@ -22,7 +22,7 @@ const DefaultReapSettlement = 2 * time.Second
 
 const (
 	settlementPollInterval = 10 * time.Millisecond
-	recordSchemaVersion    = 2
+	recordSchemaVersion    = 3
 )
 
 // errNoProc is a definitive "gone", distinct from a probe failure (Undetermined, fails closed).
@@ -31,6 +31,8 @@ var errNoProc = errors.New("no such process")
 var (
 	// ErrInvalidRecord means a durable process record lacks required identity.
 	ErrInvalidRecord = errors.New("proc: invalid durable process record")
+	// ErrIdentityChanged means a process no longer has the exact boot/start identity supplied by its authenticated peer.
+	ErrIdentityChanged = errors.New("proc: process identity changed")
 	// ErrRecordSchema means a durable process store is not the exact current format.
 	ErrRecordSchema = errors.New("proc: unsupported durable process record schema")
 )
@@ -47,6 +49,11 @@ type Record struct {
 	Boot string `json:"boot"`
 	// Comm is the child's initial OS-reported (truncated) process name.
 	Comm string `json:"comm"`
+	// Executable is the exact kernel-resolved path bound to AuditToken.
+	Executable string `json:"executable,omitempty"`
+	// AuditToken is Darwin's stable (pid, pidversion) kill authority for a
+	// protected peer. Spawned disposable workers use the zero value.
+	AuditToken AuditToken `json:"audit_token,omitzero"`
 	// Generation tags the daemon instance that spawned the child.
 	Generation string `json:"generation"`
 	// ProcessGroup means PID is also the process-group id and signals target the
@@ -84,6 +91,16 @@ func validateRecordIdentity(r Record) error {
 	}
 	if r.Boot == "" {
 		return fmt.Errorf("%w: boot is required", ErrInvalidRecord)
+	}
+	if !r.AuditToken.IsZero() {
+		if err := validateAuditToken(r.AuditToken, r.PID); err != nil {
+			return err
+		}
+		if r.Executable == "" {
+			return fmt.Errorf("%w: audit-token record requires executable", ErrInvalidRecord)
+		}
+	} else if r.Executable != "" {
+		return fmt.Errorf("%w: executable requires audit-token authority", ErrInvalidRecord)
 	}
 	return nil
 }
@@ -154,15 +171,70 @@ type Reaper struct {
 	// Settlement bounds post-SIGKILL proof; zero means DefaultReapSettlement.
 	Settlement time.Duration
 
-	prober   prober
-	signaler signaler
-	clock    clock
+	prober      prober
+	signaler    signaler
+	auditSignal func(AuditToken, syscall.Signal) (bool, error)
+	auditPath   func(AuditToken) (string, error)
+	clock       clock
 }
 
 // Track snapshots a freshly spawned child's identity through the same prober
 // Reap revalidates with and records it under this reaper's Generation.
 func (r *Reaper) Track(ctx context.Context, pid int) (Record, error) {
 	return r.track(ctx, pid, false)
+}
+
+// TrackIdentity durably records an already authenticated exact process identity.
+// It re-probes before writing so PID reuse can never turn the supplied identity
+// into authority over a different process.
+func (r *Reaper) TrackIdentity(ctx context.Context, identity Identity) (Record, error) {
+	rec := Record{
+		PID: identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
+		Comm: identity.Comm, Generation: r.Generation, Executable: identity.Executable,
+		AuditToken: identity.AuditToken,
+	}
+	if err := rec.Validate(); err != nil {
+		return Record{}, err
+	}
+	boot, err := r.prb().bootID()
+	if err != nil {
+		return Record{}, fmt.Errorf("revalidate boot identity: %w", err)
+	}
+	if boot != rec.Boot {
+		return Record{}, ErrIdentityChanged
+	}
+	if rec.AuditToken.Valid() {
+		path, err := r.auditExecutable(rec.AuditToken)
+		if err != nil {
+			return Record{}, fmt.Errorf("revalidate audit-token process: %w", err)
+		}
+		if path != rec.Executable {
+			return Record{}, ErrIdentityChanged
+		}
+	}
+	info, err := r.prb().probe(rec.PID)
+	if errors.Is(err, errNoProc) {
+		return Record{}, ErrNoProcess
+	}
+	if err != nil {
+		return Record{}, fmt.Errorf("revalidate pid %d: %w", rec.PID, err)
+	}
+	if info.startTime != rec.StartTime || info.zombie {
+		return Record{}, ErrIdentityChanged
+	}
+	if rec.AuditToken.Valid() {
+		path, err := r.auditExecutable(rec.AuditToken)
+		if err != nil {
+			return Record{}, fmt.Errorf("settle audit-token process identity: %w", err)
+		}
+		if path != rec.Executable {
+			return Record{}, ErrIdentityChanged
+		}
+	}
+	if err := r.Store.Add(ctx, rec); err != nil {
+		return Record{}, fmt.Errorf("record authenticated process %d: %w", rec.PID, err)
+	}
+	return rec, nil
 }
 
 // TrackGroup records a child whose PID leads its own process group and session.
@@ -207,6 +279,73 @@ func (r *Reaper) Untrack(ctx context.Context, rec Record) error {
 	return nil
 }
 
+// Terminate delivers the bounded TERM/KILL ladder to one exact durably tracked
+// process or process group and removes its record only after absence, reuse, or
+// settlement is proven.
+func (r *Reaper) Terminate(ctx context.Context, rec Record) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := rec.Validate(); err != nil {
+		return err
+	}
+	records, err := r.Store.Load(ctx)
+	if err != nil {
+		return fmt.Errorf("load tracked process: %w", err)
+	}
+	tracked := false
+	for _, candidate := range records {
+		if candidate == rec {
+			tracked = true
+			break
+		}
+	}
+	if !tracked {
+		return errors.New("proc: process is not durably tracked")
+	}
+	boot, err := r.prb().bootID()
+	if err != nil {
+		return fmt.Errorf("load current boot identity: %w", err)
+	}
+	reaped, err := r.terminateOne(ctx, rec, boot)
+	if err != nil {
+		return err
+	}
+	if !reaped {
+		return errors.New("proc: tracked process remained live")
+	}
+	if err := r.Store.Remove(ctx, []Record{rec}); err != nil {
+		return fmt.Errorf("remove terminated process %d: %w", rec.PID, err)
+	}
+	return nil
+}
+
+func (r *Reaper) terminateOne(ctx context.Context, rec Record, boot string) (bool, error) {
+	if rec.Boot != boot {
+		return true, nil
+	}
+	if rec.PID <= 1 || rec.PID == os.Getpid() {
+		return false, errors.New("refusing unsafe process identity")
+	}
+	if gone, err := r.auditRecordGone(rec); gone || err != nil {
+		return gone, err
+	}
+	info, err := r.prb().probe(rec.PID)
+	if rec.ProcessGroup {
+		return r.reapGroup(ctx, rec, info, err, true)
+	}
+	switch {
+	case errors.Is(err, errNoProc):
+		return true, nil
+	case err != nil:
+		return false, err
+	case info.startTime != rec.StartTime, info.zombie:
+		return true, nil
+	default:
+		return r.reapOrphan(ctx, rec)
+	}
+}
+
 // Owns reports whether rec still identifies the same live process instance.
 func (r *Reaper) Owns(rec Record) (bool, error) {
 	if err := rec.Validate(); err != nil {
@@ -218,6 +357,9 @@ func (r *Reaper) Owns(rec Record) (bool, error) {
 	}
 	if rec.Boot != boot {
 		return false, nil
+	}
+	if gone, err := r.auditRecordGone(rec); gone || err != nil {
+		return false, err
 	}
 	info, err := r.prb().probe(rec.PID)
 	if errors.Is(err, errNoProc) {
@@ -283,9 +425,12 @@ func (r *Reaper) reapOne(ctx context.Context, rec Record, boot string) (bool, er
 	if rec.PID <= 1 || rec.PID == os.Getpid() {
 		return false, errors.New("refusing unsafe process identity")
 	}
+	if gone, err := r.auditRecordGone(rec); gone || err != nil {
+		return gone, err
+	}
 	info, err := r.prb().probe(rec.PID)
 	if rec.ProcessGroup {
-		return r.reapGroup(ctx, rec, info, err)
+		return r.reapGroup(ctx, rec, info, err, false)
 	}
 	switch {
 	case errors.Is(err, errNoProc):
@@ -304,8 +449,7 @@ func (r *Reaper) reapOne(ctx context.Context, rec Record, boot string) (bool, er
 
 // SIGTERM → grace → re-revalidate → SIGKILL; ESRCH is success, and a PID reused during grace is never SIGKILLed.
 func (r *Reaper) reapOrphan(ctx context.Context, rec Record) (bool, error) {
-	target := signalTarget(rec)
-	gone, err := r.sendSignal(target, syscall.SIGTERM)
+	gone, err := r.sendRecordSignal(rec, syscall.SIGTERM)
 	if err != nil {
 		return false, err // Undetermined signal error → fail closed
 	}
@@ -316,6 +460,9 @@ func (r *Reaper) reapOrphan(ctx context.Context, rec Record) (bool, error) {
 	case <-ctx.Done():
 		return false, ctx.Err() // aborted mid-grace; retry next pass
 	case <-clockOrReal(r.clock).After(r.graceDur()):
+	}
+	if gone, err := r.auditRecordGone(rec); gone || err != nil {
+		return gone, err
 	}
 	info, perr := r.prb().probe(rec.PID)
 	switch {
@@ -328,17 +475,17 @@ func (r *Reaper) reapOrphan(ctx context.Context, rec Record) (bool, error) {
 	case info.zombie:
 		return true, nil
 	}
-	if _, err := r.sendSignal(target, syscall.SIGKILL); err != nil {
+	if _, err := r.sendRecordSignal(rec, syscall.SIGKILL); err != nil {
 		return false, err // Undetermined → fail closed
 	}
 	return r.awaitProcessSettlement(ctx, rec)
 }
 
-func (r *Reaper) reapGroup(ctx context.Context, rec Record, leader procInfo, leaderErr error) (bool, error) {
+func (r *Reaper) reapGroup(ctx context.Context, rec Record, leader procInfo, leaderErr error, permitCurrent bool) (bool, error) {
 	if rec.SessionID <= 1 || rec.SessionID != rec.PID {
 		return false, errors.New("process group has no durable dedicated-session identity")
 	}
-	if rec.Generation == r.Generation {
+	if !permitCurrent && rec.Generation == r.Generation {
 		return false, nil
 	}
 	switch {
@@ -389,6 +536,9 @@ func (r *Reaper) awaitProcessSettlement(ctx context.Context, rec Record) (bool, 
 	clock := clockOrReal(r.clock)
 	deadline := clock.Now().Add(r.settlementDur())
 	for {
+		if gone, err := r.auditRecordGone(rec); gone || err != nil {
+			return gone, err
+		}
 		info, err := r.prb().probe(rec.PID)
 		switch {
 		case errors.Is(err, errNoProc):
@@ -470,13 +620,6 @@ func (r *Reaper) verifiedGroupMembers(rec Record) ([]groupMember, error) {
 	return nil, errors.New("process-group membership changed during identity verification")
 }
 
-func signalTarget(rec Record) int {
-	if rec.ProcessGroup {
-		return -rec.PID
-	}
-	return rec.PID
-}
-
 // sendSignal delivers sig to pid, mapping ESRCH (already gone) to gone=true.
 func (r *Reaper) sendSignal(pid int, sig syscall.Signal) (gone bool, err error) {
 	if err := r.sig().signal(pid, sig); err != nil {
@@ -484,6 +627,40 @@ func (r *Reaper) sendSignal(pid int, sig syscall.Signal) (gone bool, err error) 
 			return true, nil
 		}
 		return false, err
+	}
+	return false, nil
+}
+
+func (r *Reaper) sendRecordSignal(rec Record, sig syscall.Signal) (bool, error) {
+	if rec.AuditToken.Valid() {
+		if r.auditSignal != nil {
+			return r.auditSignal(rec.AuditToken, sig)
+		}
+		return signalAuditToken(rec.AuditToken, sig)
+	}
+	return r.sendSignal(rec.PID, sig)
+}
+
+func (r *Reaper) auditExecutable(token AuditToken) (string, error) {
+	if r.auditPath != nil {
+		return r.auditPath(token)
+	}
+	return ExecutablePathAuditToken(token)
+}
+
+func (r *Reaper) auditRecordGone(rec Record) (bool, error) {
+	if !rec.AuditToken.Valid() {
+		return false, nil
+	}
+	path, err := r.auditExecutable(rec.AuditToken)
+	if errors.Is(err, ErrNoProcess) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("revalidate audit-token process: %w", err)
+	}
+	if path != rec.Executable {
+		return false, fmt.Errorf("%w: audit-token executable got %q, want %q", ErrIdentityChanged, path, rec.Executable)
 	}
 	return false, nil
 }
@@ -522,6 +699,35 @@ func (r *Reaper) settlementDur() time.Duration {
 type FileStore struct {
 	// Path is the JSON records file.
 	Path string
+
+	ops *recordFileOps
+}
+
+type recordFileOps struct {
+	syncTemp func(*os.File) error
+	rename   func(string, string) error
+	syncDir  func(string) error
+}
+
+func (s *FileStore) recordOps() recordFileOps {
+	ops := recordFileOps{
+		syncTemp: func(file *os.File) error { return file.Sync() },
+		rename:   os.Rename,
+		syncDir:  fsyncDir,
+	}
+	if s.ops == nil {
+		return ops
+	}
+	if s.ops.syncTemp != nil {
+		ops.syncTemp = s.ops.syncTemp
+	}
+	if s.ops.rename != nil {
+		ops.rename = s.ops.rename
+	}
+	if s.ops.syncDir != nil {
+		ops.syncDir = s.ops.syncDir
+	}
+	return ops
 }
 
 // Add records rec, replacing any prior record for the same process instance.
@@ -588,7 +794,7 @@ func (s *FileStore) mutate(ctx context.Context, fn func([]Record) []Record) erro
 	if err != nil {
 		return err
 	}
-	return writeRecords(s.Path, fn(recs))
+	return writeRecords(s.Path, fn(recs), s.recordOps())
 }
 
 // PID, boot, and start time: reuse within or across boots is a distinct instance.
@@ -630,7 +836,7 @@ func readRecords(path string) ([]Record, error) {
 	return file.Records, nil
 }
 
-func writeRecords(path string, recs []Record) error {
+func writeRecords(path string, recs []Record, ops recordFileOps) error {
 	if recs == nil {
 		recs = []Record{}
 	}
@@ -643,10 +849,11 @@ func writeRecords(path string, recs []Record) error {
 	if err != nil {
 		return fmt.Errorf("encode records: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := mkdirAllDurable(dir, 0o700, ops.syncDir); err != nil {
 		return fmt.Errorf("create records dir: %w", err)
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".records-*")
+	tmp, err := os.CreateTemp(dir, ".records-*")
 	if err != nil {
 		return fmt.Errorf("create temp records: %w", err)
 	}
@@ -656,13 +863,26 @@ func writeRecords(path string, recs []Record) error {
 		_ = os.Remove(tmpName)
 		return fmt.Errorf("write temp records: %w", err)
 	}
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("chmod temp records: %w", err)
+	}
+	if err := ops.syncTemp(tmp); err != nil {
+		tmp.Close()
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("fsync temp records: %w", err)
+	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmpName)
 		return fmt.Errorf("close temp records: %w", err)
 	}
-	if err := os.Rename(tmpName, path); err != nil {
+	if err := ops.rename(tmpName, path); err != nil {
 		_ = os.Remove(tmpName)
 		return fmt.Errorf("rename records into place: %w", err)
+	}
+	if err := ops.syncDir(dir); err != nil {
+		return fmt.Errorf("fsync records dir: %w", err)
 	}
 	return nil
 }

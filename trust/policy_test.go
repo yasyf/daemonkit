@@ -120,3 +120,40 @@ func TestRequirementExplicitlyIncludesAppGroupAndTypedExtras(t *testing.T) {
 		t.Fatalf("typed extras changed: %v", got)
 	}
 }
+
+func TestRequirementValidationDigestIsCanonicalAndComplete(t *testing.T) {
+	first := Requirement{
+		TeamID: "SXKCTF23Q2", SigningIdentifier: "com.yasyf.daemonkit.x",
+		RequiredAppGroup: "group.com.yasyf.daemonkit",
+		RequiredEntitlements: map[string]EntitlementRequirement{
+			"com.yasyf.role":    {Match: EntitlementString, String: "broker"},
+			"com.yasyf.enabled": {Match: EntitlementBoolean, Boolean: true},
+		},
+	}
+	second := Requirement{
+		TeamID: first.TeamID, SigningIdentifier: first.SigningIdentifier, RequiredAppGroup: first.RequiredAppGroup,
+		RequiredEntitlements: map[string]EntitlementRequirement{
+			"com.yasyf.enabled": first.RequiredEntitlements["com.yasyf.enabled"],
+			"com.yasyf.role":    first.RequiredEntitlements["com.yasyf.role"],
+		},
+	}
+	firstDigest, err := first.ValidationDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondDigest, err := second.ValidationDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstDigest != secondDigest || firstDigest == ([32]byte{}) {
+		t.Fatalf("canonical digests = %x / %x", firstDigest, secondDigest)
+	}
+	second.RequiredAppGroup = "group.com.yasyf.daemonkit.other"
+	changed, err := second.ValidationDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed == firstDigest {
+		t.Fatal("App Group requirement did not affect opaque validation digest")
+	}
+}

@@ -2,14 +2,29 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/trust"
+	"github.com/yasyf/daemonkit/wire"
 )
 
 const openPath = "/usr/bin/open"
+
+const (
+	appStopDeadline = 5 * time.Second
+	appStopQuiet    = 250 * time.Millisecond
+	appStopPoll     = 25 * time.Millisecond
+)
 
 // AppKeepAlive is a per-user KeepAlive LaunchAgent whose Program is
 // `/usr/bin/open -g -W <app>`: -W blocks until the app exits AND attaches to
@@ -26,6 +41,60 @@ type AppKeepAlive struct {
 	BundleID string
 	// RestartPolicy defines when launchd restarts the app waiter. Required.
 	RestartPolicy RestartPolicy
+}
+
+// AppProcessReaper durably owns one exact app process through bounded termination.
+type AppProcessReaper interface {
+	Reap(context.Context) error
+	TrackIdentity(context.Context, proc.Identity) (proc.Record, error)
+	Terminate(context.Context, proc.Record) error
+}
+
+// AppOwnedProcessRecovery settles durable child and process-group records left by the app.
+type AppOwnedProcessRecovery interface {
+	Reap(context.Context) error
+}
+
+// AppStopSpec identifies the fixed signed app endpoint and durable process owner.
+type AppStopSpec struct {
+	Dial           wire.Dialer
+	ExecutableName string
+	Requirement    trust.Requirement
+	// EntitlementValidationDigest is the opaque digest bound by the prior
+	// authenticated session; callers never disclose entitlement values here.
+	EntitlementValidationDigest [32]byte
+	Reaper                      AppProcessReaper
+	Dependents                  AppOwnedProcessRecovery
+
+	peerFromConn func(net.Conn) (wire.Peer, error)
+	processes    func(string) ([]proc.Identity, error)
+	checkPeer    func(wire.Peer, trust.Requirement) error
+	now          func() time.Time
+	pause        func(context.Context, time.Duration) error
+	deadline     time.Duration
+	quiet        time.Duration
+}
+
+// AuthenticatedAppPeer is the exact kernel and signed-policy identity proven
+// by a prior authenticated app session.
+type AuthenticatedAppPeer struct {
+	PID                         int
+	UID                         int
+	StartTime                   string
+	Boot                        string
+	Executable                  string
+	AuditTokenDigest            [32]byte
+	EntitlementValidationDigest [32]byte
+}
+
+// NewAuthenticatedAppPeer binds one accepted peer to the opaque digest of the
+// full signed-side trust requirement already checked for that session.
+func NewAuthenticatedAppPeer(peer wire.Peer, validationDigest [32]byte) AuthenticatedAppPeer {
+	return AuthenticatedAppPeer{
+		PID: peer.PID, UID: peer.UID, StartTime: peer.StartTime, Boot: peer.Boot,
+		Executable: peer.Executable, AuditTokenDigest: sha256.Sum256(peer.Audit),
+		EntitlementValidationDigest: validationDigest,
+	}
 }
 
 const keepAlivePlist = `<?xml version="1.0" encoding="UTF-8"?>
@@ -132,6 +201,273 @@ func (k AppKeepAlive) Install(ctx context.Context) error {
 	return nil
 }
 
+// Stop settles prior durable workers, authenticates and terminates every exact
+// fixed-app execution, withdraws launchd ownership, and requires a bounded
+// quiet interval with both the service unloaded and the exact executable absent.
+func (k AppKeepAlive) Stop(ctx context.Context, spec AppStopSpec, expected AuthenticatedAppPeer) error {
+	executable, err := k.validateStop(spec)
+	if err != nil {
+		return err
+	}
+	if err := expected.validate(executable); err != nil {
+		return err
+	}
+	if expected.EntitlementValidationDigest != spec.EntitlementValidationDigest {
+		return errors.New("keepalive agent: authenticated app peer trust requirement changed")
+	}
+	if err := spec.Reaper.Reap(ctx); err != nil {
+		return fmt.Errorf("reap preexisting fixed app workers: %w", err)
+	}
+	deadline := spec.timeNow().Add(spec.stopDeadline())
+	var quietSince time.Time
+	for {
+		conn, err := spec.Dial(ctx)
+		if err != nil && !appEndpointAbsent(err) {
+			return fmt.Errorf("dial fixed app: %w", err)
+		}
+		processes, inspectErr := spec.executableProcesses(executable)
+		if inspectErr != nil {
+			if conn != nil {
+				_ = conn.Close()
+			}
+			return fmt.Errorf("inventory fixed app executable: %w", inspectErr)
+		}
+		if conn != nil {
+			quietSince = time.Time{}
+			peer, err := spec.peer(conn)
+			if err != nil {
+				_ = conn.Close()
+				return fmt.Errorf("identify fixed app peer: %w", err)
+			}
+			if err := spec.check(peer); err != nil {
+				_ = conn.Close()
+				return fmt.Errorf("authenticate fixed app peer: %w", err)
+			}
+			if !expected.matches(peer) {
+				_ = conn.Close()
+				return errors.New("fixed app peer changed after authenticated proof")
+			}
+			record, err := spec.Reaper.TrackIdentity(ctx, peer.ProcessIdentity())
+			if err != nil {
+				_ = conn.Close()
+				return fmt.Errorf("durably track fixed app: %w", err)
+			}
+			if _, err := k.ensureUnloaded(ctx); err != nil {
+				_ = conn.Close()
+				return err
+			}
+			closeErr := conn.Close()
+			if err := spec.Reaper.Terminate(ctx, record); err != nil {
+				return fmt.Errorf("terminate fixed app: %w", err)
+			}
+			if closeErr != nil {
+				return fmt.Errorf("close fixed app session: %w", closeErr)
+			}
+			continue
+		}
+
+		if len(processes) == 0 {
+			reloaded, err := k.ensureUnloaded(ctx)
+			if err != nil {
+				return err
+			}
+			if reloaded {
+				quietSince = time.Time{}
+			}
+			now := spec.timeNow()
+			if quietSince.IsZero() {
+				quietSince = now
+			} else if now.Sub(quietSince) >= spec.stopQuiet() {
+				if err := spec.Dependents.Reap(ctx); err != nil {
+					return fmt.Errorf("reap fixed app dependents: %w", err)
+				}
+				return nil
+			}
+		} else {
+			quietSince = time.Time{}
+		}
+		if !spec.timeNow().Before(deadline) {
+			return fmt.Errorf("fixed app did not settle before deadline: %d exact executable process(es) remain", len(processes))
+		}
+		if err := spec.wait(ctx, appStopPoll); err != nil {
+			return err
+		}
+	}
+}
+
+func (p AuthenticatedAppPeer) validate(executable string) error {
+	if p.PID <= 1 || p.UID < 0 || p.StartTime == "" || p.Boot == "" || p.Executable != executable ||
+		p.AuditTokenDigest == ([32]byte{}) || p.EntitlementValidationDigest == ([32]byte{}) {
+		return errors.New("keepalive agent: authenticated app peer proof is incomplete")
+	}
+	return nil
+}
+
+func (p AuthenticatedAppPeer) matches(peer wire.Peer) bool {
+	return p.PID == peer.PID && p.UID == peer.UID && p.StartTime == peer.StartTime &&
+		p.Boot == peer.Boot && p.Executable == peer.Executable &&
+		p.AuditTokenDigest == sha256.Sum256(peer.Audit)
+}
+
+func (k AppKeepAlive) validateStop(spec AppStopSpec) (string, error) {
+	if err := k.validate(); err != nil {
+		return "", err
+	}
+	if spec.Dial == nil || spec.Reaper == nil || spec.Dependents == nil {
+		return "", errors.New("keepalive agent: app stop requires a dialer, durable reaper, and dependent recovery")
+	}
+	if spec.EntitlementValidationDigest == ([32]byte{}) {
+		return "", errors.New("keepalive agent: app stop entitlement validation digest is required")
+	}
+	if filepath.Base(spec.ExecutableName) != spec.ExecutableName || spec.ExecutableName == "." || spec.ExecutableName == "" {
+		return "", errors.New("keepalive agent: app stop executable name is invalid")
+	}
+	if k.BundleID == "" || spec.Requirement.SigningIdentifier != k.BundleID {
+		return "", errors.New("keepalive agent: app stop signing identifier must equal BundleID")
+	}
+	if _, err := spec.Requirement.DRString(); err != nil {
+		return "", fmt.Errorf("keepalive agent: app stop trust requirement: %w", err)
+	}
+	executable := filepath.Join(k.AppPath, "Contents", "MacOS", spec.ExecutableName)
+	if err := validateDirectAppPath(k.AppPath, executable); err != nil {
+		return "", err
+	}
+	return executable, nil
+}
+
+func validateDirectAppPath(appPath, executable string) error {
+	clean := filepath.Clean(executable)
+	current := string(filepath.Separator)
+	for _, element := range strings.Split(strings.TrimPrefix(clean, current), string(filepath.Separator)) {
+		current = filepath.Join(current, element)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return fmt.Errorf("keepalive agent: inspect fixed app path %s: %w", current, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("keepalive agent: fixed app path %s is a symlink", current)
+		}
+	}
+	app, err := os.Lstat(appPath)
+	if err != nil {
+		return fmt.Errorf("keepalive agent: inspect fixed app path %s: %w", appPath, err)
+	}
+	if !app.IsDir() {
+		return fmt.Errorf("keepalive agent: fixed app path %s is not a directory", appPath)
+	}
+	info, err := os.Lstat(executable)
+	if err != nil {
+		return fmt.Errorf("keepalive agent: inspect fixed app executable %s: %w", executable, err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("keepalive agent: fixed app executable %s is not a regular file", executable)
+	}
+	return nil
+}
+
+func (s AppStopSpec) peer(conn net.Conn) (wire.Peer, error) {
+	if s.peerFromConn != nil {
+		return s.peerFromConn(conn)
+	}
+	unix, ok := conn.(*net.UnixConn)
+	if !ok {
+		return wire.Peer{}, errors.New("fixed app dial did not return a Unix connection")
+	}
+	return wire.PeerFromConn(unix)
+}
+
+func (s AppStopSpec) executableProcesses(executable string) ([]proc.Identity, error) {
+	if s.processes != nil {
+		return s.processes(executable)
+	}
+	return proc.ExecutableIdentities(executable)
+}
+
+func (s AppStopSpec) check(peer wire.Peer) error {
+	if s.checkPeer != nil {
+		return s.checkPeer(peer, s.Requirement)
+	}
+	return (trust.Policy{Requirement: &s.Requirement}).Check(peer)
+}
+
+func (k AppKeepAlive) bootout(ctx context.Context) error {
+	if out, err := launchctl(ctx, "bootout", serviceTarget(k.Label)); err != nil && !notLoaded(err) {
+		return fmt.Errorf("launchctl bootout: %w: %s", err, out)
+	}
+	return nil
+}
+
+func (k AppKeepAlive) ensureUnloaded(ctx context.Context) (bool, error) {
+	loaded, err := k.loaded(ctx)
+	if err != nil {
+		return false, err
+	}
+	observedLoaded := loaded
+	if loaded {
+		if err := k.bootout(ctx); err != nil {
+			return false, err
+		}
+	}
+	loaded, err = k.loaded(ctx)
+	if err != nil {
+		return false, err
+	}
+	if loaded {
+		return false, errors.New("keepalive agent remained loaded after bootout")
+	}
+	return observedLoaded, nil
+}
+
+func (k AppKeepAlive) loaded(ctx context.Context) (bool, error) {
+	out, err := launchctl(ctx, "print", serviceTarget(k.Label))
+	if err == nil {
+		return true, nil
+	}
+	if notLoaded(err) {
+		return false, nil
+	}
+	return false, fmt.Errorf("launchctl print: %w: %s", err, out)
+}
+
+func (s AppStopSpec) timeNow() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
+}
+
+func (s AppStopSpec) wait(ctx context.Context, duration time.Duration) error {
+	if s.pause != nil {
+		return s.pause(ctx, duration)
+	}
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (s AppStopSpec) stopDeadline() time.Duration {
+	if s.deadline > 0 {
+		return s.deadline
+	}
+	return appStopDeadline
+}
+
+func (s AppStopSpec) stopQuiet() time.Duration {
+	if s.quiet > 0 {
+		return s.quiet
+	}
+	return appStopQuiet
+}
+
+func appEndpointAbsent(err error) bool {
+	return errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ECONNREFUSED)
+}
+
 // Uninstall boots out the agent and removes its plist; the app keeps running
 // (bootout kills the open waiter, not the app). A bootout failure other than
 // "not loaded" aborts before the plist is removed.
@@ -139,8 +475,8 @@ func (k AppKeepAlive) Uninstall(ctx context.Context) error {
 	if err := k.validate(); err != nil {
 		return err
 	}
-	if out, err := launchctl(ctx, "bootout", serviceTarget(k.Label)); err != nil && !notLoaded(err) {
-		return fmt.Errorf("launchctl bootout: %w: %s", err, out)
+	if err := k.bootout(ctx); err != nil {
+		return err
 	}
 	path, err := k.PlistPath()
 	if err != nil {

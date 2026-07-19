@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/wire"
 )
 
@@ -191,7 +192,20 @@ func TestPolicyCheckAcceptsSubstitutedPeer_TF1(t *testing.T) {
 }
 
 func TestPeerTokenPIDReuse_TF2(t *testing.T) {
-	t.Skip("TF2 (PID reuse) is nondeterministic to pin in-tree; documented limitation — see db24393")
+	conn := spawnPeerSub(t, "/bin/sleep", "86400")
+	peer, err := wire.PeerFromConn(conn)
+	if err != nil {
+		t.Fatalf("PeerFromConn: %v", err)
+	}
+	token, err := proc.AuditTokenFromBytes(peer.Audit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recycled := token
+	recycled[28] ^= 1
+	if _, err := proc.BindAuditTokenIdentity(recycled, peer.PID); err == nil {
+		t.Fatal("audit-token binding accepted a different pidversion for the live PID")
+	}
 }
 
 func TestPeerTokenFDDelegation_TF5(t *testing.T) {

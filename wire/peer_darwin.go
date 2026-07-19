@@ -8,8 +8,17 @@ import (
 	"unsafe"
 
 	"github.com/ebitengine/purego"
+	"github.com/yasyf/daemonkit/proc"
 	"golang.org/x/sys/unix"
 )
+
+func bindPeerIdentity(peer Peer) (proc.Identity, error) {
+	token, err := proc.AuditTokenFromBytes(peer.Audit)
+	if err != nil {
+		return proc.Identity{}, err
+	}
+	return proc.BindAuditTokenIdentity(token, peer.PID)
+}
 
 // auditTokenLen is the byte size of darwin's audit_token_t (8 uint32).
 const auditTokenLen = 32
