@@ -23,7 +23,8 @@ daemonkit/
 
 daemonkit is **extracted from the fleet** — fusekit (`proc/`, `service/`,
 `appgroup/`), cc-interact (`version/`, `paths/`), cc-orchestrate (`supervise/`),
-cc-pool, synckit, captain-hook, and authkit are the donors and the consumers.
+claude-pool (module `github.com/yasyf/cc-pool`), synckit, captain-hook, and
+authkit are the donors and the consumers.
 When porting code in, `cp` the file then edit in place — never recreate from
 scratch — so lifecycle bytes and reviewable diffs stay identical. daemonkit
 imports nothing from the fleet; dev wiring across repos uses an untracked
@@ -39,4 +40,4 @@ Run Go tests with `scripts/test.sh ./...` (a `ulimit -u` wrapper around
 exponential fork bomb that exhausts the process table and freezes the machine.
 The harness caps the per-UID process count so a runaway fails fast with
 `EAGAIN`. CI runs through the harness too. (See the 2026-06-24 mount-holder
-fork-storm incident, recorded in cc-pool's cc-notes: `ccn doc show ef281ea`.)
+fork-storm incident, recorded in claude-pool's cc-notes: `ccn doc show ef281ea`.)
