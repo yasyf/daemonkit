@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"syscall"
 	"time"
 
@@ -58,4 +59,31 @@ func signalerOrSys(s signaler) signaler {
 		return sysSignaler{}
 	}
 	return s
+}
+
+// processWaiter reaps an exited child when the incumbent is owned by this
+// process. Non-children remain observable only through their probed identity.
+type processWaiter interface {
+	wait(pid int) (bool, error)
+}
+
+type sysProcessWaiter struct{}
+
+func (sysProcessWaiter) wait(pid int) (bool, error) {
+	var status syscall.WaitStatus
+	waited, err := syscall.Wait4(pid, &status, syscall.WNOHANG, nil)
+	if errors.Is(err, syscall.ECHILD) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return waited == pid, nil
+}
+
+func processWaiterOrSys(w processWaiter) processWaiter {
+	if w == nil {
+		return sysProcessWaiter{}
+	}
+	return w
 }

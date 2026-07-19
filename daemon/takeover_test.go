@@ -359,6 +359,93 @@ func TestTakeoverRequestDaemonKillLadder(t *testing.T) {
 	}
 }
 
+func TestTakeoverRequestDaemonPIDExitWaitsAfterSIGKILL(t *testing.T) {
+	const start = "111.222"
+	tests := []struct {
+		name  string
+		after proberResult
+	}{
+		{name: "identity disappears", after: proberResult{err: proc.ErrNoProcess}},
+		{name: "pid is reused", after: proberResult{id: proc.Identity{PID: 100, StartTime: "999.000"}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prober := newSettlementGateProber(start, tt.after)
+			peer := &fakePeer{health: []healthResult{
+				{h: Health{Build: "1.0.0", PID: 100}},
+				{h: Health{Build: "1.0.0", PID: 100}},
+			}}
+			sig := &fakeSignaler{}
+			cfg := TakeoverConfig{
+				Self: "2.0.0", Peer: peer, Contract: RequestDaemon, WaitMode: PIDExit,
+				WaitTimeout: time.Second, clock: newAutoClock(), prober: prober, signaler: sig,
+			}
+
+			result := make(chan takeoverResult, 1)
+			go func() {
+				outcome, err := Run(context.Background(), cfg)
+				result <- takeoverResult{outcome: outcome, err: err}
+			}()
+			<-prober.entered
+			if calls := sig.calls(); !equalSignals(calls, []signalRec{{100, syscall.SIGKILL}}) {
+				t.Fatalf("signals = %v, want SIGKILL", calls)
+			}
+			select {
+			case got := <-result:
+				t.Fatalf("Run returned before exit proof: outcome=%s err=%v", got.outcome, got.err)
+			default:
+			}
+			close(prober.release)
+			got := <-result
+			if got.err != nil || got.outcome != Bind {
+				t.Fatalf("Run = (%s, %v), want bind", got.outcome, got.err)
+			}
+		})
+	}
+}
+
+func TestTakeoverRequestDaemonPIDExitTimesOutWithoutProof(t *testing.T) {
+	const start = "111.222"
+	peer := &fakePeer{health: []healthResult{
+		{h: Health{Build: "1.0.0", PID: 100}},
+		{h: Health{Build: "1.0.0", PID: 100}},
+	}}
+	prober := &fakeProber{results: []proberResult{
+		{id: proc.Identity{PID: 100, StartTime: start}},
+		{id: proc.Identity{PID: 100, StartTime: start}},
+		{id: proc.Identity{PID: 100, StartTime: start}},
+	}}
+	sig := &fakeSignaler{}
+	outcome, err := Run(context.Background(), TakeoverConfig{
+		Self: "2.0.0", Peer: peer, Contract: RequestDaemon, WaitMode: PIDExit,
+		WaitTimeout: 200 * time.Millisecond, clock: newAutoClock(), prober: prober, signaler: sig,
+	})
+	if !errors.Is(err, ErrReleaseTimeout) {
+		t.Fatalf("Run = (%s, %v), want ErrReleaseTimeout", outcome, err)
+	}
+	if outcome == Bind {
+		t.Fatal("takeover authorized bind without exit proof")
+	}
+}
+
+func TestTakeoverRequestDaemonPIDExitReapsChild(t *testing.T) {
+	predecessor := startBlockedProcess(t)
+	peer := &fakePeer{health: []healthResult{
+		{h: Health{Build: "1.0.0", PID: predecessor.pid()}},
+		{h: Health{Build: "1.0.0", PID: predecessor.pid()}},
+	}}
+	outcome, err := Run(context.Background(), TakeoverConfig{
+		Self: "2.0.0", Peer: peer, Contract: RequestDaemon, WaitMode: PIDExit,
+		Grace: time.Millisecond, WaitTimeout: 5 * time.Second,
+	})
+	if err != nil || outcome != Bind {
+		t.Fatalf("Run = (%s, %v), want bind", outcome, err)
+	}
+	if _, err := proc.Probe(predecessor.pid()); !errors.Is(err, proc.ErrNoProcess) {
+		t.Fatalf("Probe(reaped child) = %v, want ErrNoProcess", err)
+	}
+}
+
 func TestTakeoverRequestDaemonAlreadyGone(t *testing.T) {
 	peer := &fakePeer{health: []healthResult{{h: Health{Build: "1.0.0", PID: 100}}}}
 	prober := &fakeProber{results: []proberResult{{err: proc.ErrNoProcess}}}
@@ -516,6 +603,30 @@ type gatedProcessProber struct {
 	entered   chan struct{}
 	release   chan struct{}
 	unblocked bool
+}
+
+type settlementGateProber struct {
+	calls   int
+	start   string
+	after   proberResult
+	entered chan struct{}
+	release chan struct{}
+}
+
+func newSettlementGateProber(start string, after proberResult) *settlementGateProber {
+	return &settlementGateProber{
+		start: start, after: after, entered: make(chan struct{}), release: make(chan struct{}),
+	}
+}
+
+func (p *settlementGateProber) probe(pid int) (proc.Identity, error) {
+	p.calls++
+	if p.calls == 3 {
+		close(p.entered)
+		<-p.release
+		return p.after.id, p.after.err
+	}
+	return proc.Identity{PID: pid, StartTime: p.start}, nil
 }
 
 func newGatedProcessProber() *gatedProcessProber {

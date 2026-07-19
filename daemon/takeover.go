@@ -85,6 +85,7 @@ type TakeoverConfig struct {
 	clock       clock
 	prober      prober
 	signaler    signaler
+	waiter      processWaiter
 }
 
 // Run probes the incumbent and returns the takeover verdict: ExitSelf when
@@ -140,7 +141,14 @@ func (cfg TakeoverConfig) evictRequestDaemon(ctx context.Context, h Health) (Out
 	if err := cfg.sleep(ctx, cfg.grace()); err != nil {
 		return 0, err
 	}
-	return cfg.killIfSameOwner(ctx, victim, id.StartTime)
+	outcome, err := cfg.killIfSameOwner(ctx, victim, id.StartTime)
+	if err != nil || outcome != Bind || cfg.WaitMode != PIDExit {
+		return outcome, err
+	}
+	if err := cfg.waitProcessExit(ctx, victim, id.StartTime); err != nil {
+		return 0, err
+	}
+	return Bind, nil
 }
 
 // Signals victim only while the same {pid, start_time} still holds the socket; released, vanished, or reused means no signal.
@@ -213,6 +221,37 @@ func (cfg TakeoverConfig) waitRelease(ctx context.Context, h Health) error {
 	}
 }
 
+func (cfg TakeoverConfig) waitProcessExit(ctx context.Context, pid int, startTime string) error {
+	clk := cfg.clk()
+	deadline := clk.Now().Add(cfg.waitTimeout())
+	for {
+		id, err := cfg.prb().probe(pid)
+		if errors.Is(err, proc.ErrNoProcess) {
+			return nil
+		}
+		if err == nil && id.StartTime != startTime {
+			return nil
+		}
+		if err == nil {
+			reaped, waitErr := cfg.wtr().wait(pid)
+			if waitErr != nil {
+				return fmt.Errorf("wait incumbent %d: %w", pid, waitErr)
+			}
+			if reaped {
+				return nil
+			}
+		}
+		if clk.Now().After(deadline) {
+			return fmt.Errorf("%w after %s", ErrReleaseTimeout, cfg.waitTimeout())
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-clk.After(takeoverPollInterval):
+		}
+	}
+}
+
 func (cfg TakeoverConfig) releasedOnce(ctx context.Context, h Health, baseline string) (bool, error) {
 	switch cfg.WaitMode {
 	case SocketRelease:
@@ -247,9 +286,10 @@ func (cfg TakeoverConfig) sleep(ctx context.Context, d time.Duration) error {
 	}
 }
 
-func (cfg TakeoverConfig) clk() clock    { return clockOrReal(cfg.clock) }
-func (cfg TakeoverConfig) prb() prober   { return proberOrSys(cfg.prober) }
-func (cfg TakeoverConfig) sig() signaler { return signalerOrSys(cfg.signaler) }
+func (cfg TakeoverConfig) clk() clock         { return clockOrReal(cfg.clock) }
+func (cfg TakeoverConfig) prb() prober        { return proberOrSys(cfg.prober) }
+func (cfg TakeoverConfig) sig() signaler      { return signalerOrSys(cfg.signaler) }
+func (cfg TakeoverConfig) wtr() processWaiter { return processWaiterOrSys(cfg.waiter) }
 func (cfg TakeoverConfig) grace() time.Duration {
 	if cfg.Grace > 0 {
 		return cfg.Grace
