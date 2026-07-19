@@ -27,7 +27,8 @@ func (p Peer) ProcessIdentity() proc.Identity {
 // MatchesProcess reports whether rec names the exact process instance that
 // opened the accepted socket. Comm is informational and may change across exec.
 func (p Peer) MatchesProcess(rec proc.Record) bool {
-	return p.PID == rec.PID && p.StartTime != "" && p.StartTime == rec.StartTime
+	return p.PID == rec.PID && p.StartTime != "" && p.StartTime == rec.StartTime &&
+		p.Boot != "" && p.Boot == rec.Boot
 }
 
 // PeerFromConn reads conn's peer credentials and snapshots the corresponding

@@ -13,6 +13,8 @@ import (
 	"time"
 )
 
+const testBoot = "test-boot"
+
 func mustAdd(t *testing.T, s Store, rec Record) {
 	t.Helper()
 	if err := s.Add(context.Background(), rec); err != nil {
@@ -78,6 +80,15 @@ type fakeProber struct {
 	memberSets [][]groupMember
 	groupCalls int
 	groupErr   error
+	boot       string
+	bootErr    error
+}
+
+func (f *fakeProber) bootID() (string, error) {
+	if f.boot == "" {
+		return testBoot, f.bootErr
+	}
+	return f.boot, f.bootErr
 }
 
 type probeResult struct {
@@ -148,7 +159,7 @@ func liveInfo() procInfo { return procInfo{startTime: "111.222", comm: "worker"}
 
 func matchingRecord(pid int, gen string) Record {
 	i := liveInfo()
-	return Record{PID: pid, StartTime: i.startTime, Comm: i.comm, Generation: gen}
+	return Record{PID: pid, StartTime: i.startTime, Boot: testBoot, Comm: i.comm, Generation: gen}
 }
 
 func matchingGroupRecord(pid int, gen string) Record {
@@ -193,6 +204,13 @@ func TestTrackGroupAndUntrack(t *testing.T) {
 	}
 	if rec.PID != cmd.Process.Pid || rec.Generation != "current-gen" {
 		t.Fatalf("record = %+v, want pid %d generation current-gen", rec, cmd.Process.Pid)
+	}
+	boot, err := BootID()
+	if err != nil {
+		t.Fatalf("BootID: %v", err)
+	}
+	if rec.Boot != boot {
+		t.Fatalf("record boot = %q, want current kernel boot %q", rec.Boot, boot)
 	}
 	if store.len() != 1 {
 		t.Fatalf("store size = %d, want 1", store.len())
@@ -254,6 +272,45 @@ func TestOwnsRevalidatesProcessInstance(t *testing.T) {
 				t.Fatalf("Owns = %t, want %t", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestOwnsRequiresCurrentBootBeforeProcessProbe(t *testing.T) {
+	rec := matchingRecord(4242, "old-gen")
+	prober := &fakeProber{
+		boot: "current-boot",
+		info: liveInfo(),
+	}
+	r := &Reaper{prober: prober}
+
+	rec.Boot = "prior-boot"
+	owned, err := r.Owns(rec)
+	if err != nil {
+		t.Fatalf("Owns cross-boot record: %v", err)
+	}
+	if owned {
+		t.Fatal("Owns cross-boot record = true, want stale")
+	}
+	if got := prober.probedPIDs(); len(got) != 0 {
+		t.Fatalf("probed pids = %v, want none for cross-boot record", got)
+	}
+}
+
+func TestOwnsRejectsMissingBootBeforeProcessProbe(t *testing.T) {
+	rec := matchingRecord(4242, "old-gen")
+	rec.Boot = ""
+	prober := &fakeProber{info: liveInfo()}
+	r := &Reaper{prober: prober}
+
+	owned, err := r.Owns(rec)
+	if !errors.Is(err, ErrInvalidRecord) {
+		t.Fatalf("Owns error = %v, want ErrInvalidRecord", err)
+	}
+	if owned {
+		t.Fatal("Owns incomplete record = true, want false")
+	}
+	if got := prober.probedPIDs(); len(got) != 0 {
+		t.Fatalf("probed pids = %v, want none for incomplete record", got)
 	}
 }
 
@@ -340,12 +397,42 @@ func TestReapRejectsLegacyGroupWithoutSessionIdentity(t *testing.T) {
 	rec.ProcessGroup = true
 	mustAdd(t, store, rec)
 	prober := &fakeProber{byPID: map[int]probeResult{rec.PID: {err: errNoProc}}}
-	r := &Reaper{Store: store, Generation: "new-gen", prober: prober}
-	if err := r.Reap(context.Background()); err == nil || !strings.Contains(err.Error(), "no durable dedicated-session identity") {
-		t.Fatalf("Reap error = %v, want missing session identity failure", err)
+	sig := &recSignaler{err: errors.New("signal must not be sent")}
+	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig}
+	if err := r.Reap(context.Background()); !errors.Is(err, ErrInvalidRecord) {
+		t.Fatalf("Reap error = %v, want ErrInvalidRecord", err)
+	}
+	if got := prober.probedPIDs(); len(got) != 0 {
+		t.Fatalf("probed pids = %v, want none for invalid record", got)
+	}
+	if got := sig.calls(); len(got) != 0 {
+		t.Fatalf("signals = %v, want none for invalid record", got)
 	}
 	if store.len() != 1 {
 		t.Fatalf("store size = %d, want incompatible record retained", store.len())
+	}
+}
+
+func TestReapDropsCrossBootRecordWithoutProbeOrSignal(t *testing.T) {
+	store := &memStore{}
+	rec := matchingRecord(4181, "old-gen")
+	rec.Boot = "prior-boot"
+	mustAdd(t, store, rec)
+	prober := &fakeProber{boot: "current-boot", info: liveInfo()}
+	sig := &recSignaler{err: errors.New("signal must not be sent")}
+	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig}
+
+	if err := r.Reap(context.Background()); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	if got := prober.probedPIDs(); len(got) != 0 {
+		t.Fatalf("probed pids = %v, want none for stale cross-boot record", got)
+	}
+	if got := sig.calls(); len(got) != 0 {
+		t.Fatalf("signals = %v, want none for stale cross-boot record", got)
+	}
+	if store.len() != 0 {
+		t.Fatalf("store size = %d, want stale cross-boot record removed", store.len())
 	}
 }
 
@@ -709,8 +796,8 @@ func TestFileStoreRoundTrip(t *testing.T) {
 		t.Errorf("Load missing = %v, want empty", got)
 	}
 
-	a := Record{PID: 100, StartTime: "1.1", Comm: "a", Generation: "g1"}
-	b := Record{PID: 200, StartTime: "2.2", Comm: "b", Generation: "g1"}
+	a := Record{PID: 100, StartTime: "1.1", Boot: testBoot, Comm: "a", Generation: "g1"}
+	b := Record{PID: 200, StartTime: "2.2", Boot: testBoot, Comm: "b", Generation: "g1"}
 	mustAdd(t, store, a)
 	mustAdd(t, store, b)
 	mustAdd(t, store, a)
@@ -744,18 +831,44 @@ func TestFileStoreRemoveByInstance(t *testing.T) {
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	store := &FileStore{Path: filepath.Join(dir, "records.json")}
 
-	reused := Record{PID: 300, StartTime: "9.9", Comm: "new", Generation: "g2"}
-	mustAdd(t, store, Record{PID: 300, StartTime: "3.3", Comm: "old", Generation: "g1"})
-	mustAdd(t, store, reused)
+	current := Record{PID: 300, StartTime: "9.9", Boot: "current-boot", Comm: "new", Generation: "g2"}
+	mustAdd(t, store, Record{PID: 300, StartTime: "9.9", Boot: "prior-boot", Comm: "old", Generation: "g1"})
+	mustAdd(t, store, current)
 
-	if err := store.Remove(ctx, []Record{{PID: 300, StartTime: "3.3"}}); err != nil {
+	if err := store.Remove(ctx, []Record{{PID: 300, StartTime: "9.9", Boot: "prior-boot"}}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := store.Load(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].StartTime != "9.9" {
-		t.Errorf("Load = %v, want only the reused-pid instance (start 9.9)", got)
+	if len(got) != 1 || got[0] != current {
+		t.Errorf("Load = %v, want only current-boot instance %v", got, current)
+	}
+}
+
+func TestFileStoreRejectsLegacySchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "records.json")
+	legacy := `[{"pid":100,"start_time":"1.1","comm":"worker","generation":"old"}]`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := (&FileStore{Path: path}).Load(context.Background())
+	if !errors.Is(err, ErrRecordSchema) {
+		t.Fatalf("Load error = %v, want ErrRecordSchema", err)
+	}
+}
+
+func TestFileStoreRejectsCurrentSchemaRecordWithoutBoot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "records.json")
+	incomplete := `{"schema":2,"records":[{"pid":100,"start_time":"1.1","comm":"worker","generation":"old"}]}`
+	if err := os.WriteFile(path, []byte(incomplete), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := (&FileStore{Path: path}).Load(context.Background())
+	if !errors.Is(err, ErrInvalidRecord) {
+		t.Fatalf("Load error = %v, want ErrInvalidRecord", err)
 	}
 }

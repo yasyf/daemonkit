@@ -101,6 +101,29 @@ func TestManagedProcessCannotExecOrBecomeReadyBeforeDurableRecord(t *testing.T) 
 	assertPIDGone(t, pid)
 }
 
+func TestManagedProcessRejectsRecordWithoutBootBeforeExec(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "started")
+	registry := newFakeRegistry()
+	registry.recordBoot = ""
+	registry.trackStarted = make(chan int, 1)
+	pool, err := NewPool(1, registry)
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	_, err = pool.Start(context.Background(), managedProcessSpec(t, marker))
+	if !errors.Is(err, proc.ErrInvalidRecord) {
+		t.Fatalf("Start error = %v, want ErrInvalidRecord", err)
+	}
+	pid := <-registry.trackStarted
+	assertPIDGone(t, pid)
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("child executed with incomplete durable identity: %v", err)
+	}
+	if got := registry.recordCount(); got != 0 {
+		t.Fatalf("durable records = %d, want invalid record removed", got)
+	}
+}
+
 func TestManagedProcessReadinessTimeoutKillsReapsAndUntracks(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "started")
 	registry := newFakeRegistry()

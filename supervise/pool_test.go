@@ -32,6 +32,7 @@ type fakeRegistry struct {
 	ownsStarted  chan struct{}
 	ownsRelease  <-chan struct{}
 	reapErr      error
+	recordBoot   string
 	records      map[int]proc.Record
 }
 
@@ -41,7 +42,7 @@ type ownsResult struct {
 }
 
 func newFakeRegistry() *fakeRegistry {
-	return &fakeRegistry{owns: true, records: make(map[int]proc.Record)}
+	return &fakeRegistry{owns: true, recordBoot: "test-boot", records: make(map[int]proc.Record)}
 }
 
 func (f *fakeRegistry) TrackGroup(ctx context.Context, pid int) (proc.Record, error) {
@@ -65,6 +66,7 @@ func (f *fakeRegistry) TrackGroup(ctx context.Context, pid int) (proc.Record, er
 	rec := proc.Record{
 		PID:          pid,
 		StartTime:    "test-start",
+		Boot:         f.recordBoot,
 		Comm:         "worker",
 		Generation:   "test-generation",
 		ProcessGroup: true,
@@ -242,6 +244,33 @@ func TestRunTracksBeforeDispatchAndReaps(t *testing.T) {
 	pool.Close()
 	if err := pool.Wait(context.Background()); err != nil {
 		t.Fatalf("Wait: %v", err)
+	}
+}
+
+func TestRunRejectsRecordWithoutBootBeforeDispatch(t *testing.T) {
+	registry := newFakeRegistry()
+	registry.recordBoot = ""
+	registry.trackStarted = make(chan int, 1)
+	pool, err := NewPool(1, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := &bytes.Buffer{}
+	err = pool.Run(context.Background(), Task{
+		Path:   "/bin/cat",
+		Stdin:  workerInput(t, "must not execute"),
+		Stdout: out,
+	})
+	if !errors.Is(err, proc.ErrInvalidRecord) {
+		t.Fatalf("Run error = %v, want ErrInvalidRecord", err)
+	}
+	pid := <-registry.trackStarted
+	assertPIDGone(t, pid)
+	if got := out.String(); got != "" {
+		t.Fatalf("output = %q, want no dispatch", got)
+	}
+	if got := registry.recordCount(); got != 0 {
+		t.Fatalf("durable records = %d, want invalid record removed", got)
 	}
 }
 

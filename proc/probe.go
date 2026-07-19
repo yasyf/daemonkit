@@ -1,8 +1,8 @@
 package proc
 
 // Identity is a live process's revalidation identity. A PID paired with a
-// matching StartTime is the only safe kill authority: a reused PID gets a
-// fresh StartTime.
+// matching Boot and StartTime are the only safe kill authority: a reused PID
+// gets a fresh StartTime, and start stamps never cross boot sessions.
 type Identity struct {
 	PID       int
 	StartTime string

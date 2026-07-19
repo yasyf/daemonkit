@@ -1,10 +1,12 @@
 package proc
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -18,19 +20,31 @@ const DefaultReapGrace = 5 * time.Second
 // DefaultReapSettlement bounds post-SIGKILL identity polling.
 const DefaultReapSettlement = 2 * time.Second
 
-const settlementPollInterval = 10 * time.Millisecond
+const (
+	settlementPollInterval = 10 * time.Millisecond
+	recordSchemaVersion    = 2
+)
 
 // errNoProc is a definitive "gone", distinct from a probe failure (Undetermined, fails closed).
 var errNoProc = errors.New("no such process")
 
+var (
+	// ErrInvalidRecord means a durable process record lacks required identity.
+	ErrInvalidRecord = errors.New("proc: invalid durable process record")
+	// ErrRecordSchema means a durable process store is not the exact current format.
+	ErrRecordSchema = errors.New("proc: unsupported durable process record schema")
+)
+
 // Record identifies one spawned child across daemon generations. Reap pairs
-// PID with the opaque kernel start stamp before signaling; PID alone is never
-// kill authority, while Comm remains informational across exec.
+// PID with the boot session and opaque kernel start stamp before signaling;
+// PID alone is never kill authority, while Comm remains informational across exec.
 type Record struct {
 	// PID is the spawned child's process id.
 	PID int `json:"pid"`
 	// StartTime is the prober's opaque, platform-native process start stamp.
 	StartTime string `json:"start_time"`
+	// Boot is the kernel boot session in which StartTime was captured.
+	Boot string `json:"boot"`
 	// Comm is the child's initial OS-reported (truncated) process name.
 	Comm string `json:"comm"`
 	// Generation tags the daemon instance that spawned the child.
@@ -43,16 +57,47 @@ type Record struct {
 	SessionID int `json:"session_id,omitempty"`
 }
 
+// Validate rejects an incomplete durable process identity.
+func (r Record) Validate() error {
+	if err := validateRecordIdentity(r); err != nil {
+		return err
+	}
+	if r.Generation == "" {
+		return fmt.Errorf("%w: generation is required", ErrInvalidRecord)
+	}
+	if r.ProcessGroup {
+		if r.PID <= 1 || r.SessionID != r.PID {
+			return fmt.Errorf("%w: process group requires a dedicated session leader", ErrInvalidRecord)
+		}
+	} else if r.SessionID != 0 {
+		return fmt.Errorf("%w: non-group record has a session id", ErrInvalidRecord)
+	}
+	return nil
+}
+
+func validateRecordIdentity(r Record) error {
+	if r.PID <= 0 {
+		return fmt.Errorf("%w: pid is required", ErrInvalidRecord)
+	}
+	if r.StartTime == "" {
+		return fmt.Errorf("%w: start time is required", ErrInvalidRecord)
+	}
+	if r.Boot == "" {
+		return fmt.Errorf("%w: boot is required", ErrInvalidRecord)
+	}
+	return nil
+}
+
 // Store persists orphan Records across daemon generations; implementations
 // serialize read-modify-writes so a spawning daemon's Add never races a
 // successor's Remove.
 type Store interface {
 	// Add records a spawned child, replacing any prior record for the same
-	// process instance (PID + StartTime).
+	// process instance (PID + StartTime + Boot).
 	Add(ctx context.Context, rec Record) error
 	// Load returns every stored record.
 	Load(ctx context.Context) ([]Record, error)
-	// Remove deletes the given records (matched by PID + StartTime).
+	// Remove deletes the given records (matched by PID + StartTime + Boot).
 	Remove(ctx context.Context, victims []Record) error
 }
 
@@ -72,6 +117,7 @@ type groupMember struct {
 type prober interface {
 	probe(pid int) (procInfo, error)
 	groupMembers(groupID, sessionID int) ([]groupMember, error)
+	bootID() (string, error)
 }
 
 type sysProber struct{}
@@ -81,6 +127,8 @@ func (sysProber) probe(pid int) (procInfo, error) { return probeProc(pid) }
 func (sysProber) groupMembers(groupID, sessionID int) ([]groupMember, error) {
 	return probeGroupMembers(groupID, sessionID)
 }
+
+func (sysProber) bootID() (string, error) { return BootID() }
 
 type signaler interface {
 	signal(pid int, sig syscall.Signal) error
@@ -123,6 +171,10 @@ func (r *Reaper) TrackGroup(ctx context.Context, pid int) (Record, error) {
 }
 
 func (r *Reaper) track(ctx context.Context, pid int, processGroup bool) (Record, error) {
+	boot, err := r.prb().bootID()
+	if err != nil {
+		return Record{}, fmt.Errorf("snapshot boot identity: %w", err)
+	}
 	info, err := r.prb().probe(pid)
 	if err != nil {
 		return Record{}, fmt.Errorf("snapshot pid %d: %w", pid, err)
@@ -133,6 +185,7 @@ func (r *Reaper) track(ctx context.Context, pid int, processGroup bool) (Record,
 	rec := Record{
 		PID:          pid,
 		StartTime:    info.startTime,
+		Boot:         boot,
 		Comm:         info.comm,
 		Generation:   r.Generation,
 		ProcessGroup: processGroup,
@@ -156,6 +209,16 @@ func (r *Reaper) Untrack(ctx context.Context, rec Record) error {
 
 // Owns reports whether rec still identifies the same live process instance.
 func (r *Reaper) Owns(rec Record) (bool, error) {
+	if err := rec.Validate(); err != nil {
+		return false, err
+	}
+	boot, err := r.prb().bootID()
+	if err != nil {
+		return false, fmt.Errorf("revalidate boot identity: %w", err)
+	}
+	if rec.Boot != boot {
+		return false, nil
+	}
 	info, err := r.prb().probe(rec.PID)
 	if errors.Is(err, errNoProc) {
 		return false, nil
@@ -183,13 +246,17 @@ func (r *Reaper) Reap(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("load reaper records: %w", err)
 	}
+	boot, err := r.prb().bootID()
+	if err != nil {
+		return fmt.Errorf("load current boot identity: %w", err)
+	}
 	drop := make([]Record, 0, len(recs))
 	var unresolved []error
 	for _, rec := range recs {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		reaped, reapErr := r.reapOne(ctx, rec)
+		reaped, reapErr := r.reapOne(ctx, rec, boot)
 		if reapErr != nil {
 			unresolved = append(unresolved, fmt.Errorf("reap child %d: %w", rec.PID, reapErr))
 		}
@@ -206,7 +273,13 @@ func (r *Reaper) Reap(ctx context.Context) error {
 }
 
 // Drop only on provably gone, reused, or reaped; our own live child or an Undetermined probe fails closed and keeps the record.
-func (r *Reaper) reapOne(ctx context.Context, rec Record) (bool, error) {
+func (r *Reaper) reapOne(ctx context.Context, rec Record, boot string) (bool, error) {
+	if err := rec.Validate(); err != nil {
+		return false, err
+	}
+	if rec.Boot != boot {
+		return true, nil
+	}
 	if rec.PID <= 1 || rec.PID == os.Getpid() {
 		return false, errors.New("refusing unsafe process identity")
 	}
@@ -464,13 +537,16 @@ func (s *FileStore) Add(ctx context.Context, rec Record) error {
 	})
 }
 
-// Remove deletes the given records, matched by PID + StartTime.
+// Remove deletes the given records, matched by PID + StartTime + Boot.
 func (s *FileStore) Remove(ctx context.Context, victims []Record) error {
 	if len(victims) == 0 {
 		return nil
 	}
 	drop := make(map[string]struct{}, len(victims))
 	for _, v := range victims {
+		if err := validateRecordIdentity(v); err != nil {
+			return err
+		}
 		drop[recordKey(v)] = struct{}{}
 	}
 	return s.mutate(ctx, func(recs []Record) []Record {
@@ -515,8 +591,15 @@ func (s *FileStore) mutate(ctx context.Context, fn func([]Record) []Record) erro
 	return writeRecords(s.Path, fn(recs))
 }
 
-// PID plus start time: a reused PID is a distinct instance.
-func recordKey(r Record) string { return strconv.Itoa(r.PID) + "\x00" + r.StartTime }
+// PID, boot, and start time: reuse within or across boots is a distinct instance.
+func recordKey(r Record) string {
+	return strconv.Itoa(r.PID) + "\x00" + r.Boot + "\x00" + r.StartTime
+}
+
+type recordFile struct {
+	Schema  int      `json:"schema"`
+	Records []Record `json:"records"`
+}
 
 func readRecords(path string) ([]Record, error) {
 	data, err := os.ReadFile(path)
@@ -526,21 +609,37 @@ func readRecords(path string) ([]Record, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read records %s: %w", path, err)
 	}
-	if len(data) == 0 {
-		return nil, nil
+	var file recordFile
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&file); err != nil {
+		return nil, fmt.Errorf("%w: parse records %s: %w", ErrRecordSchema, path, err)
 	}
-	var recs []Record
-	if err := json.Unmarshal(data, &recs); err != nil {
-		return nil, fmt.Errorf("parse records %s: %w", path, err)
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("%w: trailing records data", ErrRecordSchema)
 	}
-	return recs, nil
+	if file.Schema != recordSchemaVersion {
+		return nil, fmt.Errorf("%w: got %d, want %d", ErrRecordSchema, file.Schema, recordSchemaVersion)
+	}
+	for _, rec := range file.Records {
+		if err := rec.Validate(); err != nil {
+			return nil, err
+		}
+	}
+	return file.Records, nil
 }
 
 func writeRecords(path string, recs []Record) error {
 	if recs == nil {
 		recs = []Record{}
 	}
-	data, err := json.MarshalIndent(recs, "", "  ")
+	for _, rec := range recs {
+		if err := rec.Validate(); err != nil {
+			return err
+		}
+	}
+	data, err := json.MarshalIndent(recordFile{Schema: recordSchemaVersion, Records: recs}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode records: %w", err)
 	}

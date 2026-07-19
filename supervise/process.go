@@ -155,7 +155,8 @@ func (p *Pool) Start(ctx context.Context, spec ProcessSpec) (*Process, error) {
 			unexpectedWaitError(waitErr),
 		)
 	}
-	if record.PID != cmd.Process.Pid || record.StartTime == "" ||
+	recordErr := record.Validate()
+	if recordErr != nil || record.PID != cmd.Process.Pid ||
 		!record.ProcessGroup || record.SessionID != record.PID {
 		_ = gateW.Close()
 		untrackErr := p.registry.Untrack(context.WithoutCancel(processCtx), record)
@@ -166,6 +167,7 @@ func (p *Pool) Start(ctx context.Context, spec ProcessSpec) (*Process, error) {
 		waitErr := cmd.Wait()
 		return nil, errors.Join(
 			errors.New("supervise: registry returned an invalid managed process record"),
+			recordErr,
 			untrackErr,
 			killErr,
 			unexpectedWaitError(waitErr),

@@ -303,6 +303,24 @@ func (p *Pool) Run(ctx context.Context, task Task) error {
 			unexpectedWaitError(waitErr),
 		)
 	}
+	if recordErr := rec.Validate(); recordErr != nil || rec.PID != cmd.Process.Pid ||
+		!rec.ProcessGroup || rec.SessionID != rec.PID {
+		_ = gateW.Close()
+		_ = statusR.Close()
+		untrackErr := p.registry.Untrack(context.WithoutCancel(workerCtx), rec)
+		if untrackErr != nil {
+			untrackErr = fmt.Errorf("supervise: untrack invalid worker process record: %w", untrackErr)
+		}
+		killErr := p.killUntrackedGroup(cmd.Process.Pid)
+		waitErr := cmd.Wait()
+		return errors.Join(
+			errors.New("supervise: registry returned an invalid worker process record"),
+			recordErr,
+			untrackErr,
+			killErr,
+			unexpectedWaitError(waitErr),
+		)
+	}
 
 	waited := make(chan error, 1)
 	go func() { waited <- cmd.Wait() }()

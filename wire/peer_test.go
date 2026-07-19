@@ -35,14 +35,17 @@ func TestPeerFromConnSelf(t *testing.T) {
 			if p.StartTime == "" || p.Comm == "" || p.Boot == "" {
 				t.Errorf("process identity = %+v, want complete kernel identity", p.ProcessIdentity())
 			}
-			if !p.MatchesProcess(proc.Record{PID: p.PID, StartTime: p.StartTime}) {
+			if !p.MatchesProcess(proc.Record{PID: p.PID, StartTime: p.StartTime, Boot: p.Boot}) {
 				t.Fatal("peer did not match its exact process record")
 			}
-			if p.MatchesProcess(proc.Record{PID: p.PID + 1, StartTime: p.StartTime}) {
+			if p.MatchesProcess(proc.Record{PID: p.PID + 1, StartTime: p.StartTime, Boot: p.Boot}) {
 				t.Fatal("peer matched a different pid")
 			}
-			if p.MatchesProcess(proc.Record{PID: p.PID, StartTime: p.StartTime + "-reused"}) {
+			if p.MatchesProcess(proc.Record{PID: p.PID, StartTime: p.StartTime + "-reused", Boot: p.Boot}) {
 				t.Fatal("peer matched a reused pid with a different start identity")
+			}
+			if p.MatchesProcess(proc.Record{PID: p.PID, StartTime: p.StartTime, Boot: p.Boot + "-other"}) {
+				t.Fatal("peer matched the same pid and start identity from another boot")
 			}
 			if runtime.GOOS == "darwin" {
 				if len(p.Audit) != 32 {
