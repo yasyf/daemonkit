@@ -255,7 +255,7 @@ func TestManagedProcessStopEscalatesAndReapsExactChild(t *testing.T) {
 	}
 }
 
-func TestManagedProcessContextCancellationUsesStopLadder(t *testing.T) {
+func TestManagedProcessStartupContextCancellationAfterReadyDoesNotStopProcess(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "started")
 	registry := newFakeRegistry()
 	pool, err := NewPool(1, registry)
@@ -269,8 +269,57 @@ func TestManagedProcessContextCancellationUsesStopLadder(t *testing.T) {
 	}
 	pid := readPIDFile(t, marker)
 	cancel()
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancelWait()
+	if err := process.Wait(waitCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Wait after startup cancellation = %v, want running process", err)
+	}
+	if got := registry.recordCount(); got != 1 {
+		t.Fatalf("durable records after startup cancellation = %d, want 1", got)
+	}
+	pool.Cancel()
+	if err := pool.Wait(context.Background()); err != nil {
+		t.Fatalf("pool Wait: %v", err)
+	}
 	if err := process.Wait(context.Background()); !errors.Is(err, ErrProcessStopped) {
-		t.Fatalf("Wait error = %v, want ErrProcessStopped", err)
+		t.Fatalf("Wait after pool cancellation = %v, want ErrProcessStopped", err)
+	}
+	assertPIDGone(t, pid)
+	if got := registry.recordCount(); got != 0 {
+		t.Fatalf("durable records = %d, want 0", got)
+	}
+}
+
+func TestManagedProcessStartupCancellationBeforeReadinessStopsAndReaps(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "started")
+	registry := newFakeRegistry()
+	registry.trackStarted = make(chan int, 1)
+	pool, err := NewPool(1, registry)
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	ready := make(chan struct{})
+	spec := managedProcessSpec(t, marker)
+	spec.Ready = func(ctx context.Context, _ proc.Record) error {
+		close(ready)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan error, 1)
+	go func() {
+		_, startErr := pool.Start(ctx, spec)
+		started <- startErr
+	}()
+	pid := <-registry.trackStarted
+	select {
+	case <-ready:
+	case <-time.After(time.Second):
+		t.Fatal("readiness did not start")
+	}
+	cancel()
+	if err := <-started; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start = %v, want context.Canceled", err)
 	}
 	assertPIDGone(t, pid)
 	if got := registry.recordCount(); got != 0 {

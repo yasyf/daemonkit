@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -15,7 +16,18 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/supervise"
 )
+
+const runtimeManagedProcessEnv = "DAEMONKIT_RUNTIME_MANAGED_PROCESS"
+
+func TestRuntimeManagedProcessHelper(_ *testing.T) {
+	if os.Getenv(runtimeManagedProcessEnv) == "" {
+		return
+	}
+	signal.Ignore(syscall.SIGTERM)
+	select {}
+}
 
 type runtimeEvents struct {
 	mu     sync.Mutex
@@ -197,6 +209,10 @@ type runtimeCloser struct {
 	err    error
 }
 
+type runtimeCloserFunc func() error
+
+func (f runtimeCloserFunc) Close() error { return f() }
+
 func (c *runtimeCloser) Close() error {
 	c.events.add(c.event)
 	return c.err
@@ -225,7 +241,7 @@ func runtimeTestConfig(t *testing.T, peer Peer) (RuntimeConfig, *runtimeEvents, 
 		Workers:   workers,
 		State:     &runtimeCloser{events: events, event: "state-close"},
 		Resources: &runtimeCloser{events: events, event: "resources-close"},
-		Activate: func(context.Context) error {
+		Activate: func(Activation) error {
 			events.add("activate")
 			return nil
 		},
@@ -286,6 +302,7 @@ func TestRuntimeShutdownOrderAndDoubleRunClose(t *testing.T) {
 		"server-close-intake",
 		"admission-settle",
 		"workers-close",
+		"workers-cancel",
 		"workers-wait",
 		"serve-exit",
 		"state-close",
@@ -412,7 +429,7 @@ func TestRuntimeTakeoverVersionOrdering(t *testing.T) {
 
 func TestRuntimeActivatesAfterListenerOwnershipBeforeServing(t *testing.T) {
 	cfg, events, server, _, _ := runtimeTestConfig(t, absentRuntimePeer())
-	cfg.Activate = func(context.Context) error {
+	cfg.Activate = func(Activation) error {
 		info, err := os.Lstat(cfg.Socket)
 		if err != nil {
 			return fmt.Errorf("activation listener: %w", err)
@@ -453,13 +470,158 @@ func TestRuntimeActivatesAfterListenerOwnershipBeforeServing(t *testing.T) {
 	}
 }
 
+func TestRuntimeSeparatesActivationStartupFromResourceLifetime(t *testing.T) {
+	cfg, events, server, admission, _ := runtimeTestConfig(t, absentRuntimePeer())
+	activated := make(chan Activation, 1)
+	var lifetime context.Context
+	cfg.Activate = func(activation Activation) error {
+		if err := activation.Startup.Err(); err != nil {
+			return fmt.Errorf("startup context entered canceled: %w", err)
+		}
+		if err := activation.Lifetime.Err(); err != nil {
+			return fmt.Errorf("lifetime context entered canceled: %w", err)
+		}
+		lifetime = activation.Lifetime
+		activated <- activation
+		events.add("activate")
+		return nil
+	}
+	cfg.Resources = runtimeCloserFunc(func() error {
+		events.add("resources-close")
+		if err := lifetime.Err(); !errors.Is(err, context.Canceled) {
+			return fmt.Errorf("resource lifetime at close = %v, want canceled", err)
+		}
+		return nil
+	})
+	runtime, err := NewRuntime(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := startRuntime(context.Background(), t, runtime, server)
+	activation := <-activated
+	select {
+	case <-activation.Startup.Done():
+	default:
+		t.Fatal("startup context remained live after activation returned")
+	}
+	select {
+	case <-activation.Lifetime.Done():
+		t.Fatal("resource lifetime ended before shutdown")
+	default:
+	}
+
+	doneRequest, err := admission.Admit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- runtime.Close(context.Background()) }()
+	events.wait(t, "admission-settle")
+	select {
+	case <-activation.Lifetime.Done():
+		t.Fatal("resource lifetime ended before admitted work drained")
+	default:
+	}
+	doneRequest()
+	select {
+	case <-activation.Lifetime.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("resource lifetime was not canceled during shutdown")
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatalf("Close = %v", err)
+	}
+	if err := waitRuntime(t, runDone); err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+	if events.index("admission-settle") >= events.index("resources-close") {
+		t.Fatalf("resource close preceded admission drain: %v", events.snapshot())
+	}
+}
+
+func TestRuntimeOwnsManagedProcessThroughServingAndPostDrainShutdown(t *testing.T) {
+	store := &proc.FileStore{Path: filepath.Join(t.TempDir(), "workers.json")}
+	pool, err := supervise.NewPool(1, &proc.Reaper{
+		Store: store, Generation: "runtime-test",
+	})
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	cfg, events, server, admission, _ := runtimeTestConfig(t, absentRuntimePeer())
+	cfg.Workers = pool
+	var process *supervise.Process
+	cfg.Activate = func(activation Activation) error {
+		var startErr error
+		process, startErr = pool.Start(activation.Startup, supervise.ProcessSpec{
+			Path: os.Args[0],
+			Args: []string{"-test.run=^TestRuntimeManagedProcessHelper$"},
+			Env:  append(os.Environ(), runtimeManagedProcessEnv+"=1"),
+		})
+		events.add("activate")
+		return startErr
+	}
+	runtime, err := NewRuntime(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := startRuntime(context.Background(), t, runtime, server)
+	if process == nil {
+		t.Fatal("activation did not publish managed process")
+	}
+	assertProcessRunning := func(stage string) {
+		t.Helper()
+		waitCtx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+		defer cancel()
+		if err := process.Wait(waitCtx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("managed process at %s = %v, want running", stage, err)
+		}
+	}
+	assertProcessRunning("serve")
+
+	doneRequest, err := admission.Admit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- runtime.Close(context.Background()) }()
+	events.wait(t, "admission-settle")
+	assertProcessRunning("admission drain")
+	doneRequest()
+	if err := <-closeDone; err != nil {
+		t.Fatalf("Close = %v", err)
+	}
+	if err := waitRuntime(t, runDone); err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+	if err := process.Wait(context.Background()); !errors.Is(err, supervise.ErrProcessStopped) {
+		t.Fatalf("managed process after shutdown = %v, want ErrProcessStopped", err)
+	}
+	records, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("durable process records after shutdown = %v, want none", records)
+	}
+}
+
 func TestRuntimeActivationFailureNeverServesAndClosesOwnedState(t *testing.T) {
 	want := errors.New("activate failed")
 	cfg, events, server, _, _ := runtimeTestConfig(t, absentRuntimePeer())
-	cfg.Activate = func(context.Context) error {
+	lifetimeDone := make(chan struct{})
+	cfg.Activate = func(activation Activation) error {
 		events.add("activate")
+		go func() {
+			<-activation.Lifetime.Done()
+			close(lifetimeDone)
+		}()
 		return want
 	}
+	cfg.Resources = runtimeCloserFunc(func() error {
+		<-lifetimeDone
+		events.add("resources-close")
+		return nil
+	})
 	runtime, err := NewRuntime(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -475,7 +637,7 @@ func TestRuntimeActivationFailureNeverServesAndClosesOwnedState(t *testing.T) {
 	}
 	wantEvents := []string{
 		"activate", "admission-close", "server-close-intake", "admission-settle",
-		"workers-close", "workers-wait", "state-close", "resources-close",
+		"workers-close", "workers-cancel", "workers-wait", "state-close", "resources-close",
 	}
 	if got := events.snapshot(); !reflect.DeepEqual(got, wantEvents) {
 		t.Fatalf("activation failure events = %v, want %v", got, wantEvents)
@@ -487,7 +649,7 @@ func TestRuntimeActivationFailureNeverServesAndClosesOwnedState(t *testing.T) {
 
 func TestRuntimeActivationPanicNeverServesAndClosesOwnedState(t *testing.T) {
 	cfg, events, server, _, _ := runtimeTestConfig(t, absentRuntimePeer())
-	cfg.Activate = func(context.Context) error {
+	cfg.Activate = func(Activation) error {
 		events.add("activate")
 		panic("activation exploded")
 	}
@@ -506,7 +668,7 @@ func TestRuntimeActivationPanicNeverServesAndClosesOwnedState(t *testing.T) {
 	}
 	wantEvents := []string{
 		"activate", "admission-close", "server-close-intake", "admission-settle",
-		"workers-close", "workers-wait", "state-close", "resources-close",
+		"workers-close", "workers-cancel", "workers-wait", "state-close", "resources-close",
 	}
 	if got := events.snapshot(); !reflect.DeepEqual(got, wantEvents) {
 		t.Fatalf("activation panic events = %v, want %v", got, wantEvents)
@@ -547,13 +709,14 @@ func TestRuntimeInterruptionsCancelAndJoinActivationBeforeCleanup(t *testing.T) 
 			entered := make(chan struct{})
 			canceled := make(chan struct{})
 			release := make(chan struct{})
-			cfg.Activate = func(ctx context.Context) error {
+			cfg.Activate = func(activation Activation) error {
 				events.add("activate")
 				close(entered)
-				<-ctx.Done()
+				<-activation.Startup.Done()
+				<-activation.Lifetime.Done()
 				close(canceled)
 				<-release
-				return ctx.Err()
+				return activation.Startup.Err()
 			}
 			parent, cancelParent := context.WithCancel(context.Background())
 			defer cancelParent()
@@ -605,7 +768,7 @@ func TestRuntimeRejectsProtocolMismatch(t *testing.T) {
 	if !errors.Is(err, ErrProtocolMismatch) {
 		t.Fatalf("Run = %v, want ErrProtocolMismatch", err)
 	}
-	want := []string{"workers-close", "workers-wait", "state-close", "resources-close"}
+	want := []string{"workers-close", "workers-cancel", "workers-wait", "state-close", "resources-close"}
 	if got := events.snapshot(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("events = %v, want %v", got, want)
 	}
@@ -736,8 +899,8 @@ func TestRuntimeWaitsForWorkerSettlementPastDeadline(t *testing.T) {
 	if cancels != 1 {
 		t.Fatalf("worker cancellations = %d, want 1: %v", cancels, got)
 	}
-	if events.index("workers-wait") >= events.index("workers-cancel") ||
-		events.index("workers-cancel") >= events.index("state-close") {
+	if events.index("workers-cancel") >= events.index("workers-wait") ||
+		events.index("workers-wait") >= events.index("state-close") {
 		t.Fatalf("deadline settlement order = %v", got)
 	}
 }
@@ -782,8 +945,8 @@ func TestRuntimeCloseUnstartedWaitsForWorkerSettlementPastDeadline(t *testing.T)
 	if cancels != 1 {
 		t.Fatalf("worker cancellations = %d, want 1: %v", cancels, got)
 	}
-	if events.index("workers-wait") >= events.index("workers-cancel") ||
-		events.index("workers-cancel") >= events.index("state-close") {
+	if events.index("workers-cancel") >= events.index("workers-wait") ||
+		events.index("workers-wait") >= events.index("state-close") {
 		t.Fatalf("unstarted deadline settlement order = %v", got)
 	}
 }
@@ -893,8 +1056,10 @@ func TestRuntimeCrashOrderContinuesCleanup(t *testing.T) {
 					t.Errorf("cleanup omitted %q: %v", required, got)
 				}
 			}
-			if events.index("workers-cancel") >= 0 {
-				t.Errorf("settled workers were canceled: %v", got)
+			if events.index("workers-cancel") < 0 ||
+				events.index("admission-settle") >= events.index("workers-cancel") ||
+				events.index("workers-cancel") >= events.index("workers-wait") {
+				t.Errorf("worker cancellation order = %v", got)
 			}
 		})
 	}

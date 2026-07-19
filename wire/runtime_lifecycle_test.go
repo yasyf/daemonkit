@@ -87,7 +87,7 @@ func TestRuntimeLifecycleAckPrecedesShutdownOrHandoff(t *testing.T) {
 				Workers:         settledWorkers{},
 				State:           lifecycleCloser{},
 				Resources:       lifecycleCloser{closed: settled},
-				Activate:        func(context.Context) error { return nil },
+				Activate:        func(daemon.Activation) error { return nil },
 				ShutdownTimeout: 3 * time.Second,
 				Signals:         make(chan os.Signal),
 			}
@@ -208,7 +208,7 @@ func TestRuntimeHandoffResponseSurvivesImmediateSessionClosure(t *testing.T) {
 			Peer: absentPeer{}, Contract: daemon.ResourceOwner, WaitMode: daemon.SocketRelease,
 			Admission: intake, Server: server, Workers: settledWorkers{},
 			State: lifecycleCloser{}, Resources: lifecycleCloser{},
-			Activate: func(context.Context) error { return nil },
+			Activate: func(daemon.Activation) error { return nil },
 			Handoff:  func(context.Context) error { return nil },
 			Signals:  make(chan os.Signal),
 		}
@@ -273,7 +273,7 @@ func TestResourceOwnerSocketReleaseKeepsLifecycleAvailableWhileDraining(t *testi
 		Peer: absentPeer{}, Contract: daemon.ResourceOwner, WaitMode: daemon.SocketRelease,
 		Admission: intake, Server: server, Workers: settledWorkers{},
 		State: lifecycleCloser{}, Resources: lifecycleCloser{},
-		Activate: func(context.Context) error { return nil },
+		Activate: func(daemon.Activation) error { return nil },
 		Handoff: func(ctx context.Context) error {
 			close(handoffStarted)
 			select {

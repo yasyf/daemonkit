@@ -229,7 +229,7 @@ func (p *Pool) Run(ctx context.Context, task Task) error {
 	if task.Path == "" {
 		return errors.New("supervise: worker path is required")
 	}
-	workerCtx, workerID, cancel, err := p.acquire(ctx)
+	workerCtx, workerID, cancel, err := p.acquire(ctx, ctx)
 	if err != nil {
 		return err
 	}
@@ -350,7 +350,10 @@ func (p *Pool) Run(ctx context.Context, task Task) error {
 	return p.await(workerCtx, rec, status, waited)
 }
 
-func (p *Pool) acquire(ctx context.Context) (context.Context, uint64, context.CancelFunc, error) {
+func (p *Pool) acquire(
+	wait context.Context,
+	lifetime context.Context,
+) (context.Context, uint64, context.CancelFunc, error) {
 	for {
 		p.mu.Lock()
 		if p.closed {
@@ -362,7 +365,7 @@ func (p *Pool) acquire(ctx context.Context) (context.Context, uint64, context.Ca
 			return nil, 0, nil, ErrCanceled
 		}
 		if p.active < p.limit {
-			workerCtx, cancel := context.WithCancel(ctx)
+			workerCtx, cancel := context.WithCancel(lifetime)
 			p.active++
 			p.nextID++
 			workerID := p.nextID
@@ -374,8 +377,8 @@ func (p *Pool) acquire(ctx context.Context) (context.Context, uint64, context.Ca
 		p.mu.Unlock()
 
 		select {
-		case <-ctx.Done():
-			return nil, 0, nil, fmt.Errorf("supervise: wait for worker slot: %w", ctx.Err())
+		case <-wait.Done():
+			return nil, 0, nil, fmt.Errorf("supervise: wait for worker slot: %w", wait.Err())
 		case <-changed:
 		}
 	}

@@ -102,16 +102,23 @@ func (p *Process) Stop(ctx context.Context) error {
 	}
 }
 
-// Start launches a long-lived child in a dedicated process group. The wrapper
-// cannot exec the child until its exact identity has been durably recorded.
-func (p *Pool) Start(ctx context.Context, spec ProcessSpec) (*Process, error) {
+// Start launches a long-lived child in a dedicated process group. startup
+// bounds launch and readiness only; after success, only Process.Stop or pool
+// cancellation ends the process lifetime.
+func (p *Pool) Start(startup context.Context, spec ProcessSpec) (*Process, error) {
 	if spec.Path == "" {
 		return nil, errors.New("supervise: managed process path is required")
 	}
-	processCtx, workerID, cancel, err := p.acquire(ctx)
+	processCtx, workerID, cancel, err := p.acquire(startup, context.WithoutCancel(startup))
 	if err != nil {
 		return nil, err
 	}
+	startupCtx, cancelStartup := context.WithCancel(startup)
+	stopStartup := context.AfterFunc(processCtx, cancelStartup)
+	defer func() {
+		stopStartup()
+		cancelStartup()
+	}()
 	cleanupSlot := true
 	defer func() {
 		if cleanupSlot {
@@ -119,7 +126,7 @@ func (p *Pool) Start(ctx context.Context, spec ProcessSpec) (*Process, error) {
 			p.release(workerID)
 		}
 	}()
-	if err := processCtx.Err(); err != nil {
+	if err := startupCtx.Err(); err != nil {
 		return nil, fmt.Errorf("supervise: managed process canceled before start: %w", err)
 	}
 
@@ -136,7 +143,7 @@ func (p *Pool) Start(ctx context.Context, spec ProcessSpec) (*Process, error) {
 	}
 	_ = readyW.Close()
 	_ = gateR.Close()
-	if err := awaitWrapperReady(processCtx, readyR); err != nil {
+	if err := awaitWrapperReady(startupCtx, readyR); err != nil {
 		_ = gateW.Close()
 		killErr := p.killUntrackedGroup(cmd.Process.Pid)
 		waitErr := cmd.Wait()
@@ -147,7 +154,7 @@ func (p *Pool) Start(ctx context.Context, spec ProcessSpec) (*Process, error) {
 		)
 	}
 
-	record, err := p.registry.TrackGroup(processCtx, cmd.Process.Pid)
+	record, err := p.registry.TrackGroup(startupCtx, cmd.Process.Pid)
 	if err != nil {
 		_ = gateW.Close()
 		killErr := p.killUntrackedGroup(cmd.Process.Pid)
@@ -162,7 +169,7 @@ func (p *Pool) Start(ctx context.Context, spec ProcessSpec) (*Process, error) {
 	if recordErr != nil || record.PID != cmd.Process.Pid ||
 		!record.ProcessGroup || record.SessionID != record.PID {
 		_ = gateW.Close()
-		untrackErr := p.registry.Untrack(context.WithoutCancel(processCtx), record)
+		untrackErr := p.registry.Untrack(context.WithoutCancel(startupCtx), record)
 		if untrackErr != nil {
 			untrackErr = fmt.Errorf("supervise: untrack invalid managed process record: %w", untrackErr)
 		}
@@ -177,9 +184,9 @@ func (p *Pool) Start(ctx context.Context, spec ProcessSpec) (*Process, error) {
 		)
 	}
 	if spec.Recorded != nil {
-		if err := spec.Recorded(processCtx, record); err != nil {
+		if err := spec.Recorded(startupCtx, record); err != nil {
 			_ = gateW.Close()
-			untrackErr := p.registry.Untrack(context.WithoutCancel(processCtx), record)
+			untrackErr := p.registry.Untrack(context.WithoutCancel(startupCtx), record)
 			if untrackErr != nil {
 				untrackErr = fmt.Errorf("supervise: untrack rejected managed process record: %w", untrackErr)
 			}
@@ -202,15 +209,29 @@ func (p *Pool) Start(ctx context.Context, spec ProcessSpec) (*Process, error) {
 	cleanupSlot = false
 
 	if err := writePayload(gateW, []byte("start\n")); err != nil {
-		stopErr := process.Stop(context.WithoutCancel(ctx))
+		stopErr := process.Stop(context.WithoutCancel(startup))
 		return nil, errors.Join(fmt.Errorf("supervise: release managed process gate: %w", err), stopErr)
 	}
 	if spec.Ready == nil {
+		if err := startupCtx.Err(); err != nil {
+			stopErr := process.Stop(context.WithoutCancel(startup))
+			return nil, errors.Join(
+				fmt.Errorf("supervise: managed process startup: %w", err),
+				stopErr,
+			)
+		}
 		return process, nil
 	}
-	if err := process.awaitReady(processCtx, spec); err != nil {
-		stopErr := process.Stop(context.WithoutCancel(ctx))
+	if err := process.awaitReady(startupCtx, spec); err != nil {
+		stopErr := process.Stop(context.WithoutCancel(startup))
 		return nil, errors.Join(err, stopErr)
+	}
+	if err := startupCtx.Err(); err != nil {
+		stopErr := process.Stop(context.WithoutCancel(startup))
+		return nil, errors.Join(
+			fmt.Errorf("supervise: managed process startup: %w", err),
+			stopErr,
+		)
 	}
 	return process, nil
 }

@@ -49,6 +49,14 @@ type Resources interface {
 	Close() error
 }
 
+// Activation separates bounded startup work from the runtime-owned resource
+// lifetime. Startup is canceled when Activate returns. Lifetime remains live
+// after successful activation until ordered shutdown reaches resource teardown.
+type Activation struct {
+	Startup  context.Context
+	Lifetime context.Context
+}
+
 // RuntimeConfig defines one daemon process generation. Every ownership seam is
 // required so a partial shutdown cannot silently omit a lifecycle phase.
 type RuntimeConfig struct {
@@ -69,8 +77,9 @@ type RuntimeConfig struct {
 	Resources    Resources
 	// Activate constructs and publishes the generation's owned state only after
 	// listener acquisition and takeover have established exclusive ownership.
-	// Cancellation must not return until every activation-started operation is settled.
-	Activate func(context.Context) error
+	// It must use Startup only for bounded construction and readiness, and
+	// Lifetime for resources retained after a successful return.
+	Activate func(Activation) error
 
 	// Handoff transfers external ownership during an upgrade. It is required
 	// exactly for ResourceOwner and is never called for ordinary shutdown.
@@ -240,7 +249,7 @@ func (r *Runtime) Run(ctx context.Context) (err error) {
 
 	signalCh, stopSignals := r.signalChannel()
 	defer stopSignals()
-	activated, activationCause, activateErr := r.activate(ctx, signalCh)
+	cancelActivation, activated, activationCause, activateErr := r.activate(ctx, signalCh)
 	if !activated {
 		closeErr := r.closeAcquired(ctx, listener, lock)
 		return errors.Join(activationCause, activateErr, closeErr)
@@ -279,54 +288,69 @@ func (r *Runtime) Run(ctx context.Context) (err error) {
 		}
 	}
 
-	shutdownErr := r.shutdown(ctx, kind, listener, lock, cancelServe, serveDone, servedEarly)
+	shutdownErr := r.shutdown(
+		ctx, kind, listener, lock, cancelActivation, cancelServe, serveDone, servedEarly,
+	)
 	return errors.Join(cause, shutdownErr)
 }
 
-func (r *Runtime) activate(parent context.Context, signalCh <-chan os.Signal) (bool, error, error) {
-	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
+func (r *Runtime) activate(
+	parent context.Context,
+	signalCh <-chan os.Signal,
+) (context.CancelFunc, bool, error, error) {
+	startup, cancelStartup := context.WithCancel(parent)
+	lifetime, cancelLifetime := context.WithCancel(context.WithoutCancel(parent))
 	done := make(chan error, 1)
-	go func() { done <- runActivation(ctx, r.cfg.Activate) }()
-	defer cancel()
+	go func() {
+		done <- runActivation(Activation{Startup: startup, Lifetime: lifetime}, r.cfg.Activate)
+	}()
 
 	select {
 	case err := <-done:
+		cancelStartup()
 		if err != nil {
-			return false, nil, fmt.Errorf("daemon: activate runtime: %w", err)
+			cancelLifetime()
+			return nil, false, nil, fmt.Errorf("daemon: activate runtime: %w", err)
 		}
 		if err := parent.Err(); err != nil {
-			return false, err, nil
+			cancelLifetime()
+			return nil, false, err, nil
 		}
 		select {
 		case <-r.stop:
-			return false, nil, nil
+			cancelLifetime()
+			return nil, false, nil, nil
 		default:
 		}
 		select {
 		case <-signalCh:
-			return false, nil, nil
+			cancelLifetime()
+			return nil, false, nil, nil
 		default:
 		}
-		return true, nil, nil
+		return cancelLifetime, true, nil, nil
 	case <-r.stop:
-		cancel()
-		return false, nil, interruptedActivationError(<-done)
+		cancelStartup()
+		cancelLifetime()
+		return nil, false, nil, interruptedActivationError(<-done)
 	case <-parent.Done():
-		cancel()
-		return false, parent.Err(), interruptedActivationError(<-done)
+		cancelStartup()
+		cancelLifetime()
+		return nil, false, parent.Err(), interruptedActivationError(<-done)
 	case <-signalCh:
-		cancel()
-		return false, nil, interruptedActivationError(<-done)
+		cancelStartup()
+		cancelLifetime()
+		return nil, false, nil, interruptedActivationError(<-done)
 	}
 }
 
-func runActivation(ctx context.Context, activate func(context.Context) error) (err error) {
+func runActivation(activation Activation, activate func(Activation) error) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err = fmt.Errorf("daemon: activation panic: %v", recovered)
 		}
 	}()
-	return activate(ctx)
+	return activate(activation)
 }
 
 func interruptedActivationError(err error) error {
@@ -415,6 +439,7 @@ func (r *Runtime) shutdown(
 	kind stopKind,
 	listener net.Listener,
 	lock *os.File,
+	cancelActivation context.CancelFunc,
 	cancelServe context.CancelFunc,
 	serveDone <-chan error,
 	servedEarly bool,
@@ -439,6 +464,7 @@ func (r *Runtime) shutdown(
 		}
 	}
 
+	cancelActivation()
 	cancelServe()
 	if !servedEarly {
 		if err := <-serveDone; err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {
@@ -505,24 +531,8 @@ func (r *Runtime) closeUnstarted(parent context.Context) error {
 
 func settleWorkers(ctx context.Context, workers Workers) error {
 	workers.Close()
-	settled := make(chan error, 1)
-	go func() {
-		settled <- workers.Wait(ctx)
-	}()
-
-	select {
-	case err := <-settled:
-		return err
-	case <-ctx.Done():
-	}
-
-	select {
-	case err := <-settled:
-		return err
-	default:
-	}
 	workers.Cancel()
-	return errors.Join(ctx.Err(), <-settled)
+	return workers.Wait(ctx)
 }
 
 func wrapRuntimeClose(action string, err error) error {
