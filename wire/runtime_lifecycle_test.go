@@ -215,7 +215,13 @@ func TestRuntimeHandoffResponseSurvivesImmediateSessionClosure(t *testing.T) {
 		server.RegisterLifecycle(runtime)
 		runDone := make(chan error, 1)
 		go func() { runDone <- runtime.Run(context.Background()) }()
-		client := newRuntimeClient(t, path, "server-test")
+		client := newRuntimeClientWithDial(t, "server-test", func(ctx context.Context) (net.Conn, error) {
+			conn, err := wire.UnixDialer(path)(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return &failResponseWindowConn{Conn: conn, requestWritten: make(chan struct{})}, nil
+		})
 		payload, err := lifeproto.Encode(lifeproto.NewHandoffRequest())
 		if err != nil {
 			t.Fatalf("iteration %d: Encode: %v", iteration, err)
@@ -398,10 +404,15 @@ func dialRuntime(t *testing.T, path string) net.Conn {
 
 func newRuntimeClient(t *testing.T, path, build string) *wire.Client {
 	t.Helper()
+	return newRuntimeClientWithDial(t, build, wire.UnixDialer(path))
+}
+
+func newRuntimeClientWithDial(t *testing.T, build string, dial wire.Dialer) *wire.Client {
+	t.Helper()
 	deadline := time.Now().Add(time.Second)
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		client, err := wire.NewClient(ctx, wire.ClientConfig{Dial: wire.UnixDialer(path), Build: build})
+		client, err := wire.NewClient(ctx, wire.ClientConfig{Dial: dial, Build: build})
 		cancel()
 		if err == nil {
 			return client

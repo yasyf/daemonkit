@@ -128,15 +128,16 @@ type outboundFrame struct {
 
 // ClientCall is one in-flight request on a Client.
 type ClientCall struct {
-	client       *Client
-	id           uint64
-	chunks       chan Chunk
-	inbound      *boundedStream[Chunk]
-	ready        chan struct{}
-	deliveryDone chan struct{}
-	deliveryOnce sync.Once
-	sendCredits  *creditWindow
-	sendMu       sync.Mutex
+	client         *Client
+	id             uint64
+	responseStream bool
+	chunks         chan Chunk
+	inbound        *boundedStream[Chunk]
+	ready          chan struct{}
+	deliveryDone   chan struct{}
+	deliveryOnce   sync.Once
+	sendCredits    *creditWindow
+	sendMu         sync.Mutex
 
 	mu              sync.Mutex
 	terminal        callResult
@@ -228,9 +229,10 @@ func (c *Client) PeerBuild() BuildIdentity { return c.peer }
 // Events returns the bounded server-pushed event stream.
 func (c *Client) Events() <-chan Event { return c.eventOut }
 
-// Call sends a unary request and waits for its terminal response.
+// Call sends a unary request without response-stream negotiation and waits for
+// its terminal response.
 func (c *Client) Call(ctx context.Context, op Op, tenant string, payload []byte) (Result, error) {
-	call, err := c.Open(ctx, op, tenant, payload, true)
+	call, err := c.open(ctx, op, tenant, payload, true, false)
 	if err != nil {
 		outcome := PreSendFailure
 		var openErr *OpenError
@@ -242,9 +244,21 @@ func (c *Client) Call(ctx context.Context, op Op, tenant string, payload []byte)
 	return call.Response(ctx)
 }
 
-// Open starts a request. endInput marks payload as the complete request body;
-// pass false to follow it with SendChunk and CloseSend.
+// Open starts a request that may return a streamed response. endInput marks
+// payload as the complete request body; pass false to follow it with SendChunk
+// and CloseSend.
 func (c *Client) Open(ctx context.Context, op Op, tenant string, payload []byte, endInput bool) (*ClientCall, error) {
+	return c.open(ctx, op, tenant, payload, endInput, true)
+}
+
+func (c *Client) open(
+	ctx context.Context,
+	op Op,
+	tenant string,
+	payload []byte,
+	endInput bool,
+	responseStream bool,
+) (*ClientCall, error) {
 	if op == "" {
 		return nil, &OpenError{Outcome: PreSendFailure, Err: errors.New("wire: operation is required")}
 	}
@@ -253,15 +267,16 @@ func (c *Client) Open(ctx context.Context, op Op, tenant string, payload []byte,
 	}
 	id := c.nextID.Add(1)
 	call := &ClientCall{
-		client:       c,
-		id:           id,
-		chunks:       make(chan Chunk),
-		inbound:      newBoundedStream[Chunk](c.streamCap),
-		ready:        make(chan struct{}),
-		deliveryDone: make(chan struct{}),
-		sendCredits:  newCreditWindow(),
-		sendEnded:    endInput,
-		receiveEnded: false,
+		client:         c,
+		id:             id,
+		responseStream: responseStream,
+		chunks:         make(chan Chunk),
+		inbound:        newBoundedStream[Chunk](c.streamCap),
+		ready:          make(chan struct{}),
+		deliveryDone:   make(chan struct{}),
+		sendCredits:    newCreditWindow(),
+		sendEnded:      endInput,
+		receiveEnded:   false,
 	}
 	c.mu.Lock()
 	c.pending[id] = call
@@ -283,13 +298,17 @@ func (c *Client) Open(ctx context.Context, op Op, tenant string, payload []byte,
 		return nil, &OpenError{Outcome: requestOutcome, Err: fmt.Errorf("wire: send request: %w", err)}
 	}
 	requestOutcome = PostSendFailure
-	if err := c.sendFrame(callCtx, Frame{Kind: FrameWindow, ID: id, Sequence: c.streamWindow}); err != nil {
-		cancel()
-		err = fmt.Errorf("wire: grant response window: %w", err)
-		c.fail(err)
-		return nil, &OpenError{Outcome: requestOutcome, Err: err}
+	if responseStream {
+		if err := c.sendFrame(callCtx, Frame{Kind: FrameWindow, ID: id, Sequence: c.streamWindow}); err != nil {
+			cancel()
+			err = fmt.Errorf("wire: grant response window: %w", err)
+			c.fail(err)
+			return nil, &OpenError{Outcome: requestOutcome, Err: err}
+		}
+		go call.deliverChunks()
+	} else {
+		close(call.chunks)
 	}
-	go call.deliverChunks()
 	go func() {
 		defer cancel()
 		select {
@@ -666,6 +685,9 @@ func (c *Client) receiveStream(frame Frame) error {
 	c.mu.Unlock()
 	if call == nil {
 		return nil
+	}
+	if !call.responseStream {
+		return ErrFlowControl
 	}
 	call.mu.Lock()
 	if call.receiveEnded {

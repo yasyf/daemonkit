@@ -129,7 +129,7 @@ func newClient(t *testing.T, running *runningServer, config func(*wire.ClientCon
 	return client
 }
 
-func TestCallClassifiesResponseWindowFailureAfterRequestCommitAsPostSend(t *testing.T) {
+func TestCallDoesNotNegotiateResponseStream(t *testing.T) {
 	var calls atomic.Int32
 	server := &wire.Server{Build: "server-test"}
 	server.RegisterControl("mutate", func(context.Context, wire.Request) (any, error) {
@@ -154,16 +154,51 @@ func TestCallClassifiesResponseWindowFailureAfterRequestCommitAsPostSend(t *test
 	t.Cleanup(func() { _ = client.Close() })
 
 	result, err := client.Call(context.Background(), "mutate", "", nil)
+	if err != nil || result.Outcome != wire.Delivered || string(result.Response.Payload) != "true" {
+		t.Fatalf("Call = %#v, %v", result, err)
+	}
+	select {
+	case <-requestWritten:
+	default:
+		t.Fatal("request frame was not committed")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("handler calls = %d, want 1", calls.Load())
+	}
+}
+
+func TestOpenClassifiesResponseWindowFailureAfterRequestCommitAsPostSend(t *testing.T) {
+	var calls atomic.Int32
+	server := &wire.Server{Build: "server-test"}
+	server.RegisterControl("mutate", func(context.Context, wire.Request) (any, error) {
+		calls.Add(1)
+		return true, nil
+	})
+	running := startSessionServer(t, server, func() (func(), error) { return func() {}, nil })
+	requestWritten := make(chan struct{})
+	client, err := wire.NewClient(context.Background(), wire.ClientConfig{
+		Build: "server-test",
+		Dial: func(ctx context.Context) (net.Conn, error) {
+			conn, err := wire.UnixDialer(running.path)(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return &failResponseWindowConn{Conn: conn, requestWritten: requestWritten}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	call, err := client.Open(context.Background(), "mutate", "", nil, true)
 	if err == nil {
-		t.Fatal("Call succeeded after response-window write failure")
+		t.Fatalf("Open succeeded after response-window write failure: %#v", call)
 	}
 	select {
 	case <-requestWritten:
 	default:
 		t.Fatal("request frame was not committed before response-window failure")
-	}
-	if result.Outcome != wire.PostSendFailure {
-		t.Fatalf("outcome = %s, want %s", result.Outcome, wire.PostSendFailure)
 	}
 	var openErr *wire.OpenError
 	if !errors.As(err, &openErr) || openErr.Outcome != wire.PostSendFailure {
