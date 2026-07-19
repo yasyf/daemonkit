@@ -10,23 +10,6 @@ private let applicationGroupsKey = "com.apple.security.application-groups"
 private let runtimeAndLibraryValidation: UInt32 = 0x0001_0000 | 0x0000_2000
 private let trustE2EEnabled = ProcessInfo.processInfo.environment["DAEMONKIT_TRUST_E2E"] == "1"
 
-private func shortSocketDir() throws -> URL {
-    let dir = URL(fileURLWithPath: "/tmp/dk-tr-\(getpid())-\(UInt32.random(in: 0 ..< 0xFFFF))")
-    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    return dir
-}
-
-private func makeAddress(path: String) -> sockaddr_un? {
-    var address = sockaddr_un()
-    address.sun_family = sa_family_t(AF_UNIX)
-    let bytes = Array(path.utf8)
-    guard bytes.count < MemoryLayout.size(ofValue: address.sun_path) else { return nil }
-    withUnsafeMutableBytes(of: &address.sun_path) { destination in
-        bytes.withUnsafeBytes { destination.copyMemory(from: $0) }
-    }
-    return address
-}
-
 private func withAddress<Result>(
     _ address: inout sockaddr_un,
     _ body: (UnsafePointer<sockaddr>, socklen_t) -> Result
