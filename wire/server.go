@@ -26,14 +26,15 @@ var (
 )
 
 const (
-	defaultWorkers          = 8
-	defaultBacklog          = 32
-	defaultInboundQueue     = 64
-	defaultOutboundQueue    = 128
-	defaultStreamQueue      = 16
-	defaultMaxSessions      = 64
-	defaultHandshakeTimeout = 10 * time.Second
-	defaultWriteTimeout     = 10 * time.Second
+	defaultWorkers           = 8
+	defaultBacklog           = 32
+	defaultInboundQueue      = 64
+	defaultOutboundQueue     = 128
+	defaultStreamQueue       = 16
+	defaultMaxSessions       = 64
+	defaultPeerVerifyTimeout = 2 * time.Second
+	defaultHandshakeTimeout  = 10 * time.Second
+	defaultWriteTimeout      = 10 * time.Second
 )
 
 var reservedOps = map[Op]struct{}{
@@ -67,13 +68,21 @@ type result struct {
 	err error
 }
 
+type sessionCapacity uint8
+
+const (
+	ordinarySessionCapacity sessionCapacity = iota + 1
+	protectedSessionCapacity
+)
+
 // Server serves persistent, multiplexed v4 sessions on a listener owned by its caller.
 // Register handlers and lifecycle controls before Serve.
 type Server struct {
 	// Build is the server build identity sent during the mandatory handshake.
 	Build string
-	// Trust augments the non-optional same-effective-uid trust floor.
-	Trust func(Peer) error
+	// Trust augments the non-optional same-effective-uid trust floor. It must
+	// return when ctx is canceled.
+	Trust func(context.Context, Peer) error
 	// Ladder supplies per-operation server deadlines.
 	Ladder Ladder
 	// Workers caps simultaneous concurrent handlers.
@@ -88,6 +97,14 @@ type Server struct {
 	StreamQueue int
 	// MaxSessions caps accepted and handshaking connections.
 	MaxSessions int
+	// ReservedProtectedSessions withholds capacity from ordinary peers so exact
+	// authenticated lifecycle and bootstrap peers cannot be starved.
+	ReservedProtectedSessions int
+	// ProtectedSession classifies an already identified and trusted peer without
+	// reading client-controlled frames. It must return when ctx is canceled.
+	ProtectedSession func(context.Context, Peer) (bool, error)
+	// PeerVerificationTimeout bounds pre-capacity trust and classification.
+	PeerVerificationTimeout time.Duration
 	// MaxFrame caps each encoded frame.
 	MaxFrame int
 	// HandshakeTimeout bounds the mandatory first-frame exchange.
@@ -106,12 +123,13 @@ type Server struct {
 	sessions     map[*session]struct{}
 	streamWindow uint32
 
-	queue        chan job
-	slots        chan struct{}
-	sessionSlots chan struct{}
-	poolWG       sync.WaitGroup
-	sessionWG    sync.WaitGroup
-	closeOnce    sync.Once
+	queue                 chan job
+	slots                 chan struct{}
+	ordinarySessionSlots  chan struct{}
+	protectedSessionSlots chan struct{}
+	poolWG                sync.WaitGroup
+	sessionWG             sync.WaitGroup
+	closeOnce             sync.Once
 }
 
 // RegisterControl registers a control handler outside the worker pool.
@@ -171,6 +189,9 @@ func (s *Server) Serve(
 	if s.Build == "" {
 		return errors.New("wire: Build is required")
 	}
+	if err := s.validateSessionCapacity(); err != nil {
+		return err
+	}
 	streamWindow, err := uint32Length("stream queue", s.streamQueue())
 	if err != nil {
 		return errors.New("wire: stream queue exceeds protocol window")
@@ -199,7 +220,8 @@ func (s *Server) Serve(
 	}
 	s.queue = make(chan job, backlog)
 	s.slots = make(chan struct{}, workers+backlog)
-	s.sessionSlots = make(chan struct{}, s.maxSessions())
+	s.ordinarySessionSlots = make(chan struct{}, s.maxSessions()-s.ReservedProtectedSessions)
+	s.protectedSessionSlots = make(chan struct{}, s.ReservedProtectedSessions)
 	s.mu.Unlock()
 
 	for range workers {
@@ -254,38 +276,50 @@ func (s *Server) accept(ctx context.Context, admit, admitLifecycle func() (func(
 		if err != nil {
 			return err
 		}
-		select {
-		case s.sessionSlots <- struct{}{}:
-		default:
+		unix, ok := conn.(*net.UnixConn)
+		if !ok {
+			_ = conn.Close()
+			continue
+		}
+		peer, err := PeerFromConn(unix)
+		if err != nil {
+			_ = conn.Close()
+			s.Log.Debug("wire: reject unidentified peer", "err", err)
+			continue
+		}
+		verifyCtx, cancelVerify := context.WithTimeout(ctx, s.peerVerificationTimeout())
+		protected, err := s.verifyPeer(verifyCtx, peer)
+		cancelVerify()
+		if err != nil {
+			_ = conn.Close()
+			s.Log.Debug("wire: reject untrusted peer", "err", err)
+			continue
+		}
+		capacity, ok := s.acquireSessionCapacity(protected)
+		if !ok {
 			_ = conn.Close()
 			continue
 		}
 		s.sessionWG.Add(1)
-		go func() {
+		go func(conn net.Conn, peer Peer, capacity sessionCapacity) {
 			defer func() {
-				<-s.sessionSlots
+				s.releaseSessionCapacity(capacity)
 				s.sessionWG.Done()
 			}()
-			if err := s.serveConn(ctx, conn, admit, admitLifecycle); err != nil && !isDisconnect(err) {
+			if err := s.serveConn(ctx, conn, peer, admit, admitLifecycle); err != nil && !isDisconnect(err) {
 				s.Log.Debug("wire: session ended", "err", err)
 			}
-		}()
+		}(conn, peer, capacity)
 	}
 }
 
-func (s *Server) serveConn(ctx context.Context, conn net.Conn, admit, admitLifecycle func() (func(), error)) error {
+func (s *Server) serveConn(
+	ctx context.Context,
+	conn net.Conn,
+	peer Peer,
+	admit, admitLifecycle func() (func(), error),
+) error {
 	defer conn.Close()
-	unix, ok := conn.(*net.UnixConn)
-	if !ok {
-		return errors.New("wire: unix connection required")
-	}
-	peer, err := PeerFromConn(unix)
-	if err != nil {
-		return fmt.Errorf("wire: identify peer: %w", err)
-	}
-	if err := s.trust(peer); err != nil {
-		return err
-	}
 	codec := NewCodec(conn)
 	codec.MaxFrame = s.maxFrame()
 	if err := codec.SetDeadline(earlierDeadline(ctx, s.handshakeTimeout())); err != nil {
@@ -459,14 +493,19 @@ func (s *Server) closeSessions() {
 	}
 }
 
-func (s *Server) trust(peer Peer) error {
+func (s *Server) verifyPeer(ctx context.Context, peer Peer) (bool, error) {
 	if peer.UID != os.Geteuid() {
-		return fmt.Errorf("%w: uid %d != %d", ErrUntrustedPeer, peer.UID, os.Geteuid())
+		return false, fmt.Errorf("%w: uid %d != %d", ErrUntrustedPeer, peer.UID, os.Geteuid())
 	}
 	if s.Trust != nil {
-		return s.Trust(peer)
+		if err := s.Trust(ctx, peer); err != nil {
+			return false, err
+		}
 	}
-	return nil
+	if s.ProtectedSession == nil {
+		return false, nil
+	}
+	return s.ProtectedSession(ctx, peer)
 }
 
 func (s *Server) maxFrame() int {
@@ -488,6 +527,13 @@ func (s *Server) writeTimeout() time.Duration {
 		return s.WriteTimeout
 	}
 	return defaultWriteTimeout
+}
+
+func (s *Server) peerVerificationTimeout() time.Duration {
+	if s.PeerVerificationTimeout > 0 {
+		return s.PeerVerificationTimeout
+	}
+	return defaultPeerVerifyTimeout
 }
 
 func (s *Server) inboundQueue() int {
@@ -516,6 +562,49 @@ func (s *Server) maxSessions() int {
 		return s.MaxSessions
 	}
 	return defaultMaxSessions
+}
+
+func (s *Server) validateSessionCapacity() error {
+	maximum := s.maxSessions()
+	switch {
+	case s.PeerVerificationTimeout < 0:
+		return errors.New("wire: peer verification timeout must not be negative")
+	case s.ReservedProtectedSessions < 0:
+		return errors.New("wire: reserved protected sessions must not be negative")
+	case s.ReservedProtectedSessions > maximum:
+		return fmt.Errorf("wire: reserved protected sessions %d exceed maximum sessions %d", s.ReservedProtectedSessions, maximum)
+	case s.ReservedProtectedSessions != 0 && s.ProtectedSession == nil:
+		return errors.New("wire: protected session classifier is required when capacity is reserved")
+	default:
+		return nil
+	}
+}
+
+func (s *Server) acquireSessionCapacity(protected bool) (sessionCapacity, bool) {
+	if protected {
+		select {
+		case s.protectedSessionSlots <- struct{}{}:
+			return protectedSessionCapacity, true
+		default:
+		}
+	}
+	select {
+	case s.ordinarySessionSlots <- struct{}{}:
+		return ordinarySessionCapacity, true
+	default:
+		return 0, false
+	}
+}
+
+func (s *Server) releaseSessionCapacity(capacity sessionCapacity) {
+	switch capacity {
+	case ordinarySessionCapacity:
+		<-s.ordinarySessionSlots
+	case protectedSessionCapacity:
+		<-s.protectedSessionSlots
+	default:
+		panic("wire: invalid session capacity release")
+	}
 }
 
 func earlierDeadline(ctx context.Context, timeout time.Duration) time.Time {
