@@ -3,6 +3,7 @@ package wire_test
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"math"
@@ -18,6 +19,30 @@ import (
 
 	"github.com/yasyf/daemonkit/wire"
 )
+
+var errResponseWindowWrite = errors.New("response window write failed")
+
+type failResponseWindowConn struct {
+	net.Conn
+	requestWritten chan struct{}
+	requestOnce    sync.Once
+}
+
+func (c *failResponseWindowConn) Write(p []byte) (int, error) {
+	if len(p) > 20 {
+		kind := wire.FrameKind(p[10])
+		id := binary.BigEndian.Uint64(p[12:20])
+		if kind == wire.FrameWindow && id != 0 {
+			return 0, errResponseWindowWrite
+		}
+		n, err := c.Conn.Write(p)
+		if kind == wire.FrameRequest && err == nil && n == len(p) {
+			c.requestOnce.Do(func() { close(c.requestWritten) })
+		}
+		return n, err
+	}
+	return c.Conn.Write(p)
+}
 
 type runningServer struct {
 	path     string
@@ -101,6 +126,77 @@ func newClient(t *testing.T, running *runningServer, config func(*wire.ClientCon
 	}
 	t.Cleanup(func() { _ = client.Close() })
 	return client
+}
+
+func TestCallClassifiesResponseWindowFailureAfterRequestCommitAsPostSend(t *testing.T) {
+	var calls atomic.Int32
+	server := &wire.Server{Build: "server-test"}
+	server.RegisterControl("mutate", func(context.Context, wire.Request) (any, error) {
+		calls.Add(1)
+		return true, nil
+	})
+	running := startSessionServer(t, server, func() (func(), error) { return func() {}, nil })
+	requestWritten := make(chan struct{})
+	client, err := wire.NewClient(context.Background(), wire.ClientConfig{
+		Build: "server-test",
+		Dial: func(ctx context.Context) (net.Conn, error) {
+			conn, err := wire.UnixDialer(running.path)(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return &failResponseWindowConn{Conn: conn, requestWritten: requestWritten}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	result, err := client.Call(context.Background(), "mutate", "", nil)
+	if err == nil {
+		t.Fatal("Call succeeded after response-window write failure")
+	}
+	select {
+	case <-requestWritten:
+	default:
+		t.Fatal("request frame was not committed before response-window failure")
+	}
+	if result.Outcome != wire.PostSendFailure {
+		t.Fatalf("outcome = %s, want %s", result.Outcome, wire.PostSendFailure)
+	}
+	var openErr *wire.OpenError
+	if !errors.As(err, &openErr) || openErr.Outcome != wire.PostSendFailure {
+		t.Fatalf("error = %v, want typed post-send OpenError", err)
+	}
+	if !errors.Is(err, errResponseWindowWrite) {
+		t.Fatalf("error = %v, want response-window write failure", err)
+	}
+}
+
+func TestCallClassifiesUnwrittenOversizedRequestAsPreSend(t *testing.T) {
+	var calls atomic.Int32
+	server := &wire.Server{Build: "server-test"}
+	server.RegisterControl("mutate", func(context.Context, wire.Request) (any, error) {
+		calls.Add(1)
+		return true, nil
+	})
+	running := startSessionServer(t, server, func() (func(), error) { return func() {}, nil })
+	client := newClient(t, running, func(config *wire.ClientConfig) { config.MaxFrame = 256 })
+
+	result, err := client.Call(context.Background(), "mutate", "", bytes.Repeat([]byte("x"), 512))
+	if !errors.Is(err, wire.ErrFrameTooLarge) {
+		t.Fatalf("error = %v, want ErrFrameTooLarge", err)
+	}
+	if result.Outcome != wire.PreSendFailure {
+		t.Fatalf("outcome = %s, want %s", result.Outcome, wire.PreSendFailure)
+	}
+	var openErr *wire.OpenError
+	if !errors.As(err, &openErr) || openErr.Outcome != wire.PreSendFailure {
+		t.Fatalf("error = %v, want typed pre-send OpenError", err)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("handler calls = %d, want 0", calls.Load())
+	}
 }
 
 func admitAll(counter *atomic.Int32) func() (func(), error) {

@@ -61,6 +61,20 @@ type Result struct {
 	Response Response
 }
 
+// OpenError reports whether a request frame was committed before Open failed.
+type OpenError struct {
+	Outcome Outcome
+	Err     error
+}
+
+// Error describes the failed request setup.
+func (e *OpenError) Error() string {
+	return fmt.Sprintf("wire: open %s: %v", e.Outcome, e.Err)
+}
+
+// Unwrap returns the request setup failure.
+func (e *OpenError) Unwrap() error { return e.Err }
+
 // Dialer opens one persistent session connection.
 type Dialer func(ctx context.Context) (net.Conn, error)
 
@@ -218,7 +232,12 @@ func (c *Client) Events() <-chan Event { return c.eventOut }
 func (c *Client) Call(ctx context.Context, op Op, tenant string, payload []byte) (Result, error) {
 	call, err := c.Open(ctx, op, tenant, payload, true)
 	if err != nil {
-		return Result{Outcome: PreSendFailure}, err
+		outcome := PreSendFailure
+		var openErr *OpenError
+		if errors.As(err, &openErr) {
+			outcome = openErr.Outcome
+		}
+		return Result{Outcome: outcome}, err
 	}
 	return call.Response(ctx)
 }
@@ -227,10 +246,10 @@ func (c *Client) Call(ctx context.Context, op Op, tenant string, payload []byte)
 // pass false to follow it with SendChunk and CloseSend.
 func (c *Client) Open(ctx context.Context, op Op, tenant string, payload []byte, endInput bool) (*ClientCall, error) {
 	if op == "" {
-		return nil, errors.New("wire: operation is required")
+		return nil, &OpenError{Outcome: PreSendFailure, Err: errors.New("wire: operation is required")}
 	}
 	if err := c.sessionErr(); err != nil {
-		return nil, err
+		return nil, &OpenError{Outcome: PreSendFailure, Err: err}
 	}
 	id := c.nextID.Add(1)
 	call := &ClientCall{
@@ -257,16 +276,18 @@ func (c *Client) Open(ctx context.Context, op Op, tenant string, payload []byte,
 	if !deadline.IsZero() {
 		frame.DeadlineUnixMilli = deadline.UnixMilli()
 	}
+	requestOutcome := PreSendFailure
 	if err := c.sendFrame(callCtx, frame); err != nil {
 		cancel()
 		c.removePending(id)
-		return nil, fmt.Errorf("wire: send request: %w", err)
+		return nil, &OpenError{Outcome: requestOutcome, Err: fmt.Errorf("wire: send request: %w", err)}
 	}
+	requestOutcome = PostSendFailure
 	if err := c.sendFrame(callCtx, Frame{Kind: FrameWindow, ID: id, Sequence: c.streamWindow}); err != nil {
 		cancel()
 		err = fmt.Errorf("wire: grant response window: %w", err)
 		c.fail(err)
-		return nil, err
+		return nil, &OpenError{Outcome: requestOutcome, Err: err}
 	}
 	go call.deliverChunks()
 	go func() {

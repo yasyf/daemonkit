@@ -533,8 +533,8 @@ private actor ServerRequestState {
     }
 
     func writeTerminal(_ write: @Sendable () throws -> Void) throws {
-        try write()
         terminalSent = true
+        try write()
     }
 
     func waitForTerminalAcknowledgement(timeout: TimeInterval) async throws {

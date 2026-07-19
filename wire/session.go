@@ -60,9 +60,9 @@ type session struct {
 }
 
 type sessionOutbound struct {
-	frame   Frame
-	done    chan error
-	written func()
+	frame       Frame
+	done        chan error
+	beforeWrite func()
 }
 
 type requestState struct {
@@ -158,10 +158,10 @@ func (s *session) writeLoop() {
 		case <-s.ctx.Done():
 			terminalErr = s.ctx.Err()
 		case outgoing := <-s.outbound:
-			err := s.codec.WriteFrame(outgoing.frame)
-			if err == nil && outgoing.written != nil {
-				outgoing.written()
+			if outgoing.beforeWrite != nil {
+				outgoing.beforeWrite()
 			}
+			err := s.codec.WriteFrame(outgoing.frame)
 			if outgoing.done != nil {
 				outgoing.done <- err
 			}
@@ -627,13 +627,13 @@ func (s *session) sendResponseWritten(
 	ctx context.Context,
 	id uint64,
 	response Response,
-	written func(),
+	beforeWrite func(),
 ) error {
 	payload, err := json.Marshal(response)
 	if err != nil {
 		return fmt.Errorf("wire: marshal envelope: %w", err)
 	}
-	return s.enqueueAndWait(ctx, Frame{Kind: FrameResponse, Flags: FlagEnd, ID: id, Payload: payload}, written)
+	return s.enqueueAndWait(ctx, Frame{Kind: FrameResponse, Flags: FlagEnd, ID: id, Payload: payload}, beforeWrite)
 }
 
 func (s *session) enqueue(ctx context.Context, frame Frame) error {
@@ -654,10 +654,10 @@ func (s *session) enqueue(ctx context.Context, frame Frame) error {
 	}
 }
 
-func (s *session) enqueueAndWait(ctx context.Context, frame Frame, written func()) error {
+func (s *session) enqueueAndWait(ctx context.Context, frame Frame, beforeWrite func()) error {
 	done := make(chan error, 1)
 	select {
-	case s.outbound <- sessionOutbound{frame: frame, done: done, written: written}:
+	case s.outbound <- sessionOutbound{frame: frame, done: done, beforeWrite: beforeWrite}:
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-s.ctx.Done():
