@@ -14,6 +14,7 @@ public final class ReloadCoalescer: @unchecked Sendable {
     private let lock = NSLock()
     private var lastFire: Date?
 
+    /// Creates a coalescer that fires `reload` at most once per `interval`.
     public init(
         interval: TimeInterval = 300,
         now: @escaping @Sendable () -> Date = { Date() },

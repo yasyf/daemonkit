@@ -74,6 +74,7 @@ public struct PeerTrust: Sendable {
     /// and the UID floor still apply; enabling it is a security decision.
     public let allowUnhardened: Bool
 
+    /// Creates a policy enforcing the UID floor plus the optional designated requirement.
     public init(requirement: String? = nil, allowUnhardened: Bool = false) {
         self.requirement = requirement
         self.allowUnhardened = allowUnhardened
