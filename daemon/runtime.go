@@ -366,9 +366,7 @@ func (r *Runtime) shutdown(
 	if err := r.cfg.Admission.Settle(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("daemon: settle admission: %w", err))
 	}
-	r.cfg.Workers.Close()
-	r.cfg.Workers.Cancel()
-	if err := r.cfg.Workers.Wait(ctx); err != nil {
+	if err := settleWorkers(ctx, r.cfg.Workers); err != nil {
 		errs = append(errs, fmt.Errorf("daemon: settle workers: %w", err))
 	}
 	if kind == stopHandoff && r.cfg.Contract == ResourceOwner && len(errs) == 0 {
@@ -401,9 +399,7 @@ func (r *Runtime) shutdown(
 func (r *Runtime) closeUnstarted(parent context.Context) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), r.shutdownTimeout())
 	defer cancel()
-	r.cfg.Workers.Close()
-	r.cfg.Workers.Cancel()
-	workerErr := r.cfg.Workers.Wait(ctx)
+	workerErr := settleWorkers(ctx, r.cfg.Workers)
 	stateErr := r.cfg.State.Close()
 	resourceErr := r.cfg.Resources.Close()
 	return errors.Join(
@@ -411,6 +407,28 @@ func (r *Runtime) closeUnstarted(parent context.Context) error {
 		wrapRuntimeClose("close state", stateErr),
 		wrapRuntimeClose("close resources", resourceErr),
 	)
+}
+
+func settleWorkers(ctx context.Context, workers Workers) error {
+	workers.Close()
+	settled := make(chan error, 1)
+	go func() {
+		settled <- workers.Wait(ctx)
+	}()
+
+	select {
+	case err := <-settled:
+		return err
+	case <-ctx.Done():
+	}
+
+	select {
+	case err := <-settled:
+		return err
+	default:
+	}
+	workers.Cancel()
+	return errors.Join(ctx.Err(), <-settled)
 }
 
 func wrapRuntimeClose(action string, err error) error {

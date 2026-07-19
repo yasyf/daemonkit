@@ -277,7 +277,6 @@ func TestRuntimeShutdownOrderAndDoubleRunClose(t *testing.T) {
 		"server-close-intake",
 		"admission-settle",
 		"workers-close",
-		"workers-cancel",
 		"workers-wait",
 		"serve-exit",
 		"state-close",
@@ -317,7 +316,7 @@ func TestRuntimeHealthUsesExactIdentityAndDrainState(t *testing.T) {
 	}
 }
 
-func TestRuntimeSettlesAdmissionBeforeCancelingWorkers(t *testing.T) {
+func TestRuntimeSettlesAdmissionBeforeClosingWorkers(t *testing.T) {
 	cfg, events, server, admission, _ := runtimeTestConfig(t, absentRuntimePeer())
 	doneRequest, err := admission.Admit()
 	if err != nil {
@@ -410,7 +409,7 @@ func TestRuntimeRejectsProtocolMismatch(t *testing.T) {
 	if !errors.Is(err, ErrProtocolMismatch) {
 		t.Fatalf("Run = %v, want ErrProtocolMismatch", err)
 	}
-	want := []string{"workers-close", "workers-cancel", "workers-wait", "state-close", "resources-close"}
+	want := []string{"workers-close", "workers-wait", "state-close", "resources-close"}
 	if got := events.snapshot(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("events = %v, want %v", got, want)
 	}
@@ -518,14 +517,78 @@ func TestRuntimeWaitsForWorkerSettlementPastDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	events.wait(t, "workers-wait")
+	events.wait(t, "workers-cancel")
 	select {
 	case err := <-runDone:
 		t.Fatalf("Run returned before worker settlement: %v", err)
 	default:
 	}
+	if events.index("state-close") >= 0 || events.index("resources-close") >= 0 {
+		t.Fatalf("resources closed before worker settlement: %v", events.snapshot())
+	}
 	close(release)
 	if err := waitRuntime(t, runDone); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Run = %v, want deadline after settlement", err)
+	}
+	got := events.snapshot()
+	cancels := 0
+	for _, event := range got {
+		if event == "workers-cancel" {
+			cancels++
+		}
+	}
+	if cancels != 1 {
+		t.Fatalf("worker cancellations = %d, want 1: %v", cancels, got)
+	}
+	if events.index("workers-wait") >= events.index("workers-cancel") ||
+		events.index("workers-cancel") >= events.index("state-close") {
+		t.Fatalf("deadline settlement order = %v", got)
+	}
+}
+
+func TestRuntimeCloseUnstartedWaitsForWorkerSettlementPastDeadline(t *testing.T) {
+	peer := &fakePeer{health: []healthResult{{h: Health{Build: "v1.0.0", Protocol: 1, PID: 222}}}}
+	cfg, events, _, _, workers := runtimeTestConfig(t, peer)
+	release := make(chan struct{})
+	workers.waitGate = release
+	workers.waitContext = true
+	cfg.ShutdownTimeout = time.Millisecond
+	runtime, err := NewRuntime(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- runtime.Run(context.Background()) }()
+	events.wait(t, "workers-wait")
+	events.wait(t, "workers-cancel")
+	select {
+	case err := <-runDone:
+		t.Fatalf("Run returned before unstarted worker settlement: %v", err)
+	default:
+	}
+	if events.index("state-close") >= 0 || events.index("resources-close") >= 0 {
+		t.Fatalf("resources closed before unstarted worker settlement: %v", events.snapshot())
+	}
+	close(release)
+	err = waitRuntime(t, runDone)
+	for _, want := range []error{ErrProtocolMismatch, context.DeadlineExceeded} {
+		if !errors.Is(err, want) {
+			t.Fatalf("Run = %v, missing %v", err, want)
+		}
+	}
+	got := events.snapshot()
+	cancels := 0
+	for _, event := range got {
+		if event == "workers-cancel" {
+			cancels++
+		}
+	}
+	if cancels != 1 {
+		t.Fatalf("worker cancellations = %d, want 1: %v", cancels, got)
+	}
+	if events.index("workers-wait") >= events.index("workers-cancel") ||
+		events.index("workers-cancel") >= events.index("state-close") {
+		t.Fatalf("unstarted deadline settlement order = %v", got)
 	}
 }
 
@@ -629,10 +692,13 @@ func TestRuntimeCrashOrderContinuesCleanup(t *testing.T) {
 			if len(got) == 0 || got[len(got)-1] != "resources-close" {
 				t.Fatalf("resources were not closed last: %v", got)
 			}
-			for _, required := range []string{"workers-cancel", "workers-wait", "state-close", "resources-close"} {
+			for _, required := range []string{"workers-wait", "state-close", "resources-close"} {
 				if events.index(required) < 0 {
 					t.Errorf("cleanup omitted %q: %v", required, got)
 				}
+			}
+			if events.index("workers-cancel") >= 0 {
+				t.Errorf("settled workers were canceled: %v", got)
 			}
 		})
 	}
