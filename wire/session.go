@@ -21,6 +21,9 @@ func (s *AcceptedSession) Peer() Peer { return s.s.peer }
 // Build returns the client build supplied by the mandatory handshake.
 func (s *AcceptedSession) Build() string { return s.s.build }
 
+// Done closes when this exact authenticated session is torn down.
+func (s *AcceptedSession) Done() <-chan struct{} { return s.s.ctx.Done() }
+
 // PushEvent enqueues a server-pushed event with bounded backpressure.
 func (s *AcceptedSession) PushEvent(ctx context.Context, event Event) error {
 	if event.Topic == "" {

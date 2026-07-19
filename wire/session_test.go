@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/daemonkit/drain"
 	"github.com/yasyf/daemonkit/wire"
 )
 
@@ -355,6 +356,90 @@ func TestPersistentSessionMultiplexesEventsAndStreams(t *testing.T) {
 	}
 	if got := inflight.Load(); got != 0 {
 		t.Fatalf("inflight = %d, want eventual 0", got)
+	}
+}
+
+func TestAcceptedSessionDoneOutlivesUnaryAdmissionAndIsSessionScoped(t *testing.T) {
+	sessions := make(chan *wire.AcceptedSession, 2)
+	server := &wire.Server{Build: "server-test"}
+	server.RegisterControl("bind", func(_ context.Context, request wire.Request) (any, error) {
+		sessions <- request.Session
+		return true, nil
+	})
+	var intake drain.Intake
+	running := startSessionServer(t, server, intake.Admit)
+	firstClient := newClient(t, running, nil)
+	secondClient := newClient(t, running, nil)
+
+	if _, err := firstClient.Call(context.Background(), "bind", "", nil); err != nil {
+		t.Fatalf("first bind: %v", err)
+	}
+	first := <-sessions
+	if _, err := secondClient.Call(context.Background(), "bind", "", nil); err != nil {
+		t.Fatalf("second bind: %v", err)
+	}
+	second := <-sessions
+	if first == second {
+		t.Fatal("different clients shared one AcceptedSession")
+	}
+	firstDone := first.Done()
+	if got := first.Done(); got != firstDone {
+		t.Fatal("Done returned a different channel for one session")
+	}
+	settleCtx, settleCancel := context.WithTimeout(context.Background(), time.Second)
+	defer settleCancel()
+	if err := intake.Settle(settleCtx); err != nil {
+		t.Fatalf("settle unary bind admission: %v", err)
+	}
+	for name, done := range map[string]<-chan struct{}{"first": firstDone, "second": second.Done()} {
+		select {
+		case <-done:
+			t.Fatalf("%s Done closed while its session remained connected", name)
+		default:
+		}
+	}
+
+	if err := firstClient.Close(); err != nil {
+		t.Fatalf("close first client: %v", err)
+	}
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("first Done did not close after client close")
+	}
+	if err := firstClient.Close(); err != nil {
+		t.Fatalf("close first client again: %v", err)
+	}
+	select {
+	case <-firstDone:
+	default:
+		t.Fatal("first Done stopped reporting teardown")
+	}
+	select {
+	case <-second.Done():
+		t.Fatal("closing first client closed another session's Done")
+	default:
+	}
+}
+
+func TestAcceptedSessionDoneClosesOnServerShutdown(t *testing.T) {
+	sessions := make(chan *wire.AcceptedSession, 1)
+	server := &wire.Server{Build: "server-test"}
+	server.RegisterControl("bind", func(_ context.Context, request wire.Request) (any, error) {
+		sessions <- request.Session
+		return true, nil
+	})
+	running := startSessionServer(t, server, func() (func(), error) { return func() {}, nil })
+	client := newClient(t, running, nil)
+	if _, err := client.Call(context.Background(), "bind", "", nil); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	session := <-sessions
+	running.stop(t)
+	select {
+	case <-session.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Done did not close on server shutdown")
 	}
 }
 
