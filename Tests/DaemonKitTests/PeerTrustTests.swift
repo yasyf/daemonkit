@@ -99,177 +99,178 @@ private func spawnFixture(_ name: String, in directory: URL) throws -> FixturePe
     return FixturePeer(server: server, process: process)
 }
 
-@Suite(.serialized)
-struct PeerTrustTests {
-    @Test func requirementBuildsCanonicalDeveloperIDPolicy() throws {
-        let requirement = try PeerTrust.Requirement(
-            teamIdentifier: fixtureTeam,
-            signingIdentifier: "com.yasyf.consumer",
-            requiredAppGroup: "group.com.yasyf.consumer",
-            requiredEntitlements: [
-                "com.yasyf.role": .string("broker"),
-            ]
-        )
-        #expect(requirement.designatedRequirement ==
-            "identifier \"com.yasyf.consumer\" and anchor apple generic " +
-            "and certificate leaf[subject.OU] = \"SXKCTF23Q2\" " +
-            "and certificate 1[field.1.2.840.113635.100.6.2.6] exists " +
-            "and certificate leaf[field.1.2.840.113635.100.6.1.13] exists")
-        #expect(requirement.requiredEntitlements[applicationGroupsKey] == .stringArrayContains("group.com.yasyf.consumer"))
-        #expect(requirement.requiredEntitlements["com.yasyf.role"] == .string("broker"))
-    }
-
-    @Test func requirementRejectsIncompleteOrAmbiguousIdentity() {
-        #expect(throws: PeerTrust.RequirementError.emptyTeamIdentifier) {
-            _ = try PeerTrust.Requirement(teamIdentifier: "", signingIdentifier: "com.yasyf.x")
-        }
-        #expect(throws: PeerTrust.RequirementError.emptySigningIdentifier) {
-            _ = try PeerTrust.Requirement(teamIdentifier: fixtureTeam, signingIdentifier: "")
-        }
-        #expect(throws: PeerTrust.RequirementError.emptyRequiredAppGroup) {
-            _ = try PeerTrust.Requirement(
+extension SocketTransportTests {
+    struct PeerTrustTests {
+        @Test func requirementBuildsCanonicalDeveloperIDPolicy() throws {
+            let requirement = try PeerTrust.Requirement(
                 teamIdentifier: fixtureTeam,
-                signingIdentifier: "com.yasyf.x",
-                requiredAppGroup: ""
+                signingIdentifier: "com.yasyf.consumer",
+                requiredAppGroup: "group.com.yasyf.consumer",
+                requiredEntitlements: [
+                    "com.yasyf.role": .string("broker"),
+                ]
             )
+            #expect(requirement.designatedRequirement ==
+                "identifier \"com.yasyf.consumer\" and anchor apple generic " +
+                "and certificate leaf[subject.OU] = \"SXKCTF23Q2\" " +
+                "and certificate 1[field.1.2.840.113635.100.6.2.6] exists " +
+                "and certificate leaf[field.1.2.840.113635.100.6.1.13] exists")
+            #expect(requirement.requiredEntitlements[applicationGroupsKey] == .stringArrayContains("group.com.yasyf.consumer"))
+            #expect(requirement.requiredEntitlements["com.yasyf.role"] == .string("broker"))
         }
-        #expect(throws: PeerTrust.RequirementError.unsafeIdentityField("bad\"team")) {
-            _ = try PeerTrust.Requirement(teamIdentifier: "bad\"team", signingIdentifier: "com.yasyf.x")
-        }
-        #expect(throws: PeerTrust.RequirementError.duplicateAppGroupRequirement) {
-            _ = try PeerTrust.Requirement(
-                teamIdentifier: fixtureTeam,
-                signingIdentifier: "com.yasyf.x",
-                requiredAppGroup: "group.x",
-                requiredEntitlements: [applicationGroupsKey: .stringArrayContains("group.other")]
-            )
-        }
-    }
 
-    @Test func signedPolicyWithoutAppGroupIsValid() throws {
-        let requirement = try PeerTrust.Requirement(
-            teamIdentifier: fixtureTeam,
-            signingIdentifier: "com.yasyf.consumer"
-        )
-        #expect(requirement.requiredEntitlements.isEmpty)
-    }
-
-    @Test func sameUIDFloorStillAdmitsTheConnectedTestProcess() throws {
-        let directory = try shortSocketDir()
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let connection = acceptedConnection(at: directory.appendingPathComponent("s.sock").path)
-        defer { close(connection.server); close(connection.client) }
-        try PeerTrust.testingUIDOnly.check(descriptor: connection.server)
-    }
-
-    @Test func typedDeveloperIDRequirementRejectsTheAdHocTestProcess() throws {
-        let directory = try shortSocketDir()
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let connection = acceptedConnection(at: directory.appendingPathComponent("s.sock").path)
-        defer { close(connection.server); close(connection.client) }
-        do {
-            try PeerTrust(requirement: fixtureRequirement()).check(descriptor: connection.server)
-            Issue.record("expected the ad-hoc test process to fail the Developer ID policy")
-        } catch let error as PeerTrust.TrustError {
-            guard case .untrustedPeer = error else {
-                Issue.record("expected .untrustedPeer, got \(error)")
-                return
+        @Test func requirementRejectsIncompleteOrAmbiguousIdentity() {
+            #expect(throws: PeerTrust.RequirementError.emptyTeamIdentifier) {
+                _ = try PeerTrust.Requirement(teamIdentifier: "", signingIdentifier: "com.yasyf.x")
+            }
+            #expect(throws: PeerTrust.RequirementError.emptySigningIdentifier) {
+                _ = try PeerTrust.Requirement(teamIdentifier: fixtureTeam, signingIdentifier: "")
+            }
+            #expect(throws: PeerTrust.RequirementError.emptyRequiredAppGroup) {
+                _ = try PeerTrust.Requirement(
+                    teamIdentifier: fixtureTeam,
+                    signingIdentifier: "com.yasyf.x",
+                    requiredAppGroup: ""
+                )
+            }
+            #expect(throws: PeerTrust.RequirementError.unsafeIdentityField("bad\"team")) {
+                _ = try PeerTrust.Requirement(teamIdentifier: "bad\"team", signingIdentifier: "com.yasyf.x")
+            }
+            #expect(throws: PeerTrust.RequirementError.duplicateAppGroupRequirement) {
+                _ = try PeerTrust.Requirement(
+                    teamIdentifier: fixtureTeam,
+                    signingIdentifier: "com.yasyf.x",
+                    requiredAppGroup: "group.x",
+                    requiredEntitlements: [applicationGroupsKey: .stringArrayContains("group.other")]
+                )
             }
         }
-    }
 
-    @Test func requiredEntitlementsMatchClosedTypedPredicates() throws {
-        let requirement = try PeerTrust.Requirement(
-            teamIdentifier: fixtureTeam,
-            signingIdentifier: "com.yasyf.consumer",
-            requiredAppGroup: "group.com.yasyf.consumer",
-            requiredEntitlements: [
-                "com.yasyf.enabled": .boolean(true),
-                "com.yasyf.role": .string("broker"),
-                "com.yasyf.scopes": .stringArrayContains("mutate"),
+        @Test func signedPolicyWithoutAppGroupIsValid() throws {
+            let requirement = try PeerTrust.Requirement(
+                teamIdentifier: fixtureTeam,
+                signingIdentifier: "com.yasyf.consumer"
+            )
+            #expect(requirement.requiredEntitlements.isEmpty)
+        }
+
+        @Test func sameUIDFloorStillAdmitsTheConnectedTestProcess() throws {
+            let directory = try shortSocketDir()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let connection = acceptedConnection(at: directory.appendingPathComponent("s.sock").path)
+            defer { close(connection.server); close(connection.client) }
+            try PeerTrust.testingUIDOnly.check(descriptor: connection.server)
+        }
+
+        @Test func typedDeveloperIDRequirementRejectsTheAdHocTestProcess() throws {
+            let directory = try shortSocketDir()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let connection = acceptedConnection(at: directory.appendingPathComponent("s.sock").path)
+            defer { close(connection.server); close(connection.client) }
+            do {
+                try PeerTrust(requirement: fixtureRequirement()).check(descriptor: connection.server)
+                Issue.record("expected the ad-hoc test process to fail the Developer ID policy")
+            } catch let error as PeerTrust.TrustError {
+                guard case .untrustedPeer = error else {
+                    Issue.record("expected .untrustedPeer, got \(error)")
+                    return
+                }
+            }
+        }
+
+        @Test func requiredEntitlementsMatchClosedTypedPredicates() throws {
+            let requirement = try PeerTrust.Requirement(
+                teamIdentifier: fixtureTeam,
+                signingIdentifier: "com.yasyf.consumer",
+                requiredAppGroup: "group.com.yasyf.consumer",
+                requiredEntitlements: [
+                    "com.yasyf.enabled": .boolean(true),
+                    "com.yasyf.role": .string("broker"),
+                    "com.yasyf.scopes": .stringArrayContains("mutate"),
+                ]
+            )
+            let info: NSDictionary = [
+                kSecCodeInfoStatus: NSNumber(value: runtimeAndLibraryValidation),
+                kSecCodeInfoEntitlementsDict: [
+                    applicationGroupsKey: ["group.com.yasyf.consumer"],
+                    "com.yasyf.enabled": true,
+                    "com.yasyf.role": "broker",
+                    "com.yasyf.scopes": ["read", "mutate"],
+                ] as NSDictionary,
             ]
-        )
-        let info: NSDictionary = [
-            kSecCodeInfoStatus: NSNumber(value: runtimeAndLibraryValidation),
-            kSecCodeInfoEntitlementsDict: [
-                applicationGroupsKey: ["group.com.yasyf.consumer"],
-                "com.yasyf.enabled": true,
-                "com.yasyf.role": "broker",
-                "com.yasyf.scopes": ["read", "mutate"],
-            ] as NSDictionary,
-        ]
-        try PeerTrust.enforceSignedPeer(info: info, requiredEntitlements: requirement.requiredEntitlements)
-    }
-
-    @Test func missingOrWrongAppGroupFailsClosed() throws {
-        let requirement = try fixtureRequirement()
-        let missing: NSDictionary = [
-            kSecCodeInfoStatus: NSNumber(value: runtimeAndLibraryValidation),
-            kSecCodeInfoEntitlementsDict: [:] as NSDictionary,
-        ]
-        #expect(throws: PeerTrust.TrustError.requiredEntitlementMissing(applicationGroupsKey)) {
-            try PeerTrust.enforceSignedPeer(info: missing, requiredEntitlements: requirement.requiredEntitlements)
+            try PeerTrust.enforceSignedPeer(info: info, requiredEntitlements: requirement.requiredEntitlements)
         }
-        let wrong: NSDictionary = [
-            kSecCodeInfoStatus: NSNumber(value: runtimeAndLibraryValidation),
-            kSecCodeInfoEntitlementsDict: [applicationGroupsKey: ["group.other"]] as NSDictionary,
-        ]
-        #expect(throws: PeerTrust.TrustError.requiredEntitlementMismatch(applicationGroupsKey)) {
-            try PeerTrust.enforceSignedPeer(info: wrong, requiredEntitlements: requirement.requiredEntitlements)
-        }
-    }
 
-    @Test func socketServerRequiresAnExplicitTrustPolicy() async throws {
-        let directory = try shortSocketDir()
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let path = directory.appendingPathComponent("s.sock").path
-        let server = SocketServer(path: path, build: "server-test", trust: .testingUIDOnly) { request in
-            .terminal(SocketTerminal(payload: request.payload))
+        @Test func missingOrWrongAppGroupFailsClosed() throws {
+            let requirement = try fixtureRequirement()
+            let missing: NSDictionary = [
+                kSecCodeInfoStatus: NSNumber(value: runtimeAndLibraryValidation),
+                kSecCodeInfoEntitlementsDict: [:] as NSDictionary,
+            ]
+            #expect(throws: PeerTrust.TrustError.requiredEntitlementMissing(applicationGroupsKey)) {
+                try PeerTrust.enforceSignedPeer(info: missing, requiredEntitlements: requirement.requiredEntitlements)
+            }
+            let wrong: NSDictionary = [
+                kSecCodeInfoStatus: NSNumber(value: runtimeAndLibraryValidation),
+                kSecCodeInfoEntitlementsDict: [applicationGroupsKey: ["group.other"]] as NSDictionary,
+            ]
+            #expect(throws: PeerTrust.TrustError.requiredEntitlementMismatch(applicationGroupsKey)) {
+                try PeerTrust.enforceSignedPeer(info: wrong, requiredEntitlements: requirement.requiredEntitlements)
+            }
         }
-        try server.start()
-        defer { server.stop() }
-        let client = try SocketClient(path: path, build: "server-test")
-        defer { client.close() }
-        let result = try await client.call(operation: "echo", payload: Data(#""hi""#.utf8))
-        #expect(result.payload == Data(#""hi""#.utf8))
-    }
 
-    @Test func serverClosesConnectionForARejectedSignedPeer() throws {
-        let directory = try shortSocketDir()
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let path = directory.appendingPathComponent("s.sock").path
-        let server = try SocketServer(
-            path: path,
-            build: "server-test",
-            trust: PeerTrust(requirement: fixtureRequirement())
-        ) { _ in
-            Issue.record("handler must not run for a rejected peer")
-            return .terminal(SocketTerminal())
+        @Test func socketServerRequiresAnExplicitTrustPolicy() async throws {
+            let directory = try shortSocketDir()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let path = directory.appendingPathComponent("s.sock").path
+            let server = SocketServer(path: path, build: "server-test", trust: .testingUIDOnly) { request in
+                .terminal(SocketTerminal(payload: request.payload))
+            }
+            try server.start()
+            defer { server.stop() }
+            let client = try SocketClient(path: path, build: "server-test")
+            defer { client.close() }
+            let result = try await client.call(operation: "echo", payload: Data(#""hi""#.utf8))
+            #expect(result.payload == Data(#""hi""#.utf8))
         }
-        try server.start()
-        defer { server.stop() }
-        #expect(throws: (any Error).self) {
-            _ = try SocketClient(path: path, build: "server-test")
+
+        @Test func serverClosesConnectionForARejectedSignedPeer() throws {
+            let directory = try shortSocketDir()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let path = directory.appendingPathComponent("s.sock").path
+            let server = try SocketServer(
+                path: path,
+                build: "server-test",
+                trust: PeerTrust(requirement: fixtureRequirement())
+            ) { _ in
+                Issue.record("handler must not run for a rejected peer")
+                return .terminal(SocketTerminal())
+            }
+            try server.start()
+            defer { server.stop() }
+            #expect(throws: (any Error).self) {
+                _ = try SocketClient(path: path, build: "server-test")
+            }
         }
-    }
 
-    @Test(.enabled(if: trustE2EEnabled, "set DAEMONKIT_TRUST_E2E=1 and build signed fixtures")) func signedFixtureWithRequiredAppGroupPasses() throws {
-        let directory = try shortSocketDir()
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let peer = try spawnFixture("fixture-devid-a", in: directory)
-        defer { peer.close() }
-        try PeerTrust(requirement: fixtureRequirement()).check(descriptor: peer.server)
-    }
+        @Test(.enabled(if: trustE2EEnabled, "set DAEMONKIT_TRUST_E2E=1 and build signed fixtures")) func signedFixtureWithRequiredAppGroupPasses() throws {
+            let directory = try shortSocketDir()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let peer = try spawnFixture("fixture-devid-a", in: directory)
+            defer { peer.close() }
+            try PeerTrust(requirement: fixtureRequirement()).check(descriptor: peer.server)
+        }
 
-    @Test(.enabled(if: trustE2EEnabled, "set DAEMONKIT_TRUST_E2E=1 and build signed fixtures")) func signedFixtureWithWrongAppGroupFails() throws {
-        let directory = try shortSocketDir()
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let peer = try spawnFixture("fixture-devid-wronggroup", in: directory)
-        defer { peer.close() }
-        #expect(throws: PeerTrust.TrustError.requiredEntitlementMismatch(applicationGroupsKey)) {
-            try PeerTrust(
-                requirement: fixtureRequirement(identifier: "com.yasyf.daemonkit.fixture-wronggroup")
-            ).check(descriptor: peer.server)
+        @Test(.enabled(if: trustE2EEnabled, "set DAEMONKIT_TRUST_E2E=1 and build signed fixtures")) func signedFixtureWithWrongAppGroupFails() throws {
+            let directory = try shortSocketDir()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let peer = try spawnFixture("fixture-devid-wronggroup", in: directory)
+            defer { peer.close() }
+            #expect(throws: PeerTrust.TrustError.requiredEntitlementMismatch(applicationGroupsKey)) {
+                try PeerTrust(
+                    requirement: fixtureRequirement(identifier: "com.yasyf.daemonkit.fixture-wronggroup")
+                ).check(descriptor: peer.server)
+            }
         }
     }
 }
