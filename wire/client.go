@@ -31,7 +31,8 @@ const (
 	PreSendFailure
 	// Rejected proves the server did not dispatch the request.
 	Rejected
-	// PostSendFailure means the request was sent but no terminal response arrived.
+	// PostSendFailure means the request was sent but no terminal response
+	// arrived; never auto-replay it.
 	PostSendFailure
 )
 

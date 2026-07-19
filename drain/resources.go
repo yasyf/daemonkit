@@ -1,11 +1,8 @@
 // Package drain is the drain-on-upgrade engine: a draining daemon hands its
-// resources to a strictly-newer successor with every row in exactly one journal,
-// and never force-clears unless policy permits a proven Dead liveness verdict.
-//
-// The engine defends against crashes, power loss, and concurrent cooperating
-// processes sharing the state dir. A hostile same-UID actor staging symlinks or
-// mutating the dotdir out-of-band is out of scope; per-message identity
-// hardening is a later phase.
+// resources to a strictly-newer successor with every row in exactly one
+// journal, and never force-clears unless policy permits a proven Dead
+// verdict. It defends against crashes, power loss, and concurrent
+// cooperating processes; a hostile same-UID actor is out of scope.
 package drain
 
 import "context"

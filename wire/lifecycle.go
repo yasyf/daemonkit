@@ -20,8 +20,9 @@ type Lifecycle interface {
 	Handoff(context.Context) error
 }
 
-// RegisterLifecycle installs lifecycle-v2 health, shutdown, and handoff handlers.
-// These handlers bypass ordinary admission so shutdown cannot deadlock its ACK.
+// RegisterLifecycle installs the reserved lifecycle handlers: health, shutdown,
+// and handoff. They skip build-mismatch and drain rejection — a shutdown
+// request is acknowledged mid-drain — but still pass ordinary admission.
 func (s *Server) RegisterLifecycle(lifecycle Lifecycle) {
 	if lifecycle == nil {
 		panic("wire: lifecycle is required")

@@ -8,9 +8,6 @@ import (
 	"time"
 )
 
-// TestEnsureCurrentPollsPastOldVersion: while the retiring older daemon still
-// answers Health, EnsureCurrent keeps polling and returns only once the peer
-// reports EXACTLY the target version.
 func TestEnsureCurrentPollsPastOldVersion(t *testing.T) {
 	old := Health{Build: "1.0.0", PID: 100}
 	target := Health{Build: "2.0.0", PID: 200}
@@ -31,8 +28,6 @@ func TestEnsureCurrentPollsPastOldVersion(t *testing.T) {
 	}
 }
 
-// TestEnsureCurrentTimeout: a peer stuck on the old version fails with
-// ErrEnsureTimeout once the deadline elapses.
 func TestEnsureCurrentTimeout(t *testing.T) {
 	peer := &fakePeer{health: []healthResult{{h: Health{Build: "1.0.0", PID: 100}}}}
 	cfg := EnsureConfig{
@@ -49,7 +44,6 @@ func TestEnsureCurrentTimeout(t *testing.T) {
 	}
 }
 
-// TestEnsureCurrentEnsureError: an Ensure hook failure aborts the wait.
 func TestEnsureCurrentEnsureError(t *testing.T) {
 	boom := errors.New("spawn failed")
 	peer := &fakePeer{health: []healthResult{{h: Health{Build: "1.0.0"}}}}

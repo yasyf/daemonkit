@@ -1,8 +1,7 @@
-// Package daemon is the consumer-agnostic lifecycle shell for a detached daemon:
-// the successor-initiated takeover ladder, the target-version ensure gate, the
-// incumbent-initiated skew watch, an idle-exit timer, and a foreign-key-preserving
-// state file. It talks to a running peer only through the exact-protocol Peer
-// interface, which each consumer adapts from the generated lifecycle client.
+// Package daemon is the consumer-agnostic lifecycle shell for a detached
+// daemon: the successor-initiated takeover ladder, the ensure gate, the skew
+// watch, an idle-exit timer, and a foreign-key-preserving state file.
+// Consumers adapt a running peer through the exact-protocol Peer interface.
 package daemon
 
 import "context"
@@ -39,9 +38,8 @@ type Health struct {
 	Busy bool
 }
 
-// Peer is a running daemon as its successor or a client sees it, adapted by each
-// consumer from its own frozen wire client. Every method blocks on I/O and takes
-// ctx first.
+// Peer is a running daemon as its successor or a client sees it. Every method
+// blocks on I/O and takes ctx first.
 type Peer interface {
 	// Health returns the peer's current snapshot.
 	Health(ctx context.Context) (Health, error)

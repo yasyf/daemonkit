@@ -12,7 +12,6 @@ import (
 
 var errFakeLaunch = errors.New("fake launchctl failure")
 
-// fakeLauncher records the launchctl verbs Agent issues and fails on failOn.
 type fakeLauncher struct {
 	failOn string
 	verbs  []string
@@ -104,11 +103,11 @@ func TestAgentPathIsBrewManaged(t *testing.T) {
 		path string
 		want bool
 	}{
-		{path: "/opt/homebrew/Cellar/cc-pool/1.2.3/bin/cc-pool", want: true}, // versioned Cellar
-		{path: "/opt/homebrew/opt/cc-pool/bin/cc-pool", want: true},          // opt symlink tree
-		{path: "/opt/homebrew/bin/cc-pool", want: true},                      // brew bin symlink
-		{path: "/Users/x/go/bin/cc-pool", want: false},                       // go install
-		{path: "/usr/local/bin/other-tool", want: false},                     // unrelated binary
+		{path: "/opt/homebrew/Cellar/cc-pool/1.2.3/bin/cc-pool", want: true},
+		{path: "/opt/homebrew/opt/cc-pool/bin/cc-pool", want: true},
+		{path: "/opt/homebrew/bin/cc-pool", want: true},
+		{path: "/Users/x/go/bin/cc-pool", want: false},
+		{path: "/usr/local/bin/other-tool", want: false},
 	}
 	for _, tc := range cases {
 		if got := a.pathIsBrewManaged(tc.path); got != tc.want {
@@ -137,7 +136,7 @@ func TestWritePlistRendersAgent(t *testing.T) {
 		RestartPolicy: RestartAlways,
 		Env: map[string]string{
 			"PATH":      "/usr/bin",
-			"AMPERSAND": "a&b<c", // must be XML-escaped, not emitted raw
+			"AMPERSAND": "a&b<c",
 		},
 	}
 	path, err := a.WritePlist()
@@ -160,7 +159,7 @@ func TestWritePlistRendersAgent(t *testing.T) {
 		"<key>PATH</key>",
 		"<string>/usr/bin</string>",
 		"<key>KeepAlive</key>",
-		"a&amp;b&lt;c", // escaping happened
+		"a&amp;b&lt;c",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("rendered plist missing %q\n---\n%s", want, s)

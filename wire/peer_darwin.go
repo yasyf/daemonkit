@@ -50,13 +50,8 @@ func peerFromFD(fd int) (Peer, error) {
 	return Peer{PID: pid, UID: int(xu.Uid), Audit: audit}, nil
 }
 
-// peerAuditToken reads the raw 32-byte audit_token_t via LOCAL_PEERTOKEN through
-// libc getsockopt. A raw read is required: unix.GetsockoptString truncates the
-// token at its first NUL, and the token's pid/uid words routinely hold NULs.
-//
-// LOCAL_PEERTOKEN is query-time, not connect-frozen: XNU resolves it from the
-// peer socket's last_pid at getsockopt time (bsd/kern/uipc_usrreq.c), unlike
-// LOCAL_PEERCRED. See trust.Policy.Check for the accepted consequences.
+// A raw getsockopt read: GetsockoptString truncates at the first NUL, and the
+// token routinely holds NULs. Query-time binding — see trust.Policy.Check.
 func peerAuditToken(fd int) ([]byte, error) {
 	getsockoptOnce.Do(loadGetsockopt)
 	if getsockoptErr != nil {

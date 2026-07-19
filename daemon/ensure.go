@@ -32,10 +32,8 @@ type EnsureConfig struct {
 }
 
 // EnsureCurrent serializes through the start flock, then polls until the peer
-// answering Health reports EXACTLY target. Reachability alone is not success — a
-// retiring older daemon still answers — so it keeps polling until the reported
-// Build and Protocol match the targets, returning ErrEnsureTimeout if the
-// deadline elapses.
+// answering Health reports EXACTLY the target build and protocol — reachability
+// alone is not success, a retiring older daemon still answers — or ErrEnsureTimeout.
 func EnsureCurrent(ctx context.Context, cfg EnsureConfig, target string) error {
 	lockDeadline := cfg.Timeout
 	if lockDeadline <= 0 {

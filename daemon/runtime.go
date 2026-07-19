@@ -34,10 +34,9 @@ type SessionServer interface {
 	CloseIntake() error
 }
 
-// Workers owns every disposable worker admitted by a Runtime.
-//
-// Wait must not return while an admitted worker or tracked process group remains
-// alive. A context error is reported only after identity-safe settlement.
+// Workers owns every disposable worker admitted by a Runtime. Wait must not
+// return while an admitted worker or tracked process group remains alive; a
+// context error is reported only after identity-safe settlement.
 type Workers interface {
 	Close()
 	Cancel()

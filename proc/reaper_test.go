@@ -13,7 +13,6 @@ import (
 	"time"
 )
 
-// mustAdd stores rec or fails the test.
 func mustAdd(t *testing.T, s Store, rec Record) {
 	t.Helper()
 	if err := s.Add(context.Background(), rec); err != nil {
@@ -21,7 +20,6 @@ func mustAdd(t *testing.T, s Store, rec Record) {
 	}
 }
 
-// memStore is an in-memory Store double for the reaper-logic tests.
 type memStore struct {
 	mu   sync.Mutex
 	recs []Record
@@ -69,8 +67,6 @@ func (m *memStore) len() int {
 	return len(m.recs)
 }
 
-// fakeProber returns a fixed identity or error for every pid, unless perProbe
-// overrides the result on a given (0-indexed) probe.
 type fakeProber struct {
 	mu         sync.Mutex
 	info       procInfo
@@ -120,12 +116,11 @@ func (f *fakeProber) probedPIDs() []int {
 	return append([]int(nil), f.probed...)
 }
 
-// recSignaler records every signal and optionally delegates to the OS.
 type recSignaler struct {
 	mu       sync.Mutex
 	sent     []signalCall
 	delegate signaler
-	err      error // returned for every call when delegate is nil
+	err      error
 }
 
 type signalCall struct {
@@ -354,16 +349,14 @@ func TestReapRejectsLegacyGroupWithoutSessionIdentity(t *testing.T) {
 	}
 }
 
-// TestReapPIDReuseResistance: a live, innocent process whose start time differs
-// from the record is never signaled, and the stale record is dropped.
 func TestReapPIDReuseResistance(t *testing.T) {
 	ctx := context.Background()
 	store := &memStore{}
-	prober := &fakeProber{info: liveInfo()} // the live process
+	prober := &fakeProber{info: liveInfo()}
 	sig := &recSignaler{err: errors.New("signal must not be sent")}
 
 	rec := matchingRecord(4242, "old-gen")
-	rec.StartTime = "999999.000000" // record predates a reused pid
+	rec.StartTime = "999999.000000"
 	mustAdd(t, store, rec)
 
 	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
@@ -378,8 +371,6 @@ func TestReapPIDReuseResistance(t *testing.T) {
 	}
 }
 
-// TestReapProbeErrorFailsClosed: an Undetermined probe signals nothing and keeps
-// the record for a later pass.
 func TestReapProbeErrorFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	store := &memStore{}
@@ -399,8 +390,6 @@ func TestReapProbeErrorFailsClosed(t *testing.T) {
 	}
 }
 
-// TestReapStaleRecordCleanup: a record whose pid no longer exists is dropped
-// without any signal (ESRCH-as-success on the initial probe).
 func TestReapStaleRecordCleanup(t *testing.T) {
 	ctx := context.Background()
 	store := &memStore{}
@@ -420,13 +409,11 @@ func TestReapStaleRecordCleanup(t *testing.T) {
 	}
 }
 
-// TestReapESRCHOnSignalIsSuccess: an orphan that exits between probe and SIGTERM
-// (kill → ESRCH) counts as reaped; the record is dropped.
 func TestReapESRCHOnSignalIsSuccess(t *testing.T) {
 	ctx := context.Background()
 	store := &memStore{}
 	prober := &fakeProber{info: liveInfo()}
-	sig := &recSignaler{err: syscall.ESRCH} // process gone by the time we signal
+	sig := &recSignaler{err: syscall.ESRCH}
 	mustAdd(t, store, matchingRecord(7272, "old-gen"))
 
 	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
@@ -442,8 +429,6 @@ func TestReapESRCHOnSignalIsSuccess(t *testing.T) {
 	}
 }
 
-// TestReapRefusesSelfAndPID1: records for pid<=1 or the caller's own pid are
-// never probed or signaled, and are kept.
 func TestReapRefusesSelfAndPID1(t *testing.T) {
 	ctx := context.Background()
 	store := &memStore{}
@@ -468,8 +453,6 @@ func TestReapRefusesSelfAndPID1(t *testing.T) {
 	}
 }
 
-// TestReapSkipsOwnGeneration: a live child bearing the reaper's own generation
-// is never signaled and its record is kept.
 func TestReapSkipsOwnGeneration(t *testing.T) {
 	ctx := context.Background()
 	store := &memStore{}
@@ -489,17 +472,14 @@ func TestReapSkipsOwnGeneration(t *testing.T) {
 	}
 }
 
-// TestReapPIDReuseDuringGrace: an orphan that dies during the grace window and
-// whose pid is reused (new start time) is never SIGKILLed; the record drops.
 func TestReapPIDReuseDuringGrace(t *testing.T) {
 	ctx := context.Background()
 	store := &memStore{}
-	// probe 0: initial revalidation matches; probe 1: post-grace, pid reused.
 	prober := &fakeProber{perProbe: []probeResult{
 		{info: liveInfo()},
 		{info: procInfo{startTime: "555.000000", comm: "someoneelse"}},
 	}}
-	sig := &recSignaler{} // SIGTERM succeeds; SIGKILL must not follow
+	sig := &recSignaler{}
 	mustAdd(t, store, matchingRecord(9292, "old-gen"))
 
 	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
@@ -515,8 +495,6 @@ func TestReapPIDReuseDuringGrace(t *testing.T) {
 	}
 }
 
-// TestReapCommMismatchDuringGrace: a post-grace probe matching pid+startTime but
-// not comm (the process exec'd away) is never SIGKILLed; the record drops.
 func TestReapCommMismatchDuringGrace(t *testing.T) {
 	ctx := context.Background()
 	store := &memStore{}
@@ -524,7 +502,7 @@ func TestReapCommMismatchDuringGrace(t *testing.T) {
 		{info: liveInfo()},
 		{info: procInfo{startTime: liveInfo().startTime, comm: "execd-away"}},
 	}}
-	sig := &recSignaler{} // SIGTERM succeeds; SIGKILL must not follow
+	sig := &recSignaler{}
 	mustAdd(t, store, matchingRecord(9393, "old-gen"))
 
 	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
@@ -540,8 +518,6 @@ func TestReapCommMismatchDuringGrace(t *testing.T) {
 	}
 }
 
-// TestReapReprobeErrorFailsClosed: an Undetermined re-probe after SIGTERM stops
-// short of SIGKILL and keeps the record.
 func TestReapReprobeErrorFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	store := &memStore{}
@@ -627,10 +603,6 @@ func TestReapRetainsRecordWhenKilledGroupNeverSettles(t *testing.T) {
 	}
 }
 
-// TestReapLadderRealChild spawns a real SIGTERM-ignoring child through a
-// non-test binary, tracks it with the real prober and a FileStore, then proves
-// the full SIGTERM → grace → SIGKILL ladder ends the process. It exercises the
-// real prober and signaler end to end.
 func TestReapLadderRealChild(t *testing.T) {
 	ctx := context.Background()
 	pid, wait := startTermIgnorer(t)
@@ -642,13 +614,12 @@ func TestReapLadderRealChild(t *testing.T) {
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	store := &FileStore{Path: filepath.Join(dir, "records.json")}
 
-	// Record the child under a prior generation via the real prober.
 	old := &Reaper{Store: store, Generation: "old-gen"}
 	if _, err := old.Track(ctx, pid); err != nil {
 		t.Fatalf("Track: %v", err)
 	}
 
-	sig := &recSignaler{delegate: sysSignaler{}} // real kills, recorded
+	sig := &recSignaler{delegate: sysSignaler{}}
 	r := &Reaper{Store: store, Generation: "new-gen", signaler: sig, clock: newFakeClock()}
 	if err := r.Reap(ctx); err != nil {
 		t.Fatalf("Reap: %v", err)
@@ -659,7 +630,6 @@ func TestReapLadderRealChild(t *testing.T) {
 		t.Fatalf("signal ladder = %v, want [SIGTERM SIGKILL] (child ignores SIGTERM)", calls)
 	}
 
-	// The child was mine; reap the zombie so kill(pid,0) can report ESRCH.
 	wait()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -680,9 +650,6 @@ func TestReapLadderRealChild(t *testing.T) {
 	}
 }
 
-// startTermIgnorer starts a single /bin/sh that installs an empty SIGTERM trap
-// and blocks reading a held-open pipe (no child to orphan), so only SIGKILL can
-// end it. It returns the pid and a wait func that reaps the zombie.
 func startTermIgnorer(t *testing.T) (int, func()) {
 	t.Helper()
 	pr, pw, err := os.Pipe()
@@ -695,9 +662,6 @@ func startTermIgnorer(t *testing.T) (int, func()) {
 		pw.Close()
 		t.Fatal(err)
 	}
-	// echo after trap: the ready byte proves the child has exec'd /bin/sh (comm
-	// is stable, no fork-window mismatch) and installed the TERM trap before we
-	// Track it.
 	cmd := exec.Command("/bin/sh", "-c", `trap "" TERM; echo r; read _`)
 	cmd.Stdin = pr
 	cmd.Stdout = wout
@@ -708,8 +672,8 @@ func startTermIgnorer(t *testing.T) (int, func()) {
 		wout.Close()
 		t.Fatalf("start term-ignorer: %v", err)
 	}
-	pr.Close()   // the child holds its own dup; keep pw open so read blocks
-	wout.Close() // the child holds its own dup; parent reads readiness on rout
+	pr.Close()
+	wout.Close()
 	if _, err := rout.Read(make([]byte, 1)); err != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
@@ -737,7 +701,6 @@ func TestFileStoreRoundTrip(t *testing.T) {
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	store := &FileStore{Path: filepath.Join(dir, "records.json")}
 
-	// Missing file loads as empty.
 	got, err := store.Load(ctx)
 	if err != nil {
 		t.Fatalf("Load missing: %v", err)
@@ -750,7 +713,7 @@ func TestFileStoreRoundTrip(t *testing.T) {
 	b := Record{PID: 200, StartTime: "2.2", Comm: "b", Generation: "g1"}
 	mustAdd(t, store, a)
 	mustAdd(t, store, b)
-	mustAdd(t, store, a) // re-adding the same instance replaces, not duplicates
+	mustAdd(t, store, a)
 
 	got, err = store.Load(ctx)
 	if err != nil {
@@ -781,12 +744,10 @@ func TestFileStoreRemoveByInstance(t *testing.T) {
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	store := &FileStore{Path: filepath.Join(dir, "records.json")}
 
-	// Same pid, different start time == different instance (pid reuse).
 	reused := Record{PID: 300, StartTime: "9.9", Comm: "new", Generation: "g2"}
 	mustAdd(t, store, Record{PID: 300, StartTime: "3.3", Comm: "old", Generation: "g1"})
 	mustAdd(t, store, reused)
 
-	// Removing the old instance leaves the reused-pid record intact.
 	if err := store.Remove(ctx, []Record{{PID: 300, StartTime: "3.3"}}); err != nil {
 		t.Fatal(err)
 	}

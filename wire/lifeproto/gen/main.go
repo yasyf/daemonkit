@@ -1,7 +1,6 @@
-// Command gen emits both language bindings for the lifeproto lifecycle envelope
-// from the single declarative schema in spec.go: the Go binding at
-// wire/lifeproto/lifeproto.go and the Swift binding at
-// Sources/DaemonKit/LifecycleWire.swift. Run it via `go generate ./wire/...`.
+// Command gen emits both lifeproto bindings from the schema in spec.go:
+// wire/lifeproto/lifeproto.go and Sources/DaemonKit/LifecycleWire.swift.
+// Run it via `go generate ./wire/...`.
 package main
 
 import (
@@ -27,9 +26,6 @@ func main() {
 	writeFile(filepath.Join(root, "Sources", "DaemonKit", "LifecycleWire.swift"), []byte(renderSwift(lifeproto)))
 }
 
-// moduleRoot walks up from the working directory to the directory holding go.mod
-// so the generator writes to fixed paths whether it is invoked from the package
-// directory (go generate) or the module root (go run ./wire/lifeproto/gen).
 func moduleRoot() (string, error) {
 	dir, err := os.Getwd()
 	if err != nil {
@@ -141,12 +137,8 @@ func renderGoMessage(b *strings.Builder, m message) {
 	fmt.Fprintf(b, "\treturn %s{%s}\n}\n\n", m.name, strings.Join(assigns, ", "))
 }
 
-// swiftStatic holds the version-independent Swift declarations: the JSON
-// assembler, the message protocol, the error, and the Envelope peek type. The
-// assembler is what lets Swift match Go's bytes — Foundation's JSONEncoder
-// reorders keys (and .sortedKeys sorts them alphabetically), neither matching
-// Go's struct field order, so encoding is done by hand in wire order with
-// Go-compatible string escaping.
+// Foundation's JSONEncoder cannot reproduce Go's struct-order marshaling
+// (.sortedKeys sorts alphabetically), so Swift encodes by hand in wire order.
 const swiftStatic = "" +
 	`/// Assembles flat lifecycle frames in Go's ` + "`json.Marshal`" + ` field order
 /// with Go-compatible string escaping, so the Swift bytes match the Go peer
@@ -239,9 +231,8 @@ public struct Envelope: Decodable, Sendable {
 }
 `
 
-// renderSwift builds the Swift binding source. The output is checked in as-is
-// (excluded from swiftformat/swiftlint) and pinned byte-stable by the CI drift
-// gate; keep the layout self-consistent.
+// renderSwift builds the Swift binding source, checked in as-is (excluded
+// from swiftformat/swiftlint) and pinned byte-stable by the CI drift gate.
 func renderSwift(s schema) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s\n\n", genHeader)
@@ -317,7 +308,6 @@ func renderSwiftMessage(b *strings.Builder, m message) {
 	b.WriteString("}\n")
 }
 
-// swiftEncoder maps a field kind to its LifecycleJSON value encoder.
 func swiftEncoder(k fieldKind) string {
 	switch {
 	case k.slice:
@@ -331,7 +321,6 @@ func swiftEncoder(k fieldKind) string {
 	}
 }
 
-// swiftCtorDoc turns the Go-style ctor doc (a verb phrase) into a Swift sentence.
 func swiftCtorDoc(m message) string {
 	return strings.ToUpper(m.ctorDoc[:1]) + m.ctorDoc[1:]
 }

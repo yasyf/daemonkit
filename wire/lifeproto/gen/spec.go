@@ -1,12 +1,8 @@
 package main
 
-// spec.go is the single source of truth for the lifeproto lifecycle envelope:
-// the protocol version, the op strings, and every message's flat field set.
-// The generator (main.go) reads this table and emits both the Go binding
-// (wire/lifeproto/lifeproto.go) and the Swift binding
-// (Sources/DaemonKit/LifecycleWire.swift) so the two languages can never drift.
-// The wire shape is FLAT: {"v":2,"op":<op>, ...fields}. Version 2 is an exact
-// contract with no compatibility negotiation or legacy parser.
+// spec.go is the single source of truth for the lifeproto envelope: the
+// protocol version, the op strings, and every message's flat field set. Any
+// change here is an intentional protocol break: increment the exact version.
 
 // fieldKind pairs a wire field's Go and Swift types. slice marks a []string,
 // whose Go constructor nil-normalizes to [] so it never encodes as null.
@@ -22,9 +18,7 @@ var (
 	boolKind   = fieldKind{goType: "bool", swiftType: "Bool"}
 )
 
-// field is one op-specific wire field beyond the shared {v, op} header. json is
-// the frozen wire key, goName the Go struct field, name the Swift property and
-// the constructor parameter shared by both languages.
+// field is one op-specific wire field beyond the shared {v, op} header.
 type field struct {
 	json   string
 	goName string
@@ -33,8 +27,6 @@ type field struct {
 	doc    string
 }
 
-// message is one request or response type. fields are the op-specific fields in
-// wire order; the {v, op} header is prepended by the generator.
 type message struct {
 	name    string
 	op      string
@@ -45,8 +37,7 @@ type message struct {
 	ctorDoc string
 }
 
-// op is a lifecycle operation: a Go const, its frozen wire value, and its Swift
-// enum case.
+// op is a lifecycle operation: a Go const, its frozen wire value, and its Swift enum case.
 type op struct {
 	constName string
 	value     string

@@ -2,8 +2,6 @@ package daemon
 
 import "testing"
 
-// TestStateStrings pins the State enum's wire strings; the Swift peer decodes the
-// same values.
 func TestStateStrings(t *testing.T) {
 	tests := []struct {
 		state State

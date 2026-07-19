@@ -12,11 +12,6 @@ import (
 	"testing"
 )
 
-// keepAliveGolden is the exact plist AppKeepAlive generates for the shared
-// cask holder — a frozen artifact: a failing compare is a behavior change,
-// not a literal to update casually. `-W` (block until exit, attach to a
-// running instance) is what keeps launchd's KeepAlive from spinning against
-// an already-running holder.
 const keepAliveGolden = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -55,9 +50,6 @@ func TestAppKeepAliveGoldenPlist(t *testing.T) {
 	}
 }
 
-// keepAliveGoldenWithBundle is the same holder plist with a BundleID set: the
-// AssociatedBundleIdentifiers key appears after KeepAlive. Absent a BundleID the
-// key is omitted (TestAppKeepAliveGoldenPlist pins that byte-identical output).
 const keepAliveGoldenWithBundle = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -163,7 +155,6 @@ func stubLaunchctl(t *testing.T, fn func(ctx context.Context, args ...string) (s
 	t.Cleanup(func() { launchctl = orig })
 }
 
-// shExit fabricates a genuine *exec.ExitError with the given exit code.
 func shExit(t *testing.T, code int) error {
 	t.Helper()
 	err := exec.Command("/bin/sh", "-c", fmt.Sprintf("exit %d", code)).Run()

@@ -150,9 +150,9 @@ func (s *Server) OnActivity(f func()) {
 	s.onActivity = f
 }
 
-// Serve accepts v3 sessions until ctx is cancelled. admit is called once for
-// every request and its returned done function runs after the terminal response
-// has been written to the connection.
+// Serve accepts v3 sessions until ctx is cancelled. admit runs for every
+// request that clears the pre-admission checks; its done runs when the
+// request's execution settles, including cancellation and write-failure paths.
 func (s *Server) Serve(ctx context.Context, listener net.Listener, admit func() (func(), error)) error {
 	if listener == nil {
 		return errors.New("wire: listener is required")

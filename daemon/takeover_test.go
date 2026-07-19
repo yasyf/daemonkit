@@ -14,8 +14,6 @@ import (
 	"github.com/yasyf/daemonkit/proc"
 )
 
-// TestTakeoverSameOrNewerExitsSelf: a same-version or newer incumbent makes the
-// successor exit without a single shutdown, signal, or handoff. Ties never evict.
 func TestTakeoverSameOrNewerExitsSelf(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -48,8 +46,6 @@ func TestTakeoverSameOrNewerExitsSelf(t *testing.T) {
 	}
 }
 
-// TestTakeoverNoIncumbentBinds: a transport-proven absent listener means nothing
-// to take over, so the caller may bind; no eviction is attempted.
 func TestTakeoverNoIncumbentBinds(t *testing.T) {
 	peer := &fakePeer{health: []healthResult{{err: fmt.Errorf("dial lifecycle: %w", ErrNoPeer)}}}
 	sig := &fakeSignaler{}
@@ -163,13 +159,10 @@ func TestTakeoverRefusesProtocolMismatch(t *testing.T) {
 	}
 }
 
-// TestTakeoverResourceOwnerHandoffNoSignals: a strictly-older ResourceOwner is
-// asked to hand off, then the successor waits for release and binds without a
-// shutdown or signal.
 func TestTakeoverResourceOwnerHandoffNoSignals(t *testing.T) {
 	peer := &fakePeer{health: []healthResult{
 		{h: Health{Build: "1.0.0", PID: 100}},
-		{err: ErrNoPeer}, // release-wait sees the socket gone
+		{err: ErrNoPeer},
 	}}
 	sig := &fakeSignaler{}
 	cfg := TakeoverConfig{
@@ -192,8 +185,6 @@ func TestTakeoverResourceOwnerHandoffNoSignals(t *testing.T) {
 	}
 }
 
-// TestTakeoverHandoffWaitModes pins whether handoff completion follows socket
-// release or the predecessor process exiting.
 func TestTakeoverHandoffWaitModes(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -293,14 +284,12 @@ func TestTakeoverHandoffWaitModes(t *testing.T) {
 	}
 }
 
-// TestTakeoverRequestDaemonKillLadder exercises the Shutdown -> grace ->
-// PID-revalidated SIGKILL ladder and every branch that must NOT kill.
 func TestTakeoverRequestDaemonKillLadder(t *testing.T) {
 	const start = "111.222"
 	tests := []struct {
 		name        string
-		afterGrace  healthResult // Health re-read after the grace window
-		reprobe     proberResult // probe of the victim after grace
+		afterGrace  healthResult
+		reprobe     proberResult
 		signalErr   error
 		wantSignals []signalRec
 	}{
@@ -340,12 +329,12 @@ func TestTakeoverRequestDaemonKillLadder(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			peer := &fakePeer{health: []healthResult{
-				{h: Health{Build: "1.0.0", PID: 100}}, // initial probe
+				{h: Health{Build: "1.0.0", PID: 100}},
 				tt.afterGrace,
 			}}
 			prober := &fakeProber{results: []proberResult{
-				{id: proc.Identity{PID: 100, StartTime: start}}, // pre-shutdown probe
-				tt.reprobe, // post-grace revalidation
+				{id: proc.Identity{PID: 100, StartTime: start}},
+				tt.reprobe,
 			}}
 			sig := &fakeSignaler{err: tt.signalErr}
 			cfg := TakeoverConfig{
@@ -370,8 +359,6 @@ func TestTakeoverRequestDaemonKillLadder(t *testing.T) {
 	}
 }
 
-// TestTakeoverRequestDaemonAlreadyGone: an incumbent that vanished before its
-// pre-shutdown probe is never shut down or signaled; the caller just binds.
 func TestTakeoverRequestDaemonAlreadyGone(t *testing.T) {
 	peer := &fakePeer{health: []healthResult{{h: Health{Build: "1.0.0", PID: 100}}}}
 	prober := &fakeProber{results: []proberResult{{err: proc.ErrNoProcess}}}
@@ -396,8 +383,6 @@ func TestTakeoverRequestDaemonAlreadyGone(t *testing.T) {
 	}
 }
 
-// TestTakeoverRefusesSelfAndInit: a RequestDaemon eviction refuses to target
-// pid<=1 or the successor's own pid, before any shutdown.
 func TestTakeoverRefusesSelfAndInit(t *testing.T) {
 	tests := []struct {
 		name string
@@ -430,9 +415,6 @@ func TestTakeoverRefusesSelfAndInit(t *testing.T) {
 	}
 }
 
-// TestTakeoverResourceOwnerHandoffsWhileBusy: Busy is observability, not a
-// compatibility switch. Exact-protocol ResourceOwners always use the handoff
-// contract and are never signaled.
 func TestTakeoverResourceOwnerHandoffsWhileBusy(t *testing.T) {
 	peer := &fakePeer{health: []healthResult{
 		{h: Health{Build: "1.0.0", PID: 100, Busy: true}},

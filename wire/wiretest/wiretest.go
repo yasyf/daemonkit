@@ -1,7 +1,6 @@
-// Package wiretest is the in-process harness for wire's framing and peer tests:
-// short-path socket dirs, a real client/server connection pair, an injectable
-// peer for handler tests, and a manually-advanced clock mirroring proc's seam.
-// It is framing- and peer-level only, never envelope-aware.
+// Package wiretest is the in-process harness for wire's transport and peer
+// tests: short-path socket dirs, a real client/server pair, an injectable
+// peer, and a manually-advanced clock mirroring proc's seam.
 package wiretest
 
 import (
@@ -17,9 +16,9 @@ import (
 	"github.com/yasyf/daemonkit/wire"
 )
 
-// SocketDir returns a fresh directory short enough for a unix socket path (macOS
-// caps sun_path at 104 bytes, which t.TempDir() paths routinely exceed), with
-// removal registered on t.
+// SocketDir returns a fresh directory short enough for a unix socket path
+// (macOS caps sun_path at 104 bytes; t.TempDir routinely exceeds it), removed
+// on t's cleanup.
 func SocketDir(t *testing.T) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", fmt.Sprintf("dk-%d-", os.Getpid()))
@@ -30,9 +29,8 @@ func SocketDir(t *testing.T) string {
 	return dir
 }
 
-// Pair returns a connected client/server unix-socket pair over a real socket in
-// a short-path dir, with both ends closed on t. Both ends live in this process,
-// so PeerFromConn on either reports this process's own uid and pid.
+// Pair returns a connected client/server unix-socket pair. Both ends live in this
+// process, so PeerFromConn on either reports this process's own uid and pid.
 func Pair(t *testing.T) (client, server *net.UnixConn) {
 	t.Helper()
 	sock := filepath.Join(SocketDir(t), "s")
@@ -71,9 +69,8 @@ func Pair(t *testing.T) (client, server *net.UnixConn) {
 
 type peerKey struct{}
 
-// WithPeer returns a context carrying p, for handler tests that need a peer
-// identity without a real cross-credential socket. Production peers come from
-// wire.PeerFromConn over a live connection; this seam is test-only.
+// WithPeer returns a context carrying p for handler tests that need a peer
+// identity. Production peers come from wire.PeerFromConn; this seam is test-only.
 func WithPeer(ctx context.Context, p wire.Peer) context.Context {
 	return context.WithValue(ctx, peerKey{}, p)
 }

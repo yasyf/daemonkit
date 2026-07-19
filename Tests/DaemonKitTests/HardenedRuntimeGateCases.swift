@@ -3,7 +3,6 @@ import Foundation
 import Security
 import Testing
 
-// Mirrors of xnu cs_blobs.h status bits, independent of the implementation's.
 let csValid: UInt32 = 0x0000_0001
 let csGetTaskAllow: UInt32 = 0x0000_0004
 let csForcedLV: UInt32 = 0x0000_0010

@@ -2,9 +2,8 @@ package daemon
 
 import "errors"
 
-// ErrNoPeer means the lifecycle endpoint has no listening peer. Transports may
-// return it only when connection setup proves the endpoint absent; protocol,
-// trust, timeout, and other failures must retain their original error.
+// ErrNoPeer means the lifecycle endpoint has no listening peer, returned only
+// when connection setup proves the endpoint absent.
 var ErrNoPeer = errors.New("daemon: no lifecycle peer")
 
 // ErrRefuseVictim means a takeover refused to signal a PID it must never target:

@@ -150,6 +150,7 @@ public final class SocketServer: @unchecked Sendable {
     private let configuration: Configuration
     private let trust: PeerTrust
     private let handler: @Sendable (SocketRequest) async -> SocketResponse
+    // Serial: stop() joins the single long-lived accept loop via acceptQueue.sync.
     private let acceptQueue = DispatchQueue(label: "com.yasyf.daemonkit.SocketServer.accept")
     private let sessionGroup = DispatchGroup()
     private let lock = NSLock()

@@ -17,27 +17,20 @@ import (
 	"github.com/yasyf/daemonkit/wire"
 )
 
-// These tests PIN query-time peer identity on the unix-socket transport: a peer
-// that execs a different image after connecting authenticates as its CURRENT image.
-
 const (
 	peerSubSockEnv = "DAEMONKIT_PEERSUB_SOCK"
 	peerSubExecEnv = "DAEMONKIT_PEERSUB_EXEC"
 	peerSubArgsEnv = "DAEMONKIT_PEERSUB_ARGS"
 )
 
-// TestMain runs the substitution helper on a re-exec (peerSubSockEnv set), else the
-// suite. The helper execs a foreign image, never os.Executable() — no fork-bomb risk.
 func TestMain(m *testing.M) {
 	if os.Getenv(peerSubSockEnv) != "" {
 		runPeerSub()
-		os.Exit(70) // exec failed; unreachable on success
+		os.Exit(70)
 	}
 	os.Exit(m.Run())
 }
 
-// runPeerSub dials, waits for the go-ahead byte, then execs peerSubExecEnv on the
-// SAME pid, holding a non-CLOEXEC dup open so last_pid still resolves this pid.
 func runPeerSub() {
 	conn, err := net.Dial("unix", os.Getenv(peerSubSockEnv))
 	if err != nil {
@@ -57,8 +50,6 @@ func runPeerSub() {
 		heldFD int
 		dupErr error
 	)
-	// dup(2) clears CLOEXEC on the new fd; it outlives conn and the exec, holding
-	// the peer socket end open independently of any Go object.
 	if err := raw.Control(func(fd uintptr) { heldFD, dupErr = syscall.Dup(int(fd)) }); err != nil || dupErr != nil {
 		os.Exit(74)
 	}
@@ -69,11 +60,9 @@ func runPeerSub() {
 	os.Exit(75)
 }
 
-// spawnPeerSub re-execs this test binary as the connecting helper (which becomes
-// execTarget on the same pid) and returns the accepted server-side connection.
 func spawnPeerSub(t *testing.T, execTarget, execArgs string) *net.UnixConn {
 	t.Helper()
-	dir, err := os.MkdirTemp("/tmp", "dk-sub") // short path: unix socket names cap at ~104 bytes
+	dir, err := os.MkdirTemp("/tmp", "dk-sub")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +107,6 @@ func spawnPeerSub(t *testing.T, execTarget, execArgs string) *net.UnixConn {
 	}
 }
 
-// requireVerifier loads the Security.framework verifier or skips.
 func requireVerifier(t *testing.T) {
 	t.Helper()
 	secOnce.Do(loadSecurity)
@@ -127,8 +115,6 @@ func requireVerifier(t *testing.T) {
 	}
 }
 
-// resolvesTo reads the peer's CURRENT audit token (query-time) and reports whether
-// the resolved SecCode satisfies req.
 func resolvesTo(t *testing.T, conn *net.UnixConn, req string) bool {
 	t.Helper()
 	peer, err := wire.PeerFromConn(conn)
@@ -157,36 +143,24 @@ func eventually(t *testing.T, d time.Duration, cond func() bool) bool {
 	}
 }
 
-// TestPeerTokenIsQueryTimeLive_TF1 pins TF1 (fork/exec substitution): a peer that
-// execs /bin/sleep after connecting authenticates as /bin/sleep — a query-time image.
 func TestPeerTokenIsQueryTimeLive_TF1(t *testing.T) {
-	// Residual platform limitation: LOCAL_PEERTOKEN is query-time-live, so the
-	// identity observed at admission can differ from the original connector.
 	requireVerifier(t)
 	const sleepReq = `identifier "com.apple.sleep" and anchor apple`
 
 	conn := spawnPeerSub(t, "/bin/sleep", "86400")
 
-	// Before the substitution the peer is this (non-Apple) test binary.
 	if resolvesTo(t, conn, sleepReq) {
 		t.Fatal("baseline: peer resolves to /bin/sleep before the exec")
 	}
-	// Release the helper; it execs /bin/sleep on the same pid + connection.
 	if _, err := conn.Write([]byte{1}); err != nil {
 		t.Fatalf("signal helper: %v", err)
 	}
-	// The query-time identity flips to /bin/sleep — the substitution succeeds.
 	if !eventually(t, 5*time.Second, func() bool { return resolvesTo(t, conn, sleepReq) }) {
 		t.Fatal("peer identity never became /bin/sleep after the exec — substitution not observed")
 	}
 }
 
-// TestPolicyCheckAcceptsSubstitutedPeer_TF1 pins the security consequence: a peer
-// that execs a Developer ID fixture after connecting is ACCEPTED by Policy.Check.
 func TestPolicyCheckAcceptsSubstitutedPeer_TF1(t *testing.T) {
-	// Residual platform limitation: LOCAL_PEERTOKEN identifies the process at
-	// query time, so substitution by another process satisfying this exact policy
-	// before admission remains accepted.
 	requireE2E(t)
 	requireVerifier(t)
 	fixture := fixtureBin(t, "fixture-devid-a")
@@ -195,7 +169,6 @@ func TestPolicyCheckAcceptsSubstitutedPeer_TF1(t *testing.T) {
 
 	conn := spawnPeerSub(t, fixture, "")
 
-	// Baseline: the connector is the untrusted test binary → rejected.
 	peer, err := wire.PeerFromConn(conn)
 	if err != nil {
 		t.Fatalf("PeerFromConn: %v", err)
@@ -203,11 +176,9 @@ func TestPolicyCheckAcceptsSubstitutedPeer_TF1(t *testing.T) {
 	if err := p.Check(peer); !errors.Is(err, ErrUntrustedPeer) {
 		t.Fatalf("baseline Check = %v, want ErrUntrustedPeer (connector is not the fixture)", err)
 	}
-	// Release the helper; it execs the Developer ID fixture on the same pid.
 	if _, err := conn.Write([]byte{1}); err != nil {
 		t.Fatalf("signal helper: %v", err)
 	}
-	// Policy.Check now ACCEPTS the substituted peer — the documented bypass.
 	if !eventually(t, 5*time.Second, func() bool {
 		peer, err := wire.PeerFromConn(conn)
 		if err != nil {
@@ -219,18 +190,10 @@ func TestPolicyCheckAcceptsSubstitutedPeer_TF1(t *testing.T) {
 	}
 }
 
-// TestPeerTokenPIDReuse_TF2 documents TF2 (PID reuse): a recycled pid lets a later
-// LOCAL_PEERTOKEN read resolve an unrelated image. Not pinned — pid reuse is racy.
 func TestPeerTokenPIDReuse_TF2(t *testing.T) {
-	// Residual platform limitation: query-time lookup cannot bind a recycled pid
-	// to the original connector.
 	t.Skip("TF2 (PID reuse) is nondeterministic to pin in-tree; documented limitation — see db24393")
 }
 
-// TestPeerTokenFDDelegation_TF5 documents TF5 (fd delegation): SCM_RIGHTS fd passing
-// or a setuid binary detaches identity from the connection's actor.
 func TestPeerTokenFDDelegation_TF5(t *testing.T) {
-	// Residual platform limitation: this needs a privileged multi-process harness
-	// to pin, and connection admission cannot attribute later fd delegation.
 	t.Skip("TF5 (fd delegation / SCM_RIGHTS / setuid) needs a privileged multi-process harness; documented limitation — see db24393")
 }

@@ -20,17 +20,12 @@ const DefaultReapSettlement = 2 * time.Second
 
 const settlementPollInterval = 10 * time.Millisecond
 
-// errNoProc means a probed PID has no live process — a definitive "gone",
-// distinct from a probe failure (which is Undetermined and fails closed).
+// errNoProc is a definitive "gone", distinct from a probe failure (Undetermined, fails closed).
 var errNoProc = errors.New("no such process")
 
-// Record identifies one spawned child across daemon generations. The reaper
-// revalidates every identity field against the live process table before it signals,
-// so a reused PID is never mistaken for the recorded process — a PID alone is
-// never kill authority. StartTime is the prober's platform-native stable form
-// (darwin: the process start Timeval; linux: /proc start ticks), compared as an
-// opaque string; Comm is the OS-truncated process name; Generation tags the
-// daemon instance that spawned the child.
+// Record identifies one spawned child across daemon generations; Reap
+// revalidates every identity field against the live process table before it
+// signals — a PID alone is never kill authority.
 type Record struct {
 	// PID is the spawned child's process id.
 	PID int `json:"pid"`
@@ -48,21 +43,19 @@ type Record struct {
 	SessionID int `json:"session_id,omitempty"`
 }
 
-// Store persists orphan Records across daemon generations. Implementations must
-// serialize their read-modify-writes across processes so a spawning daemon's Add
-// never races a successor's Remove.
+// Store persists orphan Records across daemon generations; implementations
+// serialize read-modify-writes so a spawning daemon's Add never races a
+// successor's Remove.
 type Store interface {
 	// Add records a spawned child, replacing any prior record for the same
 	// process instance (PID + StartTime).
 	Add(ctx context.Context, rec Record) error
 	// Load returns every stored record.
 	Load(ctx context.Context) ([]Record, error)
-	// Remove deletes the given records (matched by PID + StartTime), leaving
-	// concurrently-added records intact.
+	// Remove deletes the given records (matched by PID + StartTime).
 	Remove(ctx context.Context, victims []Record) error
 }
 
-// procInfo is the identity snapshot the prober reads from the live process table.
 type procInfo struct {
 	startTime string
 	comm      string
@@ -76,14 +69,11 @@ type groupMember struct {
 	info procInfo
 }
 
-// prober reads a live process's identity from the OS. Production uses sysProber;
-// tests substitute a fake to inject errors and control identity.
 type prober interface {
 	probe(pid int) (procInfo, error)
 	groupMembers(groupID, sessionID int) ([]groupMember, error)
 }
 
-// sysProber is the production prober backed by the OS process table.
 type sysProber struct{}
 
 func (sysProber) probe(pid int) (procInfo, error) { return probeProc(pid) }
@@ -92,26 +82,19 @@ func (sysProber) groupMembers(groupID, sessionID int) ([]groupMember, error) {
 	return probeGroupMembers(groupID, sessionID)
 }
 
-// signaler delivers a signal to a process. Production uses sysSignaler; tests
-// substitute a fake to observe the ladder and inject ESRCH.
 type signaler interface {
 	signal(pid int, sig syscall.Signal) error
 }
 
-// sysSignaler is the production signaler backed by kill(2).
 type sysSignaler struct{}
 
 func (sysSignaler) signal(pid int, sig syscall.Signal) error { return syscall.Kill(pid, sig) }
 
-// Reaper reaps provably-ours orphaned children of a prior daemon generation. A
-// daemon MUST build a Reaper with a fresh unique Generation and run one Reap at
-// cold start, before accepting registrations, so a predecessor's orphans are
-// cleared before the successor rebinds their sockets; children it later spawns
-// are recorded with Track and become the next generation's orphans.
-//
-// Reap signals only a record whose process or dedicated-session identity is
-// revalidated and whose generation differs from its own. Any mismatch drops a
-// stale record; any unresolved probe keeps the record and makes Reap fail.
+// Reaper reaps provably-ours orphaned children of a prior daemon generation:
+// build one with a fresh unique Generation and run one Reap at cold start,
+// before accepting registrations. Reap signals only a record whose process or
+// dedicated-session identity is revalidated and whose generation differs;
+// any unresolved probe fails closed.
 type Reaper struct {
 	// Store persists orphan records across generations. Required.
 	Store Store
@@ -128,10 +111,8 @@ type Reaper struct {
 	clock    clock
 }
 
-// Track snapshots a freshly spawned child's identity from the live process table
-// and records it under this reaper's Generation, so a later generation can reap
-// it if it orphans. Snapshotting through the same prober the reaper revalidates
-// with guarantees the stored start time and comm match a future probe exactly.
+// Track snapshots a freshly spawned child's identity through the same prober
+// Reap revalidates with and records it under this reaper's Generation.
 func (r *Reaper) Track(ctx context.Context, pid int) (Record, error) {
 	return r.track(ctx, pid, false)
 }
@@ -194,11 +175,9 @@ func (r *Reaper) Owns(rec Record) (bool, error) {
 	return true, nil
 }
 
-// Reap revalidates every stored record against the live process table and
-// signals only provably-ours orphans of a prior generation, dropping records
-// whose recorded process is gone or reused and keeping records it could not
-// resolve. Run it once unconditionally at cold start before accepting
-// registrations (see Reaper).
+// Reap revalidates every stored record and signals only provably-ours
+// orphans of a prior generation, dropping gone-or-reused records and keeping
+// unresolved ones. Run it once at cold start before accepting registrations.
 func (r *Reaper) Reap(ctx context.Context) error {
 	recs, err := r.Store.Load(ctx)
 	if err != nil {
@@ -226,9 +205,7 @@ func (r *Reaper) Reap(ctx context.Context) error {
 	return errors.Join(unresolved...)
 }
 
-// reapOne returns whether rec should be dropped from the store: true once the
-// recorded process is provably gone, reused, or reaped; false to keep it (our
-// own live child, or an Undetermined probe that fails closed).
+// Drop only on provably gone, reused, or reaped; our own live child or an Undetermined probe fails closed and keeps the record.
 func (r *Reaper) reapOne(ctx context.Context, rec Record) (bool, error) {
 	if rec.PID <= 1 || rec.PID == os.Getpid() {
 		return false, errors.New("refusing unsafe process identity")
@@ -252,10 +229,7 @@ func (r *Reaper) reapOne(ctx context.Context, rec Record) (bool, error) {
 	return r.reapOrphan(ctx, rec)
 }
 
-// reapOrphan runs the SIGTERM → grace → re-revalidate → SIGKILL ladder against a
-// confirmed orphan and returns whether to drop its record. ESRCH at any point is
-// success. It fails closed on any Undetermined probe or signal error, and never
-// escalates to SIGKILL once the PID has been reused during the grace window.
+// SIGTERM → grace → re-revalidate → SIGKILL; ESRCH is success, and a PID reused during grace is never SIGKILLed.
 func (r *Reaper) reapOrphan(ctx context.Context, rec Record) (bool, error) {
 	target := signalTarget(rec)
 	gone, err := r.sendSignal(target, syscall.SIGTERM)
@@ -541,8 +515,7 @@ func (s *FileStore) mutate(ctx context.Context, fn func([]Record) []Record) erro
 	return writeRecords(s.Path, fn(recs))
 }
 
-// recordKey identifies a process instance: PID plus its start time, so a reused
-// PID with a different start time is a distinct key.
+// PID plus start time: a reused PID is a distinct instance.
 func recordKey(r Record) string { return strconv.Itoa(r.PID) + "\x00" + r.StartTime }
 
 func readRecords(path string) ([]Record, error) {

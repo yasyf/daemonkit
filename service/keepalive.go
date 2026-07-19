@@ -9,28 +9,20 @@ import (
 	"path/filepath"
 )
 
-// openPath is where macOS ships /usr/bin/open; the LaunchAgent's Program.
 const openPath = "/usr/bin/open"
 
-// AppKeepAlive is a per-user KeepAlive LaunchAgent that keeps a long-lived
-// .app bundle — the shared cask mount-holder at mountd.HolderApp — running
-// for the login session. The agent's Program is `/usr/bin/open -g -W <app>`:
-// -W makes open BLOCK until the app exits AND attach to an already-running
-// instance rather than launching a second copy, so launchd's KeepAlive
-// relaunches the app only on a real exit and never spins against a live
-// holder (-g keeps the launch in the background). A private, cask-less holder
-// binary is not a bundle open can adopt this way; it stays CLI-spawned by its
-// consumer daemon (proc.Spawn) with no LaunchAgent.
+// AppKeepAlive is a per-user KeepAlive LaunchAgent whose Program is
+// `/usr/bin/open -g -W <app>`: -W blocks until the app exits AND attaches to
+// a running instance, so launchd relaunches only on a real exit and never
+// spins against a live holder.
 type AppKeepAlive struct {
-	// Label is the LaunchAgent label / reverse-DNS identifier (e.g.
-	// "com.yasyf.fusekit-holder"): it names the plist and the launchctl
-	// service target. Required.
+	// Label is the LaunchAgent label / reverse-DNS identifier naming the plist
+	// and the launchctl service target. Required.
 	Label string
 	// AppPath is the absolute .app bundle path open launches. Required.
 	AppPath string
 	// BundleID, when set, adds an AssociatedBundleIdentifiers entry so launchd
-	// attributes this agent to the app bundle; empty omits the key and keeps the
-	// rendered plist byte-identical to the no-bundle output.
+	// attributes this agent to the app bundle; empty omits the key.
 	BundleID string
 	// RestartPolicy defines when launchd restarts the app waiter. Required.
 	RestartPolicy RestartPolicy
@@ -57,8 +49,7 @@ const keepAlivePlist = `<?xml version="1.0" encoding="UTF-8"?>
 </plist>
 `
 
-// assocBundleBlock renders the optional AssociatedBundleIdentifiers key; empty
-// when no BundleID is set so the plist stays byte-identical to the donor.
+// Rendered only when BundleID is set, so the no-bundle plist stays byte-identical to the donor.
 const assocBundleBlock = `    <key>AssociatedBundleIdentifiers</key>
     <array>
         <string>%s</string>
@@ -78,7 +69,6 @@ func (k AppKeepAlive) validate() error {
 	return nil
 }
 
-// plist renders the LaunchAgent plist; every interpolated value is XML-escaped.
 func (k AppKeepAlive) plist() ([]byte, error) {
 	if err := k.validate(); err != nil {
 		return nil, err
@@ -95,14 +85,12 @@ func (k AppKeepAlive) plist() ([]byte, error) {
 	return fmt.Appendf(nil, keepAlivePlist, label, openPath, openPath, app, restart, assoc), nil
 }
 
-// PlistPath is the LaunchAgent plist location
-// (~/Library/LaunchAgents/<Label>.plist).
+// PlistPath is the LaunchAgent plist location (~/Library/LaunchAgents/<Label>.plist).
 func (k AppKeepAlive) PlistPath() (string, error) {
 	return plistPath(k.Label)
 }
 
-// WritePlist renders and writes the LaunchAgent plist, returning the path
-// written.
+// WritePlist renders and writes the LaunchAgent plist, returning the path written.
 func (k AppKeepAlive) WritePlist() (string, error) {
 	body, err := k.plist()
 	if err != nil {
@@ -122,38 +110,31 @@ func (k AppKeepAlive) WritePlist() (string, error) {
 }
 
 // Install writes the plist and (re)bootstraps the agent so the app runs now
-// and at every login. Idempotent: an existing instance is booted out first —
-// that kills only the blocked `open -W` waiter, never the app it waits on —
-// and with the app already running, the fresh open attaches via -W instead of
-// starting a second copy.
+// and at every login. Bootout kills only the blocked open waiter, and the
+// fresh open attaches via -W instead of starting a second copy.
 func (k AppKeepAlive) Install(ctx context.Context) error {
 	plist, err := k.WritePlist()
 	if err != nil {
 		return err
 	}
-	// Best-effort remove any previous instance so bootstrap does not conflict.
 	_, _ = launchctl(ctx, "bootout", serviceTarget(k.Label))
-	// enable before bootstrap: it clears a user/MDM disable regardless of load
-	// state, and a disabled label fails bootstrap before enable could self-heal.
+	// enable before bootstrap: it clears a user/MDM disable, and a disabled label fails bootstrap.
 	if out, err := launchctl(ctx, "enable", serviceTarget(k.Label)); err != nil {
 		return fmt.Errorf("launchctl enable: %w: %s", err, out)
 	}
 	if out, err := launchctl(ctx, "bootstrap", domainTarget(), plist); err != nil {
 		return fmt.Errorf("launchctl bootstrap: %w: %s", err, out)
 	}
-	// bootstrap already started it (RunAtLoad); plain `kickstart` (no `-k`)
-	// covers the loaded-but-not-running race and no-ops when already running.
+	// Plain kickstart (no -k) covers the loaded-but-not-running race and no-ops when already running.
 	if out, err := launchctl(ctx, "kickstart", serviceTarget(k.Label)); err != nil {
 		return fmt.Errorf("launchctl kickstart: %w: %s", err, out)
 	}
 	return nil
 }
 
-// Uninstall boots out the agent and removes its plist; the app itself keeps
-// running (bootout kills the open waiter, not the app). A missing plist is
-// not an error. A bootout failure other than "not loaded" aborts before the
-// plist is removed, so a still-loaded agent never becomes an on-disk-invisible
-// orphan.
+// Uninstall boots out the agent and removes its plist; the app keeps running
+// (bootout kills the open waiter, not the app). A bootout failure other than
+// "not loaded" aborts before the plist is removed.
 func (k AppKeepAlive) Uninstall(ctx context.Context) error {
 	if err := k.validate(); err != nil {
 		return err
@@ -171,7 +152,6 @@ func (k AppKeepAlive) Uninstall(ctx context.Context) error {
 	return nil
 }
 
-// notLoaded reports whether a launchctl error means the label is not loaded:
 // bootout exits 3 ("No such process") for an unloaded service target.
 func notLoaded(err error) bool {
 	var exit *exec.ExitError
