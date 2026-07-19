@@ -47,26 +47,6 @@ func newBoundedStream[T any](capacity int) *boundedStream[T] {
 
 func (s *boundedStream[T]) channel() <-chan T { return s.values }
 
-func (s *boundedStream[T]) send(ctx context.Context, value T) error {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return errStreamClosed
-	}
-	s.senders.Add(1)
-	s.mu.Unlock()
-	defer s.senders.Done()
-
-	select {
-	case s.values <- value:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-s.done:
-		return errStreamClosed
-	}
-}
-
 func (s *boundedStream[T]) offer(value T) error {
 	s.mu.Lock()
 	if s.closed {

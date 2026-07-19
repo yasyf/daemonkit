@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"net"
 	"os"
 	"sync"
@@ -97,13 +96,14 @@ type Server struct {
 	// Log receives accept and session diagnostics.
 	Log *slog.Logger
 
-	mu         sync.Mutex
-	handlers   map[Op]entry
-	onActivity func()
-	listener   net.Listener
-	started    bool
-	draining   bool
-	sessions   map[*session]struct{}
+	mu           sync.Mutex
+	handlers     map[Op]entry
+	onActivity   func()
+	listener     net.Listener
+	started      bool
+	draining     bool
+	sessions     map[*session]struct{}
+	streamWindow uint32
 
 	queue        chan job
 	slots        chan struct{}
@@ -163,7 +163,8 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener, admit func() 
 	if s.Build == "" {
 		return errors.New("wire: Build is required")
 	}
-	if uint64(s.streamQueue()) > math.MaxUint32 {
+	streamWindow, err := uint32Length("stream queue", s.streamQueue())
+	if err != nil {
 		return errors.New("wire: stream queue exceeds protocol window")
 	}
 	s.mu.Lock()
@@ -174,6 +175,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener, admit func() 
 	s.started = true
 	s.listener = listener
 	s.sessions = make(map[*session]struct{})
+	s.streamWindow = streamWindow
 	if s.Log == nil {
 		s.Log = slog.Default()
 	}

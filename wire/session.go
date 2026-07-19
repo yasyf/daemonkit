@@ -220,7 +220,7 @@ func (s *session) receiveRequest(ctx context.Context, frame Frame) error {
 	}
 	s.active[frame.ID] = state
 	s.mu.Unlock()
-	if err := s.enqueue(ctx, Frame{Kind: FrameWindow, ID: frame.ID, Sequence: uint32(s.server.streamQueue())}); err != nil {
+	if err := s.enqueue(ctx, Frame{Kind: FrameWindow, ID: frame.ID, Sequence: s.server.streamWindow}); err != nil {
 		state.close()
 		s.removeRequest(frame.ID)
 		return err

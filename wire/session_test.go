@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -105,6 +107,63 @@ func admitAll(counter *atomic.Int32) func() (func(), error) {
 	return func() (func(), error) {
 		counter.Add(1)
 		return func() { counter.Add(-1) }, nil
+	}
+}
+
+func oversizedProtocolWindow(t *testing.T) int {
+	t.Helper()
+	if strconv.IntSize < 64 {
+		t.Skip("oversized protocol windows require a 64-bit int")
+	}
+	return int(uint64(math.MaxUint32) + 1)
+}
+
+func TestClientRejectsOversizedProtocolWindowsBeforeDial(t *testing.T) {
+	window := oversizedProtocolWindow(t)
+	tests := []struct {
+		name   string
+		config wire.ClientConfig
+		want   string
+	}{
+		{name: "stream", config: wire.ClientConfig{StreamQueue: window}, want: "wire: stream queue exceeds protocol window"},
+		{name: "event", config: wire.ClientConfig{EventQueue: window}, want: "wire: event queue exceeds protocol window"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var dials atomic.Int32
+			test.config.Build = "client-test"
+			test.config.Dial = func(context.Context) (net.Conn, error) {
+				dials.Add(1)
+				return nil, errors.New("dial invoked")
+			}
+			_, err := wire.NewClient(context.Background(), test.config)
+			if err == nil || err.Error() != test.want {
+				t.Fatalf("NewClient error = %v, want %q", err, test.want)
+			}
+			if got := dials.Load(); got != 0 {
+				t.Fatalf("dial count = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestServerRejectsOversizedProtocolWindowBeforeStarting(t *testing.T) {
+	window := oversizedProtocolWindow(t)
+	dir, err := os.MkdirTemp("/tmp", "daemonkit-wire-window-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	path := filepath.Join(dir, "daemon.sock")
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer listener.Close()
+	server := &wire.Server{Build: "server-test", StreamQueue: window}
+	err = server.Serve(context.Background(), listener, func() (func(), error) { return func() {}, nil })
+	if err == nil || err.Error() != "wire: stream queue exceeds protocol window" {
+		t.Fatalf("Serve error = %v, want oversized-window rejection", err)
 	}
 }
 
@@ -625,6 +684,7 @@ func TestCanceledRequestStreamReapsHandlerAndPreservesSession(t *testing.T) {
 	server := &wire.Server{Build: "server-test", InboundQueue: 1, StreamQueue: 1}
 	server.RegisterControl("upload", func(_ context.Context, request wire.Request) (any, error) {
 		for range request.Chunks {
+			continue
 		}
 		close(settled)
 		return true, nil

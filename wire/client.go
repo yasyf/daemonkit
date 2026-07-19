@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -102,6 +101,7 @@ type Client struct {
 	closeOnce               sync.Once
 	failOnce                sync.Once
 	streamCap               int
+	streamWindow            uint32
 	cancelSettlementTimeout time.Duration
 }
 
@@ -149,8 +149,13 @@ func NewClient(ctx context.Context, config ClientConfig) (*Client, error) {
 	}
 	streamCap := positiveOr(config.StreamQueue, defaultStreamQueue)
 	eventCap := positiveOr(config.EventQueue, defaultStreamQueue)
-	if uint64(streamCap) > math.MaxUint32 || uint64(eventCap) > math.MaxUint32 {
+	streamWindow, err := uint32Length("stream queue", streamCap)
+	if err != nil {
 		return nil, errors.New("wire: stream queue exceeds protocol window")
+	}
+	eventWindow, err := uint32Length("event queue", eventCap)
+	if err != nil {
+		return nil, errors.New("wire: event queue exceeds protocol window")
 	}
 	conn, err := config.Dial(ctx)
 	if err != nil {
@@ -188,9 +193,10 @@ func NewClient(ctx context.Context, config ClientConfig) (*Client, error) {
 		eventOut:                make(chan Event),
 		pending:                 make(map[uint64]*ClientCall),
 		streamCap:               streamCap,
+		streamWindow:            streamWindow,
 		cancelSettlementTimeout: durationOr(config.CancelSettlementTimeout, defaultCancelSettlementTimeout),
 	}
-	if err := codec.WriteFrame(Frame{Kind: FrameWindow, Sequence: uint32(eventCap)}); err != nil {
+	if err := codec.WriteFrame(Frame{Kind: FrameWindow, Sequence: eventWindow}); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("wire: grant event window: %w", err)
 	}
@@ -255,7 +261,7 @@ func (c *Client) Open(ctx context.Context, op Op, tenant string, payload []byte,
 		c.removePending(id)
 		return nil, fmt.Errorf("wire: send request: %w", err)
 	}
-	if err := c.sendFrame(callCtx, Frame{Kind: FrameWindow, ID: id, Sequence: uint32(c.streamCap)}); err != nil {
+	if err := c.sendFrame(callCtx, Frame{Kind: FrameWindow, ID: id, Sequence: c.streamWindow}); err != nil {
 		cancel()
 		err = fmt.Errorf("wire: grant response window: %w", err)
 		c.fail(err)
@@ -563,7 +569,7 @@ func (c *Client) readLoop(ctx context.Context) {
 				return
 			}
 		case FrameStream:
-			if err := c.receiveStream(ctx, frame); err != nil {
+			if err := c.receiveStream(frame); err != nil {
 				c.fail(err)
 				return
 			}
@@ -620,7 +626,7 @@ func (c *Client) receiveResponse(frame Frame) error {
 	return nil
 }
 
-func (c *Client) receiveStream(ctx context.Context, frame Frame) error {
+func (c *Client) receiveStream(frame Frame) error {
 	if frame.ID == 0 || frame.Op != "" || frame.Tenant != "" {
 		return fmt.Errorf("%w: response stream frame", ErrInvalidFrame)
 	}
