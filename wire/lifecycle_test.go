@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"sync/atomic"
@@ -90,6 +91,117 @@ func (f *fakeLifecycle) Shutdown(context.Context) error {
 func (f *fakeLifecycle) Handoff(context.Context) error {
 	f.handoffs.Add(1)
 	return nil
+}
+
+type armedWriteFailureConn struct {
+	net.Conn
+	armed           atomic.Bool
+	failReads       atomic.Bool
+	closeAfterWrite bool
+}
+
+func (c *armedWriteFailureConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if c.failReads.Load() {
+		return 0, errors.New("injected post-send read failure")
+	}
+	return n, err
+}
+
+func (c *armedWriteFailureConn) Write(p []byte) (int, error) {
+	if !c.armed.CompareAndSwap(true, false) {
+		return c.Conn.Write(p)
+	}
+	if !c.closeAfterWrite {
+		return 0, errors.New("injected pre-send failure")
+	}
+	c.failReads.Store(true)
+	written := 0
+	for written < len(p) {
+		n, err := c.Conn.Write(p[written:])
+		written += n
+		if err != nil {
+			return written, err
+		}
+		if n == 0 {
+			return written, io.ErrShortWrite
+		}
+	}
+	return written, nil
+}
+
+func TestLifecyclePeerReopensOnlyForProvenPreSendFailure(t *testing.T) {
+	lifecycle := &fakeLifecycle{}
+	server := &wire.Server{Build: "server-test"}
+	server.RegisterLifecycle(lifecycle)
+	running := startSessionServer(t, server, func() (func(), error) { return func() {}, nil })
+
+	var dials atomic.Int32
+	var first *armedWriteFailureConn
+	peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
+		Build: "client-test",
+		Dial: func(ctx context.Context) (net.Conn, error) {
+			conn, err := wire.UnixDialer(running.path)(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if dials.Add(1) == 1 {
+				first = &armedWriteFailureConn{Conn: conn}
+				return first, nil
+			}
+			return conn, nil
+		},
+	}}
+	t.Cleanup(func() { _ = peer.Close() })
+	if _, err := peer.Health(t.Context()); err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+	first.armed.Store(true)
+	if err := peer.Handoff(t.Context()); err != nil {
+		t.Fatalf("Handoff after proven pre-send failure: %v", err)
+	}
+	if got := dials.Load(); got != 2 {
+		t.Fatalf("dial count = %d, want 2", got)
+	}
+	if got := lifecycle.handoffs.Load(); got != 1 {
+		t.Fatalf("handoff count = %d, want 1", got)
+	}
+}
+
+func TestLifecyclePeerDoesNotReplayPostSendHandoff(t *testing.T) {
+	lifecycle := &fakeLifecycle{}
+	server := &wire.Server{Build: "server-test"}
+	server.RegisterLifecycle(lifecycle)
+	running := startSessionServer(t, server, func() (func(), error) { return func() {}, nil })
+
+	var dials atomic.Int32
+	var first *armedWriteFailureConn
+	peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
+		Build: "client-test",
+		Dial: func(ctx context.Context) (net.Conn, error) {
+			conn, err := wire.UnixDialer(running.path)(ctx)
+			if err != nil {
+				return nil, err
+			}
+			dials.Add(1)
+			first = &armedWriteFailureConn{Conn: conn, closeAfterWrite: true}
+			return first, nil
+		},
+	}}
+	t.Cleanup(func() { _ = peer.Close() })
+	if _, err := peer.Health(t.Context()); err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+	first.armed.Store(true)
+	if err := peer.Handoff(t.Context()); err == nil {
+		t.Fatal("post-send Handoff unexpectedly succeeded")
+	}
+	if got := dials.Load(); got != 1 {
+		t.Fatalf("post-send handoff redialed %d times, want 1", got)
+	}
+	if got := lifecycle.handoffs.Load(); got > 1 {
+		t.Fatalf("post-send handoff replayed: count = %d", got)
+	}
 }
 
 func TestLifecycleSkipsDrainRejectionButParticipatesInAdmission(t *testing.T) {

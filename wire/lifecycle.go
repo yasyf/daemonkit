@@ -120,7 +120,7 @@ func (p *LifecyclePeer) disconnected() bool {
 // Shutdown asks the peer to begin orderly shutdown.
 func (p *LifecyclePeer) Shutdown(ctx context.Context) error {
 	var response lifeproto.ShutdownResponse
-	if err := p.call(ctx, Op(lifeproto.OpShutdown), lifeproto.NewShutdownRequest(), &response); err != nil {
+	if err := p.callPreSend(ctx, Op(lifeproto.OpShutdown), lifeproto.NewShutdownRequest(), &response); err != nil {
 		return err
 	}
 	if !response.OK {
@@ -132,7 +132,7 @@ func (p *LifecyclePeer) Shutdown(ctx context.Context) error {
 // Handoff asks the peer to release its listener for a successor.
 func (p *LifecyclePeer) Handoff(ctx context.Context) error {
 	var response lifeproto.HandoffResponse
-	if err := p.call(ctx, Op(lifeproto.OpHandoff), lifeproto.NewHandoffRequest(), &response); err != nil {
+	if err := p.callPreSend(ctx, Op(lifeproto.OpHandoff), lifeproto.NewHandoffRequest(), &response); err != nil {
 		return err
 	}
 	if !response.OK {
@@ -186,6 +186,19 @@ func (p *LifecyclePeer) call(ctx context.Context, op Op, message any, dst any) e
 		return fmt.Errorf("wire: lifecycle response op mismatch: got %q, want %q", envelope.Op, op)
 	}
 	return nil
+}
+
+func (p *LifecyclePeer) callPreSend(ctx context.Context, op Op, message any, dst any) error {
+	err := p.call(ctx, op, message, dst)
+	if err == nil || ctx.Err() != nil || !provesPreSendFailure(err) {
+		return err
+	}
+	return p.call(ctx, op, message, dst)
+}
+
+func provesPreSendFailure(err error) bool {
+	var openErr *OpenError
+	return errors.As(err, &openErr) && openErr.Outcome == PreSendFailure
 }
 
 func (p *LifecyclePeer) session(ctx context.Context) (*Client, error) {
