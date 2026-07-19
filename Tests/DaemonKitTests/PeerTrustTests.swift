@@ -224,7 +224,7 @@ struct PeerTrustTests {
         defer { try? FileManager.default.removeItem(at: directory) }
         let path = directory.appendingPathComponent("s.sock").path
         let server = SocketServer(path: path, build: "server-test", trust: .testingUIDOnly) { request in
-            SocketResponse(payload: request.payload)
+            .terminal(SocketTerminal(payload: request.payload))
         }
         try server.start()
         defer { server.stop() }
@@ -244,7 +244,7 @@ struct PeerTrustTests {
             trust: PeerTrust(requirement: fixtureRequirement())
         ) { _ in
             Issue.record("handler must not run for a rejected peer")
-            return SocketResponse()
+            return .terminal(SocketTerminal())
         }
         try server.start()
         defer { server.stop() }
