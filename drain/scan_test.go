@@ -285,7 +285,11 @@ func TestScanReclaimSerializesOnRootLock(t *testing.T) {
 	if err := os.Remove(filepath.Join(g.Dir(), "owner.json")); err != nil {
 		t.Fatal(err)
 	}
-	lock, err := proc.Flock(context.Background(), g.rootLock())
+	lock, err := (proc.FileLockSpec{
+		Path:     g.rootLock(),
+		Mode:     proc.FileLockExclusive,
+		Deadline: time.Second,
+	}).Acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +301,7 @@ func TestScanReclaimSerializesOnRootLock(t *testing.T) {
 	if !dirExists(t, g.Dir()) {
 		t.Fatal("locked-out reclaim removed the generation")
 	}
-	if err := lock.Release(); err != nil {
+	if err := lock.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if err := ScanPeers(context.Background(), cfg); err != nil {

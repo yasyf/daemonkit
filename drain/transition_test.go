@@ -293,7 +293,11 @@ func TestTransitionJoinsInFlightAdoption(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	held, err := proc.Flock(ctx, e.canonical.lockPath())
+	held, err := (proc.FileLockSpec{
+		Path:     e.canonical.lockPath(),
+		Mode:     proc.FileLockExclusive,
+		Deadline: time.Second,
+	}).Acquire(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,7 +306,7 @@ func TestTransitionJoinsInFlightAdoption(t *testing.T) {
 	waitInflight(t, cfg.Intake)
 	transitionErr := make(chan error, 1)
 	go func() { transitionErr <- Transition(ctx, cfg) }()
-	held.Release()
+	held.Close()
 
 	if err := <-adoptErr; err != nil {
 		t.Fatalf("AdoptDead: %v", err)

@@ -71,7 +71,7 @@ func (s StrikeStore) ladder() []time.Duration {
 // Parked reports whether the breaker is parked at now, and until when.
 func (s StrikeStore) Parked(ctx context.Context, now time.Time) (bool, time.Time, error) {
 	var st strikeState
-	err := withFlock(ctx, s.Path+".lock", func() error {
+	err := withFileLock(ctx, s.Path+".lock", func() error {
 		var err error
 		st, err = s.load()
 		return err
@@ -88,7 +88,7 @@ func (s StrikeStore) Parked(ctx context.Context, now time.Time) (bool, time.Time
 // launch costs one unconsumed strike, which the park ladder must tolerate.
 func (s StrikeStore) Gate(ctx context.Context, now time.Time) (allowed bool, until time.Time, err error) {
 	file := daemon.StateFile{Path: s.Path}
-	err = withFlock(ctx, s.Path+".lock", func() error {
+	err = withFileLock(ctx, s.Path+".lock", func() error {
 		st, err := s.load()
 		if err != nil {
 			return err

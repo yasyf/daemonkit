@@ -34,8 +34,8 @@ type FileLockSpec struct {
 	Deadline time.Duration
 }
 
-// FlockHandle owns an acquired advisory lock.
-type FlockHandle struct {
+// FileLockHandle owns a FileLockSpec acquisition.
+type FileLockHandle struct {
 	mu       sync.Mutex
 	f        *os.File
 	closed   bool
@@ -45,7 +45,7 @@ type FlockHandle struct {
 // Close idempotently drops the lock and closes the handle. The lock file is
 // deliberately retained because unlinking a held lock creates a second inode
 // that another process can own concurrently.
-func (h *FlockHandle) Close() error {
+func (h *FileLockHandle) Close() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed {
@@ -64,12 +64,6 @@ func (h *FlockHandle) Close() error {
 	}
 	return nil
 }
-
-// Release drops ownership and closes the handle.
-func (h *FlockHandle) Release() error { return h.Close() }
-
-// FileLockHandle owns a FileLockSpec acquisition.
-type FileLockHandle = FlockHandle
 
 // Acquire waits for ownership until the earlier of ctx cancellation and the
 // spec's explicit Deadline.
@@ -129,34 +123,6 @@ func (s FileLockSpec) validate() error {
 	return nil
 }
 
-// TryLock takes an exclusive advisory lock on path without blocking, returning
-// ErrLockBusy when another owner already holds it.
-func TryLock(path string) (*FlockHandle, error) {
-	f, err := openFileLock(path)
-	if err != nil {
-		return nil, err
-	}
-	err = tryFileLock(f, FileLockExclusive)
-	if err == nil {
-		return &FlockHandle{f: f}, nil
-	}
-	_ = f.Close()
-	if errors.Is(err, unix.EWOULDBLOCK) {
-		return nil, ErrLockBusy
-	}
-	return nil, fmt.Errorf("flock %s: %w", path, err)
-}
-
-// Flock takes an exclusive cross-process advisory lock on path, polling so ctx
-// cancellation is observed without a goroutine leak on a stuck holder.
-func Flock(ctx context.Context, path string) (*FlockHandle, error) {
-	f, err := openFileLock(path)
-	if err != nil {
-		return nil, err
-	}
-	return fileLockPoll(ctx, f, path, FileLockExclusive)
-}
-
 func fileLockPoll(ctx context.Context, f *os.File, path string, mode FileLockMode) (*FileLockHandle, error) {
 	for {
 		if err := ctx.Err(); err != nil {
@@ -165,7 +131,7 @@ func fileLockPoll(ctx context.Context, f *os.File, path string, mode FileLockMod
 		}
 		err := tryFileLock(f, mode)
 		if err == nil {
-			return &FlockHandle{f: f}, nil
+			return &FileLockHandle{f: f}, nil
 		}
 		if !errors.Is(err, unix.EWOULDBLOCK) {
 			_ = f.Close()

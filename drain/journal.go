@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/proc"
@@ -68,11 +69,15 @@ func NewJournal(path string) Journal {
 }
 
 func (j Journal) withLock(ctx context.Context, fn func() error) error {
-	lock, err := proc.Flock(ctx, j.lock)
+	lock, err := (proc.FileLockSpec{
+		Path:     j.lock,
+		Mode:     proc.FileLockExclusive,
+		Deadline: 5 * time.Second,
+	}).Acquire(ctx)
 	if err != nil {
 		return err
 	}
-	defer lock.Release()
+	defer lock.Close()
 	if j.genDir != "" {
 		if _, err := os.Stat(j.genDir); err != nil {
 			return fmt.Errorf("generation %s: %w", filepath.Base(j.genDir), err)
@@ -425,12 +430,16 @@ func readState(path string) (map[string]json.RawMessage, error) {
 	return state, nil
 }
 
-func withFlock(ctx context.Context, path string, fn func() error) error {
-	lock, err := proc.Flock(ctx, path)
+func withFileLock(ctx context.Context, path string, fn func() error) error {
+	lock, err := (proc.FileLockSpec{
+		Path:     path,
+		Mode:     proc.FileLockExclusive,
+		Deadline: 5 * time.Second,
+	}).Acquire(ctx)
 	if err != nil {
 		return err
 	}
-	defer lock.Release()
+	defer lock.Close()
 	return fn()
 }
 
@@ -658,7 +667,7 @@ func (g Generation) writeOwnerUnlocked(id proc.Identity, inc string) error {
 // A matching retry rewrites the full durable chain: a readable record can still be undurable (rename landed, dir fsync failed).
 func (g Generation) claimOwner(ctx context.Context, id proc.Identity) (Generation, error) {
 	var bound Generation
-	err := withFlock(ctx, g.rootLock(), func() error {
+	err := withFileLock(ctx, g.rootLock(), func() error {
 		// A preseeded symlink would route the owner write outside the layout.
 		if fi, err := os.Lstat(g.dir); err == nil {
 			if fi.Mode()&os.ModeSymlink != 0 {
@@ -730,7 +739,7 @@ func (g Generation) clearStaleMarker() error {
 
 func (g Generation) bind(ctx context.Context) (Generation, error) {
 	var bound Generation
-	err := withFlock(ctx, g.rootLock(), func() error {
+	err := withFileLock(ctx, g.rootLock(), func() error {
 		rec, err := readOwnerFile(g.ownerPath())
 		if err != nil {
 			return err
@@ -786,7 +795,7 @@ func mintInc() (string, error) {
 
 // Remove durably deletes the generation directory once its rows are terminal or adopted.
 func (g Generation) Remove(ctx context.Context) error {
-	return withFlock(ctx, g.rootLock(), func() error {
+	return withFileLock(ctx, g.rootLock(), func() error {
 		if g.inc != "" {
 			inc, err := readOwnerInc(g.ownerPath())
 			if err == nil && inc != g.inc {

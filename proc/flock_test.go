@@ -17,12 +17,16 @@ import (
 
 func bumpUnderLock(t *testing.T, lockPath, counterPath string) {
 	t.Helper()
-	h, err := Flock(context.Background(), lockPath)
+	h, err := (FileLockSpec{
+		Path:     lockPath,
+		Mode:     FileLockExclusive,
+		Deadline: 5 * time.Second,
+	}).Acquire(context.Background())
 	if err != nil {
 		t.Errorf("acquire: %v", err)
 		return
 	}
-	defer h.Release()
+	defer h.Close()
 	b, err := os.ReadFile(counterPath)
 	if err != nil {
 		t.Errorf("read counter: %v", err)
@@ -35,7 +39,7 @@ func bumpUnderLock(t *testing.T, lockPath, counterPath string) {
 	}
 }
 
-func TestFlockSerializesCriticalSection(t *testing.T) {
+func TestFileLockSerializesCriticalSection(t *testing.T) {
 	dir := t.TempDir()
 	lockPath := filepath.Join(dir, "counter.lock")
 	counterPath := filepath.Join(dir, "counter")
@@ -67,63 +71,75 @@ func TestFlockSerializesCriticalSection(t *testing.T) {
 	}
 }
 
-func TestFlockRespectsContext(t *testing.T) {
+func TestFileLockRespectsContext(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ctx.lock")
-	held, err := Flock(context.Background(), path)
+	held, err := (FileLockSpec{
+		Path:     path,
+		Mode:     FileLockExclusive,
+		Deadline: time.Second,
+	}).Acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer held.Release()
+	defer held.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, err = Flock(ctx, path)
+	_, err = (FileLockSpec{
+		Path:     path,
+		Mode:     FileLockExclusive,
+		Deadline: time.Second,
+	}).Acquire(ctx)
 	if err == nil {
-		t.Fatal("Flock succeeded while the lock was held; want a ctx error")
+		t.Fatal("Acquire succeeded while the lock was held; want a ctx error")
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v, want errors.Is context.DeadlineExceeded", err)
 	}
 	if waited := time.Since(start); waited > time.Second {
-		t.Fatalf("Flock took %v to honor a 50ms deadline", waited)
+		t.Fatalf("Acquire took %v to honor a 50ms deadline", waited)
 	}
 }
 
 const (
-	flockChildLockEnv  = "FUSEKIT_FLOCK_TEST_LOCK"
-	flockChildReadyEnv = "FUSEKIT_FLOCK_TEST_READY"
-	flockChildHold     = 700 * time.Millisecond
-	fileLockChildEnv   = "DAEMONKIT_FILE_LOCK_TEST_PATH"
-	fileLockReadyEnv   = "DAEMONKIT_FILE_LOCK_TEST_READY"
+	fileLockExclusiveChildEnv = "DAEMONKIT_FILE_LOCK_EXCLUSIVE_TEST_PATH"
+	fileLockExclusiveReadyEnv = "DAEMONKIT_FILE_LOCK_EXCLUSIVE_TEST_READY"
+	fileLockSharedChildEnv    = "DAEMONKIT_FILE_LOCK_SHARED_TEST_PATH"
+	fileLockSharedReadyEnv    = "DAEMONKIT_FILE_LOCK_SHARED_TEST_READY"
+	fileLockChildHold         = 700 * time.Millisecond
 )
 
-func TestFlockChildHolds(t *testing.T) {
-	lockPath := os.Getenv(flockChildLockEnv)
-	readyPath := os.Getenv(flockChildReadyEnv)
+func TestFileLockExclusiveChildHolds(t *testing.T) {
+	lockPath := os.Getenv(fileLockExclusiveChildEnv)
+	readyPath := os.Getenv(fileLockExclusiveReadyEnv)
 	if lockPath == "" || readyPath == "" {
-		t.Skip("child-only helper; driven by TestFlockCrossProcess")
+		t.Skip("child-only helper; driven by TestFileLockExclusiveCrossProcess")
 	}
-	h, err := Flock(context.Background(), lockPath)
+	h, err := (FileLockSpec{
+		Path:     lockPath,
+		Mode:     FileLockExclusive,
+		Deadline: time.Second,
+	}).Acquire(context.Background())
 	if err != nil {
 		t.Fatalf("child acquire: %v", err)
 	}
 	if err := os.WriteFile(readyPath, []byte("1"), 0o600); err != nil {
 		t.Fatalf("child signal ready: %v", err)
 	}
-	time.Sleep(flockChildHold)
-	h.Release()
+	time.Sleep(fileLockChildHold)
+	h.Close()
 }
 
-func TestFlockCrossProcess(t *testing.T) {
+func TestFileLockExclusiveCrossProcess(t *testing.T) {
 	dir := t.TempDir()
 	lockPath := filepath.Join(dir, "x.lock")
 	readyPath := filepath.Join(dir, "ready")
 
-	child := exec.Command(os.Args[0], "-test.run=^TestFlockChildHolds$", "-test.v")
+	child := exec.Command(os.Args[0], "-test.run=^TestFileLockExclusiveChildHolds$", "-test.v")
 	child.Env = append(os.Environ(),
-		flockChildLockEnv+"="+lockPath,
-		flockChildReadyEnv+"="+readyPath)
+		fileLockExclusiveChildEnv+"="+lockPath,
+		fileLockExclusiveReadyEnv+"="+readyPath)
 	var out bytes.Buffer
 	child.Stdout, child.Stderr = &out, &out
 	if err := child.Start(); err != nil {
@@ -152,20 +168,24 @@ func TestFlockCrossProcess(t *testing.T) {
 	}
 
 	start := time.Now()
-	h, err := Flock(context.Background(), lockPath)
+	h, err := (FileLockSpec{
+		Path:     lockPath,
+		Mode:     FileLockExclusive,
+		Deadline: 5 * time.Second,
+	}).Acquire(context.Background())
 	if err != nil {
 		t.Fatalf("parent acquire: %v; child output:\n%s", err, out.String())
 	}
 	waited := time.Since(start)
-	h.Release()
+	h.Close()
 	if waited < 300*time.Millisecond {
 		t.Fatalf("parent acquired in %v without blocking — flock is not excluding across processes; child output:\n%s", waited, out.String())
 	}
 }
 
 func TestFileLockChildHoldsShared(t *testing.T) {
-	lockPath := os.Getenv(fileLockChildEnv)
-	readyPath := os.Getenv(fileLockReadyEnv)
+	lockPath := os.Getenv(fileLockSharedChildEnv)
+	readyPath := os.Getenv(fileLockSharedReadyEnv)
 	if lockPath == "" || readyPath == "" {
 		t.Skip("child-only helper; driven by TestFileLockSharedExclusiveCrossProcess")
 	}
@@ -181,7 +201,7 @@ func TestFileLockChildHoldsShared(t *testing.T) {
 	if err := os.WriteFile(readyPath, []byte("1"), 0o600); err != nil {
 		t.Fatalf("child signal ready: %v", err)
 	}
-	time.Sleep(flockChildHold)
+	time.Sleep(fileLockChildHold)
 }
 
 func TestFileLockSharedExclusiveCrossProcess(t *testing.T) {
@@ -190,7 +210,7 @@ func TestFileLockSharedExclusiveCrossProcess(t *testing.T) {
 	readyPath := filepath.Join(dir, "ready")
 
 	child := exec.Command(os.Args[0], "-test.run=^TestFileLockChildHoldsShared$", "-test.v")
-	child.Env = append(os.Environ(), fileLockChildEnv+"="+lockPath, fileLockReadyEnv+"="+readyPath)
+	child.Env = append(os.Environ(), fileLockSharedChildEnv+"="+lockPath, fileLockSharedReadyEnv+"="+readyPath)
 	var out bytes.Buffer
 	child.Stdout, child.Stderr = &out, &out
 	if err := child.Start(); err != nil {
@@ -363,35 +383,40 @@ func TestFileLockNormalizesSafeExistingModeAndRetainsFile(t *testing.T) {
 	}
 }
 
-func TestTryLockBusyThenFree(t *testing.T) {
+func TestFileLockTryAcquireBusyThenFree(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "try.lock")
+	spec := FileLockSpec{Path: path, Mode: FileLockExclusive, Deadline: time.Second}
 
-	h1, err := TryLock(path)
+	h1, err := spec.TryAcquire()
 	if err != nil {
-		t.Fatalf("first TryLock: %v", err)
+		t.Fatalf("first TryAcquire: %v", err)
 	}
-	if _, err := TryLock(path); !errors.Is(err, ErrLockBusy) {
-		t.Fatalf("second TryLock err = %v, want ErrLockBusy", err)
+	if _, err := spec.TryAcquire(); !errors.Is(err, ErrLockBusy) {
+		t.Fatalf("second TryAcquire err = %v, want ErrLockBusy", err)
 	}
 
-	h1.Release()
-	h2, err := TryLock(path)
+	h1.Close()
+	h2, err := spec.TryAcquire()
 	if err != nil {
-		t.Fatalf("TryLock after release = %v, want success", err)
+		t.Fatalf("TryAcquire after close = %v, want success", err)
 	}
-	h2.Release()
+	h2.Close()
 }
 
-func TestFlockReleaseIsIdempotent(t *testing.T) {
-	h, err := Flock(context.Background(), filepath.Join(t.TempDir(), "idempotent.lock"))
+func TestFileLockCloseIsIdempotent(t *testing.T) {
+	h, err := (FileLockSpec{
+		Path:     filepath.Join(t.TempDir(), "idempotent.lock"),
+		Mode:     FileLockExclusive,
+		Deadline: time.Second,
+	}).Acquire(context.Background())
 	if err != nil {
-		t.Fatalf("Flock: %v", err)
+		t.Fatalf("Acquire: %v", err)
 	}
-	if err := h.Release(); err != nil {
-		t.Fatalf("first Release: %v", err)
+	if err := h.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
 	}
-	if err := h.Release(); err != nil {
-		t.Fatalf("second Release: %v", err)
+	if err := h.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
 	}
 }
 

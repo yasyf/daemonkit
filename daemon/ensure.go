@@ -37,11 +37,19 @@ type EnsureConfig struct {
 // Build and Protocol match the targets, returning ErrEnsureTimeout if the
 // deadline elapses.
 func EnsureCurrent(ctx context.Context, cfg EnsureConfig, target string) error {
-	lock, err := proc.Flock(ctx, cfg.LockPath)
+	lockDeadline := cfg.Timeout
+	if lockDeadline <= 0 {
+		lockDeadline = 5 * time.Second
+	}
+	lock, err := (proc.FileLockSpec{
+		Path:     cfg.LockPath,
+		Mode:     proc.FileLockExclusive,
+		Deadline: lockDeadline,
+	}).Acquire(ctx)
 	if err != nil {
 		return fmt.Errorf("acquire start lock %s: %w", cfg.LockPath, err)
 	}
-	defer lock.Release()
+	defer lock.Close()
 
 	clk := clockOrReal(cfg.clock)
 	var deadline time.Time

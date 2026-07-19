@@ -168,11 +168,15 @@ func AdoptDead(ctx context.Context, cfg ScanConfig, g Generation, expected proc.
 	}
 	defer done()
 	canonical := cfg.Canonical
-	lock, err := proc.Flock(ctx, g.rootLock())
+	lock, err := (proc.FileLockSpec{
+		Path:     g.rootLock(),
+		Mode:     proc.FileLockExclusive,
+		Deadline: 5 * time.Second,
+	}).Acquire(ctx)
 	if err != nil {
 		return fmt.Errorf("drain: lock drain root for %s: %w", g.Name(), err)
 	}
-	defer lock.Release()
+	defer lock.Close()
 	rec, err := readOwnerFile(g.ownerPath())
 	if err != nil {
 		return fmt.Errorf("drain: read %s owner: %w", g.Name(), err)
@@ -221,11 +225,15 @@ func AdoptDead(ctx context.Context, cfg ScanConfig, g Generation, expected proc.
 
 // An ownerless dir named by a live transition claim is mid-setup (owner write lost undurably); leave it alone.
 func reclaimOwnerless(ctx context.Context, cfg ScanConfig, g Generation) (bool, error) {
-	lock, err := proc.Flock(ctx, g.rootLock())
+	lock, err := (proc.FileLockSpec{
+		Path:     g.rootLock(),
+		Mode:     proc.FileLockExclusive,
+		Deadline: 5 * time.Second,
+	}).Acquire(ctx)
 	if err != nil {
 		return false, err
 	}
-	defer lock.Release()
+	defer lock.Close()
 	if _, err := g.ReadOwner(); err == nil {
 		return false, nil
 	} else if !errors.Is(err, os.ErrNotExist) {

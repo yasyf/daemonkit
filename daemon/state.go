@@ -9,11 +9,13 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"github.com/yasyf/daemonkit/proc"
 )
 
-// StateFile is a JSON daemon-state file guarded by a proc TryLock on Path+".lock";
+// StateFile is a JSON daemon-state file guarded by an exclusive nonblocking
+// file lock on Path+".lock";
 // it preserves keys the mutate closure does not touch byte-for-byte.
 type StateFile struct {
 	Path string
@@ -28,11 +30,15 @@ func (s StateFile) Update(ctx context.Context, mutate Mutate) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	lock, err := proc.TryLock(s.Path + ".lock")
+	lock, err := (proc.FileLockSpec{
+		Path:     s.Path + ".lock",
+		Mode:     proc.FileLockExclusive,
+		Deadline: time.Second,
+	}).TryAcquire()
 	if err != nil {
 		return err
 	}
-	defer lock.Release()
+	defer lock.Close()
 	return s.UpdateUnlocked(mutate)
 }
 

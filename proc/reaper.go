@@ -469,10 +469,9 @@ func (r *Reaper) settlementDur() time.Duration {
 	return DefaultReapSettlement
 }
 
-// FileStore is the JSON-file Store: records live in a single JSON file under a
-// caller-chosen dir, guarded by a proc.Flock lock file (Path+".lock") so
-// concurrent daemons serialize their read-modify-writes. Writes are atomic
-// (temp file + rename), and a missing file reads as an empty set.
+// FileStore is the JSON-file Store: one file guarded by an exclusive file lock
+// file so concurrent daemons serialize read-modify-writes; writes are atomic
+// (temp file + rename) and a missing file reads as an empty set.
 type FileStore struct {
 	// Path is the JSON records file.
 	Path string
@@ -513,20 +512,28 @@ func (s *FileStore) Remove(ctx context.Context, victims []Record) error {
 
 // Load returns every stored record; a missing file is an empty set.
 func (s *FileStore) Load(ctx context.Context) ([]Record, error) {
-	lock, err := Flock(ctx, s.Path+".lock")
+	lock, err := (FileLockSpec{
+		Path:     s.Path + ".lock",
+		Mode:     FileLockExclusive,
+		Deadline: 5 * time.Second,
+	}).Acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer lock.Release()
+	defer lock.Close()
 	return readRecords(s.Path)
 }
 
 func (s *FileStore) mutate(ctx context.Context, fn func([]Record) []Record) error {
-	lock, err := Flock(ctx, s.Path+".lock")
+	lock, err := (FileLockSpec{
+		Path:     s.Path + ".lock",
+		Mode:     FileLockExclusive,
+		Deadline: 5 * time.Second,
+	}).Acquire(ctx)
 	if err != nil {
 		return err
 	}
-	defer lock.Release()
+	defer lock.Close()
 	recs, err := readRecords(s.Path)
 	if err != nil {
 		return err

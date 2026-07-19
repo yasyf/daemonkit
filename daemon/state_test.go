@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/yasyf/daemonkit/proc"
 )
@@ -129,11 +130,15 @@ func TestMkdirAllDurableRetriesFailedParentSync(t *testing.T) {
 
 func TestStateFileUpdateLockBusy(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
-	held, err := proc.TryLock(path + ".lock")
+	held, err := (proc.FileLockSpec{
+		Path:     path + ".lock",
+		Mode:     proc.FileLockExclusive,
+		Deadline: time.Second,
+	}).TryAcquire()
 	if err != nil {
 		t.Fatalf("pre-hold lock: %v", err)
 	}
-	defer held.Release()
+	defer held.Close()
 
 	sf := StateFile{Path: path}
 	err = sf.Update(context.Background(), func(map[string]json.RawMessage) error {
@@ -150,11 +155,15 @@ func TestStateFileUpdateLockBusy(t *testing.T) {
 
 func TestStateFileUpdateUnlocked(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
-	held, err := proc.TryLock(path + ".lock")
+	held, err := (proc.FileLockSpec{
+		Path:     path + ".lock",
+		Mode:     proc.FileLockExclusive,
+		Deadline: time.Second,
+	}).TryAcquire()
 	if err != nil {
 		t.Fatalf("hold lock: %v", err)
 	}
-	defer held.Release()
+	defer held.Close()
 
 	sf := StateFile{Path: path}
 	err = sf.UpdateUnlocked(func(state map[string]json.RawMessage) error {

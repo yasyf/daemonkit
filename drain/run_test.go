@@ -199,7 +199,11 @@ func TestRunCanceledAfterYieldRecordsAndReleases(t *testing.T) {
 	e.res.seize = func(Key) (Fence, error) { return fence, nil }
 
 	journal := e.gen.journal()
-	lock, err := proc.Flock(context.Background(), journal.lockPath())
+	lock, err := (proc.FileLockSpec{
+		Path:     journal.lockPath(),
+		Mode:     proc.FileLockExclusive,
+		Deadline: time.Second,
+	}).Acquire(context.Background())
 	if err != nil {
 		t.Fatalf("hold journal lock: %v", err)
 	}
@@ -208,7 +212,7 @@ func TestRunCanceledAfterYieldRecordsAndReleases(t *testing.T) {
 		cancel()
 		go func() {
 			time.Sleep(50 * time.Millisecond)
-			lock.Release()
+			lock.Close()
 			close(released)
 		}()
 		return nil
