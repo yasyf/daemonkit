@@ -94,6 +94,8 @@ const (
 	flockChildLockEnv  = "FUSEKIT_FLOCK_TEST_LOCK"
 	flockChildReadyEnv = "FUSEKIT_FLOCK_TEST_READY"
 	flockChildHold     = 700 * time.Millisecond
+	fileLockChildEnv   = "DAEMONKIT_FILE_LOCK_TEST_PATH"
+	fileLockReadyEnv   = "DAEMONKIT_FILE_LOCK_TEST_READY"
 )
 
 func TestFlockChildHolds(t *testing.T) {
@@ -158,6 +160,206 @@ func TestFlockCrossProcess(t *testing.T) {
 	h.Release()
 	if waited < 300*time.Millisecond {
 		t.Fatalf("parent acquired in %v without blocking — flock is not excluding across processes; child output:\n%s", waited, out.String())
+	}
+}
+
+func TestFileLockChildHoldsShared(t *testing.T) {
+	lockPath := os.Getenv(fileLockChildEnv)
+	readyPath := os.Getenv(fileLockReadyEnv)
+	if lockPath == "" || readyPath == "" {
+		t.Skip("child-only helper; driven by TestFileLockSharedExclusiveCrossProcess")
+	}
+	h, err := (FileLockSpec{
+		Path:     lockPath,
+		Mode:     FileLockShared,
+		Deadline: time.Second,
+	}).Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("child acquire shared: %v", err)
+	}
+	defer h.Close()
+	if err := os.WriteFile(readyPath, []byte("1"), 0o600); err != nil {
+		t.Fatalf("child signal ready: %v", err)
+	}
+	time.Sleep(flockChildHold)
+}
+
+func TestFileLockSharedExclusiveCrossProcess(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "lifecycle.lock")
+	readyPath := filepath.Join(dir, "ready")
+
+	child := exec.Command(os.Args[0], "-test.run=^TestFileLockChildHoldsShared$", "-test.v")
+	child.Env = append(os.Environ(), fileLockChildEnv+"="+lockPath, fileLockReadyEnv+"="+readyPath)
+	var out bytes.Buffer
+	child.Stdout, child.Stderr = &out, &out
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if t.Failed() {
+			_ = child.Process.Kill()
+			_, _ = child.Process.Wait()
+			return
+		}
+		if err := child.Wait(); err != nil {
+			t.Errorf("child exit: %v; output:\n%s", err, out.String())
+		}
+	})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(readyPath); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("child never signaled ready; output:\n%s", out.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	shared, err := (FileLockSpec{
+		Path:     lockPath,
+		Mode:     FileLockShared,
+		Deadline: time.Second,
+	}).TryAcquire()
+	if err != nil {
+		t.Fatalf("second shared owner: %v", err)
+	}
+	defer shared.Close()
+
+	if _, err := (FileLockSpec{
+		Path:     lockPath,
+		Mode:     FileLockExclusive,
+		Deadline: time.Second,
+	}).TryAcquire(); !errors.Is(err, ErrLockBusy) {
+		t.Fatalf("exclusive TryAcquire err = %v, want ErrLockBusy", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err = (FileLockSpec{
+		Path:     lockPath,
+		Mode:     FileLockExclusive,
+		Deadline: 50 * time.Millisecond,
+	}).Acquire(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("exclusive Acquire err = %v, want context deadline", err)
+	}
+}
+
+func TestFileLockSpecValidation(t *testing.T) {
+	abs := filepath.Join(t.TempDir(), "valid.lock")
+	tests := map[string]FileLockSpec{
+		"empty path":        {Mode: FileLockShared, Deadline: time.Second},
+		"relative path":     {Path: "relative.lock", Mode: FileLockShared, Deadline: time.Second},
+		"unclean path":      {Path: abs + "/../" + filepath.Base(abs), Mode: FileLockShared, Deadline: time.Second},
+		"root path":         {Path: string(filepath.Separator), Mode: FileLockShared, Deadline: time.Second},
+		"missing mode":      {Path: abs, Deadline: time.Second},
+		"unknown mode":      {Path: abs, Mode: FileLockMode(99), Deadline: time.Second},
+		"missing deadline":  {Path: abs, Mode: FileLockShared},
+		"negative deadline": {Path: abs, Mode: FileLockShared, Deadline: -time.Second},
+	}
+	for name, spec := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := spec.TryAcquire(); !errors.Is(err, ErrInvalidFileLock) {
+				t.Fatalf("TryAcquire err = %v, want ErrInvalidFileLock", err)
+			}
+		})
+	}
+}
+
+func TestFileLockAcquireHonorsPreCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	path := filepath.Join(t.TempDir(), "canceled.lock")
+	_, err := (FileLockSpec{
+		Path:     path,
+		Mode:     FileLockExclusive,
+		Deadline: time.Second,
+	}).Acquire(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Acquire err = %v, want context.Canceled", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pre-canceled Acquire created lock file: %v", err)
+	}
+}
+
+func TestFileLockRejectsUnsafeExistingPaths(t *testing.T) {
+	dir := t.TempDir()
+	tests := map[string]func(t *testing.T) string{
+		"symlink": func(t *testing.T) string {
+			target := filepath.Join(dir, "target")
+			if err := os.WriteFile(target, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, "symlink.lock")
+			if err := os.Symlink(target, path); err != nil {
+				t.Fatal(err)
+			}
+			return path
+		},
+		"directory": func(t *testing.T) string {
+			path := filepath.Join(dir, "directory.lock")
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			return path
+		},
+		"multiple links": func(t *testing.T) string {
+			path := filepath.Join(dir, "linked.lock")
+			if err := os.WriteFile(path, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Link(path, filepath.Join(dir, "alias.lock")); err != nil {
+				t.Fatal(err)
+			}
+			return path
+		},
+		"group writable": func(t *testing.T) string {
+			path := filepath.Join(dir, "writable.lock")
+			if err := os.WriteFile(path, nil, 0o620); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(path, 0o620); err != nil {
+				t.Fatal(err)
+			}
+			return path
+		},
+	}
+	for name, setup := range tests {
+		t.Run(name, func(t *testing.T) {
+			path := setup(t)
+			_, err := (FileLockSpec{Path: path, Mode: FileLockExclusive, Deadline: time.Second}).TryAcquire()
+			if !errors.Is(err, ErrUnsafeLockFile) {
+				t.Fatalf("TryAcquire err = %v, want ErrUnsafeLockFile", err)
+			}
+		})
+	}
+}
+
+func TestFileLockNormalizesSafeExistingModeAndRetainsFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mode.lock")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h, err := (FileLockSpec{Path: path, Mode: FileLockExclusive, Deadline: time.Second}).TryAcquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("lock file removed on close: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("mode = %#o, want 0600", got)
 	}
 }
 

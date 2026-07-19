@@ -2,12 +2,14 @@ package proc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
-	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const defaultEvictPollTimeout = 30 * time.Second
@@ -32,11 +34,16 @@ func (se SingleEntrant) Listen(ctx context.Context) (net.Listener, *os.File, err
 	if err := os.MkdirAll(filepath.Dir(se.Socket), 0o700); err != nil {
 		return nil, nil, fmt.Errorf("ensure socket dir: %w", err)
 	}
-	lock, err := os.OpenFile(se.Socket+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	lock, err := openFileLock(se.Socket + ".lock")
 	if err != nil {
 		return nil, nil, fmt.Errorf("open socket lock: %w", err)
 	}
-	contended := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil
+	lockErr := tryFileLock(lock, FileLockExclusive)
+	contended := errors.Is(lockErr, unix.EWOULDBLOCK)
+	if lockErr != nil && !contended {
+		lock.Close()
+		return nil, nil, fmt.Errorf("lock socket %s: %w", se.Socket, lockErr)
+	}
 	// Evict runs even on a free lock: a live peer may predate the lock discipline.
 	evicted, eerr := se.Evict()
 	switch {
@@ -75,9 +82,12 @@ func (se SingleEntrant) pollLock(ctx context.Context, lock *os.File) error {
 	clk := clockOrReal(se.clock)
 	deadline := clk.Now().Add(timeout)
 	for {
-		err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		err := tryFileLock(lock, FileLockExclusive)
 		if err == nil {
 			return nil
+		}
+		if !errors.Is(err, unix.EWOULDBLOCK) {
+			return fmt.Errorf("poll socket lock %s: %w", se.Socket, err)
 		}
 		if clk.Now().After(deadline) {
 			return fmt.Errorf("%w within %s: %w", ErrLockStillHeld, timeout, err)
