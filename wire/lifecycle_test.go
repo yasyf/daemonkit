@@ -133,6 +133,7 @@ func (c *armedWriteFailureConn) Write(p []byte) (int, error) {
 func TestLifecyclePeerReopensOnlyForProvenPreSendFailure(t *testing.T) {
 	lifecycle := &fakeLifecycle{}
 	server := &wire.Server{Build: "server-test"}
+	protectAllLifecycleSessions(server)
 	server.RegisterLifecycle(lifecycle)
 	running := startSessionServer(t, server, func() (func(), error) { return func() {}, nil })
 
@@ -171,6 +172,7 @@ func TestLifecyclePeerReopensOnlyForProvenPreSendFailure(t *testing.T) {
 func TestLifecyclePeerDoesNotReplayPostSendHandoff(t *testing.T) {
 	lifecycle := &fakeLifecycle{}
 	server := &wire.Server{Build: "server-test"}
+	protectAllLifecycleSessions(server)
 	server.RegisterLifecycle(lifecycle)
 	running := startSessionServer(t, server, func() (func(), error) { return func() {}, nil })
 
@@ -207,6 +209,7 @@ func TestLifecyclePeerDoesNotReplayPostSendHandoff(t *testing.T) {
 func TestLifecycleSkipsDrainRejectionButParticipatesInAdmission(t *testing.T) {
 	lifecycle := &fakeLifecycle{}
 	server := &wire.Server{Build: "server-test"}
+	protectAllLifecycleSessions(server)
 	server.RegisterLifecycle(lifecycle)
 	var admissions atomic.Int32
 	running := startSessionServer(t, server, func() (func(), error) {

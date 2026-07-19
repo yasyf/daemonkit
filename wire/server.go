@@ -23,6 +23,9 @@ var (
 	ErrServerStarted = errors.New("wire: server already started")
 	// ErrBuildMismatch means an ordinary request came from a different build.
 	ErrBuildMismatch = errors.New("wire: client build does not match server build")
+	// ErrProtectedSessionRequired means a lifecycle request came from an
+	// authenticated ordinary session rather than a protected peer.
+	ErrProtectedSessionRequired = errors.New("wire: protected session required")
 )
 
 const (
@@ -116,6 +119,7 @@ type Server struct {
 
 	mu           sync.Mutex
 	handlers     map[Op]entry
+	hasLifecycle bool
 	onActivity   func()
 	listener     net.Listener
 	started      bool
@@ -157,6 +161,9 @@ func (s *Server) register(op Op, c class, h Handler, lifecycle bool) {
 		panic(fmt.Sprintf("wire: op %q already registered", op))
 	}
 	s.handlers[op] = entry{class: c, h: h, lifecycle: lifecycle}
+	if lifecycle {
+		s.hasLifecycle = true
+	}
 }
 
 // OnActivity installs a callback invoked immediately before each admitted handler.
@@ -301,15 +308,15 @@ func (s *Server) accept(ctx context.Context, admit, admitLifecycle func() (func(
 			continue
 		}
 		s.sessionWG.Add(1)
-		go func(conn net.Conn, peer Peer, capacity sessionCapacity) {
+		go func(conn net.Conn, peer Peer, protected bool, capacity sessionCapacity) {
 			defer func() {
 				s.releaseSessionCapacity(capacity)
 				s.sessionWG.Done()
 			}()
-			if err := s.serveConn(ctx, conn, peer, admit, admitLifecycle); err != nil && !isDisconnect(err) {
+			if err := s.serveConn(ctx, conn, peer, protected, admit, admitLifecycle); err != nil && !isDisconnect(err) {
 				s.Log.Debug("wire: session ended", "err", err)
 			}
-		}(conn, peer, capacity)
+		}(conn, peer, protected, capacity)
 	}
 }
 
@@ -317,6 +324,7 @@ func (s *Server) serveConn(
 	ctx context.Context,
 	conn net.Conn,
 	peer Peer,
+	protected bool,
 	admit, admitLifecycle func() (func(), error),
 ) error {
 	defer conn.Close()
@@ -342,6 +350,7 @@ func (s *Server) serveConn(
 		ctx:            sessCtx,
 		cancel:         cancel,
 		peer:           peer,
+		protected:      protected,
 		build:          identity.Build,
 		generation:     generation,
 		admit:          admit,
@@ -575,6 +584,10 @@ func (s *Server) validateSessionCapacity() error {
 		return fmt.Errorf("wire: reserved protected sessions %d exceed maximum sessions %d", s.ReservedProtectedSessions, maximum)
 	case s.ReservedProtectedSessions != 0 && s.ProtectedSession == nil:
 		return errors.New("wire: protected session classifier is required when capacity is reserved")
+	case s.hasLifecycle && s.ProtectedSession == nil:
+		return errors.New("wire: lifecycle handlers require a protected session classifier")
+	case s.hasLifecycle && s.ReservedProtectedSessions == 0:
+		return errors.New("wire: lifecycle handlers require reserved protected capacity")
 	default:
 		return nil
 	}

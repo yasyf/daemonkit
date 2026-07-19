@@ -56,6 +56,41 @@ func TestProtectedSessionsSurviveIdleOrdinarySaturation(t *testing.T) {
 	}
 }
 
+func TestLifecycleRejectsOrdinarySameUIDSessionAndAcceptsProtectedSession(t *testing.T) {
+	var protect atomic.Bool
+	lifecycleState := &countingProtectedLifecycle{}
+	server := &wire.Server{
+		Build: "server-test", MaxSessions: 2, ReservedProtectedSessions: 1,
+		ProtectedSession: func(context.Context, wire.Peer) (bool, error) {
+			return protect.Load(), nil
+		},
+	}
+	server.RegisterLifecycle(lifecycleState)
+	running := startSessionServer(t, server, admitAll(&atomic.Int32{}))
+	ordinary := &wire.LifecyclePeer{Config: wire.ClientConfig{
+		Dial: wire.UnixDialer(running.path), Build: "server-test",
+	}}
+	if _, err := ordinary.Health(t.Context()); err == nil || !strings.Contains(err.Error(), wire.ErrProtectedSessionRequired.Error()) {
+		t.Fatalf("ordinary lifecycle Health = %v, want protected rejection", err)
+	}
+	_ = ordinary.Close()
+	if lifecycleState.health.Load() != 0 {
+		t.Fatal("ordinary lifecycle request reached handler")
+	}
+
+	protect.Store(true)
+	protected := &wire.LifecyclePeer{Config: wire.ClientConfig{
+		Dial: wire.UnixDialer(running.path), Build: "server-test",
+	}}
+	defer protected.Close()
+	if _, err := protected.Health(t.Context()); err != nil {
+		t.Fatalf("protected lifecycle Health: %v", err)
+	}
+	if lifecycleState.health.Load() != 1 {
+		t.Fatalf("protected lifecycle handler calls = %d", lifecycleState.health.Load())
+	}
+}
+
 func TestUntrustedPeerIsRejectedBeforeProtectedCapacityClassification(t *testing.T) {
 	var classifications atomic.Int32
 	server := &wire.Server{
@@ -162,6 +197,21 @@ func TestProtectedSessionCapacityConfigurationIsExact(t *testing.T) {
 }
 
 type protectedTestLifecycle struct{}
+
+type countingProtectedLifecycle struct{ health atomic.Int32 }
+
+func (l *countingProtectedLifecycle) Health(context.Context) (daemon.Health, error) {
+	l.health.Add(1)
+	return daemon.Health{Build: "holder-v1", Protocol: 1, State: daemon.StateHealthy}, nil
+}
+
+func (*countingProtectedLifecycle) Shutdown(context.Context) error { return nil }
+func (*countingProtectedLifecycle) Handoff(context.Context) error  { return nil }
+
+func protectAllLifecycleSessions(server *wire.Server) {
+	server.ReservedProtectedSessions = 1
+	server.ProtectedSession = func(context.Context, wire.Peer) (bool, error) { return true, nil }
+}
 
 func (protectedTestLifecycle) Health(context.Context) (daemon.Health, error) {
 	return daemon.Health{Build: "holder-v1", Protocol: 1, State: daemon.StateHealthy}, nil

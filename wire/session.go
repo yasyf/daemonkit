@@ -21,6 +21,10 @@ func (s *AcceptedSession) Peer() Peer { return s.s.peer }
 // Build returns the client build supplied by the mandatory handshake.
 func (s *AcceptedSession) Build() string { return s.s.build }
 
+// Protected reports whether pre-capacity trust classified this exact session
+// for lifecycle or other protected service traffic.
+func (s *AcceptedSession) Protected() bool { return s.s.protected }
+
 // Done closes when this exact authenticated session is torn down.
 func (s *AcceptedSession) Done() <-chan struct{} { return s.s.ctx.Done() }
 
@@ -42,6 +46,7 @@ type session struct {
 	ctx            context.Context
 	cancel         context.CancelFunc
 	peer           Peer
+	protected      bool
 	build          string
 	generation     []byte
 	admit          func() (func(), error)
@@ -291,6 +296,12 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 		s.requestWG.Done()
 	}()
 
+	if entry.lifecycle && !s.protected {
+		if err := s.sendRejected(sessionCtx, frame.ID, ErrProtectedSessionRequired.Error()); err != nil {
+			s.close()
+		}
+		return
+	}
 	if !entry.lifecycle {
 		if s.build != s.server.Build {
 			if err := s.sendRejected(sessionCtx, frame.ID, ErrBuildMismatch.Error()); err != nil {

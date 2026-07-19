@@ -61,6 +61,7 @@ func TestRuntimeLifecycleAckPrecedesShutdownOrHandoff(t *testing.T) {
 			t.Cleanup(func() { _ = os.RemoveAll(dir) })
 			path := filepath.Join(dir, "runtime.sock")
 			server := &wire.Server{Build: "server-test", MaxFrame: maxFrame}
+			protectAllLifecycleSessions(server)
 			fillStarted := make(chan struct{})
 			server.RegisterControl("fill", func(ctx context.Context, request wire.Request) (any, error) {
 				if err := request.Session.PushEvent(ctx, wire.Event{
@@ -200,6 +201,7 @@ func TestRuntimeHandoffResponseSurvivesImmediateSessionClosure(t *testing.T) {
 		}
 		path := filepath.Join(dir, "runtime.sock")
 		server := &wire.Server{Build: "server-test"}
+		protectAllLifecycleSessions(server)
 		intake := &drain.Intake{}
 		cfg := daemon.RuntimeConfig{
 			Socket: path, Build: "server-test", Protocol: int(wire.ProtocolVersion),
@@ -259,6 +261,7 @@ func TestResourceOwnerSocketReleaseKeepsLifecycleAvailableWhileDraining(t *testi
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	path := filepath.Join(dir, "runtime.sock")
 	server := &wire.Server{Build: incumbentBuild}
+	protectAllLifecycleSessions(server)
 	server.RegisterConcurrent("work", func(context.Context, wire.Request) (any, error) {
 		return true, nil
 	})
