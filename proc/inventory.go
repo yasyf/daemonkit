@@ -10,13 +10,22 @@ import (
 // executable is exactly path. It does not use names, argv, or shell process
 // discovery, and it revalidates each PID around the identity snapshot.
 func ExecutableIdentities(path string) ([]Identity, error) {
-	pids, err := processIDs()
+	return executableIdentities(path, processIDs, ExecutablePath, Probe)
+}
+
+func executableIdentities(
+	path string,
+	list func() ([]int, error),
+	executable func(int) (string, error),
+	probe func(int) (Identity, error),
+) ([]Identity, error) {
+	pids, err := list()
 	if err != nil {
 		return nil, err
 	}
 	identities := make([]Identity, 0)
 	for _, pid := range pids {
-		before, err := ExecutablePath(pid)
+		before, err := executable(pid)
 		if errors.Is(err, ErrNoProcess) {
 			continue
 		}
@@ -26,14 +35,14 @@ func ExecutableIdentities(path string) ([]Identity, error) {
 		if before != path {
 			continue
 		}
-		identity, err := Probe(pid)
+		identity, err := probe(pid)
 		if errors.Is(err, ErrNoProcess) {
 			continue
 		}
 		if err != nil {
 			return nil, fmt.Errorf("probe executable pid %d: %w", pid, err)
 		}
-		after, err := ExecutablePath(pid)
+		after, err := executable(pid)
 		if errors.Is(err, ErrNoProcess) {
 			continue
 		}
