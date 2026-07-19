@@ -53,7 +53,15 @@ func TestManagedProcessCannotExecOrBecomeReadyBeforeDurableRecord(t *testing.T) 
 		t.Fatalf("NewPool: %v", err)
 	}
 	ready := make(chan struct{})
+	recorded := make(chan proc.Record, 1)
 	spec := managedProcessSpec(t, marker)
+	spec.Recorded = func(_ context.Context, record proc.Record) error {
+		if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+			return errors.New("child executed before recorded hook")
+		}
+		recorded <- record
+		return nil
+	}
 	spec.Ready = func(context.Context, proc.Record) error {
 		close(ready)
 		if registry.recordCount() != 1 {
@@ -89,6 +97,9 @@ func TestManagedProcessCannotExecOrBecomeReadyBeforeDurableRecord(t *testing.T) 
 	if result.process.Record().PID != pid {
 		t.Fatalf("Record PID = %d, want %d", result.process.Record().PID, pid)
 	}
+	if record := <-recorded; record != result.process.Record() {
+		t.Fatalf("Recorded record = %#v, want %#v", record, result.process.Record())
+	}
 	select {
 	case <-ready:
 	case <-time.After(time.Second):
@@ -99,6 +110,31 @@ func TestManagedProcessCannotExecOrBecomeReadyBeforeDurableRecord(t *testing.T) 
 		t.Fatalf("Stop: %v", err)
 	}
 	assertPIDGone(t, pid)
+}
+
+func TestManagedProcessRecordedRefusalPreventsExecAndRemovesRecord(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "started")
+	registry := newFakeRegistry()
+	registry.trackStarted = make(chan int, 1)
+	pool, err := NewPool(1, registry)
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	spec := managedProcessSpec(t, marker)
+	refused := errors.New("refused record")
+	spec.Recorded = func(context.Context, proc.Record) error { return refused }
+	_, err = pool.Start(context.Background(), spec)
+	if !errors.Is(err, refused) {
+		t.Fatalf("Start error = %v, want %v", err, refused)
+	}
+	pid := <-registry.trackStarted
+	assertPIDGone(t, pid)
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("child executed after recorded refusal: %v", err)
+	}
+	if got := registry.recordCount(); got != 0 {
+		t.Fatalf("durable records = %d, want rejected record removed", got)
+	}
 }
 
 func TestManagedProcessRejectsRecordWithoutBootBeforeExec(t *testing.T) {

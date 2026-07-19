@@ -47,6 +47,9 @@ type ProcessSpec struct {
 	// Ready runs only after the process-group identity is durable and execution
 	// has been released. A nil callback makes durable launch the readiness point.
 	Ready func(context.Context, proc.Record) error
+	// Recorded runs after the exact process-group identity is durable but before
+	// the wrapper can execute Path. An error aborts and reaps the process.
+	Recorded func(context.Context, proc.Record) error
 	// ReadinessTimeout bounds Ready. A non-positive value uses DefaultReadinessTimeout.
 	ReadinessTimeout time.Duration
 }
@@ -172,6 +175,23 @@ func (p *Pool) Start(ctx context.Context, spec ProcessSpec) (*Process, error) {
 			killErr,
 			unexpectedWaitError(waitErr),
 		)
+	}
+	if spec.Recorded != nil {
+		if err := spec.Recorded(processCtx, record); err != nil {
+			_ = gateW.Close()
+			untrackErr := p.registry.Untrack(context.WithoutCancel(processCtx), record)
+			if untrackErr != nil {
+				untrackErr = fmt.Errorf("supervise: untrack rejected managed process record: %w", untrackErr)
+			}
+			killErr := p.killUntrackedGroup(cmd.Process.Pid)
+			waitErr := cmd.Wait()
+			return nil, errors.Join(
+				fmt.Errorf("supervise: accept managed process record: %w", err),
+				untrackErr,
+				killErr,
+				unexpectedWaitError(waitErr),
+			)
+		}
 	}
 	waited := make(chan error, 1)
 	go func() { waited <- cmd.Wait() }()
