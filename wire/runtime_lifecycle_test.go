@@ -122,6 +122,9 @@ func TestRuntimeLifecycleAckPrecedesShutdownOrHandoff(t *testing.T) {
 			if _, err := codec.ReadFrame(); err != nil {
 				t.Fatalf("read hello ack: %v", err)
 			}
+			if err := codec.WriteFrame(wire.Frame{Kind: wire.FrameWindow, Sequence: 1}); err != nil {
+				t.Fatalf("grant event window: %v", err)
+			}
 			if err := codec.WriteFrame(wire.Frame{Kind: wire.FrameRequest, Flags: wire.FlagEnd, ID: 1, Op: "fill"}); err != nil {
 				t.Fatalf("write fill: %v", err)
 			}
@@ -142,19 +145,13 @@ func TestRuntimeLifecycleAckPrecedesShutdownOrHandoff(t *testing.T) {
 				t.Fatal("resource settlement ran before the blocked lifecycle acknowledgment")
 			case <-time.After(75 * time.Millisecond):
 			}
-			first, err := codec.ReadFrame()
-			if err != nil {
-				t.Fatalf("read blocking event: %v", err)
-			}
+			first := readNonWindowFrame(t, codec)
 			if first.Kind != wire.FrameEvent || first.Op != "block-writer" {
 				t.Fatalf("first frame = %#v", first)
 			}
 			var fillResponse, lifecycleAck bool
 			for !fillResponse || !lifecycleAck {
-				frame, err := codec.ReadFrame()
-				if err != nil {
-					t.Fatalf("read terminal response: %v", err)
-				}
+				frame := readNonWindowFrame(t, codec)
 				if frame.Kind != wire.FrameResponse {
 					t.Fatalf("terminal frame = %#v", frame)
 				}
@@ -181,6 +178,19 @@ func TestRuntimeLifecycleAckPrecedesShutdownOrHandoff(t *testing.T) {
 				t.Fatal("runtime did not exit")
 			}
 		})
+	}
+}
+
+func readNonWindowFrame(t *testing.T, codec *wire.Codec) wire.Frame {
+	t.Helper()
+	for {
+		frame, err := codec.ReadFrame()
+		if err != nil {
+			t.Fatalf("read frame: %v", err)
+		}
+		if frame.Kind != wire.FrameWindow {
+			return frame
+		}
 	}
 }
 

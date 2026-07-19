@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"os"
 	"sync"
@@ -16,7 +17,7 @@ import (
 var (
 	// ErrUntrustedPeer means the accepted unix peer failed the same-uid floor.
 	ErrUntrustedPeer = errors.New("wire: untrusted peer")
-	// ErrHandshake means the first frame did not establish a v2 session.
+	// ErrHandshake means the first frame did not establish a v3 session.
 	ErrHandshake = errors.New("wire: handshake failed")
 	// ErrServerStarted means Serve was called more than once.
 	ErrServerStarted = errors.New("wire: server already started")
@@ -66,7 +67,7 @@ type result struct {
 	err error
 }
 
-// Server serves persistent, multiplexed v2 sessions on a listener owned by its caller.
+// Server serves persistent, multiplexed v3 sessions on a listener owned by its caller.
 // Register handlers and lifecycle controls before Serve.
 type Server struct {
 	// Build is the server build identity sent during the mandatory handshake.
@@ -149,7 +150,7 @@ func (s *Server) OnActivity(f func()) {
 	s.onActivity = f
 }
 
-// Serve accepts v2 sessions until ctx is cancelled. admit is called once for
+// Serve accepts v3 sessions until ctx is cancelled. admit is called once for
 // every request and its returned done function runs after the terminal response
 // has been written to the connection.
 func (s *Server) Serve(ctx context.Context, listener net.Listener, admit func() (func(), error)) error {
@@ -161,6 +162,9 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener, admit func() 
 	}
 	if s.Build == "" {
 		return errors.New("wire: Build is required")
+	}
+	if uint64(s.streamQueue()) > math.MaxUint32 {
+		return errors.New("wire: stream queue exceeds protocol window")
 	}
 	s.mu.Lock()
 	if s.started {
@@ -288,17 +292,18 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn, admit func() (fun
 
 	sessCtx, cancel := context.WithCancel(ctx)
 	sess := &session{
-		server:   s,
-		conn:     conn,
-		codec:    codec,
-		ctx:      sessCtx,
-		cancel:   cancel,
-		peer:     peer,
-		build:    identity.Build,
-		admit:    admit,
-		outbound: make(chan sessionOutbound, s.outboundQueue()),
-		active:   make(map[uint64]*requestState),
-		seen:     make(map[uint64]struct{}),
+		server:       s,
+		conn:         conn,
+		codec:        codec,
+		ctx:          sessCtx,
+		cancel:       cancel,
+		peer:         peer,
+		build:        identity.Build,
+		admit:        admit,
+		outbound:     make(chan sessionOutbound, s.outboundQueue()),
+		eventCredits: newCreditWindow(),
+		active:       make(map[uint64]*requestState),
+		seen:         make(map[uint64]struct{}),
 	}
 	sess.accepted = &AcceptedSession{s: sess}
 	s.addSession(sess)

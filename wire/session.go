@@ -24,20 +24,24 @@ func (s *AcceptedSession) PushEvent(ctx context.Context, event Event) error {
 	if event.Topic == "" {
 		return errors.New("wire: event topic is required")
 	}
+	if err := s.s.eventCredits.acquire(ctx); err != nil {
+		return err
+	}
 	return s.s.enqueue(ctx, Frame{Kind: FrameEvent, Flags: FlagEnd, Op: Op(event.Topic), Payload: event.Payload})
 }
 
 type session struct {
-	server   *Server
-	conn     net.Conn
-	codec    *Codec
-	ctx      context.Context
-	cancel   context.CancelFunc
-	peer     Peer
-	build    string
-	admit    func() (func(), error)
-	accepted *AcceptedSession
-	outbound chan sessionOutbound
+	server       *Server
+	conn         net.Conn
+	codec        *Codec
+	ctx          context.Context
+	cancel       context.CancelFunc
+	peer         Peer
+	build        string
+	admit        func() (func(), error)
+	accepted     *AcceptedSession
+	outbound     chan sessionOutbound
+	eventCredits *creditWindow
 
 	mu        sync.Mutex
 	active    map[uint64]*requestState
@@ -55,11 +59,33 @@ type sessionOutbound struct {
 }
 
 type requestState struct {
-	cancel       context.CancelFunc
-	chunks       chan Chunk
-	next         uint32
-	inputEnded   bool
-	transportErr error
+	cancel          context.CancelFunc
+	chunks          chan Chunk
+	inbound         *boundedStream[Chunk]
+	responseCredits *creditWindow
+	deliveryDone    chan struct{}
+	deliveryOnce    sync.Once
+
+	mu            sync.Mutex
+	inputSequence streamSequence
+	inputEnded    bool
+	transportErr  error
+}
+
+func (s *requestState) close() {
+	s.cancel()
+	s.mu.Lock()
+	s.inputEnded = true
+	s.mu.Unlock()
+	s.inbound.close()
+	s.responseCredits.close()
+	s.deliveryOnce.Do(func() { close(s.deliveryDone) })
+}
+
+func (s *requestState) error() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.transportErr
 }
 
 func (s *session) run(ctx context.Context) error {
@@ -76,12 +102,17 @@ func (s *session) run(ctx context.Context) error {
 func (s *session) close() {
 	s.closeOnce.Do(func() {
 		s.cancel()
+		s.eventCredits.close()
 		_ = s.conn.Close()
 		s.mu.Lock()
+		states := make([]*requestState, 0, len(s.active))
 		for _, state := range s.active {
-			state.cancel()
+			states = append(states, state)
 		}
 		s.mu.Unlock()
+		for _, state := range states {
+			state.close()
+		}
 	})
 }
 
@@ -121,6 +152,10 @@ func (s *session) readLoop(ctx context.Context) error {
 			}
 		case FrameStream:
 			if err := s.receiveStream(frame); err != nil {
+				return err
+			}
+		case FrameWindow:
+			if err := s.receiveWindow(frame); err != nil {
 				return err
 			}
 		case FrameGoAway:
@@ -172,22 +207,34 @@ func (s *session) receiveRequest(ctx context.Context, frame Frame) error {
 		return s.sendError(ctx, frame.ID, fmt.Errorf("wire: unknown op %q", frame.Op))
 	}
 	requestCtx, cancel := s.server.requestContext(ctx, frame)
-	state := &requestState{cancel: cancel, chunks: make(chan Chunk, s.server.streamQueue())}
+	state := &requestState{
+		cancel:          cancel,
+		chunks:          make(chan Chunk),
+		inbound:         newBoundedStream[Chunk](s.server.streamQueue()),
+		responseCredits: newCreditWindow(),
+		deliveryDone:    make(chan struct{}),
+	}
 	if frame.Flags&FlagEnd != 0 {
 		state.inputEnded = true
-		close(state.chunks)
+		state.inbound.close()
 	}
 	s.active[frame.ID] = state
 	s.mu.Unlock()
+	if err := s.enqueue(ctx, Frame{Kind: FrameWindow, ID: frame.ID, Sequence: uint32(s.server.streamQueue())}); err != nil {
+		state.close()
+		s.removeRequest(frame.ID)
+		return err
+	}
 
-	s.requestWG.Add(1)
+	s.requestWG.Add(2)
+	go s.deliverRequestChunks(frame.ID, state)
 	go s.execute(ctx, requestCtx, frame, entry, state)
 	return nil
 }
 
 func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, entry entry, state *requestState) {
 	defer s.requestWG.Done()
-	defer state.cancel()
+	defer state.close()
 	defer s.removeRequest(frame.ID)
 
 	if !entry.lifecycle {
@@ -230,9 +277,10 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 		Session: s.accepted,
 	}
 	value, err := s.server.dispatch(requestCtx, entry, req)
-	s.mu.Lock()
-	transportErr := state.transportErr
-	s.mu.Unlock()
+	if requestErr := requestCtx.Err(); requestErr != nil {
+		err = requestErr
+	}
+	transportErr := state.error()
 	if transportErr != nil {
 		err = transportErr
 	}
@@ -242,12 +290,18 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 		}
 		return
 	}
-	if err := s.sendValue(requestCtx, sessionCtx, frame.ID, value, err); err != nil {
+	if err := s.sendValue(requestCtx, sessionCtx, frame.ID, state, value, err); err != nil {
 		s.close()
 	}
 }
 
-func (s *session) sendValue(requestCtx, responseCtx context.Context, id uint64, value any, handlerErr error) error {
+func (s *session) sendValue(
+	requestCtx, responseCtx context.Context,
+	id uint64,
+	state *requestState,
+	value any,
+	handlerErr error,
+) error {
 	var stream *StreamResponse
 	switch typed := value.(type) {
 	case StreamResponse:
@@ -256,25 +310,30 @@ func (s *session) sendValue(requestCtx, responseCtx context.Context, id uint64, 
 		stream = typed
 	}
 	if stream != nil {
-		sequence := uint32(0)
+		sequence := streamSequence{}
 		for {
+			if err := state.responseCredits.acquire(requestCtx); err != nil {
+				handlerErr = err
+				stream = nil
+				break
+			}
 			select {
 			case <-requestCtx.Done():
 				handlerErr = requestCtx.Err()
 				stream = nil
 			case payload, ok := <-stream.Chunks:
 				if !ok {
-					if err := s.enqueue(requestCtx, Frame{Kind: FrameStream, Flags: FlagEnd, ID: id, Sequence: sequence}); err != nil {
-						return err
-					}
 					value = stream.Value
 					stream = nil
 					break
 				}
-				if err := s.enqueue(requestCtx, Frame{Kind: FrameStream, ID: id, Sequence: sequence, Payload: payload}); err != nil {
+				current, err := sequence.take()
+				if err != nil {
 					return err
 				}
-				sequence++
+				if err := s.enqueue(requestCtx, Frame{Kind: FrameStream, ID: id, Sequence: current, Payload: payload}); err != nil {
+					return err
+				}
 			}
 			if stream == nil {
 				break
@@ -301,14 +360,10 @@ func (s *session) receiveCancel(frame Frame) error {
 	}
 	s.mu.Lock()
 	state := s.active[frame.ID]
-	if state != nil {
-		state.cancel()
-		if !state.inputEnded {
-			state.inputEnded = true
-			close(state.chunks)
-		}
-	}
 	s.mu.Unlock()
+	if state != nil {
+		state.close()
+	}
 	return nil
 }
 
@@ -318,35 +373,95 @@ func (s *session) receiveStream(frame Frame) error {
 	}
 	s.mu.Lock()
 	state := s.active[frame.ID]
-	if state == nil {
-		s.mu.Unlock()
-		return nil
-	}
-	if state.inputEnded || frame.Sequence != state.next {
-		state.transportErr = ErrStreamOrder
-		state.cancel()
-		s.mu.Unlock()
-		return nil
-	}
-	state.next++
-	chunk := Chunk{Sequence: frame.Sequence, Payload: append([]byte(nil), frame.Payload...), End: frame.Flags&FlagEnd != 0}
-	select {
-	case state.chunks <- chunk:
-	case <-s.ctx.Done():
-		s.mu.Unlock()
-		return s.ctx.Err()
-	default:
-		state.transportErr = ErrQueueFull
-		state.cancel()
-		s.mu.Unlock()
-		return nil
-	}
-	if chunk.End {
-		state.inputEnded = true
-		close(state.chunks)
-	}
 	s.mu.Unlock()
+	if state == nil {
+		return nil
+	}
+	state.mu.Lock()
+	if state.inputEnded {
+		state.transportErr = ErrStreamOrder
+		state.mu.Unlock()
+		state.close()
+		return nil
+	}
+	expected, err := state.inputSequence.take()
+	if err != nil {
+		state.transportErr = err
+		state.mu.Unlock()
+		state.close()
+		return nil
+	}
+	if frame.Sequence != expected {
+		state.transportErr = ErrStreamOrder
+		state.mu.Unlock()
+		state.close()
+		return nil
+	}
+	end := frame.Flags&FlagEnd != 0
+	if end {
+		state.inputEnded = true
+	}
+	state.mu.Unlock()
+	chunk := Chunk{Sequence: frame.Sequence, Payload: append([]byte(nil), frame.Payload...), End: end}
+	// Waiting here propagates bounded handler pressure to the socket.
+	if err := state.inbound.offer(chunk); err != nil {
+		if errors.Is(err, errStreamClosed) {
+			return nil
+		}
+		return err
+	}
+	if end {
+		state.inbound.close()
+	}
 	return nil
+}
+
+func (s *session) receiveWindow(frame Frame) error {
+	if frame.Flags != 0 || frame.Sequence == 0 || frame.Op != "" || frame.Tenant != "" || len(frame.Payload) != 0 {
+		return fmt.Errorf("%w: response or event window", ErrInvalidFrame)
+	}
+	if frame.ID == 0 {
+		return s.eventCredits.grant(frame.Sequence)
+	}
+	s.mu.Lock()
+	state := s.active[frame.ID]
+	s.mu.Unlock()
+	if state == nil {
+		return nil
+	}
+	err := state.responseCredits.grant(frame.Sequence)
+	if errors.Is(err, errStreamClosed) {
+		return nil
+	}
+	return err
+}
+
+func (s *session) deliverRequestChunks(id uint64, state *requestState) {
+	defer s.requestWG.Done()
+	defer close(state.chunks)
+	for {
+		select {
+		case chunk, ok := <-state.inbound.channel():
+			if !ok {
+				return
+			}
+			select {
+			case state.chunks <- chunk:
+				if err := s.enqueue(s.ctx, Frame{Kind: FrameWindow, ID: id, Sequence: 1}); err != nil {
+					s.close()
+					return
+				}
+			case <-state.deliveryDone:
+				return
+			case <-s.ctx.Done():
+				return
+			}
+		case <-state.deliveryDone:
+			return
+		case <-s.ctx.Done():
+			return
+		}
+	}
 }
 
 func (s *session) removeRequest(id uint64) {
@@ -357,12 +472,13 @@ func (s *session) removeRequest(id uint64) {
 
 func (s *session) closeRequestInputs() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	states := make([]*requestState, 0, len(s.active))
 	for _, state := range s.active {
-		if !state.inputEnded {
-			state.inputEnded = true
-			close(state.chunks)
-		}
+		states = append(states, state)
+	}
+	s.mu.Unlock()
+	for _, state := range states {
+		state.close()
 	}
 }
 

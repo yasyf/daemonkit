@@ -2,12 +2,12 @@ import Darwin
 import Foundation
 
 /// Exact protocol version shared by daemonkit's Go and Swift session transports.
-public let daemonKitSessionProtocolVersion: UInt16 = 2
+public let daemonKitSessionProtocolVersion: UInt16 = 3
 
 /// Default maximum encoded frame body: 4 MiB.
 public let daemonKitDefaultMaximumFrameBytes = 4 * 1024 * 1024
 
-/// A v2 session frame kind.
+/// A v3 session frame kind.
 public enum SessionFrameKind: UInt8, Sendable {
     case hello = 1
     case helloAck
@@ -17,9 +17,10 @@ public enum SessionFrameKind: UInt8, Sendable {
     case event
     case stream
     case goAway
+    case window
 }
 
-/// Flags carried by a v2 session frame.
+/// Flags carried by a v3 session frame.
 public struct SessionFrameFlags: OptionSet, Sendable {
     public let rawValue: UInt8
 
@@ -31,7 +32,7 @@ public struct SessionFrameFlags: OptionSet, Sendable {
     public static let end = SessionFrameFlags(rawValue: 1)
 }
 
-/// One exact-v2 length-prefixed session frame.
+/// One exact-v3 length-prefixed session frame.
 public struct SessionFrame: Sendable {
     public var kind: SessionFrameKind
     public var flags: SessionFrameFlags
@@ -63,7 +64,7 @@ public struct SessionFrame: Sendable {
     }
 }
 
-/// Fail-closed v2 codec errors.
+/// Fail-closed v3 codec errors.
 public enum SessionTransportError: Error, Equatable, Sendable {
     case truncatedFrame
     case frameTooLarge(actual: Int, maximum: Int)
@@ -73,7 +74,6 @@ public enum SessionTransportError: Error, Equatable, Sendable {
     case handshake(String)
     case duplicateRequestID(UInt64)
     case streamSequence(id: UInt64, got: UInt32, want: UInt32)
-    case queueFull
     case cancellationDidNotSettle
     case disconnected
 }
@@ -88,10 +88,32 @@ struct SessionBuildIdentity: Codable, Sendable {
     }
 }
 
+struct SessionSequence: Sendable {
+    private var next: UInt32
+    private var exhausted = false
+
+    init(next: UInt32 = 0) {
+        self.next = next
+    }
+
+    mutating func take() throws -> UInt32 {
+        guard !exhausted else {
+            throw SessionTransportError.invalidFrame("stream sequence exhausted")
+        }
+        let value = next
+        if next == .max {
+            exhausted = true
+        } else {
+            next += 1
+        }
+        return value
+    }
+}
+
 final class SessionFrameCodec: @unchecked Sendable {
     static let defaultMaximumFrameBytes = daemonKitDefaultMaximumFrameBytes
     private static let headerBytes = 32
-    private static let magic = Data("DKS2".utf8)
+    private static let magic = Data("DKS3".utf8)
 
     private let descriptor: Int32
     private let maximumFrameBytes: Int
@@ -233,6 +255,10 @@ final class SessionFrameCodec: @unchecked Sendable {
                   frame.deadlineUnixMilliseconds == 0, frame.operation.isEmpty,
                   frame.tenant.isEmpty, frame.payload.isEmpty
             else { throw SessionTransportError.invalidFrame("go-away frame") }
+        case .window:
+            guard frame.flags.isEmpty, frame.sequence > 0, frame.deadlineUnixMilliseconds == 0,
+                  frame.operation.isEmpty, frame.tenant.isEmpty, frame.payload.isEmpty
+            else { throw SessionTransportError.invalidFrame("window frame") }
         }
     }
 

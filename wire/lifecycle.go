@@ -20,7 +20,7 @@ type Lifecycle interface {
 	Handoff(context.Context) error
 }
 
-// RegisterLifecycle installs exact-v2 health, shutdown, and handoff handlers.
+// RegisterLifecycle installs lifecycle-v2 health, shutdown, and handoff handlers.
 // These handlers bypass ordinary admission so shutdown cannot deadlock its ACK.
 func (s *Server) RegisterLifecycle(lifecycle Lifecycle) {
 	if lifecycle == nil {
@@ -80,7 +80,7 @@ func decodeLifecycle(req Request, op string, dst any) error {
 	return nil
 }
 
-// LifecyclePeer is a persistent v2 client implementing daemon.Peer.
+// LifecyclePeer is a persistent v3 session client implementing daemon.Peer.
 type LifecyclePeer struct {
 	Config ClientConfig
 

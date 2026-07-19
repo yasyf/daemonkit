@@ -1,6 +1,7 @@
 package wire_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -288,10 +289,7 @@ func TestAdmissionCompletesAfterTerminalFrameIsWritten(t *testing.T) {
 		t.Fatal("admission completed before the blocked terminal frame was written")
 	case <-time.After(75 * time.Millisecond):
 	}
-	frame, err := codec.ReadFrame()
-	if err != nil {
-		t.Fatalf("read terminal response: %v", err)
-	}
+	frame := readSessionNonWindowFrame(t, codec)
 	if frame.Kind != wire.FrameResponse || frame.ID != 1 {
 		t.Fatalf("terminal frame = %#v", frame)
 	}
@@ -304,6 +302,19 @@ func TestAdmissionCompletesAfterTerminalFrameIsWritten(t *testing.T) {
 	codec.ReadTimeout = 100 * time.Millisecond
 	if second, err := codec.ReadFrame(); err == nil {
 		t.Fatalf("second terminal frame = %#v", second)
+	}
+}
+
+func readSessionNonWindowFrame(t *testing.T, codec *wire.Codec) wire.Frame {
+	t.Helper()
+	for {
+		frame, err := codec.ReadFrame()
+		if err != nil {
+			t.Fatalf("read frame: %v", err)
+		}
+		if frame.Kind != wire.FrameWindow {
+			return frame
+		}
 	}
 }
 
@@ -362,7 +373,7 @@ func TestBackpressuredResponseCancellationFailsSessionAndReleasesAdmission(t *te
 	}
 }
 
-func TestUnreadEventFailsSessionWithoutHeadOfLineBlocking(t *testing.T) {
+func TestSlowEventConsumerBackpressuresWithoutDropping(t *testing.T) {
 	server := &wire.Server{Build: "server-test"}
 	server.RegisterControl("events", func(ctx context.Context, request wire.Request) (any, error) {
 		if err := request.Session.PushEvent(ctx, wire.Event{Topic: "one"}); err != nil {
@@ -373,22 +384,51 @@ func TestUnreadEventFailsSessionWithoutHeadOfLineBlocking(t *testing.T) {
 		}
 		return true, nil
 	})
+	server.RegisterControl("echo", func(context.Context, wire.Request) (any, error) { return true, nil })
 	var inflight atomic.Int32
 	running := startSessionServer(t, server, admitAll(&inflight))
 	client := newClient(t, running, func(config *wire.ClientConfig) { config.EventQueue = 1 })
-	_, err := client.Call(context.Background(), "events", "", nil)
-	if !errors.Is(err, wire.ErrQueueFull) {
-		t.Fatalf("Call error = %v, want ErrQueueFull", err)
+	result := make(chan error, 1)
+	go func() {
+		_, err := client.Call(context.Background(), "events", "", nil)
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		t.Fatalf("Call completed before bounded events drained: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	echo, err := client.Call(context.Background(), "echo", "", nil)
+	if err != nil || echo.Outcome != wire.Delivered {
+		t.Fatalf("unrelated Call = %#v, %v", echo, err)
+	}
+	for _, topic := range []string{"one", "two"} {
+		select {
+		case event := <-client.Events():
+			if event.Topic != topic {
+				t.Fatalf("event topic = %q, want %q", event.Topic, topic)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("event %q not delivered", topic)
+		}
+	}
+	if err := <-result; err != nil {
+		t.Fatalf("Call: %v", err)
 	}
 }
 
-func TestUnreadResponseStreamFailsOnlyItsCall(t *testing.T) {
+func TestSlowResponseConsumerBackpressuresWithoutDropping(t *testing.T) {
 	server := &wire.Server{Build: "server-test"}
 	server.RegisterControl("stream-many", func(context.Context, wire.Request) (any, error) {
 		chunks := make(chan []byte, 3)
 		chunks <- []byte("one")
 		chunks <- []byte("two")
 		chunks <- []byte("three")
+		close(chunks)
+		return wire.StreamResponse{Chunks: chunks, Value: true}, nil
+	})
+	server.RegisterControl("stream-empty", func(context.Context, wire.Request) (any, error) {
+		chunks := make(chan []byte)
 		close(chunks)
 		return wire.StreamResponse{Chunks: chunks, Value: true}, nil
 	})
@@ -400,14 +440,45 @@ func TestUnreadResponseStreamFailsOnlyItsCall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	_, err = call.Response(context.Background())
-	if !errors.Is(err, wire.ErrQueueFull) {
-		t.Fatalf("Response error = %v, want ErrQueueFull", err)
+	response := make(chan error, 1)
+	go func() {
+		_, err := call.Response(context.Background())
+		response <- err
+	}()
+	select {
+	case err := <-response:
+		t.Fatalf("Response completed before bounded chunks drained: %v", err)
+	case <-time.After(20 * time.Millisecond):
 	}
-	time.Sleep(20 * time.Millisecond)
+	echo, err := client.Call(context.Background(), "echo", "", nil)
+	if err != nil || echo.Outcome != wire.Delivered {
+		t.Fatalf("unrelated Call = %#v, %v", echo, err)
+	}
+	var chunks []string
+	for chunk := range call.Chunks() {
+		if !chunk.End {
+			chunks = append(chunks, string(chunk.Payload))
+		}
+	}
+	if err := <-response; err != nil {
+		t.Fatalf("Response: %v", err)
+	}
+	if got, want := strings.Join(chunks, ","), "one,two,three"; got != want {
+		t.Fatalf("chunks = %q, want %q", got, want)
+	}
 	result, err := client.Call(context.Background(), "echo", "", nil)
 	if err != nil || result.Outcome != wire.Delivered {
 		t.Fatalf("subsequent Call = %#v, %v", result, err)
+	}
+	empty, err := client.Open(context.Background(), "stream-empty", "", nil, true)
+	if err != nil {
+		t.Fatalf("Open empty stream: %v", err)
+	}
+	for chunk := range empty.Chunks() {
+		t.Fatalf("empty stream chunk = %#v", chunk)
+	}
+	if result, err := empty.Response(context.Background()); err != nil || result.Outcome != wire.Delivered {
+		t.Fatalf("empty Response = %#v, %v", result, err)
 	}
 }
 
@@ -498,6 +569,123 @@ func TestRequestStreamOrderingAndCancellation(t *testing.T) {
 	}
 	if result.Response.Err == "" {
 		t.Fatal("canceled handler returned no error")
+	}
+}
+
+func TestSlowRequestConsumerBackpressuresWithoutDropping(t *testing.T) {
+	const (
+		chunkCount = 128
+		chunkBytes = 64 << 10
+	)
+	server := &wire.Server{Build: "server-test", StreamQueue: 2, MaxFrame: 2 << 20}
+	server.RegisterControl("upload", func(_ context.Context, request wire.Request) (any, error) {
+		count := 0
+		bytes := 0
+		for chunk := range request.Chunks {
+			if chunk.End {
+				continue
+			}
+			count++
+			bytes += len(chunk.Payload)
+			time.Sleep(250 * time.Microsecond)
+		}
+		return []int{count, bytes}, nil
+	})
+	var inflight atomic.Int32
+	running := startSessionServer(t, server, admitAll(&inflight))
+	client := newClient(t, running, func(config *wire.ClientConfig) { config.MaxFrame = 2 << 20 })
+	call, err := client.Open(context.Background(), "upload", "", nil, false)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	payload := bytes.Repeat([]byte{0xA5}, chunkBytes)
+	for range chunkCount {
+		if err := call.SendChunk(context.Background(), payload); err != nil {
+			t.Fatalf("SendChunk: %v", err)
+		}
+	}
+	if err := call.CloseSend(context.Background()); err != nil {
+		t.Fatalf("CloseSend: %v", err)
+	}
+	result, err := call.Response(context.Background())
+	if err != nil {
+		t.Fatalf("Response: %v", err)
+	}
+	var got []int
+	if err := json.Unmarshal(result.Response.Payload, &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(got) != 2 || got[0] != chunkCount || got[1] != chunkCount*chunkBytes {
+		t.Fatalf("upload result = %v", got)
+	}
+}
+
+func TestCanceledRequestStreamReapsHandlerAndPreservesSession(t *testing.T) {
+	settled := make(chan struct{})
+	server := &wire.Server{Build: "server-test", InboundQueue: 1, StreamQueue: 1}
+	server.RegisterControl("upload", func(_ context.Context, request wire.Request) (any, error) {
+		for range request.Chunks {
+		}
+		close(settled)
+		return true, nil
+	})
+	server.RegisterControl("next", func(context.Context, wire.Request) (any, error) { return true, nil })
+	var inflight atomic.Int32
+	running := startSessionServer(t, server, admitAll(&inflight))
+	client := newClient(t, running, nil)
+	call, err := client.Open(context.Background(), "upload", "", nil, false)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	call.Cancel()
+	select {
+	case <-settled:
+	case <-time.After(time.Second):
+		t.Fatal("request stream handler was not reaped")
+	}
+	result, err := call.Response(context.Background())
+	if err != nil {
+		t.Fatalf("canceled Response: %v", err)
+	}
+	if result.Response.Err == "" {
+		t.Fatal("canceled response has no error")
+	}
+	next, err := client.Call(context.Background(), "next", "", nil)
+	if err != nil || next.Outcome != wire.Delivered {
+		t.Fatalf("next Call = %#v, %v", next, err)
+	}
+}
+
+func TestBlockedUploadDoesNotBlockUnrelatedResponse(t *testing.T) {
+	server := &wire.Server{Build: "server-test", StreamQueue: 1}
+	server.RegisterControl("upload", func(ctx context.Context, _ wire.Request) (any, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	server.RegisterControl("echo", func(context.Context, wire.Request) (any, error) { return true, nil })
+	var inflight atomic.Int32
+	running := startSessionServer(t, server, admitAll(&inflight))
+	client := newClient(t, running, nil)
+	call, err := client.Open(context.Background(), "upload", "", nil, false)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := call.SendChunk(context.Background(), []byte("one")); err != nil {
+		t.Fatalf("first SendChunk: %v", err)
+	}
+	blocked := make(chan error, 1)
+	go func() { blocked <- call.SendChunk(context.Background(), []byte("two")) }()
+	time.Sleep(20 * time.Millisecond)
+	echo, err := client.Call(context.Background(), "echo", "", nil)
+	if err != nil || echo.Outcome != wire.Delivered {
+		t.Fatalf("unrelated Call = %#v, %v", echo, err)
+	}
+	call.Cancel()
+	if err := <-blocked; !errors.Is(err, wire.ErrCallDone) && !errors.Is(err, context.Canceled) {
+		t.Fatalf("blocked SendChunk error = %v", err)
+	}
+	if _, err := call.Response(context.Background()); err != nil {
+		t.Fatalf("Response: %v", err)
 	}
 }
 
@@ -635,9 +823,8 @@ func TestDuplicateRequestIDNeverDispatchesTwice(t *testing.T) {
 		t.Fatalf("write duplicate: %v", err)
 	}
 	codec.ReadTimeout = 200 * time.Millisecond
-	_, err = codec.ReadFrame()
-	if err == nil {
-		t.Fatal("duplicate request did not terminate the session")
+	for err == nil {
+		_, err = codec.ReadFrame()
 	}
 	time.Sleep(10 * time.Millisecond)
 	if calls.Load() != 1 {

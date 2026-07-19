@@ -1,14 +1,6 @@
 import Darwin
 import Foundation
 
-/// One terminal result from a persistent ``SocketClient`` call.
-public struct SocketCallResult: Sendable {
-    public let payload: Data?
-    public let error: String?
-    public let rejected: Bool
-    public let reason: String?
-}
-
 /// One server-pushed event.
 public struct SocketEvent: Sendable {
     public let topic: String
@@ -18,7 +10,7 @@ public struct SocketEvent: Sendable {
 /// One request multiplexed over a persistent ``SocketClient``.
 public final class SocketCall: @unchecked Sendable {
     public let id: UInt64
-    public let chunks: AsyncThrowingStream<SocketRequestChunk, Error>
+    public let chunks: SocketChunkStream
 
     private let client: SocketClient
     private let state: ClientRequestState
@@ -27,34 +19,25 @@ public final class SocketCall: @unchecked Sendable {
         self.client = client
         self.id = id
         self.state = state
-        chunks = state.chunks
+        chunks = SocketChunkStream(channel: state.chunkChannel) { [client, state] in
+            Self.cancel(client: client, id: id, state: state)
+        } consumptionOperation: { [client] _ in
+            try client.write(SessionFrame(kind: .window, id: id, sequence: 1))
+        }
     }
 
     /// Appends an ordered request-stream chunk.
-    public func sendChunk(_ payload: Data) throws {
-        try state.sendLock.withLock {
-            guard !state.sendEnded else {
-                throw SessionTransportError.invalidFrame("request stream already ended")
-            }
-            try client.write(SessionFrame(kind: .stream, id: id, sequence: state.nextSend, payload: payload))
-            state.nextSend += 1
-        }
+    public func sendChunk(_ payload: Data) async throws {
+        try await state.sender.send(client: client, id: id, payload: payload, end: false)
     }
 
     /// Sends the request-stream terminal marker exactly once.
-    public func closeSend() throws {
-        try state.sendLock.withLock {
-            guard !state.sendEnded else {
-                throw SessionTransportError.invalidFrame("request stream already ended")
-            }
-            try client.write(SessionFrame(kind: .stream, flags: .end, id: id, sequence: state.nextSend))
-            state.nextSend += 1
-            state.sendEnded = true
-        }
+    public func closeSend() async throws {
+        try await state.sender.send(client: client, id: id, payload: Data(), end: true)
     }
 
     /// Waits for the terminal response; task cancellation sends one cancel frame.
-    public func response() async throws -> SocketCallResult {
+    public func response() async throws -> SocketTerminal {
         if let cached = try state.cachedResult() {
             return cached
         }
@@ -73,6 +56,10 @@ public final class SocketCall: @unchecked Sendable {
 
     /// Requests cancellation without disconnecting the session.
     public func cancel() {
+        Self.cancel(client: client, id: id, state: state)
+    }
+
+    private static func cancel(client: SocketClient, id: UInt64, state: ClientRequestState) {
         state.cancelLock.lock()
         guard !state.cancelSent, !state.isTerminal() else {
             state.cancelLock.unlock()
@@ -81,6 +68,7 @@ public final class SocketCall: @unchecked Sendable {
         state.cancelSent = true
         state.cancelLock.unlock()
         state.endSending()
+        state.discardOutput()
         do {
             try client.write(SessionFrame(kind: .cancel, flags: .end, id: id))
         } catch {
@@ -97,7 +85,7 @@ public final class SocketCall: @unchecked Sendable {
     }
 }
 
-/// A persistent, multiplexed exact-v2 unix-socket client.
+/// A persistent, multiplexed exact-v3 unix-socket client.
 public final class SocketClient: @unchecked Sendable {
     public struct Configuration: Sendable {
         public var maximumFrameBytes: Int
@@ -125,7 +113,15 @@ public final class SocketClient: @unchecked Sendable {
     }
 
     /// Events pushed by the server, bounded by ``Configuration/eventQueueDepth``.
-    public let events: AsyncThrowingStream<SocketEvent, Error>
+    public var events: SocketEventStream {
+        SocketEventStream(channel: eventChannel) { [weak self] in
+            self?.close()
+        } consumptionOperation: { [weak self] _ in
+            guard let self else { throw SessionTransportError.disconnected }
+            try write(SessionFrame(kind: .window, sequence: 1))
+        }
+    }
+
     /// Server build identity established by the mandatory handshake.
     public let peerBuild: String
 
@@ -137,18 +133,17 @@ public final class SocketClient: @unchecked Sendable {
     private var pending: [UInt64: ClientRequestState] = [:]
     private var nextID: UInt64 = 1
     private var closed = false
-    private let eventContinuation: AsyncThrowingStream<SocketEvent, Error>.Continuation
+    private let eventChannel: SocketBoundedChannel<SocketEvent>
 
     public init(path: String, build: String, configuration: Configuration = .init()) throws {
         guard !build.isEmpty else { throw SessionTransportError.handshake("empty build") }
+        guard (1 ... Int(UInt32.max)).contains(configuration.streamQueueDepth),
+              (1 ... Int(UInt32.max)).contains(configuration.eventQueueDepth)
+        else { throw SessionTransportError.invalidFrame("stream queue exceeds protocol window") }
         self.configuration = configuration
         descriptor = try Self.connect(path: path)
         codec = SessionFrameCodec(descriptor: descriptor, maximumFrameBytes: configuration.maximumFrameBytes)
-        var continuation: AsyncThrowingStream<SocketEvent, Error>.Continuation!
-        events = AsyncThrowingStream(bufferingPolicy: .bufferingOldest(configuration.eventQueueDepth)) {
-            continuation = $0
-        }
-        eventContinuation = continuation
+        eventChannel = SocketBoundedChannel(capacity: configuration.eventQueueDepth)
         Self.configure(descriptor, receive: configuration.handshakeTimeout, send: configuration.writeTimeout)
         do {
             peerBuild = try Self.handshake(codec: codec, build: build)
@@ -157,7 +152,13 @@ public final class SocketClient: @unchecked Sendable {
             throw error
         }
         Self.configure(descriptor, receive: 0, send: configuration.writeTimeout)
-        readQueue.async { [weak self] in self?.readLoop() }
+        try codec.write(SessionFrame(
+            kind: .window,
+            sequence: UInt32(configuration.eventQueueDepth)
+        ))
+        Task { [weak self] in
+            await self?.readLoop()
+        }
     }
 
     deinit {
@@ -194,8 +195,13 @@ public final class SocketClient: @unchecked Sendable {
                 tenant: tenant,
                 payload: payload
             ))
+            try write(SessionFrame(
+                kind: .window,
+                id: id,
+                sequence: UInt32(configuration.streamQueueDepth)
+            ))
         } catch {
-            _ = remove(id)
+            fail(error)
             throw error
         }
         return SocketCall(client: self, id: id, state: state)
@@ -207,7 +213,7 @@ public final class SocketClient: @unchecked Sendable {
         tenant: String = "",
         payload: Data = Data(),
         deadline: Date? = nil
-    ) async throws -> SocketCallResult {
+    ) async throws -> SocketTerminal {
         try await open(
             operation: operation,
             tenant: tenant,
@@ -234,7 +240,7 @@ public final class SocketClient: @unchecked Sendable {
         for request in requests {
             request.finish(throwing: error)
         }
-        eventContinuation.finish(throwing: error)
+        Task { await eventChannel.finish(throwing: error) }
     }
 
     fileprivate func write(_ frame: SessionFrame) throws {
@@ -247,17 +253,19 @@ public final class SocketClient: @unchecked Sendable {
         try codec.write(frame)
     }
 
-    private func readLoop() {
+    private func readLoop() async {
         do {
             while true {
-                let frame = try codec.read()
+                let frame = try await readFrame()
                 switch frame.kind {
                 case .response:
                     try receiveResponse(frame)
                 case .stream:
-                    try receiveStream(frame)
+                    try await receiveStream(frame)
                 case .event:
-                    try receiveEvent(frame)
+                    try await receiveEvent(frame)
+                case .window:
+                    try await receiveWindow(frame)
                 case .goAway:
                     close()
                     return
@@ -270,62 +278,68 @@ public final class SocketClient: @unchecked Sendable {
         }
     }
 
+    private func readFrame() async throws -> SessionFrame {
+        try await withCheckedThrowingContinuation { continuation in
+            readQueue.async { [codec] in
+                do {
+                    try continuation.resume(returning: codec.read())
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
     private func receiveResponse(_ frame: SessionFrame) throws {
         guard frame.id != 0, frame.flags == .end, frame.operation.isEmpty, frame.tenant.isEmpty else {
             throw SessionTransportError.invalidFrame("response")
         }
-        guard let state = remove(frame.id) else { return }
         let result = try Self.decodeResponse(frame.payload)
+        guard let state = remove(frame.id) else { return }
         state.finish(returning: result)
     }
 
-    private func receiveStream(_ frame: SessionFrame) throws {
+    private func receiveStream(_ frame: SessionFrame) async throws {
         guard frame.id != 0, frame.operation.isEmpty, frame.tenant.isEmpty else {
             throw SessionTransportError.invalidFrame("response stream")
         }
-        lock.lock()
-        let state = pending[frame.id]
-        lock.unlock()
-        guard let state else { return }
-        state.receiveLock.lock()
-        guard !state.receiveEnded, frame.sequence == state.nextReceive else {
-            state.receiveLock.unlock()
-            throw SessionTransportError.streamSequence(id: frame.id, got: frame.sequence, want: state.nextReceive)
+        guard let state = pendingState(frame.id) else { return }
+        guard let chunk = try state.receive(frame) else { return }
+        let accepted = await state.chunkChannel.offer(chunk)
+        guard accepted else {
+            throw SessionTransportError.invalidFrame("response stream exceeded granted window")
         }
-        state.nextReceive += 1
-        let result = state.chunkContinuation.yield(SocketRequestChunk(
-            sequence: frame.sequence,
-            payload: frame.payload,
-            end: frame.flags.contains(.end)
-        ))
-        if case .dropped = result {
-            state.receiveLock.unlock()
-            _ = remove(frame.id)
-            state.finish(throwing: SessionTransportError.queueFull)
-            try? write(SessionFrame(kind: .cancel, flags: .end, id: frame.id))
-            return
+        if chunk.end, accepted {
+            await state.chunkChannel.finish()
         }
-        if frame.flags.contains(.end) {
-            state.receiveEnded = true
-            state.chunkContinuation.finish()
-        }
-        state.receiveLock.unlock()
     }
 
-    private func receiveEvent(_ frame: SessionFrame) throws {
+    private func receiveEvent(_ frame: SessionFrame) async throws {
         guard frame.id == 0, frame.flags == .end, !frame.operation.isEmpty, frame.tenant.isEmpty else {
             throw SessionTransportError.invalidFrame("event")
         }
-        let result = eventContinuation.yield(SocketEvent(topic: frame.operation, payload: frame.payload))
-        if case .dropped = result {
-            throw SessionTransportError.queueFull
+        let accepted = await eventChannel.offer(SocketEvent(topic: frame.operation, payload: frame.payload))
+        guard accepted else {
+            throw SessionTransportError.invalidFrame("event stream exceeded granted window")
         }
+    }
+
+    private func receiveWindow(_ frame: SessionFrame) async throws {
+        guard frame.id != 0, frame.flags.isEmpty, frame.sequence > 0,
+              frame.operation.isEmpty, frame.tenant.isEmpty, frame.payload.isEmpty
+        else { throw SessionTransportError.invalidFrame("request stream window") }
+        guard let state = pendingState(frame.id) else { return }
+        await state.sender.grant(frame.sequence)
     }
 
     private func remove(_ id: UInt64) -> ClientRequestState? {
         lock.lock()
         defer { lock.unlock() }
         return pending.removeValue(forKey: id)
+    }
+
+    private func pendingState(_ id: UInt64) -> ClientRequestState? {
+        lock.withLock { pending[id] }
     }
 
     fileprivate func fail(_ error: Error) {
@@ -343,7 +357,7 @@ public final class SocketClient: @unchecked Sendable {
         for request in requests {
             request.finish(throwing: error)
         }
-        eventContinuation.finish(throwing: error)
+        Task { await eventChannel.finish(throwing: error) }
     }
 
     private static func handshake(codec: SessionFrameCodec, build: String) throws -> String {
@@ -366,7 +380,7 @@ public final class SocketClient: @unchecked Sendable {
         return identity.build
     }
 
-    private static func decodeResponse(_ data: Data) throws -> SocketCallResult {
+    private static func decodeResponse(_ data: Data) throws -> SocketTerminal {
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw SessionTransportError.invalidFrame("response JSON")
         }
@@ -375,7 +389,7 @@ public final class SocketClient: @unchecked Sendable {
         } else {
             nil
         }
-        return SocketCallResult(
+        return SocketTerminal(
             payload: payload,
             error: object["err"] as? String,
             rejected: object["rejected"] as? Bool ?? false,
@@ -433,39 +447,33 @@ public final class SocketClient: @unchecked Sendable {
 }
 
 private final class ClientRequestState: @unchecked Sendable {
-    let chunks: AsyncThrowingStream<SocketRequestChunk, Error>
-    let results: AsyncThrowingStream<SocketCallResult, Error>
-    let chunkContinuation: AsyncThrowingStream<SocketRequestChunk, Error>.Continuation
-    let resultContinuation: AsyncThrowingStream<SocketCallResult, Error>.Continuation
-    let sendLock = NSLock()
+    let results: AsyncThrowingStream<SocketTerminal, Error>
+    let chunkChannel: SocketBoundedChannel<SocketRequestChunk>
+    let resultContinuation: AsyncThrowingStream<SocketTerminal, Error>.Continuation
+    let sender: ClientRequestSender
     let receiveLock = NSLock()
     let cancelLock = NSLock()
     let terminalLock = NSLock()
-    var nextSend: UInt32 = 0
-    var sendEnded: Bool
-    var nextReceive: UInt32 = 0
+    var receiveSequence = SessionSequence()
     var receiveEnded = false
+    var discardingOutput = false
     var cancelSent = false
-    var terminalResult: SocketCallResult?
+    var terminalResult: SocketTerminal?
     var terminalError: Error?
     var settlementStarted = false
     var terminalReady = false
 
     init(streamQueueDepth: Int, sendEnded: Bool) {
-        var chunkContinuation: AsyncThrowingStream<SocketRequestChunk, Error>.Continuation!
-        chunks = AsyncThrowingStream(bufferingPolicy: .bufferingOldest(streamQueueDepth)) {
-            chunkContinuation = $0
-        }
-        self.chunkContinuation = chunkContinuation
-        var resultContinuation: AsyncThrowingStream<SocketCallResult, Error>.Continuation!
+        sender = ClientRequestSender(ended: sendEnded)
+        chunkChannel = SocketBoundedChannel(capacity: streamQueueDepth)
+        var resultContinuation: AsyncThrowingStream<SocketTerminal, Error>.Continuation!
         results = AsyncThrowingStream(bufferingPolicy: .bufferingOldest(1)) {
             resultContinuation = $0
         }
         self.resultContinuation = resultContinuation
-        self.sendEnded = sendEnded
     }
 
-    func finish(returning result: SocketCallResult) {
+    func finish(returning result: SocketTerminal) {
         terminalLock.lock()
         settlementStarted = true
         terminalLock.unlock()
@@ -473,7 +481,7 @@ private final class ClientRequestState: @unchecked Sendable {
         receiveLock.lock()
         if !receiveEnded {
             receiveEnded = true
-            chunkContinuation.finish()
+            Task { await chunkChannel.finish() }
         }
         receiveLock.unlock()
         terminalLock.lock()
@@ -484,6 +492,26 @@ private final class ClientRequestState: @unchecked Sendable {
         resultContinuation.finish()
     }
 
+    func receive(_ frame: SessionFrame) throws -> SocketRequestChunk? {
+        receiveLock.lock()
+        defer { receiveLock.unlock() }
+        if discardingOutput {
+            return nil
+        }
+        guard !receiveEnded else {
+            throw SessionTransportError.invalidFrame("response stream already ended")
+        }
+        let expected = try receiveSequence.take()
+        guard frame.sequence == expected else {
+            throw SessionTransportError.streamSequence(id: frame.id, got: frame.sequence, want: expected)
+        }
+        let ended = frame.flags.contains(.end)
+        if ended {
+            receiveEnded = true
+        }
+        return SocketRequestChunk(sequence: frame.sequence, payload: frame.payload, end: ended)
+    }
+
     func finish(throwing error: Error) {
         terminalLock.lock()
         settlementStarted = true
@@ -492,7 +520,7 @@ private final class ClientRequestState: @unchecked Sendable {
         receiveLock.lock()
         if !receiveEnded {
             receiveEnded = true
-            chunkContinuation.finish(throwing: error)
+            Task { await chunkChannel.finish(throwing: error) }
         }
         receiveLock.unlock()
         terminalLock.lock()
@@ -502,7 +530,7 @@ private final class ClientRequestState: @unchecked Sendable {
         resultContinuation.finish(throwing: error)
     }
 
-    func cachedResult() throws -> SocketCallResult? {
+    func cachedResult() throws -> SocketTerminal? {
         terminalLock.lock()
         defer { terminalLock.unlock() }
         guard terminalReady else { return nil }
@@ -513,15 +541,57 @@ private final class ClientRequestState: @unchecked Sendable {
     }
 
     func endSending() {
-        sendLock.lock()
-        sendEnded = true
-        sendLock.unlock()
+        Task { await sender.close() }
+    }
+
+    func discardOutput() {
+        receiveLock.lock()
+        receiveEnded = true
+        discardingOutput = true
+        Task { await chunkChannel.discard() }
+        receiveLock.unlock()
     }
 
     func isTerminal() -> Bool {
         terminalLock.lock()
         defer { terminalLock.unlock() }
         return settlementStarted
+    }
+}
+
+private actor ClientRequestSender {
+    private let window = SocketCreditWindow()
+    private var sequence = SessionSequence()
+    private var ended: Bool
+
+    init(ended: Bool) {
+        self.ended = ended
+    }
+
+    func send(client: SocketClient, id: UInt64, payload: Data, end: Bool) async throws {
+        guard !ended else {
+            throw SessionTransportError.invalidFrame("request stream already ended")
+        }
+        guard await window.acquire() else { throw CancellationError() }
+        guard !ended else { throw CancellationError() }
+        let current = try sequence.take()
+        try client.write(SessionFrame(
+            kind: .stream,
+            flags: end ? .end : [],
+            id: id,
+            sequence: current,
+            payload: payload
+        ))
+        ended = end
+    }
+
+    func grant(_ count: UInt32) async {
+        await window.grant(count)
+    }
+
+    func close() async {
+        ended = true
+        await window.close()
     }
 }
 

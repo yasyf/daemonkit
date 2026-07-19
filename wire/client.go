@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -77,7 +78,7 @@ type ClientConfig struct {
 	CancelSettlementTimeout time.Duration
 }
 
-// Client is one persistent, concurrent v2 session.
+// Client is one persistent, concurrent v3 session.
 type Client struct {
 	conn   net.Conn
 	codec  *Codec
@@ -90,7 +91,8 @@ type Client struct {
 
 	nextID   atomic.Uint64
 	outbound chan outboundFrame
-	events   chan Event
+	events   *boundedStream[Event]
+	eventOut chan Event
 
 	mu      sync.Mutex
 	pending map[uint64]*ClientCall
@@ -111,20 +113,25 @@ type outboundFrame struct {
 
 // ClientCall is one in-flight request on a Client.
 type ClientCall struct {
-	client *Client
-	id     uint64
-	chunks chan Chunk
-	ready  chan struct{}
+	client       *Client
+	id           uint64
+	chunks       chan Chunk
+	inbound      *boundedStream[Chunk]
+	ready        chan struct{}
+	deliveryDone chan struct{}
+	deliveryOnce sync.Once
+	sendCredits  *creditWindow
+	sendMu       sync.Mutex
 
-	mu           sync.Mutex
-	terminal     callResult
-	nextSend     uint32
-	sendEnded    bool
-	canceled     bool
-	nextReceive  uint32
-	receiveEnded bool
-	cancelOnce   sync.Once
-	finishOnce   sync.Once
+	mu              sync.Mutex
+	terminal        callResult
+	sendSequence    streamSequence
+	sendEnded       bool
+	canceled        bool
+	receiveSequence streamSequence
+	receiveEnded    bool
+	cancelOnce      sync.Once
+	finishOnce      sync.Once
 }
 
 type callResult struct {
@@ -132,13 +139,18 @@ type callResult struct {
 	err    error
 }
 
-// NewClient dials and completes the mandatory exact-v2 handshake before returning.
+// NewClient dials and completes the mandatory exact-v3 handshake before returning.
 func NewClient(ctx context.Context, config ClientConfig) (*Client, error) {
 	if config.Dial == nil {
 		return nil, errors.New("wire: Dial is required")
 	}
 	if config.Build == "" {
 		return nil, errors.New("wire: Build is required")
+	}
+	streamCap := positiveOr(config.StreamQueue, defaultStreamQueue)
+	eventCap := positiveOr(config.EventQueue, defaultStreamQueue)
+	if uint64(streamCap) > math.MaxUint32 || uint64(eventCap) > math.MaxUint32 {
+		return nil, errors.New("wire: stream queue exceeds protocol window")
 	}
 	conn, err := config.Dial(ctx)
 	if err != nil {
@@ -172,14 +184,20 @@ func NewClient(ctx context.Context, config ClientConfig) (*Client, error) {
 		ctx:                     clientCtx,
 		cancel:                  cancel,
 		outbound:                make(chan outboundFrame, positiveOr(config.OutboundQueue, defaultOutboundQueue)),
-		events:                  make(chan Event, positiveOr(config.EventQueue, defaultStreamQueue)),
+		events:                  newBoundedStream[Event](eventCap),
+		eventOut:                make(chan Event),
 		pending:                 make(map[uint64]*ClientCall),
-		streamCap:               positiveOr(config.StreamQueue, defaultStreamQueue),
+		streamCap:               streamCap,
 		cancelSettlementTimeout: durationOr(config.CancelSettlementTimeout, defaultCancelSettlementTimeout),
 	}
-	c.loopWG.Add(2)
+	if err := codec.WriteFrame(Frame{Kind: FrameWindow, Sequence: uint32(eventCap)}); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("wire: grant event window: %w", err)
+	}
+	c.loopWG.Add(3)
 	go c.writeLoop()
 	go c.readLoop(clientCtx)
+	go c.deliverEvents()
 	return c, nil
 }
 
@@ -187,7 +205,7 @@ func NewClient(ctx context.Context, config ClientConfig) (*Client, error) {
 func (c *Client) PeerBuild() BuildIdentity { return c.peer }
 
 // Events returns the bounded server-pushed event stream.
-func (c *Client) Events() <-chan Event { return c.events }
+func (c *Client) Events() <-chan Event { return c.eventOut }
 
 // Call sends a unary request and waits for its terminal response.
 func (c *Client) Call(ctx context.Context, op Op, tenant string, payload []byte) (Result, error) {
@@ -211,8 +229,11 @@ func (c *Client) Open(ctx context.Context, op Op, tenant string, payload []byte,
 	call := &ClientCall{
 		client:       c,
 		id:           id,
-		chunks:       make(chan Chunk, c.streamCap),
+		chunks:       make(chan Chunk),
+		inbound:      newBoundedStream[Chunk](c.streamCap),
 		ready:        make(chan struct{}),
+		deliveryDone: make(chan struct{}),
+		sendCredits:  newCreditWindow(),
 		sendEnded:    endInput,
 		receiveEnded: false,
 	}
@@ -234,6 +255,13 @@ func (c *Client) Open(ctx context.Context, op Op, tenant string, payload []byte,
 		c.removePending(id)
 		return nil, fmt.Errorf("wire: send request: %w", err)
 	}
+	if err := c.sendFrame(callCtx, Frame{Kind: FrameWindow, ID: id, Sequence: uint32(c.streamCap)}); err != nil {
+		cancel()
+		err = fmt.Errorf("wire: grant response window: %w", err)
+		c.fail(err)
+		return nil, err
+	}
+	go call.deliverChunks()
 	go func() {
 		defer cancel()
 		select {
@@ -254,47 +282,89 @@ func (c *ClientCall) Chunks() <-chan Chunk { return c.chunks }
 
 // SendChunk appends one ordered request-stream chunk.
 func (c *ClientCall) SendChunk(ctx context.Context, payload []byte) error {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	select {
 	case <-c.ready:
+		c.mu.Unlock()
 		return ErrCallDone
 	default:
 	}
 	if c.canceled {
+		c.mu.Unlock()
 		return ErrCallDone
 	}
 	if c.sendEnded {
+		c.mu.Unlock()
 		return errors.New("wire: request stream already ended")
 	}
-	frame := Frame{Kind: FrameStream, ID: c.id, Sequence: c.nextSend, Payload: append([]byte(nil), payload...)}
+	c.mu.Unlock()
+	if err := c.sendCredits.acquire(ctx); err != nil {
+		if errors.Is(err, errStreamClosed) {
+			return ErrCallDone
+		}
+		return err
+	}
+	c.mu.Lock()
+	if c.canceled || c.sendEnded {
+		c.mu.Unlock()
+		return ErrCallDone
+	}
+	sequence, err := c.sendSequence.take()
+	if err != nil {
+		c.mu.Unlock()
+		return err
+	}
+	c.mu.Unlock()
+	frame := Frame{Kind: FrameStream, ID: c.id, Sequence: sequence, Payload: append([]byte(nil), payload...)}
 	if err := c.client.sendFrame(ctx, frame); err != nil {
 		return err
 	}
-	c.nextSend++
 	return nil
 }
 
 // CloseSend emits the final request-stream marker exactly once.
 func (c *ClientCall) CloseSend(ctx context.Context) error {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	select {
 	case <-c.ready:
+		c.mu.Unlock()
 		return ErrCallDone
 	default:
 	}
 	if c.canceled {
+		c.mu.Unlock()
 		return ErrCallDone
 	}
 	if c.sendEnded {
+		c.mu.Unlock()
 		return errors.New("wire: request stream already ended")
 	}
-	if err := c.client.sendFrame(ctx, Frame{Kind: FrameStream, Flags: FlagEnd, ID: c.id, Sequence: c.nextSend}); err != nil {
+	c.mu.Unlock()
+	if err := c.sendCredits.acquire(ctx); err != nil {
+		if errors.Is(err, errStreamClosed) {
+			return ErrCallDone
+		}
 		return err
 	}
-	c.nextSend++
+	c.mu.Lock()
+	if c.canceled || c.sendEnded {
+		c.mu.Unlock()
+		return ErrCallDone
+	}
+	sequence, err := c.sendSequence.take()
+	if err != nil {
+		c.mu.Unlock()
+		return err
+	}
 	c.sendEnded = true
+	c.mu.Unlock()
+	if err := c.client.sendFrame(ctx, Frame{Kind: FrameStream, Flags: FlagEnd, ID: c.id, Sequence: sequence}); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -337,6 +407,8 @@ func (c *ClientCall) cancel(parent context.Context) {
 		c.canceled = true
 		c.sendEnded = true
 		c.mu.Unlock()
+		c.sendCredits.close()
+		c.stopDelivery()
 		go func() {
 			ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), defaultWriteTimeout)
 			err := c.client.sendFrame(ctx, Frame{Kind: FrameCancel, Flags: FlagEnd, ID: c.id})
@@ -355,6 +427,61 @@ func (c *ClientCall) cancel(parent context.Context) {
 			}
 		}()
 	})
+}
+
+func (c *ClientCall) deliverChunks() {
+	defer close(c.chunks)
+	for {
+		select {
+		case chunk, ok := <-c.inbound.channel():
+			if !ok {
+				return
+			}
+			select {
+			case c.chunks <- chunk:
+				if err := c.client.sendFrame(c.client.ctx, Frame{Kind: FrameWindow, ID: c.id, Sequence: 1}); err != nil {
+					c.client.fail(fmt.Errorf("wire: return response credit: %w", err))
+					return
+				}
+			case <-c.deliveryDone:
+				return
+			case <-c.client.ctx.Done():
+				return
+			}
+		case <-c.deliveryDone:
+			return
+		case <-c.client.ctx.Done():
+			return
+		}
+	}
+}
+
+func (c *ClientCall) stopDelivery() {
+	c.deliveryOnce.Do(func() { close(c.deliveryDone) })
+}
+
+func (c *Client) deliverEvents() {
+	defer c.loopWG.Done()
+	defer close(c.eventOut)
+	for {
+		select {
+		case event, ok := <-c.events.channel():
+			if !ok {
+				return
+			}
+			select {
+			case c.eventOut <- event:
+				if err := c.sendFrame(c.ctx, Frame{Kind: FrameWindow, Sequence: 1}); err != nil {
+					c.fail(fmt.Errorf("wire: return event credit: %w", err))
+					return
+				}
+			case <-c.ctx.Done():
+				return
+			}
+		case <-c.ctx.Done():
+			return
+		}
+	}
 }
 
 // Close terminates the session and all pending calls.
@@ -423,7 +550,6 @@ func (c *Client) writeLoop() {
 
 func (c *Client) readLoop(ctx context.Context) {
 	defer c.loopWG.Done()
-	defer close(c.events)
 	for {
 		frame, err := c.codec.ReadFrame()
 		if err != nil {
@@ -446,10 +572,16 @@ func (c *Client) readLoop(ctx context.Context) {
 				c.fail(fmt.Errorf("%w: event frame", ErrInvalidFrame))
 				return
 			}
-			select {
-			case c.events <- Event{Topic: string(frame.Op), Payload: frame.Payload}:
-			default:
-				c.fail(ErrQueueFull)
+			if err := c.events.offer(Event{Topic: string(frame.Op), Payload: frame.Payload}); err != nil {
+				if errors.Is(err, errStreamClosed) && ctx.Err() != nil {
+					return
+				}
+				c.fail(err)
+				return
+			}
+		case FrameWindow:
+			if err := c.receiveWindow(frame); err != nil {
+				c.fail(err)
 				return
 			}
 		case FrameGoAway:
@@ -466,20 +598,20 @@ func (c *Client) receiveResponse(frame Frame) error {
 	if frame.ID == 0 || frame.Flags != FlagEnd || frame.Op != "" || frame.Tenant != "" {
 		return fmt.Errorf("%w: response frame", ErrInvalidFrame)
 	}
-	call := c.removePending(frame.ID)
-	if call == nil {
-		return nil
-	}
 	var response Response
 	if err := decodeStrict(frame.Payload, &response); err != nil {
 		return fmt.Errorf("wire: decode response: %w", err)
 	}
+	call := c.removePending(frame.ID)
+	if call == nil {
+		return nil
+	}
 	call.mu.Lock()
 	if !call.receiveEnded {
 		call.receiveEnded = true
-		close(call.chunks)
 	}
 	call.mu.Unlock()
+	call.inbound.close()
 	outcome := Delivered
 	if response.Rejected {
 		outcome = Rejected
@@ -499,27 +631,53 @@ func (c *Client) receiveStream(ctx context.Context, frame Frame) error {
 		return nil
 	}
 	call.mu.Lock()
-	if call.receiveEnded || frame.Sequence != call.nextReceive {
+	if call.receiveEnded {
 		call.mu.Unlock()
 		return ErrStreamOrder
 	}
-	call.nextReceive++
-	chunk := Chunk{Sequence: frame.Sequence, Payload: append([]byte(nil), frame.Payload...), End: frame.Flags&FlagEnd != 0}
-	select {
-	case call.chunks <- chunk:
-	default:
+	expected, err := call.receiveSequence.take()
+	if err != nil {
 		call.mu.Unlock()
-		c.removePending(frame.ID)
-		call.finish(callResult{result: Result{Outcome: PostSendFailure}, err: ErrQueueFull})
-		call.cancel(ctx)
-		return nil
+		return err
 	}
-	if chunk.End {
+	if frame.Sequence != expected {
+		call.mu.Unlock()
+		return ErrStreamOrder
+	}
+	end := frame.Flags&FlagEnd != 0
+	if end {
 		call.receiveEnded = true
-		close(call.chunks)
 	}
 	call.mu.Unlock()
+	chunk := Chunk{Sequence: frame.Sequence, Payload: append([]byte(nil), frame.Payload...), End: frame.Flags&FlagEnd != 0}
+	// Waiting here propagates bounded consumer pressure to the socket.
+	if err := call.inbound.offer(chunk); err != nil {
+		if errors.Is(err, errStreamClosed) {
+			return nil
+		}
+		return err
+	}
+	if end {
+		call.inbound.close()
+	}
 	return nil
+}
+
+func (c *Client) receiveWindow(frame Frame) error {
+	if frame.ID == 0 || frame.Flags != 0 || frame.Sequence == 0 || frame.Op != "" || frame.Tenant != "" || len(frame.Payload) != 0 {
+		return fmt.Errorf("%w: request stream window", ErrInvalidFrame)
+	}
+	c.mu.Lock()
+	call := c.pending[frame.ID]
+	c.mu.Unlock()
+	if call == nil {
+		return nil
+	}
+	err := call.sendCredits.grant(frame.Sequence)
+	if errors.Is(err, errStreamClosed) {
+		return nil
+	}
+	return err
 }
 
 func (c *Client) sendFrame(ctx context.Context, frame Frame) error {
@@ -548,13 +706,16 @@ func (c *Client) fail(err error) {
 		c.mu.Unlock()
 		c.cancel()
 		_ = c.conn.Close()
+		c.events.close()
 		for _, call := range pending {
 			call.mu.Lock()
 			if !call.receiveEnded {
 				call.receiveEnded = true
-				close(call.chunks)
 			}
 			call.mu.Unlock()
+			call.inbound.close()
+			call.sendCredits.close()
+			call.stopDelivery()
 			call.finish(callResult{result: Result{Outcome: PostSendFailure}, err: err})
 		}
 	})
@@ -566,10 +727,11 @@ func (c *ClientCall) finish(terminal callResult) {
 		c.terminal = terminal
 		if !c.receiveEnded {
 			c.receiveEnded = true
-			close(c.chunks)
 		}
 		c.sendEnded = true
 		c.mu.Unlock()
+		c.inbound.close()
+		c.sendCredits.close()
 		close(c.ready)
 	})
 }

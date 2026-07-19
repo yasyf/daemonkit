@@ -72,15 +72,27 @@ private final class ContinuationGate: @unchecked Sendable {
     }
 }
 
+private actor PullChunks {
+    private var chunks: ArraySlice<Data>
+
+    init(_ chunks: [Data]) {
+        self.chunks = ArraySlice(chunks)
+    }
+
+    func next() -> Data? {
+        chunks.popFirst()
+    }
+}
+
 @Suite(.serialized, .timeLimit(.minutes(1)))
 struct SocketServerTests {
-    @Test func frameV2MatchesSharedGoGolden() throws {
+    @Test func frameV3MatchesSharedGoGolden() throws {
         let repository = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
         let fixture = try JSONSerialization.jsonObject(
-            with: Data(contentsOf: repository.appendingPathComponent("wire/testdata/frame-v2.json"))
+            with: Data(contentsOf: repository.appendingPathComponent("wire/testdata/frame-v3.json"))
         ) as? [String: String]
         let hex = try #require(fixture?["hex"])
         var encoded = Data()
@@ -106,15 +118,15 @@ struct SocketServerTests {
         let path = directory.appendingPathComponent("s.sock").path
         let server = SocketServer(path: path, build: "server-test", trust: .testingUIDOnly) { request in
             if request.operation == "stream" {
-                try? request.session.pushEvent(topic: "changed", payload: Data(request.tenant.utf8))
-                let chunks = AsyncStream<Data> { continuation in
-                    continuation.yield(Data("a".utf8))
-                    continuation.yield(Data("b".utf8))
-                    continuation.finish()
-                }
-                return SocketResponse(payload: Data(#""done""#.utf8), chunks: chunks)
+                try? await request.session.pushEvent(topic: "changed", payload: Data(request.tenant.utf8))
+                let chunks = PullChunks([Data("a".utf8), Data("b".utf8)])
+                return .stream(SocketResponseStream(
+                    nextChunk: { await chunks.next() },
+                    terminal: { SocketTerminal(payload: Data(#""done""#.utf8)) },
+                    cancel: {}
+                ))
             }
-            return SocketResponse(payload: request.payload)
+            return .terminal(SocketTerminal(payload: request.payload))
         }
         try server.start()
         defer { server.stop() }
@@ -159,7 +171,7 @@ struct SocketServerTests {
             configuration: .init(handshakeTimeout: 0.1),
             trust: .testingUIDOnly
         ) { _ in
-            SocketResponse(payload: Data(#""pong""#.utf8))
+            .terminal(SocketTerminal(payload: Data(#""pong""#.utf8)))
         }
         try server.start()
         defer { server.stop() }
@@ -200,7 +212,7 @@ struct SocketServerTests {
         let gate = ContinuationGate()
         let server = SocketServer(path: path, build: "server-test", trust: .testingUIDOnly) { _ in
             await gate.wait()
-            return SocketResponse(payload: Data("null".utf8))
+            return .terminal(SocketTerminal(payload: Data("null".utf8)))
         }
         try server.start()
         defer {
@@ -218,8 +230,8 @@ struct SocketServerTests {
         await #expect(throws: SessionTransportError.cancellationDidNotSettle) {
             try await call.response()
         }
-        #expect(throws: SessionTransportError.self) {
-            try call.sendChunk(Data("late".utf8))
+        await #expect(throws: SessionTransportError.self) {
+            try await call.sendChunk(Data("late".utf8))
         }
         gate.release()
     }
@@ -230,19 +242,23 @@ struct SocketServerTests {
         let path = directory.appendingPathComponent("s.sock").path
         let server = SocketServer(path: path, build: "server-test", trust: .testingUIDOnly) { request in
             var values: [String] = []
-            for await chunk in request.chunks where !chunk.end {
-                values.append(String(data: chunk.payload, encoding: .utf8) ?? "")
+            do {
+                for try await chunk in request.chunks where !chunk.end {
+                    values.append(String(data: chunk.payload, encoding: .utf8) ?? "")
+                }
+            } catch {
+                return .terminal(SocketTerminal(error: String(describing: error)))
             }
-            return SocketResponse(payload: try? JSONEncoder().encode(values))
+            return .terminal(SocketTerminal(payload: try? JSONEncoder().encode(values)))
         }
         try server.start()
         defer { server.stop() }
         let client = try SocketClient(path: path, build: "server-test")
         defer { client.close() }
         let call = try client.open(operation: "collect", endInput: false)
-        try call.sendChunk(Data("one".utf8))
-        try call.sendChunk(Data("two".utf8))
-        try call.closeSend()
+        try await call.sendChunk(Data("one".utf8))
+        try await call.sendChunk(Data("two".utf8))
+        try await call.closeSend()
         let result = try await call.response()
         let values = try JSONDecoder().decode([String].self, from: #require(result.payload))
         #expect(values == ["one", "two"])
@@ -254,7 +270,7 @@ struct SocketServerTests {
         let path = directory.appendingPathComponent("s.sock").path
         let server = SocketServer(path: path, build: "new-build", trust: .testingUIDOnly) { _ in
             Issue.record("mismatched-build mutation handler must not run")
-            return SocketResponse(payload: Data("true".utf8))
+            return .terminal(SocketTerminal(payload: Data("true".utf8)))
         }
         try server.start()
         defer { server.stop() }
@@ -269,9 +285,12 @@ struct SocketServerTests {
         let directory = try shortSocketDir()
         defer { try? FileManager.default.removeItem(at: directory) }
         let path = directory.appendingPathComponent("s.sock").path
-        let server = SocketServer(path: path, build: "server-test", configuration: .init(maximumFrameBytes: 64), trust: .testingUIDOnly) { _ in
-            SocketResponse(payload: Data("null".utf8))
-        }
+        let server = SocketServer(
+            path: path,
+            build: "server-test",
+            configuration: .init(maximumFrameBytes: 64),
+            trust: .testingUIDOnly
+        ) { _ in .terminal(SocketTerminal(payload: Data("null".utf8))) }
         try server.start()
         defer { server.stop() }
         #expect(legacyLineIsRejected(at: path))
@@ -295,14 +314,18 @@ struct SocketServerTests {
         defer { try? FileManager.default.removeItem(at: directory) }
         let path = directory.appendingPathComponent("s.sock").path
         leaveStaleSocket(at: path)
-        let server = SocketServer(path: path, build: "server-test", trust: .testingUIDOnly) { _ in SocketResponse() }
+        let server = SocketServer(path: path, build: "server-test", trust: .testingUIDOnly) { _ in
+            .terminal(SocketTerminal())
+        }
         try server.start()
         defer { server.stop() }
         var status = stat()
         #expect(stat(path, &status) == 0)
         #expect((status.st_mode & 0o777) == 0o600)
 
-        let intruder = SocketServer(path: path, build: "intruder", trust: .testingUIDOnly) { _ in SocketResponse() }
+        let intruder = SocketServer(path: path, build: "intruder", trust: .testingUIDOnly) { _ in
+            .terminal(SocketTerminal())
+        }
         #expect(throws: SocketServerError.self) { try intruder.start() }
     }
 
@@ -310,13 +333,17 @@ struct SocketServerTests {
         let directory = try shortSocketDir()
         defer { try? FileManager.default.removeItem(at: directory) }
         let path = directory.appendingPathComponent("s.sock").path
-        let server = SocketServer(path: path, build: "server-test", trust: .testingUIDOnly) { _ in SocketResponse() }
+        let server = SocketServer(path: path, build: "server-test", trust: .testingUIDOnly) { _ in
+            .terminal(SocketTerminal())
+        }
         try server.start()
         server.stop()
         #expect(!FileManager.default.fileExists(atPath: path))
 
         let longPath = "/tmp/" + String(repeating: "a", count: 200) + ".sock"
-        let invalid = SocketServer(path: longPath, build: "server-test", trust: .testingUIDOnly) { _ in SocketResponse() }
+        let invalid = SocketServer(path: longPath, build: "server-test", trust: .testingUIDOnly) { _ in
+            .terminal(SocketTerminal())
+        }
         #expect(throws: SocketServerError.self) { try invalid.start() }
     }
 }

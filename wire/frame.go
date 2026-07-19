@@ -14,7 +14,7 @@ import (
 
 const (
 	// ProtocolVersion is the exact transport version accepted by every peer.
-	ProtocolVersion uint16 = 2
+	ProtocolVersion uint16 = 3
 	// DefaultMaxFrame caps one length-prefixed frame at 4 MiB.
 	DefaultMaxFrame = 4 << 20
 	frameHeaderSize = 32
@@ -27,15 +27,17 @@ var (
 	ErrFrameTruncated = errors.New("wire: truncated frame")
 	// ErrProtocolVersion means a frame carries a protocol other than ProtocolVersion.
 	ErrProtocolVersion = errors.New("wire: unsupported protocol version")
-	// ErrInvalidFrame means a frame violates the v2 structural contract.
+	// ErrInvalidFrame means a frame violates the v3 structural contract.
 	ErrInvalidFrame = errors.New("wire: invalid frame")
 	// ErrQueueFull means a bounded session queue cannot accept more work.
 	ErrQueueFull = errors.New("wire: queue at capacity")
+	// ErrFlowControl means a peer sent more stream data than the granted window.
+	ErrFlowControl = errors.New("wire: peer exceeded granted stream window")
 )
 
-var frameMagic = [4]byte{'D', 'K', 'S', '2'}
+var frameMagic = [4]byte{'D', 'K', 'S', '3'}
 
-// FrameKind identifies one v2 session message.
+// FrameKind identifies one v3 session message.
 type FrameKind uint8
 
 const (
@@ -55,6 +57,8 @@ const (
 	FrameStream
 	// FrameGoAway closes the session.
 	FrameGoAway
+	// FrameWindow grants one stream additional bounded-delivery credits.
+	FrameWindow
 )
 
 // FrameFlags modifies a frame without changing its kind.
@@ -77,7 +81,7 @@ type Frame struct {
 	Payload           []byte
 }
 
-// Codec reads and writes exact-v2 length-prefixed frames over one connection.
+// Codec reads and writes exact-v3 length-prefixed frames over one connection.
 // Reads are single-goroutine; writes are serialized and safe from any goroutine.
 type Codec struct {
 	MaxFrame     int
@@ -260,7 +264,7 @@ func decodeFrame(body []byte) (Frame, error) {
 	return frame, nil
 }
 
-func (k FrameKind) valid() bool { return k >= FrameHello && k <= FrameGoAway }
+func (k FrameKind) valid() bool { return k >= FrameHello && k <= FrameWindow }
 
 func uint32Length(field string, value int) (uint32, error) {
 	if value < 0 || uint64(value) > math.MaxUint32 {
@@ -337,6 +341,11 @@ func validateFrame(frame Frame) error {
 		if frame.Flags != FlagEnd || frame.ID != 0 || frame.Sequence != 0 || frame.DeadlineUnixMilli != 0 ||
 			frame.Op != "" || frame.Tenant != "" || len(frame.Payload) != 0 {
 			return fmt.Errorf("%w: go-away frame", ErrInvalidFrame)
+		}
+	case FrameWindow:
+		if frame.Flags != 0 || frame.Sequence == 0 || frame.DeadlineUnixMilli != 0 ||
+			frame.Op != "" || frame.Tenant != "" || len(frame.Payload) != 0 {
+			return fmt.Errorf("%w: window frame", ErrInvalidFrame)
 		}
 	}
 	return nil
