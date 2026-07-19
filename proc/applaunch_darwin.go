@@ -13,7 +13,12 @@ func appLaunchCmd(s Spawn, app string) (*exec.Cmd, *os.File, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("open child log: %w", err)
 	}
-	cmd := exec.Command("open", "-n", "-g", app)
+	arguments := []string{"-n", "-g", app}
+	if len(s.Args) != 0 {
+		arguments = append(arguments, "--args")
+		arguments = append(arguments, s.Args...)
+	}
+	cmd := exec.Command("open", arguments...)
 	cmd.Stdin = nil
 	cmd.Stdout, cmd.Stderr = logFile, logFile
 	return cmd, logFile, nil
