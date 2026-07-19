@@ -16,7 +16,7 @@ fills the per-release values (`__VERSION__`, `__SHA_APP__`) in the cask.
 | `entitlements/app.entitlements.tmpl` | `<App>.entitlements` | Non-sandboxed host app. The App Group is its only entitlement — the profile-authorized claim that makes the first group-container access a silent TCC grant. |
 | `entitlements/widget.entitlements.tmpl` | `<App>Widget.entitlements` | Sandboxed WidgetKit appex (macOS requires it): App Group plus a home-relative read-only temporary exception into the app's dotdir. |
 | `entitlements/appex-shared.entitlements.tmpl` | rendered on demand | File-Provider-style shared-container appex: App Group plus a home-relative read-write exception, resolved against the real home (`getpwuid`, not the container's `NSHomeDirectory`). Not wired into the default project. |
-| `cask.rb.tmpl` | the tap's cask | Full `.app` bundle (never a bare `binary` — only a bundle staples and keeps bundle-keyed TCC identity). Postflight strips quarantine and restarts the resident process; uninstall boots the supervisor out before quitting the app. |
+| `cask.rb.tmpl` | the tap's cask | Full `.app` bundle (never a bare `binary` — only a bundle staples and keeps bundle-keyed TCC identity). `__STOP_UNINSTALL_ARG__` is mandatory and must dispatch to the product's identity-verified `AppKeepAlive.Stop` plus service removal path (or an equally exact stable-bundle service API). Upgrade preflight and uninstall both require that hook to succeed; process-name discovery or killing is forbidden. Postflight strips quarantine and relaunches the settled app. |
 
 ## Render order
 

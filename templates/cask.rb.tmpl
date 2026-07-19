@@ -28,18 +28,24 @@ cask "__CASK_TOKEN__" do
   # SMAppService/LaunchAgent supervisor on launch.
   app "__APP_NAME__.app"
 
+  preflight do
+    # An existing installation must settle and unregister through the product's
+    # identity-verified daemonkit stop path before Homebrew replaces its bundle.
+    # A present app with a missing or failing hook is a hard failure.
+    installed_app = "#{appdir}/__APP_NAME__.app"
+    if Dir.exist?(installed_app)
+      system_command "#{installed_app}/Contents/MacOS/__BINARY_NAME__",
+                     args: ["__STOP_UNINSTALL_ARG__"],
+                     must_succeed: true
+    end
+  end
+
   postflight do
     # Strip Homebrew's download quarantine so first launch is silent
     # (notarized + stapled).
     system_command "/usr/bin/xattr",
                    args: ["-dr", "com.apple.quarantine", "#{appdir}/__APP_NAME__.app"],
                    must_succeed: false
-    # Restart-on-upgrade: replace the resident process so it runs from the freshly
-    # installed binary. TERM for a clean exit, then KILL any straggler. Appexes and
-    # helpers have distinct process names and reconcile off their own start-time.
-    system_command "/usr/bin/pkill", args: ["-TERM", "-x", "__PROC_NAME__"], must_succeed: false
-    sleep 1
-    system_command "/usr/bin/pkill", args: ["-KILL", "-x", "__PROC_NAME__"], must_succeed: false
     # Relaunch in the background (-g: no focus steal). Launching runs the app's
     # LoginItem.reconcile(), which (re)registers the supervisor.
     system_command "/usr/bin/open", args: ["-g", "#{appdir}/__APP_NAME__.app"], must_succeed: false
@@ -48,16 +54,12 @@ cask "__CASK_TOKEN__" do
   uninstall_preflight do
     # Boot the supervisor OUT before the app is quit/removed — quitting under a
     # live KeepAlive/SMAppService registration just triggers an instant relaunch.
-    # The binary's unregister subcommand unregisters SMAppService (or bootout +
-    # disable the LaunchAgent) and waits for the resident process to exit.
+    # The required product hook invokes AppKeepAlive.Stop (or the product's
+    # equally exact stable-bundle service API), proves absence, then unregisters.
     system_command "#{appdir}/__APP_NAME__.app/Contents/MacOS/__BINARY_NAME__",
-                   args: ["__UNREGISTER_ARG__"],
-                   must_succeed: false
+                   args: ["__STOP_UNINSTALL_ARG__"],
+                   must_succeed: true
   end
-
-  # Runs AFTER uninstall_preflight: the supervisor is already booted out, so the
-  # quit can't race a relaunch.
-  uninstall quit: "__BUNDLE_ID__"
 
   zap trash: [
     "~/Library/LaunchAgents/__LAUNCHAGENT_LABEL__.plist",
