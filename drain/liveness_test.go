@@ -1,11 +1,9 @@
 package drain
 
 import (
-	"context"
 	"errors"
 	"testing"
 
-	"github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/proc"
 )
 
@@ -95,34 +93,5 @@ func TestLivenessString(t *testing.T) {
 		if got := tt.live.String(); got != tt.want {
 			t.Errorf("String() = %q, want %q", got, tt.want)
 		}
-	}
-}
-
-func TestTakeoverProof(t *testing.T) {
-	probeErr := errors.New("proc table busy")
-	tests := []struct {
-		name    string
-		policy  ForcePolicy
-		res     proberResult
-		want    bool
-		wantErr error
-	}{
-		{"defer never confirms even dead", ForcePolicyDefer, proberResult{err: proc.ErrNoProcess}, false, nil},
-		{"confirmed-dead confirms proven gone", ForcePolicyConfirmedDead, proberResult{err: proc.ErrNoProcess}, true, nil},
-		{"probe failure is undetermined no force", ForcePolicyConfirmedDead, proberResult{err: probeErr}, false, probeErr},
-		{"alive incumbent never confirmed", ForcePolicyConfirmedDead, proberResult{id: proc.Identity{PID: 42, StartTime: "1.2"}}, false, nil},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			p := &fakeProber{results: map[int]proberResult{42: tt.res}}
-			proof := takeoverProof(tt.policy, p)
-			got, err := proof(context.Background(), daemon.Health{PID: 42})
-			if got != tt.want {
-				t.Errorf("proof = %v, want %v", got, tt.want)
-			}
-			if !errors.Is(err, tt.wantErr) {
-				t.Errorf("proof err = %v, want %v", err, tt.wantErr)
-			}
-		})
 	}
 }

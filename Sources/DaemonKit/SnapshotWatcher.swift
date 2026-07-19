@@ -11,9 +11,7 @@ public struct SnapshotDecodeError: Error, Sendable, CustomStringConvertible {
     }
 }
 
-/// The distinct states a ``SnapshotWatcher`` surfaces to its consumer. A bad
-/// file never crashes and never silently yields stale data — every failure mode
-/// is its own case the consumer switches on.
+/// The distinct states a ``SnapshotWatcher`` surfaces to its consumer.
 public enum SnapshotState<S: Sendable>: Sendable {
     /// The file decoded cleanly at the expected schema version.
     case loaded(S)
@@ -31,17 +29,10 @@ public enum SnapshotWatcherError: Error, Sendable {
     case cannotOpenDirectory(path: String, errno: Int32)
 }
 
-/// Watches a JSON snapshot file for changes and delivers a typed
-/// ``SnapshotState`` on each change.
-///
-/// The watch is placed on the **parent directory**, not the file: consumers
-/// publish snapshots with an atomic rename-into-place, which replaces the inode
-/// and so silently kills any file-level (`vnode`) watch. Watching the directory
-/// survives the swap.
-///
-/// Reloads are debounced (default ~200 ms) to collapse the burst of events a
-/// single write emits. Decoding tries ISO8601 **with** fractional seconds first,
-/// then plain ISO8601. Callbacks are delivered on the caller-provided queue.
+/// Watches a JSON snapshot file and delivers a typed ``SnapshotState`` on
+/// each change. The watch is on the **parent directory**: consumers publish
+/// via atomic rename-into-place, which replaces the inode and silently kills
+/// a file-level (`vnode`) watch.
 public final class SnapshotWatcher<S: Decodable & Sendable>: @unchecked Sendable {
     private let fileURL: URL
     private let directoryURL: URL
@@ -55,13 +46,6 @@ public final class SnapshotWatcher<S: Decodable & Sendable>: @unchecked Sendable
     private var source: DispatchSourceFileSystemObject?
     private var pending: DispatchWorkItem?
 
-    /// - Parameters:
-    ///   - fileURL: The snapshot file to watch.
-    ///   - expectedSchemaVersion: The `schema_version` the consumer accepts.
-    ///   - debounce: Delay collapsing an event burst into one reload.
-    ///   - callbackQueue: Queue the `onChange` callback runs on.
-    ///   - onChange: Called with each new ``SnapshotState`` (including the
-    ///     initial state on ``start()``).
     public init(
         fileURL: URL,
         expectedSchemaVersion: Int,
@@ -177,10 +161,7 @@ private struct SnapshotSchemaProbe: Decodable {
     }
 }
 
-/// Parses ISO8601 dates, preferring the fractional-seconds form and falling back
-/// to the plain form. The `ISO8601DateFormatter` instances are reference types
-/// (not `Sendable`); this wrapper is used only from the serial decode path, so
-/// the unchecked conformance is sound.
+/// Used only from the serial decode path, so the @unchecked Sendable is sound.
 private struct ISO8601Parser: @unchecked Sendable {
     private let fractional: ISO8601DateFormatter
     private let plain: ISO8601DateFormatter

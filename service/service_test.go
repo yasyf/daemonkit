@@ -42,11 +42,12 @@ func TestAgentInstall(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())
 			f := &fakeLauncher{failOn: tc.failOn}
 			a := Agent{
-				Label:    "com.yasyf.cc-pool",
-				Program:  "/opt/homebrew/bin/cc-pool",
-				Args:     []string{"daemon"},
-				LogPath:  filepath.Join(t.TempDir(), "daemon.log"),
-				Launcher: f,
+				Label:         "com.yasyf.cc-pool",
+				Program:       "/opt/homebrew/bin/cc-pool",
+				Args:          []string{"daemon"},
+				LogPath:       filepath.Join(t.TempDir(), "daemon.log"),
+				RestartPolicy: RestartAlways,
+				Launcher:      f,
 			}
 			err := a.Install(context.Background())
 			if (err != nil) != tc.wantErr {
@@ -128,11 +129,12 @@ func TestWritePlistRendersAgent(t *testing.T) {
 	t.Setenv("HOME", home)
 	logPath := filepath.Join(home, ".cc-pool", "daemon.log")
 	a := Agent{
-		Label:   "com.yasyf.cc-pool",
-		Formula: "cc-pool",
-		Program: "/opt/homebrew/bin/cc-pool",
-		Args:    []string{"daemon"},
-		LogPath: logPath,
+		Label:         "com.yasyf.cc-pool",
+		Formula:       "cc-pool",
+		Program:       "/opt/homebrew/bin/cc-pool",
+		Args:          []string{"daemon"},
+		LogPath:       logPath,
+		RestartPolicy: RestartAlways,
 		Env: map[string]string{
 			"PATH":      "/usr/bin",
 			"AMPERSAND": "a&b<c", // must be XML-escaped, not emitted raw
@@ -169,5 +171,65 @@ func TestWritePlistRendersAgent(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Dir(logPath)); err != nil {
 		t.Errorf("log dir was not created: %v", err)
+	}
+}
+
+func TestAgentRestartPolicyRequired(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	a := Agent{
+		Label:   "com.example.worker",
+		Program: "/usr/bin/true",
+		LogPath: filepath.Join(t.TempDir(), "worker.log"),
+	}
+	if _, err := a.WritePlist(); err == nil || !strings.Contains(err.Error(), "restart policy is required") {
+		t.Fatalf("WritePlist() err = %v, want required restart policy", err)
+	}
+}
+
+func TestAgentRestartPolicyRejectsUnknownValue(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	a := Agent{
+		Label:         "com.example.worker",
+		Program:       "/usr/bin/true",
+		LogPath:       filepath.Join(t.TempDir(), "worker.log"),
+		RestartPolicy: RestartPolicy(99),
+	}
+	if _, err := a.WritePlist(); err == nil || !strings.Contains(err.Error(), "invalid restart policy 99") {
+		t.Fatalf("WritePlist() err = %v, want invalid restart policy", err)
+	}
+}
+
+func TestAgentRestartPolicies(t *testing.T) {
+	cases := []struct {
+		name   string
+		policy RestartPolicy
+		want   string
+	}{
+		{"always", RestartAlways, "<key>KeepAlive</key>\n    <true/>"},
+		{"failure", RestartOnFailure, "<key>SuccessfulExit</key>\n        <false/>"},
+		{"never", NoRestart, "<key>KeepAlive</key>\n    <false/>"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			a := Agent{
+				Label:         "com.example.worker",
+				Program:       "/usr/bin/true",
+				LogPath:       filepath.Join(home, "worker.log"),
+				RestartPolicy: tc.policy,
+			}
+			path, err := a.WritePlist()
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(body), tc.want) {
+				t.Errorf("plist missing %q:\n%s", tc.want, body)
+			}
+		})
 	}
 }

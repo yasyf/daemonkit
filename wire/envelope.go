@@ -3,43 +3,71 @@ package wire
 import (
 	"context"
 	"encoding/json"
+	"errors"
 )
 
-// Request is the decoded input handed to a Handler: the routing Op, the
-// per-tenant serialization key (empty opts out of per-tenant serialization), the
-// OS-authenticated Peer, and the raw request frame the handler unmarshals its own
-// payload from. wire never interprets Frame beyond the Router hook, so the
-// consumer's payload shape stays opaque to this package.
-type Request struct {
-	Op     Op
-	Tenant string
-	Peer   Peer
-	Frame  []byte
+var (
+	// ErrDraining means intake is closed and the request was not dispatched.
+	ErrDraining = errors.New("wire: server is draining")
+	// ErrDuplicateID means a session reused a request identifier.
+	ErrDuplicateID = errors.New("wire: duplicate request id")
+	// ErrStreamOrder means stream chunks arrived out of sequence.
+	ErrStreamOrder = errors.New("wire: stream sequence violation")
+)
+
+// BuildIdentity is exchanged during the mandatory exact-version handshake.
+type BuildIdentity struct {
+	Protocol uint16 `json:"protocol"`
+	Build    string `json:"build"`
 }
 
-// Response is the server's single reply frame per request. The server authors it
-// even when no handler runs — a Rejected non-dispatch — so wire owns this shape
-// while leaving the request frame to the consumer's Router. Version carries
-// Server.Version verbatim (never wire's own). On success Payload holds the
-// handler's marshaled result; Err holds a handler or dispatch error string;
-// Rejected marks a proven non-dispatch (the handler never ran — safe to retry),
-// with Reason naming the admission bound that fired.
+// Request is one admitted request on a persistent session.
+type Request struct {
+	ID      uint64
+	Op      Op
+	Tenant  string
+	Peer    Peer
+	Build   string
+	Payload []byte
+	Chunks  <-chan Chunk
+	Session *AcceptedSession
+}
+
+// Chunk is one ordered streaming payload.
+type Chunk struct {
+	Sequence uint32
+	Payload  []byte
+	End      bool
+}
+
+// Event is a server-pushed session event.
+type Event struct {
+	Topic   string
+	Payload []byte
+}
+
+// Response is the terminal response for one request.
 type Response struct {
-	Version  string          `json:"version,omitempty"`
 	Rejected bool            `json:"rejected,omitempty"`
 	Reason   string          `json:"reason,omitempty"`
 	Err      string          `json:"err,omitempty"`
 	Payload  json.RawMessage `json:"payload,omitempty"`
 }
 
-// Handler runs one request and returns a value the server marshals into
-// Response.Payload, or an error surfaced in Response.Err. ctx is cancelled when
-// the op deadline elapses or the peer disconnects.
+// StreamResponse asks the server to emit Chunks in order before its terminal response.
+type StreamResponse struct {
+	Chunks <-chan []byte
+	Value  any
+}
+
+// Handler runs one request. Its context is cancelled by a cancel frame,
+// disconnect, server shutdown, or the earlier client/server deadline.
 type Handler func(ctx context.Context, req Request) (any, error)
 
-// Router extracts the routing Op and the per-tenant serialization key from a raw
-// request frame. A tenant of "" opts the request out of per-tenant
-// serialization. Its error is reported to the client as a route failure and no
-// handler runs. The consumer owns the frame's JSON shape; this hook is wire's
-// only window into it.
-type Router func(frame []byte) (op Op, tenant string, err error)
+// Admission gates every request before dispatch. A failure proves non-dispatch.
+type Admission interface {
+	Admit() (done func(), err error)
+	Close()
+	Draining() bool
+	Settle(context.Context) error
+}

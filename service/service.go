@@ -35,8 +35,7 @@ const plistTemplateText = `<?xml version="1.0" encoding="UTF-8"?>
 {{end}}    </array>
     <key>RunAtLoad</key>
     <true/>
-    <key>KeepAlive</key>
-    <true/>
+{{.Restart}}
     <key>ThrottleInterval</key>
     <integer>10</integer>
     <key>ProcessType</key>
@@ -67,10 +66,11 @@ func xmlEscape(s string) string {
 type plistKV struct{ Key, Value string }
 
 type plistData struct {
-	Label string
-	Args  []string
-	Log   string
-	Env   []plistKV
+	Label   string
+	Args    []string
+	Log     string
+	Env     []plistKV
+	Restart string
 }
 
 // Agent is a consumer's background daemon as a macOS user LaunchAgent. The
@@ -99,6 +99,8 @@ type Agent struct {
 	// a consumer's fuse library path). Keys are emitted in sorted order so the
 	// rendered plist is reproducible.
 	Env map[string]string
+	// RestartPolicy defines when launchd restarts the daemon. Required.
+	RestartPolicy RestartPolicy
 	// Launcher runs this Agent's launchctl invocations. A nil Launcher (the zero
 	// value) shells the real launchctl so struct-literal construction keeps its
 	// shape; tests inject a fake so they never touch real launchd.
@@ -123,6 +125,10 @@ func plistPath(label string) (string, error) {
 // the path written. The program binary defaults to os.Executable() when Program
 // is empty; every interpolated value is XML-escaped.
 func (a Agent) WritePlist() (string, error) {
+	restart, err := a.RestartPolicy.plist()
+	if err != nil {
+		return "", fmt.Errorf("render restart policy: %w", err)
+	}
 	bin := a.Program
 	if bin == "" {
 		exe, err := os.Executable()
@@ -151,7 +157,13 @@ func (a Agent) WritePlist() (string, error) {
 		env = append(env, plistKV{Key: xmlEscape(k), Value: xmlEscape(a.Env[k])})
 	}
 	var buf bytes.Buffer
-	if err := plistTemplate.Execute(&buf, plistData{Label: xmlEscape(a.Label), Args: args, Log: xmlEscape(a.LogPath), Env: env}); err != nil {
+	if err := plistTemplate.Execute(&buf, plistData{
+		Label:   xmlEscape(a.Label),
+		Args:    args,
+		Log:     xmlEscape(a.LogPath),
+		Env:     env,
+		Restart: restart,
+	}); err != nil {
 		return "", fmt.Errorf("render plist: %w", err)
 	}
 	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {

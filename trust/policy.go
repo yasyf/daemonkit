@@ -23,30 +23,78 @@ var ErrUntrustedPeer = errors.New("trust: untrusted peer")
 // no code-identity verifier is available — never a downgrade to UID-only.
 var ErrNoVerifier = errors.New("trust: no code-identity verifier for a configured requirement")
 
-// Requirement pins a peer's code signature to a Developer ID identity. Both
-// fields are mandatory: TeamID-only grants every team binary authority over
-// the socket; identifier-only is not globally unique across teams.
+const appGroupsEntitlement = "com.apple.security.application-groups"
+
+// EntitlementMatch is one closed required-entitlement predicate.
+type EntitlementMatch uint8
+
+const (
+	// EntitlementBoolean requires an exact CFBoolean value.
+	EntitlementBoolean EntitlementMatch = iota + 1
+	// EntitlementString requires an exact string value.
+	EntitlementString
+	// EntitlementStringArrayContains requires membership in a string array.
+	EntitlementStringArrayContains
+)
+
+// EntitlementRequirement is one typed entitlement predicate.
+type EntitlementRequirement struct {
+	Match   EntitlementMatch
+	Boolean bool
+	String  string
+}
+
+// Requirement pins a peer's code signature and mandatory capabilities.
 type Requirement struct {
-	TeamID     string
-	Identifier string
-	// AllowUnhardened skips the Hardened Runtime / library-validation /
-	// injection-entitlement demands, for a consumer shipping an audited dylib
-	// it cannot library-validate. The ONE bypass; never relaxes the DR or the
-	// UID floor. Enabling it is a security decision.
-	AllowUnhardened bool
+	TeamID               string
+	SigningIdentifier    string
+	RequiredAppGroup     string
+	RequiredEntitlements map[string]EntitlementRequirement
 }
 
 func (r Requirement) validate() error {
 	if strings.TrimSpace(r.TeamID) == "" {
 		return errors.New("trust: Requirement.TeamID is required")
 	}
-	if strings.TrimSpace(r.Identifier) == "" {
-		return errors.New("trust: Requirement.Identifier is required (a TeamID-only requirement is same-team lateral authority)")
+	if strings.TrimSpace(r.SigningIdentifier) == "" {
+		return errors.New("trust: Requirement.SigningIdentifier is required (a TeamID-only requirement is same-team lateral authority)")
 	}
-	if strings.ContainsAny(r.TeamID, `"\`) || strings.ContainsAny(r.Identifier, `"\`) {
+	if strings.ContainsAny(r.TeamID, `"\`) || strings.ContainsAny(r.SigningIdentifier, `"\`) {
 		return errors.New("trust: Requirement fields must not contain quotes or backslashes")
 	}
+	if r.RequiredAppGroup != "" {
+		if _, exists := r.RequiredEntitlements[appGroupsEntitlement]; exists {
+			return errors.New("trust: application-groups is specified by both RequiredAppGroup and RequiredEntitlements")
+		}
+	}
+	for key, requirement := range r.RequiredEntitlements {
+		if strings.TrimSpace(key) == "" {
+			return errors.New("trust: required entitlement key is empty")
+		}
+		switch requirement.Match {
+		case EntitlementBoolean:
+		case EntitlementString, EntitlementStringArrayContains:
+			if requirement.String == "" {
+				return fmt.Errorf("trust: required entitlement %q has an empty string value", key)
+			}
+		default:
+			return fmt.Errorf("trust: required entitlement %q has unknown match %d", key, requirement.Match)
+		}
+	}
 	return nil
+}
+
+func (r Requirement) entitlementRequirements() map[string]EntitlementRequirement {
+	requirements := make(map[string]EntitlementRequirement, len(r.RequiredEntitlements)+1)
+	for key, requirement := range r.RequiredEntitlements {
+		requirements[key] = requirement
+	}
+	if r.RequiredAppGroup != "" {
+		requirements[appGroupsEntitlement] = EntitlementRequirement{
+			Match: EntitlementStringArrayContains, String: r.RequiredAppGroup,
+		}
+	}
+	return requirements
 }
 
 // DRString renders the canonical designated requirement: the Developer ID
@@ -63,7 +111,7 @@ func (r Requirement) DRString() (string, error) {
 		`identifier "%s" and anchor apple generic and certificate leaf[subject.OU] = "%s" `+
 			`and certificate 1[field.1.2.840.113635.100.6.2.6] exists `+
 			`and certificate leaf[field.1.2.840.113635.100.6.1.13] exists`,
-		r.Identifier, r.TeamID,
+		r.SigningIdentifier, r.TeamID,
 	), nil
 }
 
@@ -75,9 +123,10 @@ type Policy struct {
 
 // Check enforces the same-effective-UID floor, then any configured
 // Requirement against the peer's audit token; a Requirement with no verifier
-// fails closed (ErrNoVerifier). LOCAL_PEERTOKEN binds at query time — a
-// known-unsound binding against same-UID fork/exec identity substitution; a
-// surface needing a real per-message identity guarantee uses XPC.
+// fails closed (ErrNoVerifier). LOCAL_PEERTOKEN is a query-time process
+// reference, not an immutable record of the connector. Descriptor delegation
+// or substitution by another process satisfying the same signed policy before
+// this check remains a platform limitation.
 func (p Policy) Check(peer wire.Peer) error {
 	if peer.UID != os.Geteuid() {
 		return fmt.Errorf("%w: uid %d != %d", ErrUntrustedPeer, peer.UID, os.Geteuid())

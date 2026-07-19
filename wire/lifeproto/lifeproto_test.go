@@ -3,69 +3,95 @@ package lifeproto_test
 import (
 	"encoding/json"
 	"errors"
+	"os"
 	"testing"
 
-	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/daemonkit/wire/lifeproto"
-	"github.com/yasyf/daemonkit/wire/wiretest"
 )
 
-// TestProtocolVersion pins the wire version the Swift peer also pins.
-func TestProtocolVersion(t *testing.T) {
-	if lifeproto.Version != 1 {
-		t.Fatalf("lifeproto.Version = %d, want 1 (Swift pins lifeProtocolVersion = 1)", lifeproto.Version)
-	}
+type goldenFile struct {
+	Version int          `json:"version"`
+	Cases   []goldenCase `json:"cases"`
 }
 
-// TestFrameRoundTrip proves a request written over Framing round-trips through
-// ReadEnvelope's op dispatch back into the concrete response type.
-func TestFrameRoundTrip(t *testing.T) {
-	client, server := wiretest.Pair(t)
-	cf := wire.NewFraming(client)
-	sf := wire.NewFraming(server)
+type goldenCase struct {
+	Name   string          `json:"name"`
+	Op     string          `json:"op"`
+	Kind   string          `json:"kind"`
+	Fields json.RawMessage `json:"fields"`
+	Bytes  string          `json:"bytes"`
+}
 
-	if err := lifeproto.Write(cf, lifeproto.NewHealthRequest()); err != nil {
-		t.Fatalf("write request: %v", err)
-	}
-	env, raw, err := lifeproto.ReadEnvelope(sf)
+type healthFields struct {
+	Build    string `json:"build"`
+	Protocol int    `json:"protocol"`
+	PID      int    `json:"pid"`
+	State    string `json:"state"`
+	Draining bool   `json:"draining"`
+	Busy     bool   `json:"busy"`
+}
+
+func TestExactV2Golden(t *testing.T) {
+	data, err := os.ReadFile("testdata/golden.json")
 	if err != nil {
-		t.Fatalf("read envelope: %v", err)
+		t.Fatalf("ReadFile: %v", err)
 	}
-	if env.Op != lifeproto.OpHealth {
-		t.Fatalf("op = %q, want %q", env.Op, lifeproto.OpHealth)
+	var golden goldenFile
+	if err := json.Unmarshal(data, &golden); err != nil {
+		t.Fatalf("Unmarshal golden: %v", err)
 	}
-	var req lifeproto.HealthRequest
-	if err := json.Unmarshal(raw, &req); err != nil {
-		t.Fatalf("unmarshal request: %v", err)
+	if golden.Version != lifeproto.Version || lifeproto.Version != 2 {
+		t.Fatalf("golden=%d generated=%d", golden.Version, lifeproto.Version)
 	}
-	if req.V != lifeproto.Version || req.Op != lifeproto.OpHealth {
-		t.Errorf("decoded request = %+v, want v=%d op=%q", req, lifeproto.Version, lifeproto.OpHealth)
-	}
-
-	want := lifeproto.NewHealthResponse("2.0.0", 99, "healthy", false, false, []string{"handoff"})
-	if err := lifeproto.Write(sf, want); err != nil {
-		t.Fatalf("write response: %v", err)
-	}
-	var resp lifeproto.HealthResponse
-	if err := cf.ReadJSON(&resp); err != nil {
-		t.Fatalf("read response: %v", err)
-	}
-	if resp.Version != "2.0.0" || resp.PID != 99 || resp.State != "healthy" || len(resp.Features) != 1 || resp.Features[0] != "handoff" {
-		t.Errorf("decoded response = %+v, want the written snapshot", resp)
+	for _, test := range golden.Cases {
+		t.Run(test.Name, func(t *testing.T) {
+			message := buildGolden(t, test)
+			got, err := lifeproto.Encode(message)
+			if err != nil {
+				t.Fatalf("Encode: %v", err)
+			}
+			if string(got) != test.Bytes {
+				t.Fatalf("Encode = %s, want %s", got, test.Bytes)
+			}
+			envelope, err := lifeproto.DecodeEnvelope([]byte(test.Bytes))
+			if err != nil {
+				t.Fatalf("DecodeEnvelope: %v", err)
+			}
+			if envelope.Op != test.Op {
+				t.Fatalf("op = %q, want %q", envelope.Op, test.Op)
+			}
+		})
 	}
 }
 
-// TestReadEnvelopeRejectsVersion proves a foreign protocol version fails closed
-// with ErrProtocolVersion rather than silently decoding.
-func TestReadEnvelopeRejectsVersion(t *testing.T) {
-	client, server := wiretest.Pair(t)
-	cf := wire.NewFraming(client)
-	sf := wire.NewFraming(server)
-
-	if err := cf.WriteFrame([]byte(`{"v":2,"op":"health"}`)); err != nil {
-		t.Fatalf("write: %v", err)
+func TestDecodeEnvelopeRejectsOldProtocol(t *testing.T) {
+	_, err := lifeproto.DecodeEnvelope([]byte(`{"v":1,"op":"health"}`))
+	if !errors.Is(err, lifeproto.ErrProtocolVersion) {
+		t.Fatalf("DecodeEnvelope error = %v", err)
 	}
-	if _, _, err := lifeproto.ReadEnvelope(sf); !errors.Is(err, lifeproto.ErrProtocolVersion) {
-		t.Fatalf("ReadEnvelope err = %v, want ErrProtocolVersion", err)
+}
+
+func buildGolden(t *testing.T, test goldenCase) any {
+	t.Helper()
+	switch test.Op + "/" + test.Kind {
+	case "health/request":
+		return lifeproto.NewHealthRequest()
+	case "health/response":
+		var fields healthFields
+		if err := json.Unmarshal(test.Fields, &fields); err != nil {
+			t.Fatalf("health fields: %v", err)
+		}
+		return lifeproto.NewHealthResponse(fields.Build, fields.Protocol, fields.PID, fields.State, fields.Draining, fields.Busy)
+	case "shutdown/request":
+		return lifeproto.NewShutdownRequest()
+	case "shutdown/response":
+		return lifeproto.NewShutdownResponse(true)
+	case "handoff/request":
+		return lifeproto.NewHandoffRequest()
+	case "handoff/response":
+		return lifeproto.NewHandoffResponse(true)
+	default:
+		t.Fatalf("unknown golden case %s/%s", test.Op, test.Kind)
+		return nil
 	}
 }

@@ -5,19 +5,15 @@ import Security
 
 private let log = Logger(subsystem: DaemonKit.loggingSubsystem, category: "PeerTrust")
 
-// Dynamic code-signing status bits, verified against xnu's cs_blobs.h.
-private let csGetTaskAllow: UInt32 = 0x0000_0004 // CS_GET_TASK_ALLOW: get-task-allow entitlement
-private let csForcedLV: UInt32 = 0x0000_0010 // CS_FORCED_LV: library validation forced by system policy
-private let csRequireLV: UInt32 = 0x0000_2000 // CS_REQUIRE_LV: library validation required
-private let csRuntime: UInt32 = 0x0001_0000 // CS_RUNTIME: Hardened Runtime (codesign --options runtime)
-private let csDebugged: UInt32 = 0x1000_0000 // CS_DEBUGGED: ran with invalid pages under a debugger
+private let csGetTaskAllow: UInt32 = 0x0000_0004
+private let csForcedLV: UInt32 = 0x0000_0010
+private let csRequireLV: UInt32 = 0x0000_2000
+private let csRuntime: UInt32 = 0x0001_0000
+private let csDebugged: UInt32 = 0x1000_0000
 
-/// entDisableLV turns off library validation unless CS_REQUIRE_LV/CS_FORCED_LV
-/// enforce it dynamically anyway.
 private let entDisableLV = "com.apple.security.cs.disable-library-validation"
+private let applicationGroupsEntitlement = "com.apple.security.application-groups"
 
-/// injectionEntitlements re-open code injection or debugger attachment on a
-/// Hardened Runtime binary; a peer signed with any of them is untrusted.
 private let injectionEntitlements = [
     entDisableLV,
     "com.apple.security.cs.allow-dyld-environment-variables",
@@ -27,65 +23,128 @@ private let injectionEntitlements = [
     "com.apple.security.get-task-allow",
 ]
 
-/// Verifies the code-signing identity of a connected unix-socket peer: an
-/// unconditional same-effective-UID floor plus an optional designated
-/// requirement resolved from the socket's audit token. The requirement
-/// augments the floor, never replaces it; every failure path fails closed.
+/// PeerTrust verifies one explicitly configured signed consumer at unix-socket
+/// admission. The same-effective-UID check is an unconditional floor.
 ///
-/// `LOCAL_PEERTOKEN` binds at query time — known-unsound against same-UID
-/// fork/exec identity substitution; a real per-message guarantee needs XPC.
+/// `LOCAL_PEERTOKEN` is a query-time process reference, not an immutable record
+/// of the process that originally connected. The signed policy sharply limits
+/// substitution, but descriptor delegation or substitution by another process
+/// satisfying the same policy before admission remains a platform limitation.
 public struct PeerTrust: Sendable {
-    /// Every failure path is fail-closed; the caller maps any throw to a refusal.
+    /// A closed required-entitlement predicate.
+    public enum EntitlementRequirement: Equatable, Sendable {
+        case boolean(Bool)
+        case string(String)
+        case stringArrayContains(String)
+    }
+
+    /// Configuration errors are rejected before a server can accept peers.
+    public enum RequirementError: Error, Equatable, Sendable {
+        case emptyTeamIdentifier
+        case emptySigningIdentifier
+        case emptyRequiredAppGroup
+        case unsafeIdentityField(String)
+        case emptyEntitlementKey
+        case duplicateAppGroupRequirement
+        case emptyEntitlementValue(String)
+    }
+
+    /// Requirement pins the consumer's Developer ID identity and any mandatory
+    /// capabilities owned by that consumer.
+    public struct Requirement: Equatable, Sendable {
+        public let teamIdentifier: String
+        public let signingIdentifier: String
+        public let requiredEntitlements: [String: EntitlementRequirement]
+
+        public init(
+            teamIdentifier: String,
+            signingIdentifier: String,
+            requiredAppGroup: String? = nil,
+            requiredEntitlements: [String: EntitlementRequirement] = [:]
+        ) throws {
+            guard !teamIdentifier.isEmpty else { throw RequirementError.emptyTeamIdentifier }
+            guard !signingIdentifier.isEmpty else { throw RequirementError.emptySigningIdentifier }
+            for value in [teamIdentifier, signingIdentifier] where value.contains("\"") || value.contains("\\") {
+                throw RequirementError.unsafeIdentityField(value)
+            }
+            if let requiredAppGroup {
+                guard !requiredAppGroup.isEmpty else { throw RequirementError.emptyRequiredAppGroup }
+                guard requiredEntitlements[applicationGroupsEntitlement] == nil else {
+                    throw RequirementError.duplicateAppGroupRequirement
+                }
+            }
+            for (key, requirement) in requiredEntitlements {
+                guard !key.isEmpty else { throw RequirementError.emptyEntitlementKey }
+                switch requirement {
+                case .boolean:
+                    break
+                case let .string(value), let .stringArrayContains(value):
+                    guard !value.isEmpty else { throw RequirementError.emptyEntitlementValue(key) }
+                }
+            }
+            self.teamIdentifier = teamIdentifier
+            self.signingIdentifier = signingIdentifier
+            var entitlements = requiredEntitlements
+            if let requiredAppGroup {
+                entitlements[applicationGroupsEntitlement] = .stringArrayContains(requiredAppGroup)
+            }
+            self.requiredEntitlements = entitlements
+        }
+
+        var designatedRequirement: String {
+            "identifier \"\(signingIdentifier)\" and anchor apple generic " +
+                "and certificate leaf[subject.OU] = \"\(teamIdentifier)\" " +
+                "and certificate 1[field.1.2.840.113635.100.6.2.6] exists " +
+                "and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
+        }
+    }
+
     public enum TrustError: Error, Equatable, Sendable {
-        /// `getpeereid` on the connection fd failed.
         case peerCredentialsUnavailable(errno: Int32)
-        /// The peer's euid does not equal this process's euid.
         case untrustedUID(peer: uid_t, expected: uid_t)
-        /// `getsockopt(LOCAL_PEERTOKEN)` on the connection fd failed.
         case auditTokenUnavailable(errno: Int32)
-        /// `SecCodeCopyGuestWithAttributes` could not resolve the peer's code.
         case codeUnresolvable(OSStatus)
-        /// The requirement string did not compile into a `SecRequirement`.
         case requirementInvalid(OSStatus)
-        /// The peer's code did not satisfy the designated requirement.
         case untrustedPeer(OSStatus)
-        /// `SecCodeCopySigningInformation` on the peer's code failed.
         case signingInfoUnavailable(OSStatus)
-        /// The peer's signing information carries no dynamic code-signing status.
         case signingStatusUnavailable
-        /// The peer was signed without the Hardened Runtime.
         case hardenedRuntimeMissing(status: UInt32)
-        /// The peer permits debugger attachment (`CS_GET_TASK_ALLOW`).
         case debuggable(status: UInt32)
-        /// The peer ran with invalid pages under a debugger (`CS_DEBUGGED`).
         case debugged(status: UInt32)
-        /// The peer's entitlements are not in dictionary form, so they cannot
-        /// be proven free of injection entitlements.
         case entitlementsUndecodable
-        /// The peer is signed with an injection-enabling entitlement.
         case injectionEntitled(String)
+        case requiredEntitlementMissing(String)
+        case requiredEntitlementMismatch(String)
     }
 
-    /// The designated requirement the peer must satisfy, or `nil` for UID-only
-    /// trust (the same-effective-UID floor alone).
-    public let requirement: String?
-
-    /// Skips the Hardened Runtime and injection-entitlement gate. The requirement
-    /// and the UID floor still apply; enabling it is a security decision.
-    public let allowUnhardened: Bool
-
-    /// Creates a policy enforcing the UID floor plus the optional designated requirement.
-    public init(requirement: String? = nil, allowUnhardened: Bool = false) {
-        self.requirement = requirement
-        self.allowUnhardened = allowUnhardened
+    private enum Mode: Sendable {
+        case signed(Requirement)
+        case testingUIDOnly
     }
 
-    /// Throws unless the peer on `descriptor` passes the same-effective-UID floor
-    /// and, when a requirement is configured, the designated requirement.
+    private let mode: Mode
+
+    public init(requirement: Requirement) {
+        mode = .signed(requirement)
+    }
+
+    static var testingUIDOnly: PeerTrust {
+        PeerTrust(mode: .testingUIDOnly)
+    }
+
+    private init(mode: Mode) {
+        self.mode = mode
+    }
+
+    /// Throws unless the peer passes the UID floor and configured signed policy.
     public func check(descriptor: Int32) throws {
         try enforceUIDFloor(descriptor)
-        guard let requirement else { return }
-        try enforceRequirement(descriptor, requirement)
+        switch mode {
+        case let .signed(requirement):
+            try enforceRequirement(descriptor, requirement)
+        case .testingUIDOnly:
+            return
+        }
     }
 
     private func enforceUIDFloor(_ descriptor: Int32) throws {
@@ -100,7 +159,7 @@ public struct PeerTrust: Sendable {
         }
     }
 
-    private func enforceRequirement(_ descriptor: Int32, _ requirement: String) throws {
+    private func enforceRequirement(_ descriptor: Int32, _ requirement: Requirement) throws {
         var token = try peerAuditToken(descriptor)
         let tokenData = withUnsafeBytes(of: &token) { Data($0) }
 
@@ -116,26 +175,30 @@ public struct PeerTrust: Sendable {
         }
 
         var secRequirement: SecRequirement?
-        let requirementStatus = SecRequirementCreateWithString(requirement as CFString, [], &secRequirement)
+        let requirementStatus = SecRequirementCreateWithString(
+            requirement.designatedRequirement as CFString,
+            [],
+            &secRequirement
+        )
         guard requirementStatus == errSecSuccess, let secRequirement else {
             throw TrustError.requirementInvalid(requirementStatus)
         }
 
         let validity = SecCodeCheckValidity(code, [], secRequirement)
         guard validity == errSecSuccess else {
-            log.error("peer rejected: OSStatus \(validity, privacy: .public)")
+            log.error(
+                "signed peer rejected: team=\(requirement.teamIdentifier, privacy: .public) identifier=\(requirement.signingIdentifier, privacy: .public) status=\(validity, privacy: .public)"
+            )
             throw TrustError.untrustedPeer(validity)
         }
 
-        if allowUnhardened {
-            return
-        }
-        try enforceHardenedRuntime(code)
+        try enforceSignedPeer(code, requiredEntitlements: requirement.requiredEntitlements)
     }
 
-    private func enforceHardenedRuntime(_ code: SecCode) throws {
-        // The audit-token guest is what SecCodeCopySigningInformation needs for
-        // live status flags; Swift imports SecCode/SecStaticCode as unrelated: bit cast.
+    private func enforceSignedPeer(
+        _ code: SecCode,
+        requiredEntitlements: [String: EntitlementRequirement]
+    ) throws {
         let staticCode = unsafeBitCast(code, to: SecStaticCode.self)
         var info: CFDictionary?
         let flags = SecCSFlags(rawValue: kSecCSDynamicInformation | kSecCSRequirementInformation)
@@ -143,7 +206,26 @@ public struct PeerTrust: Sendable {
         guard status == errSecSuccess, let info else {
             throw TrustError.signingInfoUnavailable(status)
         }
-        try Self.enforceHardenedRuntime(info: info as NSDictionary)
+        try Self.enforceSignedPeer(
+            info: info as NSDictionary,
+            requiredEntitlements: requiredEntitlements
+        )
+    }
+
+    static func enforceSignedPeer(
+        info: NSDictionary,
+        requiredEntitlements: [String: EntitlementRequirement]
+    ) throws {
+        try enforceHardenedRuntime(info: info)
+        let entitlements = try decodedEntitlements(info: info)
+        for key in requiredEntitlements.keys.sorted() {
+            guard let actual = entitlements?[key] else {
+                throw TrustError.requiredEntitlementMissing(key)
+            }
+            guard matches(actual, requirement: requiredEntitlements[key]!) else {
+                throw TrustError.requiredEntitlementMismatch(key)
+            }
+        }
     }
 
     static func enforceHardenedRuntime(info: NSDictionary) throws {
@@ -160,27 +242,38 @@ public struct PeerTrust: Sendable {
             throw TrustError.debugged(status: signingStatus)
         }
         let lvProven = signingStatus & (csRequireLV | csForcedLV) != 0
-        let entitlementsValue = info[kSecCodeInfoEntitlementsDict]
-        guard let entitlements = entitlementsValue as? NSDictionary else {
-            // Only both keys ABSENT is clean; a present-but-undecodable value
-            // under either key cannot be proven free of injection entitlements.
-            guard entitlementsValue == nil, info[kSecCodeInfoEntitlements] == nil else {
-                throw TrustError.entitlementsUndecodable
-            }
-            return
-        }
+        guard let entitlements = try decodedEntitlements(info: info) else { return }
         for entitlement in injectionEntitlements {
-            // Inert when the kernel enforces library validation regardless.
-            if lvProven, entitlement == entDisableLV {
-                continue
-            }
+            if lvProven, entitlement == entDisableLV { continue }
             guard let value = entitlements[entitlement] else { continue }
-            // Only a genuine CFBoolean false is clean: CFEqual alone also
-            // matches CFNumber(0) through NSNumber bridging.
             let ref = value as CFTypeRef
             guard CFGetTypeID(ref) == CFBooleanGetTypeID(), CFEqual(ref, kCFBooleanFalse) else {
                 throw TrustError.injectionEntitled(entitlement)
             }
+        }
+    }
+
+    private static func decodedEntitlements(info: NSDictionary) throws -> NSDictionary? {
+        let value = info[kSecCodeInfoEntitlementsDict]
+        if let entitlements = value as? NSDictionary {
+            return entitlements
+        }
+        guard value == nil, info[kSecCodeInfoEntitlements] == nil else {
+            throw TrustError.entitlementsUndecodable
+        }
+        return nil
+    }
+
+    private static func matches(_ actual: Any, requirement: EntitlementRequirement) -> Bool {
+        switch requirement {
+        case let .boolean(expected):
+            let ref = actual as CFTypeRef
+            let wanted = expected ? kCFBooleanTrue : kCFBooleanFalse
+            return CFGetTypeID(ref) == CFBooleanGetTypeID() && CFEqual(ref, wanted)
+        case let .string(expected):
+            return (actual as? String) == expected
+        case let .stringArrayContains(expected):
+            return (actual as? [String])?.contains(expected) == true
         }
     }
 

@@ -6,19 +6,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-
-	"github.com/yasyf/daemonkit/wire"
 )
 
 // Version is the lifecycle protocol version carried in every envelope's "v"
 // field. The Swift peer pins the same constant.
-const Version = 1
+const Version = 2
 
 // The op strings name each lifecycle operation. Frozen wire values.
 const (
 	OpHealth   = "health"
 	OpShutdown = "shutdown"
-	OpHello    = "hello"
 	OpHandoff  = "handoff"
 )
 
@@ -43,21 +40,21 @@ func NewHealthRequest() HealthRequest {
 	return HealthRequest{V: Version, Op: OpHealth}
 }
 
-// HealthResponse is the peer's health snapshot. Features is the only source of capability truth — never a version compare.
+// HealthResponse is the peer's exact-protocol health snapshot.
 type HealthResponse struct {
-	V        int      `json:"v"`
-	Op       string   `json:"op"`
-	Version  string   `json:"version"`
-	PID      int      `json:"pid"`
-	State    string   `json:"state"`
-	Draining bool     `json:"draining"`
-	Busy     bool     `json:"busy"`
-	Features []string `json:"features"`
+	V        int    `json:"v"`
+	Op       string `json:"op"`
+	Build    string `json:"build"`
+	Protocol int    `json:"protocol"`
+	PID      int    `json:"pid"`
+	State    string `json:"state"`
+	Draining bool   `json:"draining"`
+	Busy     bool   `json:"busy"`
 }
 
-// NewHealthResponse builds a health snapshot; a nil features slice encodes as [].
-func NewHealthResponse(version string, pid int, state string, draining bool, busy bool, features []string) HealthResponse {
-	return HealthResponse{V: Version, Op: OpHealth, Version: version, PID: pid, State: state, Draining: draining, Busy: busy, Features: nonNil(features)}
+// NewHealthResponse builds a health snapshot.
+func NewHealthResponse(build string, protocolVersion int, pid int, state string, draining bool, busy bool) HealthResponse {
+	return HealthResponse{V: Version, Op: OpHealth, Build: build, Protocol: protocolVersion, PID: pid, State: state, Draining: draining, Busy: busy}
 }
 
 // ShutdownRequest asks the peer to shut down.
@@ -83,29 +80,6 @@ func NewShutdownResponse(ok bool) ShutdownResponse {
 	return ShutdownResponse{V: Version, Op: OpShutdown, OK: ok}
 }
 
-// HelloRequest opens the capability handshake.
-type HelloRequest struct {
-	V  int    `json:"v"`
-	Op string `json:"op"`
-}
-
-// NewHelloRequest builds a hello request.
-func NewHelloRequest() HelloRequest {
-	return HelloRequest{V: Version, Op: OpHello}
-}
-
-// HelloResponse announces the peer's advertised feature bits.
-type HelloResponse struct {
-	V        int      `json:"v"`
-	Op       string   `json:"op"`
-	Features []string `json:"features"`
-}
-
-// NewHelloResponse builds a hello announcement; a nil features slice encodes as [].
-func NewHelloResponse(features []string) HelloResponse {
-	return HelloResponse{V: Version, Op: OpHello, Features: nonNil(features)}
-}
-
 // HandoffRequest asks the peer to release its socket for a successor.
 type HandoffRequest struct {
 	V  int    `json:"v"`
@@ -129,36 +103,23 @@ func NewHandoffResponse(ok bool) HandoffResponse {
 	return HandoffResponse{V: Version, Op: OpHandoff, OK: ok}
 }
 
-// Write marshals msg to a compact JSON frame and writes it over f.
-func Write(f *wire.Framing, msg any) error {
-	if err := f.WriteJSON(msg); err != nil {
-		return fmt.Errorf("lifeproto: write: %w", err)
+// Encode marshals one lifecycle message for a v2 request or response payload.
+func Encode(msg any) ([]byte, error) {
+	b, err := json.Marshal(msg)
+	if err != nil {
+		return nil, fmt.Errorf("lifeproto: encode: %w", err)
 	}
-	return nil
+	return b, nil
 }
 
-// ReadEnvelope reads one frame and returns its {v, op} envelope plus the raw
-// frame bytes, so a server dispatches on Op and then unmarshals the raw bytes
-// into the concrete request type. It rejects a mismatched protocol version with
-// ErrProtocolVersion.
-func ReadEnvelope(f *wire.Framing) (Envelope, []byte, error) {
-	b, err := f.ReadFrame()
-	if err != nil {
-		return Envelope{}, nil, err
-	}
+// DecodeEnvelope decodes {v, op} and rejects every foreign protocol version.
+func DecodeEnvelope(b []byte) (Envelope, error) {
 	var e Envelope
 	if err := json.Unmarshal(b, &e); err != nil {
-		return Envelope{}, nil, fmt.Errorf("lifeproto: decode envelope: %w", err)
+		return Envelope{}, fmt.Errorf("lifeproto: decode envelope: %w", err)
 	}
 	if e.V != Version {
-		return Envelope{}, nil, fmt.Errorf("%w: got v=%d, want %d", ErrProtocolVersion, e.V, Version)
+		return Envelope{}, fmt.Errorf("%w: got v=%d, want %d", ErrProtocolVersion, e.V, Version)
 	}
-	return e, b, nil
-}
-
-func nonNil(s []string) []string {
-	if s == nil {
-		return []string{}
-	}
-	return s
+	return e, nil
 }

@@ -15,7 +15,17 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const fixtureTeam = "SXKCTF23Q2"
+const (
+	fixtureTeam  = "SXKCTF23Q2"
+	fixtureGroup = "group.com.yasyf.daemonkit.fixture"
+)
+
+func fixtureRequirement(identifier string) Requirement {
+	return Requirement{
+		TeamID: fixtureTeam, SigningIdentifier: identifier,
+		RequiredAppGroup: fixtureGroup,
+	}
+}
 
 func requireE2E(t *testing.T) {
 	t.Helper()
@@ -93,7 +103,8 @@ func peerOf(t *testing.T, bin string) wire.Peer {
 func TestTrustAcceptsMatchingDeveloperID(t *testing.T) {
 	requireE2E(t)
 	peer := peerOf(t, fixtureBin(t, "fixture-devid-a"))
-	p := Policy{Requirement: &Requirement{TeamID: fixtureTeam, Identifier: "com.yasyf.daemonkit.fixture-a"}}
+	req := fixtureRequirement("com.yasyf.daemonkit.fixture-a")
+	p := Policy{Requirement: &req}
 	if err := p.Check(peer); err != nil {
 		t.Errorf("Check(matching devid) = %v, want nil", err)
 	}
@@ -102,7 +113,8 @@ func TestTrustAcceptsMatchingDeveloperID(t *testing.T) {
 func TestTrustRejectsWrongIdentifier(t *testing.T) {
 	requireE2E(t)
 	peer := peerOf(t, fixtureBin(t, "fixture-devid-a"))
-	p := Policy{Requirement: &Requirement{TeamID: fixtureTeam, Identifier: "com.yasyf.daemonkit.fixture-b"}}
+	req := fixtureRequirement("com.yasyf.daemonkit.fixture-b")
+	p := Policy{Requirement: &req}
 	if err := p.Check(peer); !errors.Is(err, ErrUntrustedPeer) {
 		t.Errorf("Check(wrong identifier) = %v, want ErrUntrustedPeer", err)
 	}
@@ -111,7 +123,9 @@ func TestTrustRejectsWrongIdentifier(t *testing.T) {
 func TestTrustRejectsWrongTeam(t *testing.T) {
 	requireE2E(t)
 	peer := peerOf(t, fixtureBin(t, "fixture-devid-a"))
-	p := Policy{Requirement: &Requirement{TeamID: "ZZ0FAKE9TX", Identifier: "com.yasyf.daemonkit.fixture-a"}}
+	req := fixtureRequirement("com.yasyf.daemonkit.fixture-a")
+	req.TeamID = "ZZ0FAKE9TX"
+	p := Policy{Requirement: &req}
 	if err := p.Check(peer); !errors.Is(err, ErrUntrustedPeer) {
 		t.Errorf("Check(wrong team) = %v, want ErrUntrustedPeer", err)
 	}
@@ -120,55 +134,54 @@ func TestTrustRejectsWrongTeam(t *testing.T) {
 func TestTrustRejectsAdHoc(t *testing.T) {
 	requireE2E(t)
 	peer := peerOf(t, fixtureBin(t, "fixture-adhoc"))
-	p := Policy{Requirement: &Requirement{TeamID: fixtureTeam, Identifier: "com.yasyf.daemonkit.fixture-adhoc"}}
+	req := fixtureRequirement("com.yasyf.daemonkit.fixture-adhoc")
+	p := Policy{Requirement: &req}
 	if err := p.Check(peer); !errors.Is(err, ErrUntrustedPeer) {
 		t.Errorf("Check(ad-hoc) = %v, want ErrUntrustedPeer (no Developer ID anchor)", err)
+	}
+}
+
+func TestTrustRejectsWrongAppGroup(t *testing.T) {
+	requireE2E(t)
+	peer := peerOf(t, fixtureBin(t, "fixture-devid-wronggroup"))
+	req := fixtureRequirement("com.yasyf.daemonkit.fixture-wronggroup")
+	if err := (Policy{Requirement: &req}).Check(peer); !errors.Is(err, ErrUntrustedPeer) {
+		t.Errorf("Check(wrong app group) = %v, want ErrUntrustedPeer", err)
 	}
 }
 
 func TestTrustRejectsUnhardened(t *testing.T) {
 	requireE2E(t)
 	peer := peerOf(t, fixtureBin(t, "fixture-devid-unhardened"))
-	req := Requirement{TeamID: fixtureTeam, Identifier: "com.yasyf.daemonkit.fixture-unhardened"}
+	req := fixtureRequirement("com.yasyf.daemonkit.fixture-unhardened")
 	if err := (Policy{Requirement: &req}).Check(peer); !errors.Is(err, ErrUntrustedPeer) {
 		t.Errorf("Check(unhardened) = %v, want ErrUntrustedPeer (lacks CS_RUNTIME)", err)
-	}
-	req.AllowUnhardened = true
-	if err := (Policy{Requirement: &req}).Check(peer); err != nil {
-		t.Errorf("Check(unhardened, AllowUnhardened) = %v, want nil", err)
 	}
 }
 
 func TestTrustRejectsDisabledLibraryValidation(t *testing.T) {
 	requireE2E(t)
 	peer := peerOf(t, fixtureBin(t, "fixture-devid-nolv"))
-	req := Requirement{TeamID: fixtureTeam, Identifier: "com.yasyf.daemonkit.fixture-nolv"}
+	req := fixtureRequirement("com.yasyf.daemonkit.fixture-nolv")
 	if err := (Policy{Requirement: &req}).Check(peer); !errors.Is(err, ErrUntrustedPeer) {
 		t.Errorf("Check(disable-library-validation) = %v, want ErrUntrustedPeer", err)
-	}
-	req.AllowUnhardened = true
-	if err := (Policy{Requirement: &req}).Check(peer); err != nil {
-		t.Errorf("Check(disable-library-validation, AllowUnhardened) = %v, want nil", err)
 	}
 }
 
 func TestTrustRejectsGetTaskAllow(t *testing.T) {
 	requireE2E(t)
 	peer := peerOf(t, fixtureBin(t, "fixture-devid-gta"))
-	req := Requirement{TeamID: fixtureTeam, Identifier: "com.yasyf.daemonkit.fixture-gta"}
+	req := fixtureRequirement("com.yasyf.daemonkit.fixture-gta")
 	if err := (Policy{Requirement: &req}).Check(peer); !errors.Is(err, ErrUntrustedPeer) {
 		t.Errorf("Check(get-task-allow) = %v, want ErrUntrustedPeer", err)
-	}
-	req.AllowUnhardened = true
-	if err := (Policy{Requirement: &req}).Check(peer); err != nil {
-		t.Errorf("Check(get-task-allow, AllowUnhardened) = %v, want nil", err)
 	}
 }
 
 func TestTrustVerificationIsLeakFree(t *testing.T) {
 	requireE2E(t)
 	peer := peerOf(t, fixtureBin(t, "fixture-devid-a"))
-	p := Policy{Requirement: &Requirement{TeamID: fixtureTeam, Identifier: "com.yasyf.daemonkit.fixture-a"}}
+	req := fixtureRequirement("com.yasyf.daemonkit.fixture-a")
+	p := Policy{Requirement: &req}
 
 	for i := 0; i < 200; i++ {
 		_ = p.Check(peer)

@@ -12,8 +12,8 @@ import (
 // answers Health, EnsureCurrent keeps polling and returns only once the peer
 // reports EXACTLY the target version.
 func TestEnsureCurrentPollsPastOldVersion(t *testing.T) {
-	old := Health{Version: "1.0.0", PID: 100}
-	target := Health{Version: "2.0.0", PID: 200}
+	old := Health{Build: "1.0.0", PID: 100}
+	target := Health{Build: "2.0.0", PID: 200}
 	peer := &fakePeer{health: []healthResult{
 		{h: old}, {h: old}, {h: old}, {h: target},
 	}}
@@ -34,7 +34,7 @@ func TestEnsureCurrentPollsPastOldVersion(t *testing.T) {
 // TestEnsureCurrentTimeout: a peer stuck on the old version fails with
 // ErrEnsureTimeout once the deadline elapses.
 func TestEnsureCurrentTimeout(t *testing.T) {
-	peer := &fakePeer{health: []healthResult{{h: Health{Version: "1.0.0", PID: 100}}}}
+	peer := &fakePeer{health: []healthResult{{h: Health{Build: "1.0.0", PID: 100}}}}
 	cfg := EnsureConfig{
 		Peer:     peer,
 		LockPath: filepath.Join(t.TempDir(), "ensure.lock"),
@@ -52,7 +52,7 @@ func TestEnsureCurrentTimeout(t *testing.T) {
 // TestEnsureCurrentEnsureError: an Ensure hook failure aborts the wait.
 func TestEnsureCurrentEnsureError(t *testing.T) {
 	boom := errors.New("spawn failed")
-	peer := &fakePeer{health: []healthResult{{h: Health{Version: "1.0.0"}}}}
+	peer := &fakePeer{health: []healthResult{{h: Health{Build: "1.0.0"}}}}
 	cfg := EnsureConfig{
 		Peer:     peer,
 		LockPath: filepath.Join(t.TempDir(), "ensure.lock"),
@@ -62,5 +62,25 @@ func TestEnsureCurrentEnsureError(t *testing.T) {
 
 	if err := EnsureCurrent(context.Background(), cfg, "2.0.0"); !errors.Is(err, boom) {
 		t.Fatalf("EnsureCurrent err = %v, want the Ensure error", err)
+	}
+}
+
+func TestEnsureCurrentRequiresExactProtocol(t *testing.T) {
+	peer := &fakePeer{health: []healthResult{
+		{h: Health{Build: "2.0.0", Protocol: 1, PID: 100}},
+		{h: Health{Build: "2.0.0", Protocol: 2, PID: 100}},
+	}}
+	cfg := EnsureConfig{
+		Peer:     peer,
+		Protocol: 2,
+		LockPath: filepath.Join(t.TempDir(), "ensure.lock"),
+		clock:    newAutoClock(),
+	}
+
+	if err := EnsureCurrent(context.Background(), cfg, "2.0.0"); err != nil {
+		t.Fatalf("EnsureCurrent: %v", err)
+	}
+	if got := peer.healthCalls(); got < 2 {
+		t.Fatalf("health calls = %d, want protocol mismatch to keep polling", got)
 	}
 }

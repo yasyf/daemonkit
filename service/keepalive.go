@@ -32,6 +32,8 @@ type AppKeepAlive struct {
 	// attributes this agent to the app bundle; empty omits the key and keeps the
 	// rendered plist byte-identical to the no-bundle output.
 	BundleID string
+	// RestartPolicy defines when launchd restarts the app waiter. Required.
+	RestartPolicy RestartPolicy
 }
 
 const keepAlivePlist = `<?xml version="1.0" encoding="UTF-8"?>
@@ -51,9 +53,7 @@ const keepAlivePlist = `<?xml version="1.0" encoding="UTF-8"?>
     </array>
     <key>RunAtLoad</key>
     <true/>
-    <key>KeepAlive</key>
-    <true/>
-%s</dict>
+%s%s</dict>
 </plist>
 `
 
@@ -72,6 +72,9 @@ func (k AppKeepAlive) validate() error {
 	if !filepath.IsAbs(k.AppPath) {
 		return fmt.Errorf("keepalive agent: AppPath %q must be an absolute .app bundle path", k.AppPath)
 	}
+	if _, err := k.RestartPolicy.plist(); err != nil {
+		return fmt.Errorf("keepalive agent: %w", err)
+	}
 	return nil
 }
 
@@ -81,11 +84,15 @@ func (k AppKeepAlive) plist() ([]byte, error) {
 		return nil, err
 	}
 	label, app := xmlEscape(k.Label), xmlEscape(k.AppPath)
+	restart, err := k.RestartPolicy.plist()
+	if err != nil {
+		return nil, fmt.Errorf("keepalive agent: %w", err)
+	}
 	assoc := ""
 	if k.BundleID != "" {
 		assoc = fmt.Sprintf(assocBundleBlock, xmlEscape(k.BundleID))
 	}
-	return fmt.Appendf(nil, keepAlivePlist, label, openPath, openPath, app, assoc), nil
+	return fmt.Appendf(nil, keepAlivePlist, label, openPath, openPath, app, restart, assoc), nil
 }
 
 // PlistPath is the LaunchAgent plist location

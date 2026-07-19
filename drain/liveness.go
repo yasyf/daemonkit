@@ -1,11 +1,9 @@
 package drain
 
 import (
-	"context"
 	"errors"
 	"fmt"
 
-	"github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/proc"
 )
 
@@ -80,28 +78,5 @@ func assess(p prober, id proc.Identity) Liveness {
 		return Dead
 	default:
 		return Alive
-	}
-}
-
-// TakeoverProof adapts the force gate to daemon.TakeoverConfig.ConfirmedDead:
-// ForcePolicyDefer never confirms; ForcePolicyConfirmedDead confirms only when
-// the reported PID probes definitively gone. A probe failure is an error.
-func TakeoverProof(policy ForcePolicy) func(context.Context, daemon.Health) (bool, error) {
-	return takeoverProof(policy, sysProber{})
-}
-
-func takeoverProof(policy ForcePolicy, p prober) func(context.Context, daemon.Health) (bool, error) {
-	return func(_ context.Context, h daemon.Health) (bool, error) {
-		if policy != ForcePolicyConfirmedDead {
-			return false, nil
-		}
-		_, err := p.probe(h.PID)
-		if errors.Is(err, proc.ErrNoProcess) {
-			return true, nil
-		}
-		if err != nil {
-			return false, fmt.Errorf("drain: probe incumbent %d: %w", h.PID, err)
-		}
-		return false, nil
 	}
 }

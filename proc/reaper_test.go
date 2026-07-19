@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -71,11 +72,16 @@ func (m *memStore) len() int {
 // fakeProber returns a fixed identity or error for every pid, unless perProbe
 // overrides the result on a given (0-indexed) probe.
 type fakeProber struct {
-	mu       sync.Mutex
-	info     procInfo
-	err      error
-	probed   []int
-	perProbe []probeResult
+	mu         sync.Mutex
+	info       procInfo
+	err        error
+	probed     []int
+	perProbe   []probeResult
+	byPID      map[int]probeResult
+	members    []groupMember
+	memberSets [][]groupMember
+	groupCalls int
+	groupErr   error
 }
 
 type probeResult struct {
@@ -88,10 +94,24 @@ func (f *fakeProber) probe(pid int) (procInfo, error) {
 	defer f.mu.Unlock()
 	n := len(f.probed)
 	f.probed = append(f.probed, pid)
+	if result, ok := f.byPID[pid]; ok {
+		return result.info, result.err
+	}
 	if n < len(f.perProbe) {
 		return f.perProbe[n].info, f.perProbe[n].err
 	}
 	return f.info, f.err
+}
+
+func (f *fakeProber) groupMembers(_, _ int) ([]groupMember, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	call := f.groupCalls
+	f.groupCalls++
+	if call < len(f.memberSets) {
+		return append([]groupMember(nil), f.memberSets[call]...), f.groupErr
+	}
+	return append([]groupMember(nil), f.members...), f.groupErr
 }
 
 func (f *fakeProber) probedPIDs() []int {
@@ -136,6 +156,204 @@ func matchingRecord(pid int, gen string) Record {
 	return Record{PID: pid, StartTime: i.startTime, Comm: i.comm, Generation: gen}
 }
 
+func matchingGroupRecord(pid int, gen string) Record {
+	rec := matchingRecord(pid, gen)
+	rec.ProcessGroup = true
+	rec.SessionID = pid
+	return rec
+}
+
+func groupInfo(pid int, startTime, comm string) procInfo {
+	return procInfo{startTime: startTime, comm: comm, groupID: pid, sessionID: pid}
+}
+
+func TestTrackGroupAndUntrack(t *testing.T) {
+	ctx := context.Background()
+	cmd := exec.Command("/bin/sh", "-c", "read _")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = stdin.Close()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+
+	store := &memStore{}
+	r := &Reaper{Store: store, Generation: "current-gen"}
+	rec, err := r.TrackGroup(ctx, cmd.Process.Pid)
+	if err != nil {
+		t.Fatalf("TrackGroup: %v", err)
+	}
+	if !rec.ProcessGroup {
+		t.Fatal("ProcessGroup = false, want true")
+	}
+	if rec.SessionID != cmd.Process.Pid {
+		t.Fatalf("SessionID = %d, want %d", rec.SessionID, cmd.Process.Pid)
+	}
+	if rec.PID != cmd.Process.Pid || rec.Generation != "current-gen" {
+		t.Fatalf("record = %+v, want pid %d generation current-gen", rec, cmd.Process.Pid)
+	}
+	if store.len() != 1 {
+		t.Fatalf("store size = %d, want 1", store.len())
+	}
+	if err := r.Untrack(ctx, rec); err != nil {
+		t.Fatalf("Untrack: %v", err)
+	}
+	if store.len() != 0 {
+		t.Fatalf("store size = %d, want 0", store.len())
+	}
+}
+
+func TestTrackGroupRejectsNonLeader(t *testing.T) {
+	cmd := exec.Command("/bin/sh", "-c", "read _")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = stdin.Close()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	r := &Reaper{
+		Store:      &memStore{},
+		Generation: "current-gen",
+		prober:     &fakeProber{info: liveInfo()},
+	}
+	if _, err := r.TrackGroup(context.Background(), cmd.Process.Pid); err == nil {
+		t.Fatal("TrackGroup succeeded for a process-group member, want error")
+	}
+}
+
+func TestOwnsRevalidatesFullIdentity(t *testing.T) {
+	rec := matchingRecord(4242, "old-gen")
+	tests := []struct {
+		name    string
+		result  probeResult
+		want    bool
+		wantErr bool
+	}{
+		{name: "match", result: probeResult{info: liveInfo()}, want: true},
+		{name: "vanished", result: probeResult{err: errNoProc}},
+		{name: "pid reused", result: probeResult{info: procInfo{startTime: "new", comm: rec.Comm}}},
+		{name: "exec changed comm", result: probeResult{info: procInfo{startTime: rec.StartTime, comm: "other"}}},
+		{name: "probe failure", result: probeResult{err: errors.New("probe failed")}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &Reaper{prober: &fakeProber{perProbe: []probeResult{tt.result}}}
+			got, err := r.Owns(rec)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Owns error = %v, wantErr %t", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Fatalf("Owns = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestReapSignalsProcessGroup(t *testing.T) {
+	ctx := context.Background()
+	store := &memStore{}
+	info := groupInfo(4141, liveInfo().startTime, liveInfo().comm)
+	members := []groupMember{{pid: 4141, info: info}}
+	prober := &fakeProber{info: info, memberSets: [][]groupMember{members, members, nil}}
+	sig := &recSignaler{}
+	rec := matchingGroupRecord(4141, "old-gen")
+	mustAdd(t, store, rec)
+
+	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
+	if err := r.Reap(ctx); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	want := []signalCall{{pid: -rec.PID, sig: syscall.SIGTERM}, {pid: -rec.PID, sig: syscall.SIGKILL}}
+	got := sig.calls()
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("signals = %v, want %v", got, want)
+	}
+}
+
+func TestReapLeaderlessGroupUsesDurableSessionMembers(t *testing.T) {
+	ctx := context.Background()
+	store := &memStore{}
+	leaderPID := 4151
+	memberPID := 4152
+	memberInfo := groupInfo(leaderPID, "222.333", "descendant")
+	prober := &fakeProber{
+		byPID: map[int]probeResult{
+			leaderPID: {err: errNoProc},
+			memberPID: {info: memberInfo},
+		},
+		memberSets: [][]groupMember{
+			{{pid: memberPID, info: memberInfo}},
+			{{pid: memberPID, info: memberInfo}},
+			nil,
+		},
+	}
+	sig := &recSignaler{}
+	rec := matchingGroupRecord(leaderPID, "old-gen")
+	mustAdd(t, store, rec)
+
+	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
+	if err := r.Reap(ctx); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	want := []signalCall{{pid: -leaderPID, sig: syscall.SIGTERM}, {pid: -leaderPID, sig: syscall.SIGKILL}}
+	got := sig.calls()
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("signals = %v, want %v", got, want)
+	}
+	if store.len() != 0 {
+		t.Fatalf("store size = %d, want reaped leaderless record removed", store.len())
+	}
+}
+
+func TestReapLeaderlessGroupEnumerationFailureFailsRecovery(t *testing.T) {
+	store := &memStore{}
+	rec := matchingGroupRecord(4161, "old-gen")
+	mustAdd(t, store, rec)
+	prober := &fakeProber{
+		byPID:    map[int]probeResult{rec.PID: {err: errNoProc}},
+		groupErr: errors.New("process table unavailable"),
+	}
+	sig := &recSignaler{err: errors.New("signal must not be sent")}
+	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig}
+	if err := r.Reap(context.Background()); err == nil || !strings.Contains(err.Error(), "process table unavailable") {
+		t.Fatalf("Reap error = %v, want unresolved enumeration failure", err)
+	}
+	if len(sig.calls()) != 0 {
+		t.Fatalf("signals = %v, want none without member proof", sig.calls())
+	}
+	if store.len() != 1 {
+		t.Fatalf("store size = %d, want forensic record retained", store.len())
+	}
+}
+
+func TestReapRejectsLegacyGroupWithoutSessionIdentity(t *testing.T) {
+	store := &memStore{}
+	rec := matchingRecord(4171, "old-gen")
+	rec.ProcessGroup = true
+	mustAdd(t, store, rec)
+	prober := &fakeProber{byPID: map[int]probeResult{rec.PID: {err: errNoProc}}}
+	r := &Reaper{Store: store, Generation: "new-gen", prober: prober}
+	if err := r.Reap(context.Background()); err == nil || !strings.Contains(err.Error(), "no durable dedicated-session identity") {
+		t.Fatalf("Reap error = %v, want missing session identity failure", err)
+	}
+	if store.len() != 1 {
+		t.Fatalf("store size = %d, want incompatible record retained", store.len())
+	}
+}
+
 // TestReapPIDReuseResistance: a live, innocent process whose start time differs
 // from the record is never signaled, and the stale record is dropped.
 func TestReapPIDReuseResistance(t *testing.T) {
@@ -170,8 +388,8 @@ func TestReapProbeErrorFailsClosed(t *testing.T) {
 	mustAdd(t, store, matchingRecord(5252, "old-gen"))
 
 	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
-	if err := r.Reap(ctx); err != nil {
-		t.Fatalf("Reap: %v", err)
+	if err := r.Reap(ctx); err == nil || !strings.Contains(err.Error(), "kern.proc probe failed") {
+		t.Fatalf("Reap error = %v, want unresolved probe failure", err)
 	}
 	if got := sig.calls(); len(got) != 0 {
 		t.Errorf("signals sent = %v, want none on Undetermined probe", got)
@@ -236,8 +454,8 @@ func TestReapRefusesSelfAndPID1(t *testing.T) {
 	mustAdd(t, store, matchingRecord(os.Getpid(), "old-gen"))
 
 	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
-	if err := r.Reap(ctx); err != nil {
-		t.Fatalf("Reap: %v", err)
+	if err := r.Reap(ctx); err == nil || !strings.Contains(err.Error(), "refusing unsafe process identity") {
+		t.Fatalf("Reap error = %v, want unsafe identity refusal", err)
 	}
 	if got := sig.calls(); len(got) != 0 {
 		t.Errorf("signals sent = %v, want none (self/init refusal)", got)
@@ -335,8 +553,8 @@ func TestReapReprobeErrorFailsClosed(t *testing.T) {
 	mustAdd(t, store, matchingRecord(9494, "old-gen"))
 
 	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
-	if err := r.Reap(ctx); err != nil {
-		t.Fatalf("Reap: %v", err)
+	if err := r.Reap(ctx); err == nil || !strings.Contains(err.Error(), "re-probe failed") {
+		t.Fatalf("Reap error = %v, want unresolved re-probe failure", err)
 	}
 	calls := sig.calls()
 	if len(calls) != 1 || calls[0].sig != syscall.SIGTERM {
@@ -344,6 +562,68 @@ func TestReapReprobeErrorFailsClosed(t *testing.T) {
 	}
 	if store.len() != 1 {
 		t.Errorf("store size = %d, want 1 (record kept, fail closed)", store.len())
+	}
+}
+
+func TestReapRemovesRecordOnlyAfterPostKillAbsence(t *testing.T) {
+	store := &memStore{}
+	rec := matchingRecord(9501, "old-gen")
+	mustAdd(t, store, rec)
+	prober := &fakeProber{perProbe: []probeResult{
+		{info: liveInfo()},
+		{info: liveInfo()},
+		{info: liveInfo()},
+		{info: liveInfo()},
+		{err: errNoProc},
+	}}
+	sig := &recSignaler{}
+	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock(), Settlement: 50 * time.Millisecond}
+	if err := r.Reap(context.Background()); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	if store.len() != 0 {
+		t.Fatalf("store size = %d, want removal after absence proof", store.len())
+	}
+	if probes := prober.probedPIDs(); len(probes) != 5 {
+		t.Fatalf("probe count = %d, want initial, grace, and three settlement probes", len(probes))
+	}
+}
+
+func TestReapRetainsRecordWhenKilledProcessNeverSettles(t *testing.T) {
+	store := &memStore{}
+	rec := matchingRecord(9502, "old-gen")
+	mustAdd(t, store, rec)
+	prober := &fakeProber{info: liveInfo()}
+	r := &Reaper{
+		Store: store, Generation: "new-gen", prober: prober,
+		signaler: &recSignaler{}, clock: newFakeClock(), Settlement: 25 * time.Millisecond,
+	}
+	err := r.Reap(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "remained live through settlement deadline") {
+		t.Fatalf("Reap error = %v, want settlement deadline failure", err)
+	}
+	if store.len() != 1 {
+		t.Fatalf("store size = %d, want unresolved record retained", store.len())
+	}
+}
+
+func TestReapRetainsRecordWhenKilledGroupNeverSettles(t *testing.T) {
+	store := &memStore{}
+	rec := matchingGroupRecord(9503, "old-gen")
+	mustAdd(t, store, rec)
+	info := groupInfo(rec.PID, rec.StartTime, rec.Comm)
+	member := groupMember{pid: rec.PID, info: info}
+	prober := &fakeProber{info: info, members: []groupMember{member}}
+	r := &Reaper{
+		Store: store, Generation: "new-gen", prober: prober,
+		signaler: &recSignaler{}, clock: newFakeClock(), Settlement: 25 * time.Millisecond,
+	}
+	err := r.Reap(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "group remained live through settlement deadline") {
+		t.Fatalf("Reap error = %v, want group settlement deadline failure", err)
+	}
+	if store.len() != 1 {
+		t.Fatalf("store size = %d, want unresolved group record retained", store.len())
 	}
 }
 

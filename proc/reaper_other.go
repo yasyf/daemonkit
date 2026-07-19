@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -30,5 +31,38 @@ func probeProc(pid int) (procInfo, error) {
 	if len(fields) < 20 {
 		return procInfo{}, fmt.Errorf("parse /proc/%d/stat: %d fields after comm, want >=20", pid, len(fields))
 	}
-	return procInfo{startTime: fields[19], comm: comm}, nil
+	groupID, err := strconv.Atoi(fields[2])
+	if err != nil {
+		return procInfo{}, fmt.Errorf("parse /proc/%d/stat process group: %w", pid, err)
+	}
+	sessionID, err := strconv.Atoi(fields[3])
+	if err != nil {
+		return procInfo{}, fmt.Errorf("parse /proc/%d/stat session: %w", pid, err)
+	}
+	return procInfo{startTime: fields[19], comm: comm, groupID: groupID, sessionID: sessionID, zombie: fields[0] == "Z"}, nil
+}
+
+func probeGroupMembers(groupID, sessionID int) ([]groupMember, error) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil, fmt.Errorf("enumerate /proc: %w", err)
+	}
+	members := make([]groupMember, 0)
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid <= 1 {
+			continue
+		}
+		info, err := probeProc(pid)
+		if errors.Is(err, errNoProc) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if info.groupID == groupID && info.sessionID == sessionID {
+			members = append(members, groupMember{pid: pid, info: info})
+		}
+	}
+	return members, nil
 }

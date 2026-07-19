@@ -1,16 +1,11 @@
 // Package daemon is the consumer-agnostic lifecycle shell for a detached daemon:
 // the successor-initiated takeover ladder, the target-version ensure gate, the
 // incumbent-initiated skew watch, an idle-exit timer, and a foreign-key-preserving
-// state file. It talks to a running peer only through the Peer interface, which
-// each consumer adapts from its own frozen wire client, and it infers capability
-// from Health.Features bits alone — never from a version compare or a trial call.
+// state file. It talks to a running peer only through the exact-protocol Peer
+// interface, which each consumer adapts from the generated lifecycle client.
 package daemon
 
 import "context"
-
-// FeatureHandoff is the Health.Features bit that advertises socket handoff; its
-// presence is the only signal that gates the takeover handoff path.
-const FeatureHandoff = "handoff"
 
 // State is a peer's coarse health verdict. A temporary secure-hardware outage is
 // StateDegraded, never a crash loop.
@@ -26,11 +21,13 @@ const (
 	StateFailed State = "failed"
 )
 
-// Health is a peer's lifecycle snapshot. Features is the sole source of
-// capability truth.
+// Health is a peer's lifecycle snapshot. Build orders takeover and Protocol is
+// the exact compatibility contract.
 type Health struct {
-	// Version is the peer's build version string, classified by the version package.
-	Version string
+	// Build is the peer's build identity, classified by the version package.
+	Build string
+	// Protocol is the peer's exact lifecycle protocol version.
+	Protocol int
 	// PID is the peer's process id, the revalidation anchor for any signal.
 	PID int
 	// State is the coarse health verdict.
@@ -40,18 +37,6 @@ type Health struct {
 	// Busy reports whether the peer is mid-operation; a busy ResourceOwner is
 	// never killed for being older.
 	Busy bool
-	// Features are the advertised capability bits.
-	Features []string
-}
-
-// HasFeature reports whether name is among the advertised Features.
-func (h Health) HasFeature(name string) bool {
-	for _, f := range h.Features {
-		if f == name {
-			return true
-		}
-	}
-	return false
 }
 
 // Peer is a running daemon as its successor or a client sees it, adapted by each

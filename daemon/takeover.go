@@ -52,8 +52,6 @@ const (
 	ExitSelf Outcome = iota + 1
 	// Bind means the socket is clear; the caller may bind.
 	Bind
-	// Defer means an older busy ResourceOwner holds the socket; back off and retry.
-	Defer
 )
 
 // String renders an Outcome for logs and test failures.
@@ -63,8 +61,6 @@ func (o Outcome) String() string {
 		return "exit-self"
 	case Bind:
 		return "bind"
-	case Defer:
-		return "defer"
 	default:
 		return fmt.Sprintf("Outcome(%d)", int(o))
 	}
@@ -74,9 +70,11 @@ func (o Outcome) String() string {
 type TakeoverConfig struct {
 	// Self is this successor's own build version string.
 	Self string
+	// Protocol is the exact lifecycle protocol both peers must speak.
+	Protocol int
 	// Peer adapts whoever currently answers the socket. Required.
 	Peer Peer
-	// Contract classifies the incumbent for the no-handoff eviction split.
+	// Contract selects the incumbent's exact shutdown or handoff contract.
 	Contract Contract
 	// WaitMode selects release detection after a handoff.
 	WaitMode WaitMode
@@ -84,32 +82,37 @@ type TakeoverConfig struct {
 	Grace time.Duration
 	// WaitTimeout bounds the post-handoff release wait; zero means DefaultWaitTimeout.
 	WaitTimeout time.Duration
-	// ConfirmedDead supplies external proof that an incumbent still answering the
-	// socket is actually dead (a stale socket over a crashed ResourceOwner). Only
-	// a true result lets a ResourceOwner takeover force in; nil never forces.
-	ConfirmedDead func(ctx context.Context, h Health) (bool, error)
-
-	clock    clock
-	prober   prober
-	signaler signaler
+	clock       clock
+	prober      prober
+	signaler    signaler
 }
 
 // Run probes the incumbent and returns the takeover verdict: ExitSelf when the
 // incumbent is same-or-newer (ties never evict), otherwise it evicts a
-// strictly-older incumbent — via handoff when Features advertises it, else per
-// Contract — and returns Bind once the socket is clear, or Defer for an older
-// busy ResourceOwner. Every wait honors ctx and the clock seam.
+// strictly-older incumbent according to Contract. RequestDaemon asks it to shut
+// down and retains the identity-safe kill ladder; ResourceOwner requests a
+// handoff and waits without ever signaling it. Every wait honors ctx and the
+// clock seam.
 func Run(ctx context.Context, cfg TakeoverConfig) (Outcome, error) {
 	h, err := cfg.Peer.Health(ctx)
-	if err != nil {
-		// No reachable incumbent: nothing to take over, the caller may bind. The
-		// start flock arbitrates a genuine race at bind time.
+	if errors.Is(err, ErrNoPeer) {
+		// No listening incumbent: nothing to take over. The start flock
+		// arbitrates a genuine race at bind time.
 		return Bind, nil
 	}
-	if !version.Newer(cfg.Self, h.Version) {
+	if err != nil {
+		return 0, fmt.Errorf("health incumbent: %w", err)
+	}
+	if h.Protocol != cfg.Protocol {
+		return 0, fmt.Errorf("%w: self %d, peer %d", ErrProtocolMismatch, cfg.Protocol, h.Protocol)
+	}
+	if !version.Newer(cfg.Self, h.Build) {
 		return ExitSelf, nil
 	}
-	if h.HasFeature(FeatureHandoff) {
+	switch cfg.Contract {
+	case RequestDaemon:
+		return cfg.evictRequestDaemon(ctx, h)
+	case ResourceOwner:
 		if err := cfg.Peer.Handoff(ctx); err != nil {
 			return 0, fmt.Errorf("request handoff: %w", err)
 		}
@@ -117,19 +120,13 @@ func Run(ctx context.Context, cfg TakeoverConfig) (Outcome, error) {
 			return 0, err
 		}
 		return Bind, nil
-	}
-	switch cfg.Contract {
-	case RequestDaemon:
-		return cfg.evictRequestDaemon(ctx, h)
-	case ResourceOwner:
-		return cfg.evictResourceOwner(ctx, h)
 	default:
 		return 0, fmt.Errorf("%w: %d", ErrUnknownContract, cfg.Contract)
 	}
 }
 
 // evictRequestDaemon runs the Shutdown -> grace -> PID-revalidated SIGKILL ladder
-// against a strictly-older, no-handoff RequestDaemon.
+// against a strictly-older RequestDaemon.
 func (cfg TakeoverConfig) evictRequestDaemon(ctx context.Context, h Health) (Outcome, error) {
 	victim := h.PID
 	if victim <= 1 || victim == os.Getpid() {
@@ -151,47 +148,29 @@ func (cfg TakeoverConfig) evictRequestDaemon(ctx context.Context, h Health) (Out
 	return cfg.killIfSameOwner(ctx, victim, id.StartTime)
 }
 
-// evictResourceOwner never kills an older ResourceOwner for age: it defers unless
-// ConfirmedDead proves the still-answering incumbent is actually dead.
-func (cfg TakeoverConfig) evictResourceOwner(ctx context.Context, h Health) (Outcome, error) {
-	if cfg.ConfirmedDead == nil {
-		return Defer, nil
-	}
-	dead, err := cfg.ConfirmedDead(ctx, h)
-	if err != nil {
-		return 0, fmt.Errorf("confirm incumbent dead: %w", err)
-	}
-	if !dead {
-		return Defer, nil
-	}
-	victim := h.PID
-	if victim <= 1 || victim == os.Getpid() {
-		return 0, fmt.Errorf("%w: pid %d", ErrRefuseVictim, victim)
-	}
-	id, err := cfg.prb().probe(victim)
-	if errors.Is(err, proc.ErrNoProcess) {
-		return Bind, nil
-	}
-	if err != nil {
-		return 0, fmt.Errorf("probe incumbent %d: %w", victim, err)
-	}
-	return cfg.killIfSameOwner(ctx, victim, id.StartTime)
-}
-
 // killIfSameOwner re-reads the socket peer and SIGKILLs victim only if the same
 // {pid, start_time} still holds it; a released socket, a vanished process, or a
 // reused PID means no signal. ESRCH counts as success.
 func (cfg TakeoverConfig) killIfSameOwner(ctx context.Context, victim int, startTime string) (Outcome, error) {
 	h2, err := cfg.Peer.Health(ctx)
-	if err != nil {
+	if errors.Is(err, ErrNoPeer) {
 		return Bind, nil // socket released during grace
+	}
+	if err != nil {
+		return 0, fmt.Errorf("revalidate socket owner: %w", err)
 	}
 	if h2.PID != victim {
 		return Bind, nil // a different owner answers now: never kill it
 	}
 	id2, err := cfg.prb().probe(victim)
-	if err != nil || id2.StartTime != startTime {
-		return Bind, nil // gone, reused, or unresolvable: fail closed, no kill
+	if errors.Is(err, proc.ErrNoProcess) {
+		return Bind, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("revalidate incumbent %d: %w", victim, err)
+	}
+	if id2.StartTime != startTime {
+		return Bind, nil // gone or reused: never signal the recorded PID
 	}
 	if err := cfg.kill(victim); err != nil {
 		return 0, fmt.Errorf("sigkill incumbent %d: %w", victim, err)
@@ -249,8 +228,11 @@ func (cfg TakeoverConfig) releasedOnce(ctx context.Context, h Health, baseline s
 	switch cfg.WaitMode {
 	case SocketRelease:
 		h2, err := cfg.Peer.Health(ctx)
-		if err != nil {
+		if errors.Is(err, ErrNoPeer) {
 			return true, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("check socket release: %w", err)
 		}
 		return h2.PID != h.PID, nil
 	case PIDExit:

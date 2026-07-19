@@ -15,6 +15,8 @@ const DefaultEnsureInterval = 100 * time.Millisecond
 type EnsureConfig struct {
 	// Peer adapts whoever answers the socket. Required.
 	Peer Peer
+	// Protocol is the exact lifecycle protocol the target must report.
+	Protocol int
 	// LockPath is the start-serialization flock, distinct from the socket bind
 	// lock, so only one caller drives a version transition at a time. Required.
 	LockPath string
@@ -32,7 +34,8 @@ type EnsureConfig struct {
 // EnsureCurrent serializes through the start flock, then polls until the peer
 // answering Health reports EXACTLY target. Reachability alone is not success — a
 // retiring older daemon still answers — so it keeps polling until the reported
-// Version matches target, returning ErrEnsureTimeout if the deadline elapses.
+// Build and Protocol match the targets, returning ErrEnsureTimeout if the
+// deadline elapses.
 func EnsureCurrent(ctx context.Context, cfg EnsureConfig, target string) error {
 	lock, err := proc.Flock(ctx, cfg.LockPath)
 	if err != nil {
@@ -55,7 +58,7 @@ func EnsureCurrent(ctx context.Context, cfg EnsureConfig, target string) error {
 				return fmt.Errorf("ensure target running: %w", err)
 			}
 		}
-		if h, err := cfg.Peer.Health(ctx); err == nil && h.Version == target {
+		if h, err := cfg.Peer.Health(ctx); err == nil && h.Build == target && h.Protocol == cfg.Protocol {
 			return nil
 		}
 		if !deadline.IsZero() && clk.Now().After(deadline) {

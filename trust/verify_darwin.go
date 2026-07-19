@@ -5,8 +5,9 @@ package trust
 import (
 	"fmt"
 	"runtime"
+	"sort"
+	"strconv"
 	"sync"
-	"unsafe"
 
 	"github.com/ebitengine/purego"
 	"github.com/yasyf/daemonkit/wire"
@@ -49,7 +50,16 @@ var (
 	cfDictionaryCreate             func(alloc uintptr, keys, values *uintptr, num int, keyCB, valCB uintptr) uintptr
 	cfNumberGetValue               func(number uintptr, theType int, valuePtr *int64) bool
 	cfDictionaryGetValue           func(dict, key uintptr) uintptr
+	cfGetTypeID                    func(cf uintptr) uintptr
+	cfBooleanGetTypeID             func() uintptr
+	cfStringGetTypeID              func() uintptr
+	cfArrayGetTypeID               func() uintptr
+	cfDictionaryGetTypeID          func() uintptr
+	cfEqual                        func(a, b uintptr) bool
+	cfArrayGetCount                func(array uintptr) int
+	cfArrayGetValueAtIndex         func(array uintptr, index int) uintptr
 	cfRelease                      func(cf uintptr)
+	memoryCopy                     func(destination *uintptr, source uintptr, size uintptr) uintptr
 	secCodeCopyGuestWithAttributes func(host, attrs uintptr, flags uint32, guest *uintptr) int32
 	secRequirementCreateWithString func(text uintptr, flags uint32, req *uintptr) int32
 	secCodeCheckValidityWithErrors func(code uintptr, flags uint32, req uintptr, errs *uintptr) int32
@@ -60,6 +70,7 @@ var (
 	infoEntsDictKey uintptr
 	infoEntsKey     uintptr
 	cfBooleanFalse  uintptr
+	cfBooleanTrue   uintptr
 	dictKeyCB       uintptr
 	dictValCB       uintptr
 )
@@ -75,6 +86,11 @@ func loadSecurity() {
 		secErr = fmt.Errorf("trust: dlopen Security: %w", err)
 		return
 	}
+	libSystem, err := purego.Dlopen("/usr/lib/libSystem.B.dylib", purego.RTLD_NOW|purego.RTLD_GLOBAL)
+	if err != nil {
+		secErr = fmt.Errorf("trust: dlopen libSystem: %w", err)
+		return
+	}
 	// RegisterLibFunc panics on a missing symbol; probe with Dlsym first so framework skew fails closed through secErr.
 	for _, fn := range []struct {
 		target any
@@ -86,7 +102,16 @@ func loadSecurity() {
 		{&cfDictionaryCreate, cf, "CFDictionaryCreate"},
 		{&cfNumberGetValue, cf, "CFNumberGetValue"},
 		{&cfDictionaryGetValue, cf, "CFDictionaryGetValue"},
+		{&cfGetTypeID, cf, "CFGetTypeID"},
+		{&cfBooleanGetTypeID, cf, "CFBooleanGetTypeID"},
+		{&cfStringGetTypeID, cf, "CFStringGetTypeID"},
+		{&cfArrayGetTypeID, cf, "CFArrayGetTypeID"},
+		{&cfDictionaryGetTypeID, cf, "CFDictionaryGetTypeID"},
+		{&cfEqual, cf, "CFEqual"},
+		{&cfArrayGetCount, cf, "CFArrayGetCount"},
+		{&cfArrayGetValueAtIndex, cf, "CFArrayGetValueAtIndex"},
 		{&cfRelease, cf, "CFRelease"},
+		{&memoryCopy, libSystem, "memcpy"},
 		{&secCodeCopyGuestWithAttributes, sec, "SecCodeCopyGuestWithAttributes"},
 		{&secRequirementCreateWithString, sec, "SecRequirementCreateWithString"},
 		{&secCodeCheckValidityWithErrors, sec, "SecCodeCheckValidityWithErrors"},
@@ -127,6 +152,11 @@ func loadSecurity() {
 		secErr = derefErr
 		return
 	}
+	cfBooleanTrue, derefErr = derefStringSym(cf, "kCFBooleanTrue")
+	if derefErr != nil {
+		secErr = derefErr
+		return
+	}
 	if dictKeyCB, derefErr = purego.Dlsym(cf, "kCFTypeDictionaryKeyCallBacks"); derefErr != nil {
 		secErr = fmt.Errorf("trust: dlsym key callbacks: %w", derefErr)
 		return
@@ -142,8 +172,9 @@ func derefStringSym(lib uintptr, name string) (uintptr, error) {
 	if err != nil {
 		return 0, fmt.Errorf("trust: dlsym %s: %w", name, err)
 	}
-	// A fixed dyld location, not a Go pointer (unsafeptr is disabled for FFI).
-	return *(*uintptr)(unsafe.Pointer(sym)), nil //nolint:gosec // G103: dereferencing a fixed dlsym address
+	var value uintptr
+	memoryCopy(&value, sym, uintptr(strconv.IntSize/8))
+	return value, nil
 }
 
 // Any failure is ErrUntrustedPeer; a missing token or verifier is
@@ -170,11 +201,7 @@ func verifyRequirement(peer wire.Peer, req Requirement) error {
 	if err := checkValidity(guest, dr); err != nil {
 		return err
 	}
-	// The ONE bypass: relaxes only the runtime/LV/injection gate, never the DR.
-	if req.AllowUnhardened {
-		return nil
-	}
-	return requireHardenedRuntime(guest)
+	return requireHardenedRuntime(guest, req)
 }
 
 func copyGuest(token []byte) (uintptr, error) {
@@ -231,7 +258,7 @@ func checkValidity(guest uintptr, dr string) error {
 }
 
 // CS_RUNTIME required; CS_GET_TASK_ALLOW and CS_DEBUGGED rejected; LV must hold via flags or an entitlements dict proven clean.
-func requireHardenedRuntime(guest uintptr) error {
+func requireHardenedRuntime(guest uintptr, req Requirement) error {
 	const kSecCSDynamicInformation = 1 << 3
 	const kCFNumberSInt64Type = 4
 	var info uintptr
@@ -257,7 +284,10 @@ func requireHardenedRuntime(guest uintptr) error {
 	if status&csDebugged != 0 {
 		return fmt.Errorf("%w: peer ran under a debugger (CS_DEBUGGED, status 0x%x)", ErrUntrustedPeer, status)
 	}
-	return rejectInjectionEntitlements(info, status&(csRequireLV|csForcedLV) != 0)
+	if err := rejectInjectionEntitlements(info, status&(csRequireLV|csForcedLV) != 0); err != nil {
+		return err
+	}
+	return requireEntitlements(info, req.entitlementRequirements())
 }
 
 func rejectInjectionEntitlements(info uintptr, lvProven bool) error {
@@ -267,6 +297,9 @@ func rejectInjectionEntitlements(info uintptr, lvProven bool) error {
 			return fmt.Errorf("%w: peer entitlements are not in dictionary form", ErrUntrustedPeer)
 		}
 		return nil
+	}
+	if cfGetTypeID(dict) != cfDictionaryGetTypeID() {
+		return fmt.Errorf("%w: peer entitlements are not in dictionary form", ErrUntrustedPeer)
 	}
 	for _, ent := range injectionEntitlements {
 		if lvProven && ent == entDisableLV {
@@ -278,9 +311,87 @@ func rejectInjectionEntitlements(info uintptr, lvProven bool) error {
 		}
 		val := cfDictionaryGetValue(dict, key)
 		cfRelease(key)
-		if val != 0 && val != cfBooleanFalse {
+		if val != 0 && (cfGetTypeID(val) != cfBooleanGetTypeID() || !cfEqual(val, cfBooleanFalse)) {
 			return fmt.Errorf("%w: peer is signed with %s", ErrUntrustedPeer, ent)
 		}
 	}
 	return nil
+}
+
+func requireEntitlements(info uintptr, requirements map[string]EntitlementRequirement) error {
+	dict := cfDictionaryGetValue(info, infoEntsDictKey)
+	if dict != 0 && cfGetTypeID(dict) != cfDictionaryGetTypeID() {
+		return fmt.Errorf("%w: peer entitlements are not in dictionary form", ErrUntrustedPeer)
+	}
+	keys := make([]string, 0, len(requirements))
+	for key := range requirements {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if dict == 0 {
+			return fmt.Errorf("%w: peer lacks required entitlement %s", ErrUntrustedPeer, key)
+		}
+		keyCF := cfStringCreateWithCString(0, key+"\x00", kCFStringEncodingUTF8)
+		if keyCF == 0 {
+			return fmt.Errorf("%w: CFStringCreateWithCString returned null", ErrNoVerifier)
+		}
+		value := cfDictionaryGetValue(dict, keyCF)
+		cfRelease(keyCF)
+		if value == 0 {
+			return fmt.Errorf("%w: peer lacks required entitlement %s", ErrUntrustedPeer, key)
+		}
+		matched, err := matchEntitlement(value, requirements[key])
+		if err != nil {
+			return err
+		}
+		if !matched {
+			return fmt.Errorf("%w: peer entitlement %s does not satisfy the required value", ErrUntrustedPeer, key)
+		}
+	}
+	return nil
+}
+
+func matchEntitlement(value uintptr, requirement EntitlementRequirement) (bool, error) {
+	switch requirement.Match {
+	case EntitlementBoolean:
+		if cfGetTypeID(value) != cfBooleanGetTypeID() {
+			return false, nil
+		}
+		wanted := cfBooleanFalse
+		if requirement.Boolean {
+			wanted = cfBooleanTrue
+		}
+		return cfEqual(value, wanted), nil
+	case EntitlementString:
+		return matchCFString(value, requirement.String)
+	case EntitlementStringArrayContains:
+		if cfGetTypeID(value) != cfArrayGetTypeID() {
+			return false, nil
+		}
+		for index := 0; index < cfArrayGetCount(value); index++ {
+			matched, err := matchCFString(cfArrayGetValueAtIndex(value, index), requirement.String)
+			if err != nil {
+				return false, err
+			}
+			if matched {
+				return true, nil
+			}
+		}
+		return false, nil
+	default:
+		return false, fmt.Errorf("%w: unknown entitlement match %d", ErrNoVerifier, requirement.Match)
+	}
+}
+
+func matchCFString(value uintptr, expected string) (bool, error) {
+	if value == 0 || cfGetTypeID(value) != cfStringGetTypeID() {
+		return false, nil
+	}
+	expectedCF := cfStringCreateWithCString(0, expected+"\x00", kCFStringEncodingUTF8)
+	if expectedCF == 0 {
+		return false, fmt.Errorf("%w: CFStringCreateWithCString returned null", ErrNoVerifier)
+	}
+	defer cfRelease(expectedCF)
+	return cfEqual(value, expectedCF), nil
 }

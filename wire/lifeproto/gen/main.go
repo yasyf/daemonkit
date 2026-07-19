@@ -66,8 +66,7 @@ func renderGo(s schema) string {
 	b.WriteString("import (\n")
 	b.WriteString("\t\"encoding/json\"\n")
 	b.WriteString("\t\"errors\"\n")
-	b.WriteString("\t\"fmt\"\n\n")
-	b.WriteString("\t\"github.com/yasyf/daemonkit/wire\"\n")
+	b.WriteString("\t\"fmt\"\n")
 	b.WriteString(")\n\n")
 
 	b.WriteString("// Version is the lifecycle protocol version carried in every envelope's \"v\"\n")
@@ -95,29 +94,21 @@ func renderGo(s schema) string {
 		renderGoMessage(&b, m)
 	}
 
-	b.WriteString("// Write marshals msg to a compact JSON frame and writes it over f.\n")
-	b.WriteString("func Write(f *wire.Framing, msg any) error {\n")
-	b.WriteString("\tif err := f.WriteJSON(msg); err != nil {\n")
-	b.WriteString("\t\treturn fmt.Errorf(\"lifeproto: write: %w\", err)\n")
-	b.WriteString("\t}\n\treturn nil\n}\n\n")
+	b.WriteString("// Encode marshals one lifecycle message for a v2 request or response payload.\n")
+	b.WriteString("func Encode(msg any) ([]byte, error) {\n")
+	b.WriteString("\tb, err := json.Marshal(msg)\n")
+	b.WriteString("\tif err != nil {\n\t\treturn nil, fmt.Errorf(\"lifeproto: encode: %w\", err)\n\t}\n")
+	b.WriteString("\treturn b, nil\n}\n\n")
 
-	b.WriteString("// ReadEnvelope reads one frame and returns its {v, op} envelope plus the raw\n")
-	b.WriteString("// frame bytes, so a server dispatches on Op and then unmarshals the raw bytes\n")
-	b.WriteString("// into the concrete request type. It rejects a mismatched protocol version with\n")
-	b.WriteString("// ErrProtocolVersion.\n")
-	b.WriteString("func ReadEnvelope(f *wire.Framing) (Envelope, []byte, error) {\n")
-	b.WriteString("\tb, err := f.ReadFrame()\n")
-	b.WriteString("\tif err != nil {\n\t\treturn Envelope{}, nil, err\n\t}\n")
+	b.WriteString("// DecodeEnvelope decodes {v, op} and rejects every foreign protocol version.\n")
+	b.WriteString("func DecodeEnvelope(b []byte) (Envelope, error) {\n")
 	b.WriteString("\tvar e Envelope\n")
 	b.WriteString("\tif err := json.Unmarshal(b, &e); err != nil {\n")
-	b.WriteString("\t\treturn Envelope{}, nil, fmt.Errorf(\"lifeproto: decode envelope: %w\", err)\n")
+	b.WriteString("\t\treturn Envelope{}, fmt.Errorf(\"lifeproto: decode envelope: %w\", err)\n")
 	b.WriteString("\t}\n")
 	b.WriteString("\tif e.V != Version {\n")
-	b.WriteString("\t\treturn Envelope{}, nil, fmt.Errorf(\"%w: got v=%d, want %d\", ErrProtocolVersion, e.V, Version)\n")
-	b.WriteString("\t}\n\treturn e, b, nil\n}\n\n")
-
-	b.WriteString("func nonNil(s []string) []string {\n")
-	b.WriteString("\tif s == nil {\n\t\treturn []string{}\n\t}\n\treturn s\n}\n")
+	b.WriteString("\t\treturn Envelope{}, fmt.Errorf(\"%w: got v=%d, want %d\", ErrProtocolVersion, e.V, Version)\n")
+	b.WriteString("\t}\n\treturn e, nil\n}\n")
 
 	return b.String()
 }
@@ -212,15 +203,14 @@ enum LifecycleJSON {
 }
 
 /// A flat lifecycle message: the shared ` + "`{v, op}`" + ` header plus op-specific
-/// fields, exchanged as one JSON object per line (the transport appends the
-/// framing ` + "`\\n`" + `).
+/// fields, carried as a v2 request or response payload.
 public protocol LifecycleMessage: Decodable, Sendable {
-    /// The single-line JSON encoding of this message, without the framing ` + "`\\n`" + `.
+    /// The compact JSON payload encoding of this message.
     func encoded() -> Data
 }
 
 public extension LifecycleMessage {
-    /// Decodes a message from a single JSON frame (newline already stripped).
+    /// Decodes a message from one v2 frame payload.
     static func decode(from data: Data) throws -> Self {
         try JSONDecoder().decode(Self.self, from: data)
     }
@@ -289,6 +279,17 @@ func renderSwiftMessage(b *strings.Builder, m message) {
 		fmt.Fprintf(b, "    /// %s\n", f.doc)
 		fmt.Fprintf(b, "    public let %s: %s\n", f.name, f.kind.swiftType)
 	}
+	b.WriteString("\n    private enum CodingKeys: String, CodingKey {\n")
+	b.WriteString("        case v\n")
+	b.WriteString("        case op\n")
+	for _, f := range m.fields {
+		if f.name == f.json {
+			fmt.Fprintf(b, "        case %s\n", f.name)
+		} else {
+			fmt.Fprintf(b, "        case %s = %q\n", f.name, f.json)
+		}
+	}
+	b.WriteString("    }\n")
 	b.WriteString("\n")
 
 	params := make([]string, 0, len(m.fields))

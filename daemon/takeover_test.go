@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -26,7 +27,7 @@ func TestTakeoverSameOrNewerExitsSelf(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			peer := &fakePeer{health: []healthResult{{h: Health{Version: tt.incumbent, PID: 100}}}}
+			peer := &fakePeer{health: []healthResult{{h: Health{Build: tt.incumbent, PID: 100}}}}
 			sig := &fakeSignaler{}
 			cfg := TakeoverConfig{Self: tt.self, Peer: peer, clock: newAutoClock(), prober: &fakeProber{results: []proberResult{{}}}, signaler: sig}
 
@@ -47,10 +48,10 @@ func TestTakeoverSameOrNewerExitsSelf(t *testing.T) {
 	}
 }
 
-// TestTakeoverNoIncumbentBinds: an unreachable socket means nothing to take over,
-// so the caller may bind; no eviction is attempted.
+// TestTakeoverNoIncumbentBinds: a transport-proven absent listener means nothing
+// to take over, so the caller may bind; no eviction is attempted.
 func TestTakeoverNoIncumbentBinds(t *testing.T) {
-	peer := &fakePeer{health: []healthResult{{err: errors.New("connection refused")}}}
+	peer := &fakePeer{health: []healthResult{{err: fmt.Errorf("dial lifecycle: %w", ErrNoPeer)}}}
 	sig := &fakeSignaler{}
 	cfg := TakeoverConfig{Self: "2.0.0", Peer: peer, clock: newAutoClock(), signaler: sig}
 
@@ -69,17 +70,110 @@ func TestTakeoverNoIncumbentBinds(t *testing.T) {
 	}
 }
 
-// TestTakeoverHandoffPathNoSignals: a strictly-older incumbent advertising the
-// handoff feature is asked to hand off, then the successor waits for release and
-// binds — never a shutdown or a signal.
-func TestTakeoverHandoffPathNoSignals(t *testing.T) {
+func TestTakeoverHealthFailuresNeverAuthorizeBindOrRelease(t *testing.T) {
+	transportErr := errors.New("lifecycle trust failure")
+	tests := []struct {
+		name   string
+		peer   *fakePeer
+		config TakeoverConfig
+	}{
+		{
+			name: "initial health failure",
+			peer: &fakePeer{health: []healthResult{{err: transportErr}}},
+			config: TakeoverConfig{
+				Self: "2.0.0", Contract: ResourceOwner, WaitMode: SocketRelease,
+			},
+		},
+		{
+			name: "socket release health failure",
+			peer: &fakePeer{health: []healthResult{
+				{h: Health{Build: "1.0.0", PID: 100}},
+				{err: transportErr},
+			}},
+			config: TakeoverConfig{
+				Self: "2.0.0", Contract: ResourceOwner, WaitMode: SocketRelease,
+			},
+		},
+		{
+			name: "request daemon owner revalidation failure",
+			peer: &fakePeer{health: []healthResult{
+				{h: Health{Build: "1.0.0", PID: 100}},
+				{err: transportErr},
+			}},
+			config: TakeoverConfig{
+				Self: "2.0.0", Contract: RequestDaemon,
+				prober: &fakeProber{results: []proberResult{{id: proc.Identity{PID: 100, StartTime: "1.2"}}}},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.config.Peer = tt.peer
+			tt.config.clock = newAutoClock()
+			got, err := Run(context.Background(), tt.config)
+			if !errors.Is(err, transportErr) {
+				t.Fatalf("Run err = %v, want transport failure", err)
+			}
+			if got != 0 {
+				t.Fatalf("outcome = %s, want zero", got)
+			}
+		})
+	}
+}
+
+func TestTakeoverRequestDaemonProbeFailureNeverAuthorizesBind(t *testing.T) {
+	probeErr := errors.New("process table unavailable")
 	peer := &fakePeer{health: []healthResult{
-		{h: Health{Version: "1.0.0", PID: 100, Features: []string{FeatureHandoff}}},
-		{err: errors.New("released")}, // release-wait sees the socket gone
+		{h: Health{Build: "1.0.0", PID: 100}},
+		{h: Health{Build: "1.0.0", PID: 100}},
+	}}
+	cfg := TakeoverConfig{
+		Self: "2.0.0", Peer: peer, Contract: RequestDaemon,
+		clock: newAutoClock(),
+		prober: &fakeProber{results: []proberResult{
+			{id: proc.Identity{PID: 100, StartTime: "1.2"}},
+			{err: probeErr},
+		}},
+	}
+
+	got, err := Run(context.Background(), cfg)
+	if !errors.Is(err, probeErr) {
+		t.Fatalf("Run err = %v, want probe failure", err)
+	}
+	if got != 0 {
+		t.Fatalf("outcome = %s, want zero", got)
+	}
+}
+
+func TestTakeoverRefusesProtocolMismatch(t *testing.T) {
+	peer := &fakePeer{health: []healthResult{{h: Health{
+		Build: "1.0.0", Protocol: 1, PID: 100,
+	}}}}
+	cfg := TakeoverConfig{Self: "2.0.0", Protocol: 2, Peer: peer}
+
+	got, err := Run(context.Background(), cfg)
+	if !errors.Is(err, ErrProtocolMismatch) {
+		t.Fatalf("Run err = %v, want ErrProtocolMismatch", err)
+	}
+	if got != 0 {
+		t.Fatalf("outcome = %s, want zero", got)
+	}
+	if shutdowns, handoffs := peer.counts(); shutdowns != 0 || handoffs != 0 {
+		t.Fatalf("calls: shutdowns=%d handoffs=%d, want 0/0", shutdowns, handoffs)
+	}
+}
+
+// TestTakeoverResourceOwnerHandoffNoSignals: a strictly-older ResourceOwner is
+// asked to hand off, then the successor waits for release and binds without a
+// shutdown or signal.
+func TestTakeoverResourceOwnerHandoffNoSignals(t *testing.T) {
+	peer := &fakePeer{health: []healthResult{
+		{h: Health{Build: "1.0.0", PID: 100}},
+		{err: ErrNoPeer}, // release-wait sees the socket gone
 	}}
 	sig := &fakeSignaler{}
 	cfg := TakeoverConfig{
-		Self: "2.0.0", Peer: peer, WaitMode: SocketRelease,
+		Self: "2.0.0", Peer: peer, Contract: ResourceOwner, WaitMode: SocketRelease,
 		clock: newAutoClock(), prober: &fakeProber{results: []proberResult{{}}}, signaler: sig,
 	}
 
@@ -183,11 +277,11 @@ func TestTakeoverHandoffWaitModes(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			predecessor := startBlockedProcess(t)
 			peer := &fakePeer{health: []healthResult{
-				{h: Health{Version: "1.0.0", PID: predecessor.pid(), Features: []string{FeatureHandoff}}},
-				{err: errors.New("socket released")},
+				{h: Health{Build: "1.0.0", PID: predecessor.pid()}},
+				{err: ErrNoPeer},
 			}}
 			cfg := TakeoverConfig{
-				Self: "2.0.0", Peer: peer, WaitMode: tt.mode,
+				Self: "2.0.0", Peer: peer, Contract: ResourceOwner, WaitMode: tt.mode,
 				WaitTimeout: 5 * time.Second, clock: newAutoClock(),
 			}
 
@@ -212,33 +306,33 @@ func TestTakeoverRequestDaemonKillLadder(t *testing.T) {
 	}{
 		{
 			name:        "same instance persists: SIGKILL, ESRCH is success",
-			afterGrace:  healthResult{h: Health{Version: "1.0.0", PID: 100}},
+			afterGrace:  healthResult{h: Health{Build: "1.0.0", PID: 100}},
 			reprobe:     proberResult{id: proc.Identity{StartTime: start}},
 			signalErr:   syscall.ESRCH,
 			wantSignals: []signalRec{{100, syscall.SIGKILL}},
 		},
 		{
 			name:        "same instance persists: SIGKILL delivered",
-			afterGrace:  healthResult{h: Health{Version: "1.0.0", PID: 100}},
+			afterGrace:  healthResult{h: Health{Build: "1.0.0", PID: 100}},
 			reprobe:     proberResult{id: proc.Identity{StartTime: start}},
 			signalErr:   nil,
 			wantSignals: []signalRec{{100, syscall.SIGKILL}},
 		},
 		{
 			name:        "pid reused during grace: no kill",
-			afterGrace:  healthResult{h: Health{Version: "1.0.0", PID: 100}},
+			afterGrace:  healthResult{h: Health{Build: "1.0.0", PID: 100}},
 			reprobe:     proberResult{id: proc.Identity{StartTime: "999.000"}},
 			wantSignals: nil,
 		},
 		{
 			name:        "socket released during grace: no kill",
-			afterGrace:  healthResult{err: errors.New("released")},
+			afterGrace:  healthResult{err: ErrNoPeer},
 			reprobe:     proberResult{id: proc.Identity{StartTime: start}},
 			wantSignals: nil,
 		},
 		{
 			name:        "different owner answers: no kill",
-			afterGrace:  healthResult{h: Health{Version: "1.0.0", PID: 200}},
+			afterGrace:  healthResult{h: Health{Build: "1.0.0", PID: 200}},
 			reprobe:     proberResult{id: proc.Identity{StartTime: start}},
 			wantSignals: nil,
 		},
@@ -246,7 +340,7 @@ func TestTakeoverRequestDaemonKillLadder(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			peer := &fakePeer{health: []healthResult{
-				{h: Health{Version: "1.0.0", PID: 100}}, // initial probe
+				{h: Health{Build: "1.0.0", PID: 100}}, // initial probe
 				tt.afterGrace,
 			}}
 			prober := &fakeProber{results: []proberResult{
@@ -279,7 +373,7 @@ func TestTakeoverRequestDaemonKillLadder(t *testing.T) {
 // TestTakeoverRequestDaemonAlreadyGone: an incumbent that vanished before its
 // pre-shutdown probe is never shut down or signaled; the caller just binds.
 func TestTakeoverRequestDaemonAlreadyGone(t *testing.T) {
-	peer := &fakePeer{health: []healthResult{{h: Health{Version: "1.0.0", PID: 100}}}}
+	peer := &fakePeer{health: []healthResult{{h: Health{Build: "1.0.0", PID: 100}}}}
 	prober := &fakeProber{results: []proberResult{{err: proc.ErrNoProcess}}}
 	sig := &fakeSignaler{}
 	cfg := TakeoverConfig{
@@ -315,7 +409,7 @@ func TestTakeoverRefusesSelfAndInit(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			peer := &fakePeer{health: []healthResult{{h: Health{Version: "1.0.0", PID: tt.pid}}}}
+			peer := &fakePeer{health: []healthResult{{h: Health{Build: "1.0.0", PID: tt.pid}}}}
 			sig := &fakeSignaler{}
 			cfg := TakeoverConfig{
 				Self: "2.0.0", Peer: peer, Contract: RequestDaemon,
@@ -336,61 +430,18 @@ func TestTakeoverRefusesSelfAndInit(t *testing.T) {
 	}
 }
 
-// TestTakeoverResourceOwnerDefers: an older ResourceOwner is never killed for
-// being older — busy with no proof, or proof of "still alive", both defer.
-func TestTakeoverResourceOwnerDefers(t *testing.T) {
-	tests := []struct {
-		name          string
-		busy          bool
-		confirmedDead func(context.Context, Health) (bool, error)
-	}{
-		{"busy, no death proof", true, nil},
-		{"idle, no death proof", false, nil},
-		{"proof says still alive", true, func(context.Context, Health) (bool, error) { return false, nil }},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			peer := &fakePeer{health: []healthResult{{h: Health{Version: "1.0.0", PID: 100, Busy: tt.busy}}}}
-			sig := &fakeSignaler{}
-			cfg := TakeoverConfig{
-				Self: "2.0.0", Peer: peer, Contract: ResourceOwner, ConfirmedDead: tt.confirmedDead,
-				clock: newAutoClock(), prober: &fakeProber{results: []proberResult{{}}}, signaler: sig,
-			}
-
-			got, err := Run(context.Background(), cfg)
-			if err != nil {
-				t.Fatalf("Run: %v", err)
-			}
-			if got != Defer {
-				t.Errorf("outcome = %s, want defer", got)
-			}
-			if sd, _ := peer.counts(); sd != 0 {
-				t.Errorf("shutdowns = %d, want 0 (never shut a ResourceOwner)", sd)
-			}
-			if calls := sig.calls(); len(calls) != 0 {
-				t.Errorf("signals = %v, want none without death proof", calls)
-			}
-		})
-	}
-}
-
-// TestTakeoverResourceOwnerForcesOnDeathProof: proof of death lets the takeover
-// force in, revalidating {pid,start_time} before the SIGKILL.
-func TestTakeoverResourceOwnerForcesOnDeathProof(t *testing.T) {
-	const start = "111.222"
+// TestTakeoverResourceOwnerHandoffsWhileBusy: Busy is observability, not a
+// compatibility switch. Exact-protocol ResourceOwners always use the handoff
+// contract and are never signaled.
+func TestTakeoverResourceOwnerHandoffsWhileBusy(t *testing.T) {
 	peer := &fakePeer{health: []healthResult{
-		{h: Health{Version: "1.0.0", PID: 100}},
-		{h: Health{Version: "1.0.0", PID: 100}}, // still answers; revalidation matches
+		{h: Health{Build: "1.0.0", PID: 100, Busy: true}},
+		{err: ErrNoPeer},
 	}}
-	prober := &fakeProber{results: []proberResult{
-		{id: proc.Identity{StartTime: start}},
-		{id: proc.Identity{StartTime: start}},
-	}}
-	sig := &fakeSignaler{err: syscall.ESRCH}
+	sig := &fakeSignaler{}
 	cfg := TakeoverConfig{
-		Self: "2.0.0", Peer: peer, Contract: ResourceOwner,
-		ConfirmedDead: func(context.Context, Health) (bool, error) { return true, nil },
-		clock:         newAutoClock(), prober: prober, signaler: sig,
+		Self: "2.0.0", Peer: peer, Contract: ResourceOwner, WaitMode: SocketRelease,
+		clock: newAutoClock(), signaler: sig,
 	}
 
 	got, err := Run(context.Background(), cfg)
@@ -398,10 +449,13 @@ func TestTakeoverResourceOwnerForcesOnDeathProof(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	if got != Bind {
-		t.Errorf("outcome = %s, want bind", got)
+		t.Fatalf("outcome = %s, want bind", got)
 	}
-	if want := []signalRec{{100, syscall.SIGKILL}}; !equalSignals(sig.calls(), want) {
-		t.Errorf("signals = %v, want %v", sig.calls(), want)
+	if shutdowns, handoffs := peer.counts(); shutdowns != 0 || handoffs != 1 {
+		t.Fatalf("calls: shutdowns=%d handoffs=%d, want 0/1", shutdowns, handoffs)
+	}
+	if calls := sig.calls(); len(calls) != 0 {
+		t.Fatalf("signals = %v, want none", calls)
 	}
 }
 

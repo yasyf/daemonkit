@@ -1,6 +1,6 @@
 // Package drain is the drain-on-upgrade engine: a draining daemon hands its
 // resources to a strictly-newer successor with every row in exactly one journal,
-// and never force-clears without ForcePolicyConfirmedDead death proof.
+// and never force-clears unless policy permits a proven Dead liveness verdict.
 //
 // The engine defends against crashes, power loss, and concurrent cooperating
 // processes sharing the state dir. A hostile same-UID actor staging symlinks or

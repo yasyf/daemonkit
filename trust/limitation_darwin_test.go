@@ -160,9 +160,8 @@ func eventually(t *testing.T, d time.Duration, cond func() bool) bool {
 // TestPeerTokenIsQueryTimeLive_TF1 pins TF1 (fork/exec substitution): a peer that
 // execs /bin/sleep after connecting authenticates as /bin/sleep — a query-time image.
 func TestPeerTokenIsQueryTimeLive_TF1(t *testing.T) {
-	// LIMITATION (db24393): LOCAL_PEERTOKEN is query-time-live; this substitution is
-	// NOT rejected today. When the XPC audit-token transport lands, flip this to
-	// assert rejection.
+	// Residual platform limitation: LOCAL_PEERTOKEN is query-time-live, so the
+	// identity observed at admission can differ from the original connector.
 	requireVerifier(t)
 	const sleepReq = `identifier "com.apple.sleep" and anchor apple`
 
@@ -185,12 +184,14 @@ func TestPeerTokenIsQueryTimeLive_TF1(t *testing.T) {
 // TestPolicyCheckAcceptsSubstitutedPeer_TF1 pins the security consequence: a peer
 // that execs a Developer ID fixture after connecting is ACCEPTED by Policy.Check.
 func TestPolicyCheckAcceptsSubstitutedPeer_TF1(t *testing.T) {
-	// LIMITATION (db24393): NOT rejected today. When the XPC audit-token transport
-	// lands, flip the final assertion to want ErrUntrustedPeer.
+	// Residual platform limitation: LOCAL_PEERTOKEN identifies the process at
+	// query time, so substitution by another process satisfying this exact policy
+	// before admission remains accepted.
 	requireE2E(t)
 	requireVerifier(t)
 	fixture := fixtureBin(t, "fixture-devid-a")
-	p := Policy{Requirement: &Requirement{TeamID: fixtureTeam, Identifier: "com.yasyf.daemonkit.fixture-a"}}
+	req := fixtureRequirement("com.yasyf.daemonkit.fixture-a")
+	p := Policy{Requirement: &req}
 
 	conn := spawnPeerSub(t, fixture, "")
 
@@ -221,15 +222,15 @@ func TestPolicyCheckAcceptsSubstitutedPeer_TF1(t *testing.T) {
 // TestPeerTokenPIDReuse_TF2 documents TF2 (PID reuse): a recycled pid lets a later
 // LOCAL_PEERTOKEN read resolve an unrelated image. Not pinned — pid reuse is racy.
 func TestPeerTokenPIDReuse_TF2(t *testing.T) {
-	// LIMITATION (db24393): a per-message XPC audit token closes the reuse window;
-	// revisit as a rejection test then.
+	// Residual platform limitation: query-time lookup cannot bind a recycled pid
+	// to the original connector.
 	t.Skip("TF2 (PID reuse) is nondeterministic to pin in-tree; documented limitation — see db24393")
 }
 
 // TestPeerTokenFDDelegation_TF5 documents TF5 (fd delegation): SCM_RIGHTS fd passing
 // or a setuid binary detaches identity from the connection's actor.
 func TestPeerTokenFDDelegation_TF5(t *testing.T) {
-	// LIMITATION (db24393): needs a privileged multi-process harness to pin; a
-	// per-message XPC audit token would confine delegation — revisit then.
+	// Residual platform limitation: this needs a privileged multi-process harness
+	// to pin, and connection admission cannot attribute later fd delegation.
 	t.Skip("TF5 (fd delegation / SCM_RIGHTS / setuid) needs a privileged multi-process harness; documented limitation — see db24393")
 }

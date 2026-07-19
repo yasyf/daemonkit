@@ -15,12 +15,17 @@ import (
 // DefaultReapGrace bounds the wait between an orphan's SIGTERM and its SIGKILL.
 const DefaultReapGrace = 5 * time.Second
 
+// DefaultReapSettlement bounds post-SIGKILL identity polling.
+const DefaultReapSettlement = 2 * time.Second
+
+const settlementPollInterval = 10 * time.Millisecond
+
 // errNoProc means a probed PID has no live process — a definitive "gone",
 // distinct from a probe failure (which is Undetermined and fails closed).
 var errNoProc = errors.New("no such process")
 
 // Record identifies one spawned child across daemon generations. The reaper
-// revalidates ALL FOUR fields against the live process table before it signals,
+// revalidates every identity field against the live process table before it signals,
 // so a reused PID is never mistaken for the recorded process — a PID alone is
 // never kill authority. StartTime is the prober's platform-native stable form
 // (darwin: the process start Timeval; linux: /proc start ticks), compared as an
@@ -35,6 +40,12 @@ type Record struct {
 	Comm string `json:"comm"`
 	// Generation tags the daemon instance that spawned the child.
 	Generation string `json:"generation"`
+	// ProcessGroup means PID is also the process-group id and signals target the
+	// entire group after its dedicated session membership is revalidated.
+	ProcessGroup bool `json:"process_group"`
+	// SessionID is the dedicated session created with a process-group leader.
+	// It remains the group's durable kernel identity after the leader exits.
+	SessionID int `json:"session_id,omitempty"`
 }
 
 // Store persists orphan Records across daemon generations. Implementations must
@@ -55,18 +66,31 @@ type Store interface {
 type procInfo struct {
 	startTime string
 	comm      string
+	groupID   int
+	sessionID int
+	zombie    bool
+}
+
+type groupMember struct {
+	pid  int
+	info procInfo
 }
 
 // prober reads a live process's identity from the OS. Production uses sysProber;
 // tests substitute a fake to inject errors and control identity.
 type prober interface {
 	probe(pid int) (procInfo, error)
+	groupMembers(groupID, sessionID int) ([]groupMember, error)
 }
 
 // sysProber is the production prober backed by the OS process table.
 type sysProber struct{}
 
 func (sysProber) probe(pid int) (procInfo, error) { return probeProc(pid) }
+
+func (sysProber) groupMembers(groupID, sessionID int) ([]groupMember, error) {
+	return probeGroupMembers(groupID, sessionID)
+}
 
 // signaler delivers a signal to a process. Production uses sysSignaler; tests
 // substitute a fake to observe the ladder and inject ESRCH.
@@ -85,9 +109,9 @@ func (sysSignaler) signal(pid int, sig syscall.Signal) error { return syscall.Ki
 // cleared before the successor rebinds their sockets; children it later spawns
 // are recorded with Track and become the next generation's orphans.
 //
-// Reap signals only a record whose PID exists AND start time AND comm match AND
-// generation differs from its own: any mismatch drops the stale record without
-// signaling, any probe error is Undetermined and touches nothing (fail closed).
+// Reap signals only a record whose process or dedicated-session identity is
+// revalidated and whose generation differs from its own. Any mismatch drops a
+// stale record; any unresolved probe keeps the record and makes Reap fail.
 type Reaper struct {
 	// Store persists orphan records across generations. Required.
 	Store Store
@@ -96,6 +120,8 @@ type Reaper struct {
 	Generation string
 	// Grace bounds the wait between SIGTERM and SIGKILL; zero means DefaultReapGrace.
 	Grace time.Duration
+	// Settlement bounds post-SIGKILL proof; zero means DefaultReapSettlement.
+	Settlement time.Duration
 
 	prober   prober
 	signaler signaler
@@ -107,15 +133,65 @@ type Reaper struct {
 // it if it orphans. Snapshotting through the same prober the reaper revalidates
 // with guarantees the stored start time and comm match a future probe exactly.
 func (r *Reaper) Track(ctx context.Context, pid int) (Record, error) {
+	return r.track(ctx, pid, false)
+}
+
+// TrackGroup records a child whose PID leads its own process group and session.
+func (r *Reaper) TrackGroup(ctx context.Context, pid int) (Record, error) {
+	return r.track(ctx, pid, true)
+}
+
+func (r *Reaper) track(ctx context.Context, pid int, processGroup bool) (Record, error) {
 	info, err := r.prb().probe(pid)
 	if err != nil {
 		return Record{}, fmt.Errorf("snapshot pid %d: %w", pid, err)
 	}
-	rec := Record{PID: pid, StartTime: info.startTime, Comm: info.comm, Generation: r.Generation}
+	if processGroup && (info.groupID != pid || info.sessionID != pid) {
+		return Record{}, fmt.Errorf("pid %d has process group %d and session %d, want a dedicated session leader", pid, info.groupID, info.sessionID)
+	}
+	rec := Record{
+		PID:          pid,
+		StartTime:    info.startTime,
+		Comm:         info.comm,
+		Generation:   r.Generation,
+		ProcessGroup: processGroup,
+	}
+	if processGroup {
+		rec.SessionID = info.sessionID
+	}
 	if err := r.Store.Add(ctx, rec); err != nil {
 		return Record{}, fmt.Errorf("record child %d: %w", pid, err)
 	}
 	return rec, nil
+}
+
+// Untrack removes a synchronously reaped child from the durable orphan store.
+func (r *Reaper) Untrack(ctx context.Context, rec Record) error {
+	if err := r.Store.Remove(ctx, []Record{rec}); err != nil {
+		return fmt.Errorf("remove child %d: %w", rec.PID, err)
+	}
+	return nil
+}
+
+// Owns reports whether rec still identifies the same live process instance.
+func (r *Reaper) Owns(rec Record) (bool, error) {
+	info, err := r.prb().probe(rec.PID)
+	if errors.Is(err, errNoProc) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("revalidate pid %d: %w", rec.PID, err)
+	}
+	if info.startTime != rec.StartTime || info.comm != rec.Comm {
+		return false, nil
+	}
+	if info.zombie {
+		return false, nil
+	}
+	if rec.ProcessGroup && (info.groupID != rec.PID || info.sessionID != rec.SessionID) {
+		return false, nil
+	}
+	return true, nil
 }
 
 // Reap revalidates every stored record against the live process table and
@@ -129,40 +205,49 @@ func (r *Reaper) Reap(ctx context.Context) error {
 		return fmt.Errorf("load reaper records: %w", err)
 	}
 	drop := make([]Record, 0, len(recs))
+	var unresolved []error
 	for _, rec := range recs {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if r.reapOne(ctx, rec) {
+		reaped, reapErr := r.reapOne(ctx, rec)
+		if reapErr != nil {
+			unresolved = append(unresolved, fmt.Errorf("reap child %d: %w", rec.PID, reapErr))
+		}
+		if reaped {
 			drop = append(drop, rec)
 		}
 	}
-	if len(drop) == 0 {
-		return nil
+	if len(drop) > 0 {
+		if err := r.Store.Remove(ctx, drop); err != nil {
+			unresolved = append(unresolved, fmt.Errorf("prune reaped records: %w", err))
+		}
 	}
-	if err := r.Store.Remove(ctx, drop); err != nil {
-		return fmt.Errorf("prune reaped records: %w", err)
-	}
-	return nil
+	return errors.Join(unresolved...)
 }
 
 // reapOne returns whether rec should be dropped from the store: true once the
 // recorded process is provably gone, reused, or reaped; false to keep it (our
 // own live child, or an Undetermined probe that fails closed).
-func (r *Reaper) reapOne(ctx context.Context, rec Record) bool {
+func (r *Reaper) reapOne(ctx context.Context, rec Record) (bool, error) {
 	if rec.PID <= 1 || rec.PID == os.Getpid() {
-		return false // never signal init or ourselves; a PID alone is not authority
+		return false, errors.New("refusing unsafe process identity")
 	}
 	info, err := r.prb().probe(rec.PID)
+	if rec.ProcessGroup {
+		return r.reapGroup(ctx, rec, info, err)
+	}
 	switch {
 	case errors.Is(err, errNoProc):
-		return true // recorded process gone → stale record
+		return true, nil // recorded process gone → stale record
 	case err != nil:
-		return false // Undetermined → fail closed, keep
+		return false, err // Undetermined → fail closed, keep
 	case info.startTime != rec.StartTime || info.comm != rec.Comm:
-		return true // pid reused: a different process holds it now → drop stale record
+		return true, nil // pid reused: a different process holds it now → drop stale record
+	case info.zombie:
+		return true, nil
 	case rec.Generation == r.Generation:
-		return false // our own current-generation child → never signal, keep
+		return false, nil // our own current-generation child → never signal, keep
 	}
 	return r.reapOrphan(ctx, rec)
 }
@@ -171,32 +256,178 @@ func (r *Reaper) reapOne(ctx context.Context, rec Record) bool {
 // confirmed orphan and returns whether to drop its record. ESRCH at any point is
 // success. It fails closed on any Undetermined probe or signal error, and never
 // escalates to SIGKILL once the PID has been reused during the grace window.
-func (r *Reaper) reapOrphan(ctx context.Context, rec Record) bool {
-	gone, err := r.sendSignal(rec.PID, syscall.SIGTERM)
+func (r *Reaper) reapOrphan(ctx context.Context, rec Record) (bool, error) {
+	target := signalTarget(rec)
+	gone, err := r.sendSignal(target, syscall.SIGTERM)
 	if err != nil {
-		return false // Undetermined signal error → fail closed
+		return false, err // Undetermined signal error → fail closed
 	}
 	if gone {
-		return true // ESRCH: already gone
+		return true, nil // ESRCH: already gone
 	}
 	select {
 	case <-ctx.Done():
-		return false // aborted mid-grace; retry next pass
+		return false, ctx.Err() // aborted mid-grace; retry next pass
 	case <-clockOrReal(r.clock).After(r.graceDur()):
 	}
 	info, perr := r.prb().probe(rec.PID)
 	switch {
 	case errors.Is(perr, errNoProc):
-		return true // exited during grace
+		return true, nil // exited during grace
 	case perr != nil:
-		return false // Undetermined → do not escalate
+		return false, perr // Undetermined → do not escalate
 	case info.startTime != rec.StartTime || info.comm != rec.Comm:
-		return true // pid reused or exec'd away during grace: no longer provably ours; never SIGKILL it
+		return true, nil // pid reused or exec'd away during grace: no longer provably ours; never SIGKILL it
+	case info.zombie:
+		return true, nil
 	}
-	if _, err := r.sendSignal(rec.PID, syscall.SIGKILL); err != nil {
-		return false // Undetermined → fail closed
+	if _, err := r.sendSignal(target, syscall.SIGKILL); err != nil {
+		return false, err // Undetermined → fail closed
 	}
-	return true
+	return r.awaitProcessSettlement(ctx, rec)
+}
+
+func (r *Reaper) reapGroup(ctx context.Context, rec Record, leader procInfo, leaderErr error) (bool, error) {
+	if rec.SessionID <= 1 || rec.SessionID != rec.PID {
+		return false, errors.New("process group has no durable dedicated-session identity")
+	}
+	if rec.Generation == r.Generation {
+		return false, nil
+	}
+	switch {
+	case leaderErr == nil && (leader.startTime != rec.StartTime || leader.comm != rec.Comm):
+		return true, nil
+	case leaderErr == nil && (leader.groupID != rec.PID || leader.sessionID != rec.SessionID):
+		return false, errors.New("process-group leader left its recorded group or session")
+	case leaderErr != nil && !errors.Is(leaderErr, errNoProc):
+		return false, leaderErr
+	}
+	members, err := r.verifiedGroupMembers(rec)
+	if err != nil {
+		return false, err
+	}
+	if len(members) == 0 {
+		return true, nil
+	}
+	gone, err := r.sendSignal(-rec.PID, syscall.SIGTERM)
+	if err != nil {
+		return false, err
+	}
+	if gone {
+		return r.groupGone(rec)
+	}
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case <-clockOrReal(r.clock).After(r.graceDur()):
+	}
+	members, err = r.verifiedGroupMembers(rec)
+	if err != nil {
+		return false, err
+	}
+	if len(members) == 0 {
+		return true, nil
+	}
+	gone, err = r.sendSignal(-rec.PID, syscall.SIGKILL)
+	if err != nil {
+		return false, err
+	}
+	if gone {
+		return r.groupGone(rec)
+	}
+	return r.awaitGroupSettlement(ctx, rec)
+}
+
+func (r *Reaper) awaitProcessSettlement(ctx context.Context, rec Record) (bool, error) {
+	clock := clockOrReal(r.clock)
+	deadline := clock.Now().Add(r.settlementDur())
+	for {
+		info, err := r.prb().probe(rec.PID)
+		switch {
+		case errors.Is(err, errNoProc):
+			return true, nil
+		case err != nil:
+			return false, fmt.Errorf("prove killed process %d settled: %w", rec.PID, err)
+		case info.startTime != rec.StartTime || info.comm != rec.Comm || info.zombie:
+			return true, nil
+		case !clock.Now().Before(deadline):
+			return false, errors.New("killed process remained live through settlement deadline")
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-clock.After(settlementPollInterval):
+		}
+	}
+}
+
+func (r *Reaper) awaitGroupSettlement(ctx context.Context, rec Record) (bool, error) {
+	clock := clockOrReal(r.clock)
+	deadline := clock.Now().Add(r.settlementDur())
+	for {
+		members, err := r.verifiedGroupMembers(rec)
+		if err != nil {
+			return false, fmt.Errorf("prove killed process group settled: %w", err)
+		}
+		if len(members) == 0 {
+			return true, nil
+		}
+		if !clock.Now().Before(deadline) {
+			return false, errors.New("killed process group remained live through settlement deadline")
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-clock.After(settlementPollInterval):
+		}
+	}
+}
+
+func (r *Reaper) groupGone(rec Record) (bool, error) {
+	members, err := r.verifiedGroupMembers(rec)
+	if err != nil {
+		return false, err
+	}
+	if len(members) != 0 {
+		return false, errors.New("process group remained enumerable after ESRCH")
+	}
+	return true, nil
+}
+
+func (r *Reaper) verifiedGroupMembers(rec Record) ([]groupMember, error) {
+	for range 3 {
+		members, err := r.prb().groupMembers(rec.PID, rec.SessionID)
+		if err != nil {
+			return nil, fmt.Errorf("enumerate process group %d session %d: %w", rec.PID, rec.SessionID, err)
+		}
+		stable := make([]groupMember, 0, len(members))
+		changed := false
+		for _, member := range members {
+			info, err := r.prb().probe(member.pid)
+			switch {
+			case errors.Is(err, errNoProc):
+				changed = true
+			case err != nil:
+				return nil, fmt.Errorf("revalidate process-group member %d: %w", member.pid, err)
+			case info.startTime != member.info.startTime || info.comm != member.info.comm || info.groupID != rec.PID || info.sessionID != rec.SessionID:
+				changed = true
+			case info.zombie:
+			default:
+				stable = append(stable, groupMember{pid: member.pid, info: info})
+			}
+		}
+		if !changed {
+			return stable, nil
+		}
+	}
+	return nil, errors.New("process-group membership changed during identity verification")
+}
+
+func signalTarget(rec Record) int {
+	if rec.ProcessGroup {
+		return -rec.PID
+	}
+	return rec.PID
 }
 
 // sendSignal delivers sig to pid, mapping ESRCH (already gone) to gone=true.
@@ -229,6 +460,13 @@ func (r *Reaper) graceDur() time.Duration {
 		return r.Grace
 	}
 	return DefaultReapGrace
+}
+
+func (r *Reaper) settlementDur() time.Duration {
+	if r.Settlement > 0 {
+		return r.Settlement
+	}
+	return DefaultReapSettlement
 }
 
 // FileStore is the JSON-file Store: records live in a single JSON file under a

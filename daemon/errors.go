@@ -2,6 +2,11 @@ package daemon
 
 import "errors"
 
+// ErrNoPeer means the lifecycle endpoint has no listening peer. Transports may
+// return it only when connection setup proves the endpoint absent; protocol,
+// trust, timeout, and other failures must retain their original error.
+var ErrNoPeer = errors.New("daemon: no lifecycle peer")
+
 // ErrRefuseVictim means a takeover refused to signal a PID it must never target:
 // init (pid <= 1) or the successor's own process. A PID alone is never kill
 // authority.
@@ -20,3 +25,18 @@ var ErrUnknownContract = errors.New("daemon: unknown takeover contract")
 
 // ErrUnknownWaitMode means a Takeover config carried an unrecognized WaitMode.
 var ErrUnknownWaitMode = errors.New("daemon: unknown takeover wait mode")
+
+// ErrProtocolMismatch refuses takeover across an incompatible lifecycle protocol.
+var ErrProtocolMismatch = errors.New("daemon: lifecycle protocol mismatch")
+
+// ErrRuntimeStarted refuses a second Run on the same Runtime.
+var ErrRuntimeStarted = errors.New("daemon: runtime already started")
+
+// ErrRuntimeNotRunning refuses lifecycle requests before Run starts.
+var ErrRuntimeNotRunning = errors.New("daemon: runtime is not running")
+
+// ErrRuntimeClosed refuses lifecycle requests after Run finishes.
+var ErrRuntimeClosed = errors.New("daemon: runtime is closed")
+
+// ErrSessionServerStopped reports a session server that returned without a shutdown request.
+var ErrSessionServerStopped = errors.New("daemon: session server stopped unexpectedly")

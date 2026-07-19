@@ -41,7 +41,11 @@ const keepAliveGolden = `<?xml version="1.0" encoding="UTF-8"?>
 `
 
 func TestAppKeepAliveGoldenPlist(t *testing.T) {
-	k := AppKeepAlive{Label: "com.yasyf.fusekit-holder", AppPath: "/Applications/fusekit-holder.app"}
+	k := AppKeepAlive{
+		Label:         "com.yasyf.fusekit-holder",
+		AppPath:       "/Applications/fusekit-holder.app",
+		RestartPolicy: RestartAlways,
+	}
 	body, err := k.plist()
 	if err != nil {
 		t.Fatalf("plist() = %v", err)
@@ -83,9 +87,10 @@ const keepAliveGoldenWithBundle = `<?xml version="1.0" encoding="UTF-8"?>
 
 func TestAppKeepAliveGoldenPlistWithBundleID(t *testing.T) {
 	k := AppKeepAlive{
-		Label:    "com.yasyf.fusekit-holder",
-		AppPath:  "/Applications/fusekit-holder.app",
-		BundleID: "com.yasyf.FusekitHolder",
+		Label:         "com.yasyf.fusekit-holder",
+		AppPath:       "/Applications/fusekit-holder.app",
+		BundleID:      "com.yasyf.FusekitHolder",
+		RestartPolicy: RestartAlways,
 	}
 	body, err := k.plist()
 	if err != nil {
@@ -97,7 +102,11 @@ func TestAppKeepAliveGoldenPlistWithBundleID(t *testing.T) {
 }
 
 func TestAppKeepAlivePlistEscapesAppPath(t *testing.T) {
-	k := AppKeepAlive{Label: "com.example.holder", AppPath: "/Apps/a&b<c>.app"}
+	k := AppKeepAlive{
+		Label:         "com.example.holder",
+		AppPath:       "/Apps/a&b<c>.app",
+		RestartPolicy: RestartAlways,
+	}
 	body, err := k.plist()
 	if err != nil {
 		t.Fatalf("plist() = %v", err)
@@ -120,6 +129,20 @@ func TestAppKeepAliveValidation(t *testing.T) {
 		{"empty label", AppKeepAlive{AppPath: "/Applications/x.app"}, "Label is required"},
 		{"relative app path", AppKeepAlive{Label: "com.example.x", AppPath: "x.app"}, "must be an absolute"},
 		{"empty app path", AppKeepAlive{Label: "com.example.x"}, "must be an absolute"},
+		{
+			"empty restart policy",
+			AppKeepAlive{Label: "com.example.x", AppPath: "/Applications/x.app"},
+			"restart policy is required",
+		},
+		{
+			"invalid restart policy",
+			AppKeepAlive{
+				Label:         "com.example.x",
+				AppPath:       "/Applications/x.app",
+				RestartPolicy: RestartPolicy(99),
+			},
+			"invalid restart policy 99",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -165,7 +188,11 @@ func TestAppKeepAliveUninstallBootout(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())
-			k := AppKeepAlive{Label: "com.example.holder", AppPath: "/Applications/x.app"}
+			k := AppKeepAlive{
+				Label:         "com.example.holder",
+				AppPath:       "/Applications/x.app",
+				RestartPolicy: RestartAlways,
+			}
 			plist, err := k.WritePlist()
 			if err != nil {
 				t.Fatalf("WritePlist() = %v", err)
@@ -201,7 +228,11 @@ func TestAppKeepAliveUninstallBootout(t *testing.T) {
 
 func TestAppKeepAliveInstallEnableBeforeBootstrap(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	k := AppKeepAlive{Label: "com.example.holder", AppPath: "/Applications/x.app"}
+	k := AppKeepAlive{
+		Label:         "com.example.holder",
+		AppPath:       "/Applications/x.app",
+		RestartPolicy: RestartAlways,
+	}
 
 	var verbs []string
 	stubLaunchctl(t, func(_ context.Context, args ...string) (string, error) {
@@ -235,7 +266,11 @@ func TestAppKeepAliveInstallEnableBeforeBootstrap(t *testing.T) {
 func TestAppKeepAliveWritePlist(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	k := AppKeepAlive{Label: "com.yasyf.fusekit-holder", AppPath: "/Applications/fusekit-holder.app"}
+	k := AppKeepAlive{
+		Label:         "com.yasyf.fusekit-holder",
+		AppPath:       "/Applications/fusekit-holder.app",
+		RestartPolicy: RestartAlways,
+	}
 	path, err := k.WritePlist()
 	if err != nil {
 		t.Fatalf("WritePlist() = %v", err)

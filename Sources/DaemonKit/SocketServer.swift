@@ -2,105 +2,156 @@ import Darwin
 import Foundation
 import os
 
-private let log = Logger(subsystem: DaemonKit.loggingSubsystem, category: "SocketServer")
+private let socketServerLog = Logger(subsystem: DaemonKit.loggingSubsystem, category: "SocketServer")
 
 /// Errors thrown while binding or running a ``SocketServer``.
 public enum SocketServerError: Error, Sendable {
-    /// The socket path exceeds the `sockaddr_un.sun_path` capacity.
     case pathTooLong(path: String, limit: Int)
-    /// A live peer answered a ping at `path`; refusing to steal the address.
     case addressInUse(path: String)
-    /// `socket(2)` failed.
     case socketFailed(errno: Int32)
-    /// `bind(2)` failed.
     case bindFailed(path: String, errno: Int32)
-    /// `listen(2)` failed.
     case listenFailed(errno: Int32)
-    /// ``SocketServer/start()`` was called on an already-started server.
     case alreadyRunning
+    case emptyBuild
 }
 
-/// A unix-domain line server for helper daemons.
-///
-/// One request line in, one reply line out, per connection: reads are framed on
-/// `\n` and capped (``Configuration/maxLineBytes``, default 64 KiB); the handler
-/// receives the request `Data` (newline stripped) and returns the reply `Data`
-/// (the framing `\n` is appended by the server).
-///
-/// Every accepted connection is verified by a ``PeerTrust`` before any frame is
-/// processed; a peer that fails the check has its connection closed with no reply
-/// and the handler is never invoked.
-///
-/// The **accept loop runs on a serial `DispatchQueue`** — never a concurrent one.
-/// A blocking `accept(2)` on a concurrent queue makes GCD spawn a fresh worker
-/// thread per pending block, exploding the thread pool; the serial queue holds
-/// exactly one blocked accept. Connections are then handed to a concurrent
-/// handler queue, each socket carrying a receive timeout so a silent client
-/// cannot wedge a handler thread. Shutdown is clean: the listener stops
-/// accepting and in-flight handlers drain before the path is unlinked.
-public final class SocketServer: @unchecked Sendable {
-    /// Per-server tuning.
-    public struct Configuration: Sendable {
-        /// Maximum request-line length in bytes (excluding the `\n`).
-        public var maxLineBytes: Int
-        /// Per-connection receive timeout; bounds handler drain at shutdown.
-        public var readTimeout: TimeInterval
+/// The immutable OS identity captured from an accepted socket.
+public struct SocketPeer: Sendable {
+    public let effectiveUserID: uid_t
+    public let effectiveGroupID: gid_t
+}
 
-        public init(maxLineBytes: Int = 64 * 1024, readTimeout: TimeInterval = 5) {
-            self.maxLineBytes = maxLineBytes
-            self.readTimeout = readTimeout
+/// One ordered request-stream chunk.
+public struct SocketRequestChunk: Sendable {
+    public let sequence: UInt32
+    public let payload: Data
+    public let end: Bool
+}
+
+/// A request admitted on a persistent session.
+public struct SocketRequest: Sendable {
+    public let id: UInt64
+    public let operation: String
+    public let tenant: String
+    public let payload: Data
+    public let chunks: AsyncStream<SocketRequestChunk>
+    public let peer: SocketPeer
+    public let peerBuild: String
+    public let session: SocketSession
+}
+
+/// A terminal response with an optional ordered output stream.
+public struct SocketResponse: Sendable {
+    public let payload: Data?
+    public let error: String?
+    public let rejected: Bool
+    public let reason: String?
+    public let chunks: AsyncStream<Data>?
+
+    public init(
+        payload: Data? = nil,
+        error: String? = nil,
+        rejected: Bool = false,
+        reason: String? = nil,
+        chunks: AsyncStream<Data>? = nil
+    ) {
+        self.payload = payload
+        self.error = error
+        self.rejected = rejected
+        self.reason = reason
+        self.chunks = chunks
+    }
+}
+
+/// A trusted persistent server session exposed to request handlers.
+public final class SocketSession: @unchecked Sendable {
+    fileprivate weak var implementation: ServerSession?
+
+    fileprivate init(implementation: ServerSession) {
+        self.implementation = implementation
+    }
+
+    /// Pushes one event to the peer on the session's serialized writer.
+    public func pushEvent(topic: String, payload: Data = Data()) throws {
+        guard !topic.isEmpty else {
+            throw SessionTransportError.invalidFrame("empty event topic")
+        }
+        guard let implementation else {
+            throw SessionTransportError.disconnected
+        }
+        try implementation.write(SessionFrame(kind: .event, flags: .end, operation: topic, payload: payload))
+    }
+}
+
+/// A unix-domain persistent v2 session server.
+public final class SocketServer: @unchecked Sendable {
+    public struct Configuration: Sendable {
+        public var maximumFrameBytes: Int
+        public var maximumActiveRequests: Int
+        public var maximumSessions: Int
+        public var streamQueueDepth: Int
+        public var handshakeTimeout: TimeInterval
+        public var writeTimeout: TimeInterval
+
+        public init(
+            maximumFrameBytes: Int = daemonKitDefaultMaximumFrameBytes,
+            maximumActiveRequests: Int = 64,
+            maximumSessions: Int = 64,
+            streamQueueDepth: Int = 16,
+            handshakeTimeout: TimeInterval = 10,
+            writeTimeout: TimeInterval = 10
+        ) {
+            self.maximumFrameBytes = maximumFrameBytes
+            self.maximumActiveRequests = maximumActiveRequests
+            self.maximumSessions = maximumSessions
+            self.streamQueueDepth = streamQueueDepth
+            self.handshakeTimeout = handshakeTimeout
+            self.writeTimeout = writeTimeout
         }
     }
 
-    private enum State: Equatable {
+    private enum State {
         case idle
         case serving
         case stopped
     }
 
     private let path: String
+    private let build: String
     private let configuration: Configuration
     private let trust: PeerTrust
-    private let handler: @Sendable (Data) -> Data
+    private let handler: @Sendable (SocketRequest) async -> SocketResponse
     private let acceptQueue = DispatchQueue(label: "com.yasyf.daemonkit.SocketServer.accept")
-    private let handlerQueue = DispatchQueue(
-        label: "com.yasyf.daemonkit.SocketServer.handlers",
+    private let sessionQueue = DispatchQueue(
+        label: "com.yasyf.daemonkit.SocketServer.sessions",
         attributes: .concurrent
     )
-    private let handlerGroup = DispatchGroup()
+    private let sessionGroup = DispatchGroup()
     private let lock = NSLock()
-    private var state: State = .idle
-    private var listenerFD: Int32 = -1
-    private var shutdownReadFD: Int32 = -1
-    private var shutdownWriteFD: Int32 = -1
+    private var state = State.idle
+    private var listenerDescriptor: Int32 = -1
+    private var shutdownReadDescriptor: Int32 = -1
+    private var shutdownWriteDescriptor: Int32 = -1
+    private var sessions: [Int32: ServerSession] = [:]
+    private var connections: Set<Int32> = []
 
-    /// - Parameters:
-    ///   - path: Filesystem path to bind the unix socket at.
-    ///   - configuration: Line cap and read timeout.
-    ///   - trust: Peer verification applied to every accepted connection before
-    ///     any frame is processed. The default enforces the same-effective-UID
-    ///     floor alone; pass a ``PeerTrust`` with a requirement to also pin the
-    ///     peer's code signature.
-    ///   - handler: Maps one request line to one reply line.
     public init(
         path: String,
+        build: String,
         configuration: Configuration = .init(),
-        trust: PeerTrust = PeerTrust(),
-        handler: @escaping @Sendable (Data) -> Data
+        trust: PeerTrust,
+        handler: @escaping @Sendable (SocketRequest) async -> SocketResponse
     ) {
         self.path = path
+        self.build = build
         self.configuration = configuration
         self.trust = trust
         self.handler = handler
     }
 
-    /// Reclaims any stale socket, binds `path`, `chmod`s it to `0600` before
-    /// accepting, and starts the accept loop.
-    ///
-    /// If `path` already exists, a live peer answering a connect ping means the
-    /// bind is refused with ``SocketServerError/addressInUse(path:)``; only a
-    /// dead socket (connect fails) is unlinked and rebound.
+    /// Reclaims a stale socket, binds with mode 0600, and starts accepting sessions.
     public func start() throws {
+        guard !build.isEmpty else { throw SocketServerError.emptyBuild }
         lock.lock()
         guard state == .idle else {
             lock.unlock()
@@ -108,19 +159,18 @@ public final class SocketServer: @unchecked Sendable {
         }
         state = .serving
         lock.unlock()
-
         do {
             let listener = try bind()
-            var pipeFDs: [Int32] = [-1, -1]
-            guard pipe(&pipeFDs) == 0 else {
-                let err = errno
+            var pipeDescriptors: [Int32] = [-1, -1]
+            guard pipe(&pipeDescriptors) == 0 else {
+                let code = errno
                 close(listener)
-                throw SocketServerError.socketFailed(errno: err)
+                throw SocketServerError.socketFailed(errno: code)
             }
             lock.lock()
-            listenerFD = listener
-            shutdownReadFD = pipeFDs[0]
-            shutdownWriteFD = pipeFDs[1]
+            listenerDescriptor = listener
+            shutdownReadDescriptor = pipeDescriptors[0]
+            shutdownWriteDescriptor = pipeDescriptors[1]
             lock.unlock()
         } catch {
             lock.lock()
@@ -128,12 +178,10 @@ public final class SocketServer: @unchecked Sendable {
             lock.unlock()
             throw error
         }
-
         acceptQueue.async { [weak self] in self?.acceptLoop() }
     }
 
-    /// Stops accepting, drains in-flight handlers, closes the listener, and
-    /// unlinks the socket path. Safe to call more than once.
+    /// Stops intake, disconnects sessions, joins their request tasks, and unlinks the path.
     public func stop() {
         lock.lock()
         guard state == .serving else {
@@ -141,23 +189,27 @@ public final class SocketServer: @unchecked Sendable {
             return
         }
         state = .stopped
-        let wfd = shutdownWriteFD
+        let writeDescriptor = shutdownWriteDescriptor
         lock.unlock()
-
         var byte: UInt8 = 1
-        var written: Int
-        repeat {
-            written = write(wfd, &byte, 1)
-        } while written == -1 && errno == EINTR
-        precondition(written == 1, "shutdown pipe write failed: errno \(errno)")
+        while Darwin.write(writeDescriptor, &byte, 1) < 0, errno == EINTR {}
         acceptQueue.sync {}
-        handlerGroup.wait()
-
         lock.lock()
-        close(shutdownReadFD)
-        close(shutdownWriteFD)
-        shutdownReadFD = -1
-        shutdownWriteFD = -1
+        let active = Array(sessions.values)
+        let descriptors = Array(connections)
+        lock.unlock()
+        for session in active {
+            session.close()
+        }
+        for descriptor in descriptors {
+            shutdown(descriptor, SHUT_RDWR)
+        }
+        sessionGroup.wait()
+        lock.lock()
+        close(shutdownReadDescriptor)
+        close(shutdownWriteDescriptor)
+        shutdownReadDescriptor = -1
+        shutdownWriteDescriptor = -1
         lock.unlock()
         unlink(path)
     }
@@ -169,20 +221,20 @@ public final class SocketServer: @unchecked Sendable {
             }
             unlink(path)
         }
-        var addr = try Self.makeAddress(path: path)
+        var address = try Self.makeAddress(path: path)
         let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw SocketServerError.socketFailed(errno: errno) }
-        let bound = withAddress(&addr) { Darwin.bind(descriptor, $0, $1) }
+        let bound = withAddress(&address) { Darwin.bind(descriptor, $0, $1) }
         guard bound == 0 else {
-            let err = errno
+            let code = errno
             close(descriptor)
-            throw SocketServerError.bindFailed(path: path, errno: err)
+            throw SocketServerError.bindFailed(path: path, errno: code)
         }
         chmod(path, 0o600)
         guard listen(descriptor, 64) == 0 else {
-            let err = errno
+            let code = errno
             close(descriptor)
-            throw SocketServerError.listenFailed(errno: err)
+            throw SocketServerError.listenFailed(errno: code)
         }
         return descriptor
     }
@@ -191,125 +243,443 @@ public final class SocketServer: @unchecked Sendable {
         let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { return false }
         defer { close(descriptor) }
-        guard var addr = try? Self.makeAddress(path: path) else { return false }
-        return withAddress(&addr) { connect(descriptor, $0, $1) } == 0
+        guard var address = try? Self.makeAddress(path: path) else { return false }
+        return withAddress(&address) { connect(descriptor, $0, $1) } == 0
     }
 
     private func acceptLoop() {
         while true {
-            var fds = [
-                pollfd(fd: listenerFD, events: Int16(POLLIN), revents: 0),
-                pollfd(fd: shutdownReadFD, events: Int16(POLLIN), revents: 0),
+            var descriptors = [
+                pollfd(fd: listenerDescriptor, events: Int16(POLLIN), revents: 0),
+                pollfd(fd: shutdownReadDescriptor, events: Int16(POLLIN), revents: 0),
             ]
-            let ready = poll(&fds, nfds_t(fds.count), -1)
+            let ready = poll(&descriptors, nfds_t(descriptors.count), -1)
             if ready < 0 {
                 if errno == EINTR {
                     continue
                 }
                 break
             }
-            if fds[1].revents != 0 {
+            if descriptors[1].revents != 0 {
                 break
             }
-            guard fds[0].revents & Int16(POLLIN) != 0 else { continue }
-            let conn = accept(listenerFD, nil, nil)
-            if conn < 0 {
+            guard descriptors[0].revents & Int16(POLLIN) != 0 else { continue }
+            let descriptor = accept(listenerDescriptor, nil, nil)
+            if descriptor < 0 {
                 if errno == EINTR || errno == ECONNABORTED {
                     continue
                 }
-                log.error("accept failed: \(String(cString: strerror(errno)), privacy: .public)")
+                socketServerLog.error("accept failed: \(String(cString: strerror(errno)), privacy: .public)")
                 continue
             }
-            handlerGroup.enter()
-            handlerQueue.async {
-                self.serve(conn)
-                self.handlerGroup.leave()
+            lock.lock()
+            if connections.count >= configuration.maximumSessions {
+                lock.unlock()
+                close(descriptor)
+                continue
+            }
+            connections.insert(descriptor)
+            lock.unlock()
+            sessionGroup.enter()
+            sessionQueue.async {
+                self.serve(descriptor)
+                self.sessionGroup.leave()
             }
         }
-        close(listenerFD)
+        close(listenerDescriptor)
     }
 
     private func serve(_ descriptor: Int32) {
-        defer { close(descriptor) }
-        configureConnection(descriptor)
+        defer {
+            lock.lock()
+            connections.remove(descriptor)
+            lock.unlock()
+            close(descriptor)
+        }
+        configure(descriptor)
         do {
             try trust.check(descriptor: descriptor)
+            var user = uid_t()
+            var group = gid_t()
+            guard getpeereid(descriptor, &user, &group) == 0 else {
+                throw SessionTransportError.systemCall(operation: "getpeereid", errno: errno)
+            }
+            let session = ServerSession(
+                descriptor: descriptor,
+                build: build,
+                peer: SocketPeer(effectiveUserID: user, effectiveGroupID: group),
+                configuration: configuration,
+                handler: handler
+            )
+            lock.lock()
+            sessions[descriptor] = session
+            lock.unlock()
+            defer {
+                lock.lock()
+                sessions.removeValue(forKey: descriptor)
+                lock.unlock()
+            }
+            try session.run()
         } catch {
-            log.notice("peer rejected, closing: \(String(describing: error), privacy: .public)")
-            return
+            socketServerLog.debug("session ended: \(String(describing: error), privacy: .public)")
         }
-        guard let request = readLine(descriptor: descriptor, cap: configuration.maxLineBytes) else { return }
-        var reply = handler(request)
-        reply.append(0x0A)
-        writeAll(descriptor: descriptor, reply)
     }
 
-    private func configureConnection(_ descriptor: Int32) {
+    private func configure(_ descriptor: Int32) {
         var enable: Int32 = 1
         setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &enable, socklen_t(MemoryLayout<Int32>.size))
+        setTimeout(descriptor, option: SO_RCVTIMEO, seconds: configuration.handshakeTimeout)
+        setTimeout(descriptor, option: SO_SNDTIMEO, seconds: configuration.writeTimeout)
+    }
+
+    private func setTimeout(_ descriptor: Int32, option: Int32, seconds: TimeInterval) {
         var timeout = timeval(
-            tv_sec: Int(configuration.readTimeout),
-            tv_usec: Int32((configuration.readTimeout - Double(Int(configuration.readTimeout))) * 1_000_000)
+            tv_sec: Int(seconds),
+            tv_usec: Int32((seconds - Double(Int(seconds))) * 1_000_000)
         )
-        setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-    }
-
-    private func readLine(descriptor: Int32, cap: Int) -> Data? {
-        var line = Data()
-        var chunk = [UInt8](repeating: 0, count: 4096)
-        while true {
-            let bytesRead = chunk.withUnsafeMutableBytes { read(descriptor, $0.baseAddress, $0.count) }
-            if bytesRead <= 0 {
-                return nil
-            }
-            if let newline = chunk[0 ..< bytesRead].firstIndex(of: 0x0A) {
-                line.append(contentsOf: chunk[0 ..< newline])
-                return line.count <= cap ? line : nil
-            }
-            line.append(contentsOf: chunk[0 ..< bytesRead])
-            if line.count > cap {
-                log.debug("request line exceeded cap of \(cap) bytes; dropping connection")
-                return nil
-            }
-        }
-    }
-
-    private func writeAll(descriptor: Int32, _ data: Data) {
-        var remaining = data
-        while !remaining.isEmpty {
-            let written = remaining.withUnsafeBytes { buffer -> Int in
-                guard let base = buffer.baseAddress else { return 0 }
-                return write(descriptor, base, buffer.count)
-            }
-            if written <= 0 {
-                return
-            }
-            remaining.removeFirst(written)
-        }
+        setsockopt(descriptor, SOL_SOCKET, option, &timeout, socklen_t(MemoryLayout<timeval>.size))
     }
 
     private static func makeAddress(path: String) throws -> sockaddr_un {
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        let capacity = MemoryLayout.size(ofValue: addr.sun_path)
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        let capacity = MemoryLayout.size(ofValue: address.sun_path)
         let bytes = Array(path.utf8)
         guard bytes.count < capacity else {
             throw SocketServerError.pathTooLong(path: path, limit: capacity - 1)
         }
-        withUnsafeMutableBytes(of: &addr.sun_path) { dst in
-            bytes.withUnsafeBytes { dst.copyMemory(from: $0) }
+        withUnsafeMutableBytes(of: &address.sun_path) { destination in
+            bytes.withUnsafeBytes { destination.copyMemory(from: $0) }
         }
-        return addr
+        return address
     }
 
-    private func withAddress<R>(
-        _ addr: inout sockaddr_un,
-        _ body: (UnsafePointer<sockaddr>, socklen_t) -> R
-    ) -> R {
-        withUnsafePointer(to: &addr) { pointer in
+    private func withAddress<Result>(
+        _ address: inout sockaddr_un,
+        _ body: (UnsafePointer<sockaddr>, socklen_t) -> Result
+    ) -> Result {
+        withUnsafePointer(to: &address) { pointer in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { rebound in
                 body(rebound, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
+    }
+}
+
+private final class ServerRequestState: @unchecked Sendable {
+    let continuation: AsyncStream<SocketRequestChunk>.Continuation
+    var task: Task<Void, Never>?
+    var nextSequence: UInt32 = 0
+    var ended = false
+    var transportError: Error?
+
+    init(continuation: AsyncStream<SocketRequestChunk>.Continuation) {
+        self.continuation = continuation
+    }
+}
+
+private final class ServerSession: @unchecked Sendable {
+    let descriptor: Int32
+    private let serverBuild: String
+    private let peer: SocketPeer
+    private let configuration: SocketServer.Configuration
+    private let handler: @Sendable (SocketRequest) async -> SocketResponse
+    private let codec: SessionFrameCodec
+    private let lock = NSLock()
+    private var active: [UInt64: ServerRequestState] = [:]
+    private var seen: Set<UInt64> = []
+    private var watermark: UInt64 = 0
+    private var closed = false
+
+    init(
+        descriptor: Int32,
+        build: String,
+        peer: SocketPeer,
+        configuration: SocketServer.Configuration,
+        handler: @escaping @Sendable (SocketRequest) async -> SocketResponse
+    ) {
+        self.descriptor = descriptor
+        serverBuild = build
+        self.peer = peer
+        self.configuration = configuration
+        self.handler = handler
+        codec = SessionFrameCodec(descriptor: descriptor, maximumFrameBytes: configuration.maximumFrameBytes)
+    }
+
+    func run() throws {
+        let clientBuild = try handshake()
+        var noTimeout = timeval()
+        setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &noTimeout, socklen_t(MemoryLayout<timeval>.size))
+        while true {
+            let frame = try codec.read()
+            switch frame.kind {
+            case .request:
+                try receiveRequest(frame, clientBuild: clientBuild)
+            case .cancel:
+                try receiveCancel(frame)
+            case .stream:
+                try receiveStream(frame)
+            case .goAway:
+                close()
+                return
+            default:
+                throw SessionTransportError.invalidFrame("client frame kind \(frame.kind)")
+            }
+        }
+    }
+
+    func write(_ frame: SessionFrame) throws {
+        lock.lock()
+        let isClosed = closed
+        lock.unlock()
+        if isClosed {
+            throw SessionTransportError.disconnected
+        }
+        try codec.write(frame)
+    }
+
+    func close() {
+        lock.lock()
+        guard !closed else {
+            lock.unlock()
+            return
+        }
+        closed = true
+        let requests = Array(active.values)
+        active.removeAll()
+        lock.unlock()
+        for request in requests {
+            request.task?.cancel()
+            request.continuation.finish()
+        }
+        shutdown(descriptor, SHUT_RDWR)
+    }
+
+    private func handshake() throws -> String {
+        let frame = try codec.read()
+        guard frame.kind == .hello, frame.flags == .end, frame.id == 0,
+              frame.sequence == 0, frame.operation.isEmpty, frame.tenant.isEmpty
+        else {
+            throw SessionTransportError.handshake("invalid hello")
+        }
+        let identity = try JSONDecoder().decode(SessionBuildIdentity.self, from: frame.payload)
+        guard identity.protocolVersion == daemonKitSessionProtocolVersion else {
+            throw SessionTransportError.unsupportedProtocolVersion(identity.protocolVersion)
+        }
+        guard !identity.build.isEmpty else {
+            throw SessionTransportError.handshake("empty build")
+        }
+        let payload = try JSONEncoder().encode(SessionBuildIdentity(
+            protocolVersion: daemonKitSessionProtocolVersion,
+            build: serverBuild
+        ))
+        try codec.write(SessionFrame(kind: .helloAck, flags: .end, payload: payload))
+        return identity.build
+    }
+
+    private func receiveRequest(_ frame: SessionFrame, clientBuild: String) throws {
+        guard frame.id != 0, !frame.operation.isEmpty, frame.sequence == 0 else {
+            throw SessionTransportError.invalidFrame("request")
+        }
+        lock.lock()
+        guard frame.id > watermark, !seen.contains(frame.id) else {
+            lock.unlock()
+            throw SessionTransportError.duplicateRequestID(frame.id)
+        }
+        guard frame.id - watermark <= UInt64(configuration.maximumActiveRequests),
+              active.count < configuration.maximumActiveRequests
+        else {
+            lock.unlock()
+            try sendRejected(id: frame.id, reason: "wire: queue at capacity")
+            return
+        }
+        seen.insert(frame.id)
+        while seen.remove(watermark + 1) != nil {
+            watermark += 1
+        }
+        if clientBuild != serverBuild, !["health", "shutdown", "handoff"].contains(frame.operation) {
+            lock.unlock()
+            try sendRejected(id: frame.id, reason: "wire: client build does not match server build")
+            return
+        }
+        var continuation: AsyncStream<SocketRequestChunk>.Continuation!
+        let policy = AsyncStream<SocketRequestChunk>.Continuation.BufferingPolicy.bufferingOldest(
+            configuration.streamQueueDepth
+        )
+        let chunks = AsyncStream<SocketRequestChunk>(bufferingPolicy: policy) {
+            continuation = $0
+        }
+        let state = ServerRequestState(continuation: continuation)
+        if frame.flags.contains(.end) {
+            state.ended = true
+            continuation.finish()
+        }
+        active[frame.id] = state
+        lock.unlock()
+
+        let publicSession = SocketSession(implementation: self)
+        let request = SocketRequest(
+            id: frame.id,
+            operation: frame.operation,
+            tenant: frame.tenant,
+            payload: frame.payload,
+            chunks: chunks,
+            peer: peer,
+            peerBuild: clientBuild,
+            session: publicSession
+        )
+        let task = Task { [weak self] in
+            guard let self else { return }
+            var response = await handler(request)
+            let transportError = transportError(for: state)
+            if let transportError {
+                response = SocketResponse(error: String(describing: transportError))
+            }
+            do {
+                try await send(response, id: frame.id)
+            } catch {
+                socketServerLog.debug("response failed: \(String(describing: error), privacy: .public)")
+            }
+            remove(frame.id)
+        }
+        state.task = task
+        if frame.deadlineUnixMilliseconds > 0 {
+            let interval = max(0, frame.deadlineUnixMilliseconds - Int64(Date().timeIntervalSince1970 * 1000))
+            Task {
+                try? await Task.sleep(for: .milliseconds(interval))
+                if !Task.isCancelled {
+                    task.cancel()
+                }
+            }
+        }
+    }
+
+    private func receiveCancel(_ frame: SessionFrame) throws {
+        guard frame.id != 0, frame.flags == .end, frame.operation.isEmpty,
+              frame.tenant.isEmpty, frame.payload.isEmpty
+        else {
+            throw SessionTransportError.invalidFrame("cancel")
+        }
+        lock.lock()
+        let state = active[frame.id]
+        if let state, !state.ended {
+            state.ended = true
+            state.continuation.finish()
+        }
+        lock.unlock()
+        state?.task?.cancel()
+    }
+
+    private func receiveStream(_ frame: SessionFrame) throws {
+        guard frame.id != 0, frame.operation.isEmpty, frame.tenant.isEmpty else {
+            throw SessionTransportError.invalidFrame("stream")
+        }
+        lock.lock()
+        guard let state = active[frame.id] else {
+            lock.unlock()
+            return
+        }
+        guard !state.ended, frame.sequence == state.nextSequence else {
+            let expected = state.nextSequence
+            state.transportError = SessionTransportError.streamSequence(
+                id: frame.id,
+                got: frame.sequence,
+                want: expected
+            )
+            lock.unlock()
+            state.task?.cancel()
+            return
+        }
+        state.nextSequence += 1
+        let result = state.continuation.yield(SocketRequestChunk(
+            sequence: frame.sequence,
+            payload: frame.payload,
+            end: frame.flags.contains(.end)
+        ))
+        if case .dropped = result {
+            state.transportError = SessionTransportError.queueFull
+            lock.unlock()
+            state.task?.cancel()
+            return
+        }
+        if frame.flags.contains(.end) {
+            state.ended = true
+            state.continuation.finish()
+        }
+        lock.unlock()
+    }
+
+    private func send(_ response: SocketResponse, id: UInt64) async throws {
+        if let chunks = response.chunks {
+            var sequence: UInt32 = 0
+            for await payload in chunks {
+                try write(SessionFrame(kind: .stream, id: id, sequence: sequence, payload: payload))
+                sequence += 1
+            }
+            try write(SessionFrame(kind: .stream, flags: .end, id: id, sequence: sequence))
+        }
+        let envelope = try responseEnvelope(response)
+        try write(SessionFrame(kind: .response, flags: .end, id: id, payload: envelope))
+    }
+
+    private func sendError(id: UInt64, _ error: Error) throws {
+        try write(SessionFrame(
+            kind: .response,
+            flags: .end,
+            id: id,
+            payload: responseEnvelope(SocketResponse(error: String(describing: error)))
+        ))
+    }
+
+    private func sendRejected(id: UInt64, reason: String) throws {
+        try write(SessionFrame(
+            kind: .response,
+            flags: .end,
+            id: id,
+            payload: responseEnvelope(SocketResponse(rejected: true, reason: reason))
+        ))
+    }
+
+    private func remove(_ id: UInt64) {
+        lock.lock()
+        active.removeValue(forKey: id)
+        lock.unlock()
+    }
+
+    private func transportError(for state: ServerRequestState) -> Error? {
+        lock.lock()
+        defer { lock.unlock() }
+        return state.transportError
+    }
+
+    private func responseEnvelope(_ response: SocketResponse) throws -> Data {
+        var members: [String] = []
+        if response.rejected {
+            members.append("\"rejected\":true")
+        }
+        if let reason = response.reason {
+            try members.append("\"reason\":\(jsonString(reason))")
+        }
+        if let error = response.error {
+            try members.append("\"err\":\(jsonString(error))")
+        }
+        if let payload = response.payload {
+            guard (try? JSONSerialization.jsonObject(with: payload, options: [.fragmentsAllowed])) != nil else {
+                throw SessionTransportError.invalidFrame("response payload is not JSON")
+            }
+            guard let payloadString = String(data: payload, encoding: .utf8) else {
+                throw SessionTransportError.invalidFrame("response payload is not UTF-8 JSON")
+            }
+            members.append("\"payload\":\(payloadString)")
+        }
+        return Data("{\(members.joined(separator: ","))}".utf8)
+    }
+
+    private func jsonString(_ value: String) throws -> String {
+        let data = try JSONSerialization.data(withJSONObject: [value])
+        guard let array = String(data: data, encoding: .utf8) else {
+            throw SessionTransportError.invalidFrame("JSON string encoding is not UTF-8")
+        }
+        return String(array.dropFirst().dropLast())
     }
 }

@@ -6,14 +6,13 @@ public extension DaemonKit {
     /// Version of the daemonkit-native lifecycle envelope (`"v"` in every flat
     /// frame). Generated from the shared lifeproto schema; the Go side pins the
     /// same `Version`.
-    static let lifeProtocolVersion = 1
+    static let lifeProtocolVersion = 2
 }
 
 /// A canonical lifecycle operation carried in a message's `op` field.
 public enum LifecycleOp: String, Sendable, CaseIterable {
     case health
     case shutdown
-    case hello
     case handoff
 }
 
@@ -72,15 +71,14 @@ enum LifecycleJSON {
 }
 
 /// A flat lifecycle message: the shared `{v, op}` header plus op-specific
-/// fields, exchanged as one JSON object per line (the transport appends the
-/// framing `\n`).
+/// fields, carried as a v2 request or response payload.
 public protocol LifecycleMessage: Decodable, Sendable {
-    /// The single-line JSON encoding of this message, without the framing `\n`.
+    /// The compact JSON payload encoding of this message.
     func encoded() -> Data
 }
 
 public extension LifecycleMessage {
-    /// Decodes a message from a single JSON frame (newline already stripped).
+    /// Decodes a message from one v2 frame payload.
     static func decode(from data: Data) throws -> Self {
         try JSONDecoder().decode(Self.self, from: data)
     }
@@ -113,6 +111,11 @@ public struct HealthRequest: LifecycleMessage {
     public let v: Int
     public let op: String
 
+    private enum CodingKeys: String, CodingKey {
+        case v
+        case op
+    }
+
     /// Builds a health request at the current protocol version.
     public init() {
         v = DaemonKit.lifeProtocolVersion
@@ -127,12 +130,14 @@ public struct HealthRequest: LifecycleMessage {
     }
 }
 
-/// HealthResponse is the peer's health snapshot. Features is the only source of capability truth — never a version compare.
+/// HealthResponse is the peer's exact-protocol health snapshot.
 public struct HealthResponse: LifecycleMessage {
     public let v: Int
     public let op: String
-    /// The peer's own build version. Never compared for capability — Features is the only source of capability truth.
-    public let version: String
+    /// The peer's build identifier.
+    public let build: String
+    /// The exact transport and lifecycle protocol version.
+    public let protocolVersion: Int
     /// The peer's process id.
     public let pid: Int
     /// The peer's lifecycle state, e.g. "healthy" or "degraded".
@@ -141,31 +146,40 @@ public struct HealthResponse: LifecycleMessage {
     public let draining: Bool
     /// Whether the peer is serving work.
     public let busy: Bool
-    /// The peer's advertised feature bits; the sole source of capability truth.
-    public let features: [String]
 
-    /// Builds a health snapshot; a nil features slice encodes as [].
-    public init(version: String, pid: Int, state: String, draining: Bool, busy: Bool, features: [String]) {
+    private enum CodingKeys: String, CodingKey {
+        case v
+        case op
+        case build
+        case protocolVersion = "protocol"
+        case pid
+        case state
+        case draining
+        case busy
+    }
+
+    /// Builds a health snapshot.
+    public init(build: String, protocolVersion: Int, pid: Int, state: String, draining: Bool, busy: Bool) {
         v = DaemonKit.lifeProtocolVersion
         op = LifecycleOp.health.rawValue
-        self.version = version
+        self.build = build
+        self.protocolVersion = protocolVersion
         self.pid = pid
         self.state = state
         self.draining = draining
         self.busy = busy
-        self.features = features
     }
 
     public func encoded() -> Data {
         LifecycleJSON.object([
             ("v", LifecycleJSON.int(v)),
             ("op", LifecycleJSON.string(op)),
-            ("version", LifecycleJSON.string(version)),
+            ("build", LifecycleJSON.string(build)),
+            ("protocol", LifecycleJSON.int(protocolVersion)),
             ("pid", LifecycleJSON.int(pid)),
             ("state", LifecycleJSON.string(state)),
             ("draining", LifecycleJSON.bool(draining)),
             ("busy", LifecycleJSON.bool(busy)),
-            ("features", LifecycleJSON.strings(features)),
         ])
     }
 }
@@ -174,6 +188,11 @@ public struct HealthResponse: LifecycleMessage {
 public struct ShutdownRequest: LifecycleMessage {
     public let v: Int
     public let op: String
+
+    private enum CodingKeys: String, CodingKey {
+        case v
+        case op
+    }
 
     /// Builds a shutdown request.
     public init() {
@@ -196,6 +215,12 @@ public struct ShutdownResponse: LifecycleMessage {
     /// Whether the peer accepted the request.
     public let ok: Bool
 
+    private enum CodingKeys: String, CodingKey {
+        case v
+        case op
+        case ok
+    }
+
     /// Builds a shutdown acknowledgement.
     public init(ok: Bool) {
         v = DaemonKit.lifeProtocolVersion
@@ -212,52 +237,15 @@ public struct ShutdownResponse: LifecycleMessage {
     }
 }
 
-/// HelloRequest opens the capability handshake.
-public struct HelloRequest: LifecycleMessage {
-    public let v: Int
-    public let op: String
-
-    /// Builds a hello request.
-    public init() {
-        v = DaemonKit.lifeProtocolVersion
-        op = LifecycleOp.hello.rawValue
-    }
-
-    public func encoded() -> Data {
-        LifecycleJSON.object([
-            ("v", LifecycleJSON.int(v)),
-            ("op", LifecycleJSON.string(op)),
-        ])
-    }
-}
-
-/// HelloResponse announces the peer's advertised feature bits.
-public struct HelloResponse: LifecycleMessage {
-    public let v: Int
-    public let op: String
-    /// The peer's advertised feature bits; the sole source of capability truth.
-    public let features: [String]
-
-    /// Builds a hello announcement; a nil features slice encodes as [].
-    public init(features: [String]) {
-        v = DaemonKit.lifeProtocolVersion
-        op = LifecycleOp.hello.rawValue
-        self.features = features
-    }
-
-    public func encoded() -> Data {
-        LifecycleJSON.object([
-            ("v", LifecycleJSON.int(v)),
-            ("op", LifecycleJSON.string(op)),
-            ("features", LifecycleJSON.strings(features)),
-        ])
-    }
-}
-
 /// HandoffRequest asks the peer to release its socket for a successor.
 public struct HandoffRequest: LifecycleMessage {
     public let v: Int
     public let op: String
+
+    private enum CodingKeys: String, CodingKey {
+        case v
+        case op
+    }
 
     /// Builds a handoff request.
     public init() {
@@ -279,6 +267,12 @@ public struct HandoffResponse: LifecycleMessage {
     public let op: String
     /// Whether the peer accepted the request.
     public let ok: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case v
+        case op
+        case ok
+    }
 
     /// Builds a handoff acknowledgement.
     public init(ok: Bool) {

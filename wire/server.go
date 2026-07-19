@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -12,46 +13,45 @@ import (
 	"time"
 )
 
-// ErrUntrustedPeer is the floor trust verdict: a peer whose uid differs from the
-// server process's own, refused when no Trust hook overrides the check.
-var ErrUntrustedPeer = errors.New("wire: untrusted peer")
+var (
+	// ErrUntrustedPeer means the accepted unix peer failed the same-uid floor.
+	ErrUntrustedPeer = errors.New("wire: untrusted peer")
+	// ErrHandshake means the first frame did not establish a v2 session.
+	ErrHandshake = errors.New("wire: handshake failed")
+	// ErrServerStarted means Serve was called more than once.
+	ErrServerStarted = errors.New("wire: server already started")
+	// ErrBuildMismatch means an ordinary request came from a different build.
+	ErrBuildMismatch = errors.New("wire: client build does not match server build")
+)
 
-// defaultWorkers bounds concurrent-handler parallelism when Workers is unset.
-const defaultWorkers = 8
+const (
+	defaultWorkers          = 8
+	defaultBacklog          = 32
+	defaultInboundQueue     = 64
+	defaultOutboundQueue    = 128
+	defaultStreamQueue      = 16
+	defaultMaxSessions      = 64
+	defaultHandshakeTimeout = 10 * time.Second
+	defaultWriteTimeout     = 10 * time.Second
+)
 
-// requestGrace bounds the initial request read when RequestTimeout is unset, so a
-// client that connects but never sends a frame cannot pin a connection goroutine
-// past shutdown.
-const requestGrace = 15 * time.Second
-
-// disconnectPoke is the read-deadline interval the per-request disconnect watcher
-// polls at.
-const disconnectPoke = 25 * time.Millisecond
-
-// writeGrace bounds a response write when WriteTimeout is unset, so a stuck write
-// cannot stall shutdown.
-const writeGrace = 10 * time.Second
-
-// reservedOps are the lifecycle op names the daemon layer owns; registering any
-// of them panics so a consumer handler can never shadow one.
 var reservedOps = map[Op]struct{}{
 	"health":   {},
 	"shutdown": {},
-	"hello":    {},
 	"handoff":  {},
 }
 
-type class int
+type class uint8
 
 const (
 	classControl class = iota
 	classConcurrent
-	classExclusive
 )
 
 type entry struct {
-	class class
-	h     Handler
+	class     class
+	h         Handler
+	lifecycle bool
 }
 
 type job struct {
@@ -66,198 +66,272 @@ type result struct {
 	err error
 }
 
-// Server dispatches LF-framed JSON requests over an already-bound net.Listener.
-// It never binds the listener itself. Registration and the OnActivity/hook
-// wiring happen before Run; the handler table is read-only once Run starts.
-//
-// Dispatch disciplines: control handlers run inline on the accepting goroutine;
-// concurrent handlers run in a bounded worker pool that replies Rejected when
-// full; exclusive handlers serialize on one shared mutex. Orthogonally, a request
-// with a non-empty tenant key serializes against same-tenant requests without
-// blocking other tenants.
+// Server serves persistent, multiplexed v2 sessions on a listener owned by its caller.
+// Register handlers and lifecycle controls before Serve.
 type Server struct {
-	// Listener is the pre-bound listener to accept on. Required; the Server never
-	// binds it and does not close it beyond intake-stop on shutdown.
-	Listener net.Listener
-	// Router extracts each frame's op and tenant key. Required.
-	Router Router
-	// Version stamps every Response verbatim; it is the CONSUMER's version, never
-	// wire's own.
-	Version string
-	// Trust gates every request before any handler, keyed on the peer's OS
-	// credentials. nil applies the same-uid floor (ErrUntrustedPeer otherwise).
+	// Build is the server build identity sent during the mandatory handshake.
+	Build string
+	// Trust augments the non-optional same-effective-uid trust floor.
 	Trust func(Peer) error
-	// Ladder bounds each op's server-side handling; an op absent from the ladder
-	// runs without a deadline. The zero Ladder imposes none.
+	// Ladder supplies per-operation server deadlines.
 	Ladder Ladder
-	// Workers caps concurrent-handler parallelism; <=0 uses defaultWorkers.
+	// Workers caps simultaneous concurrent handlers.
 	Workers int
-	// Backlog is the concurrent-pool queue depth beyond the running workers;
-	// requests past Workers+Backlog get a Rejected reply.
+	// Backlog caps queued concurrent handlers beyond Workers.
 	Backlog int
-	// RequestTimeout bounds reading the request frame; <=0 uses requestGrace.
-	RequestTimeout time.Duration
-	// WriteTimeout bounds writing the response frame; <=0 uses writeGrace.
+	// InboundQueue caps active request IDs per accepted session.
+	InboundQueue int
+	// OutboundQueue caps unsent response, stream, and event frames per session.
+	OutboundQueue int
+	// StreamQueue caps unread inbound chunks per request.
+	StreamQueue int
+	// MaxSessions caps accepted and handshaking connections.
+	MaxSessions int
+	// MaxFrame caps each encoded frame.
+	MaxFrame int
+	// HandshakeTimeout bounds the mandatory first-frame exchange.
+	HandshakeTimeout time.Duration
+	// WriteTimeout bounds each frame write.
 	WriteTimeout time.Duration
-	// OpenStore, BootReconcile, StartRealtimePlanes run in that order before Accept.
-	OpenStore           func() error
-	BootReconcile       func(ctx context.Context) error
-	StartRealtimePlanes func() error
-	// CloseResources releases consumer resources last on shutdown (and on a
-	// startup error after OpenStore succeeded).
-	CloseResources func() error
-	// Log receives accept-loop diagnostics; nil uses slog.Default.
+	// Log receives accept and session diagnostics.
 	Log *slog.Logger
 
+	mu         sync.Mutex
 	handlers   map[Op]entry
 	onActivity func()
+	listener   net.Listener
+	started    bool
+	draining   bool
+	sessions   map[*session]struct{}
 
-	cancelServe context.CancelFunc
-
-	queue       chan job
-	slots       chan struct{}
-	exclusiveMu sync.Mutex
-	tenants     *tenantGates
-
-	connWG       sync.WaitGroup
+	queue        chan job
+	slots        chan struct{}
+	sessionSlots chan struct{}
 	poolWG       sync.WaitGroup
+	sessionWG    sync.WaitGroup
 	closeOnce    sync.Once
-	shutdownOnce sync.Once
 }
 
-// RegisterControl registers op as a control handler that runs inline on the
-// accepting goroutine, outside the pool. Panics on a reserved or duplicate op.
-func (s *Server) RegisterControl(op Op, h Handler) { s.register(op, classControl, h) }
+// RegisterControl registers a control handler outside the worker pool.
+func (s *Server) RegisterControl(op Op, h Handler) { s.register(op, classControl, h, false) }
 
-// RegisterConcurrent registers op as a pooled handler; requests past the pool's
-// Workers+Backlog capacity get a Rejected reply. Panics on a reserved or
-// duplicate op.
-func (s *Server) RegisterConcurrent(op Op, h Handler) { s.register(op, classConcurrent, h) }
+// RegisterConcurrent registers a bounded worker-pool handler.
+func (s *Server) RegisterConcurrent(op Op, h Handler) { s.register(op, classConcurrent, h, false) }
 
-// RegisterExclusive registers op as an exclusive handler; all exclusive handlers
-// serialize on one shared mutex. Panics on a reserved or duplicate op.
-func (s *Server) RegisterExclusive(op Op, h Handler) { s.register(op, classExclusive, h) }
-
-func (s *Server) register(op Op, c class, h Handler) {
-	if _, ok := reservedOps[op]; ok {
+func (s *Server) register(op Op, c class, h Handler, lifecycle bool) {
+	if op == "" || h == nil {
+		panic("wire: operation and handler are required")
+	}
+	if _, reserved := reservedOps[op]; reserved && !lifecycle {
 		panic(fmt.Sprintf("wire: op %q is a reserved lifecycle op", op))
 	}
-	if s.handlers == nil {
-		s.handlers = map[Op]entry{}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.started {
+		panic("wire: handlers cannot be registered after Serve")
 	}
-	if _, dup := s.handlers[op]; dup {
+	if s.handlers == nil {
+		s.handlers = make(map[Op]entry)
+	}
+	if _, exists := s.handlers[op]; exists {
 		panic(fmt.Sprintf("wire: op %q already registered", op))
 	}
-	s.handlers[op] = entry{class: c, h: h}
+	s.handlers[op] = entry{class: c, h: h, lifecycle: lifecycle}
 }
 
-// OnActivity registers f, invoked once per admitted request (never for a Rejected
-// non-dispatch or a trust denial). Set it before Run.
-func (s *Server) OnActivity(f func()) { s.onActivity = f }
+// OnActivity installs a callback invoked immediately before each admitted handler.
+func (s *Server) OnActivity(f func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.started {
+		panic("wire: activity callback cannot change after Serve")
+	}
+	s.onActivity = f
+}
 
-// Run opens the store, boot-reconciles, starts the realtime planes, then accepts
-// until ctx is cancelled or the listener closes. Shutdown — reached on ctx
-// cancel, listener close, or a startup error after OpenStore — stops intake,
-// cancels the serve context, waits for admitted running and queued handlers to
-// settle, then closes consumer resources. Run returns ctx.Err (nil on a clean
-// listener close) or the startup error that aborted it.
-func (s *Server) Run(ctx context.Context) error {
-	if s.Listener == nil {
-		return errors.New("wire: Server.Listener is required")
+// Serve accepts v2 sessions until ctx is cancelled. admit is called once for
+// every request and its returned done function runs after the terminal response
+// has been written to the connection.
+func (s *Server) Serve(ctx context.Context, listener net.Listener, admit func() (func(), error)) error {
+	if listener == nil {
+		return errors.New("wire: listener is required")
 	}
-	if s.Router == nil {
-		return errors.New("wire: Server.Router is required")
+	if admit == nil {
+		return errors.New("wire: admission callback is required")
 	}
+	if s.Build == "" {
+		return errors.New("wire: Build is required")
+	}
+	s.mu.Lock()
+	if s.started {
+		s.mu.Unlock()
+		return ErrServerStarted
+	}
+	s.started = true
+	s.listener = listener
+	s.sessions = make(map[*session]struct{})
 	if s.Log == nil {
 		s.Log = slog.Default()
 	}
-	serveCtx, cancelServe := context.WithCancel(ctx)
-	s.cancelServe = cancelServe
-	s.tenants = newTenantGates()
 	workers := s.Workers
 	if workers <= 0 {
 		workers = defaultWorkers
 	}
-	s.queue = make(chan job, s.Backlog)
-	s.slots = make(chan struct{}, workers+s.Backlog)
+	backlog := s.Backlog
+	if backlog < 0 {
+		backlog = 0
+	} else if backlog == 0 {
+		backlog = defaultBacklog
+	}
+	s.queue = make(chan job, backlog)
+	s.slots = make(chan struct{}, workers+backlog)
+	s.sessionSlots = make(chan struct{}, s.maxSessions())
+	s.mu.Unlock()
+
 	for range workers {
 		s.poolWG.Add(1)
 		go s.worker()
 	}
 
-	if s.OpenStore != nil {
-		if err := s.OpenStore(); err != nil {
-			s.shutdown(false)
-			return fmt.Errorf("wire: open store: %w", err)
-		}
-	}
-	if s.BootReconcile != nil {
-		if err := s.BootReconcile(serveCtx); err != nil {
-			s.shutdown(true)
-			return fmt.Errorf("wire: boot reconcile: %w", err)
-		}
-	}
-	if s.StartRealtimePlanes != nil {
-		if err := s.StartRealtimePlanes(); err != nil {
-			s.shutdown(true)
-			return fmt.Errorf("wire: start realtime planes: %w", err)
+	acceptDone := make(chan error, 1)
+	go func() { acceptDone <- s.accept(ctx, admit) }()
+
+	var acceptErr error
+	select {
+	case <-ctx.Done():
+		_ = s.CloseIntake()
+		acceptErr = <-acceptDone
+	case acceptErr = <-acceptDone:
+		if acceptErr == nil || errors.Is(acceptErr, net.ErrClosed) {
+			<-ctx.Done()
+		} else {
+			_ = s.CloseIntake()
 		}
 	}
 
-	go func() {
-		<-serveCtx.Done()
-		s.closeListener()
-	}()
-	s.acceptLoop(serveCtx)
-	s.shutdown(true)
+	s.closeSessions()
+	s.sessionWG.Wait()
+	close(s.queue)
+	s.poolWG.Wait()
+	if acceptErr != nil && !errors.Is(acceptErr, net.ErrClosed) {
+		return fmt.Errorf("wire: accept: %w", acceptErr)
+	}
 	return nil
 }
 
-func (s *Server) acceptLoop(ctx context.Context) {
+// CloseIntake prevents new connections and new ordinary requests. Accepted
+// sessions stay alive so admitted work and lifecycle acknowledgements can settle.
+func (s *Server) CloseIntake() error {
+	s.mu.Lock()
+	s.draining = true
+	listener := s.listener
+	s.mu.Unlock()
+	if listener == nil {
+		return nil
+	}
+	var err error
+	s.closeOnce.Do(func() { err = listener.Close() })
+	return err
+}
+
+func (s *Server) accept(ctx context.Context, admit func() (func(), error)) error {
 	for {
-		conn, err := s.Listener.Accept()
+		conn, err := s.listener.Accept()
 		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
-				return
-			}
-			s.Log.Warn("wire: accept", "err", err)
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(100 * time.Millisecond):
-			}
+			return err
+		}
+		select {
+		case s.sessionSlots <- struct{}{}:
+		default:
+			_ = conn.Close()
 			continue
 		}
-		s.connWG.Add(1)
+		s.sessionWG.Add(1)
 		go func() {
-			defer s.connWG.Done()
-			s.handle(ctx, conn)
+			defer func() {
+				<-s.sessionSlots
+				s.sessionWG.Done()
+			}()
+			if err := s.serveConn(ctx, conn, admit); err != nil && !isDisconnect(err) {
+				s.Log.Debug("wire: session ended", "err", err)
+			}
 		}()
 	}
 }
 
-func (s *Server) closeListener() {
-	s.closeOnce.Do(func() { _ = s.Listener.Close() })
+func (s *Server) serveConn(ctx context.Context, conn net.Conn, admit func() (func(), error)) error {
+	defer conn.Close()
+	unix, ok := conn.(*net.UnixConn)
+	if !ok {
+		return errors.New("wire: unix connection required")
+	}
+	peer, err := PeerFromConn(unix)
+	if err != nil {
+		return fmt.Errorf("wire: identify peer: %w", err)
+	}
+	if err := s.trust(peer); err != nil {
+		return err
+	}
+	codec := NewCodec(conn)
+	codec.MaxFrame = s.maxFrame()
+	if err := codec.SetDeadline(earlierDeadline(ctx, s.handshakeTimeout())); err != nil {
+		return err
+	}
+	identity, err := s.serverHandshake(codec)
+	if err != nil {
+		return err
+	}
+	if err := codec.ClearDeadline(); err != nil {
+		return err
+	}
+	codec.WriteTimeout = s.writeTimeout()
+
+	sessCtx, cancel := context.WithCancel(ctx)
+	sess := &session{
+		server:   s,
+		conn:     conn,
+		codec:    codec,
+		ctx:      sessCtx,
+		cancel:   cancel,
+		peer:     peer,
+		build:    identity.Build,
+		admit:    admit,
+		outbound: make(chan sessionOutbound, s.outboundQueue()),
+		active:   make(map[uint64]*requestState),
+		seen:     make(map[uint64]struct{}),
+	}
+	sess.accepted = &AcceptedSession{s: sess}
+	s.addSession(sess)
+	defer s.removeSession(sess)
+	return sess.run(sessCtx)
 }
 
-// shutdown runs the documented teardown: stop intake, cancel the serve context,
-// wait for admitted running and queued handlers to settle (their connection
-// goroutines block until the pool drains), then close consumer resources.
-// closeResources is false only on the OpenStore-failure path, where nothing was
-// opened to close.
-func (s *Server) shutdown(closeResources bool) {
-	s.shutdownOnce.Do(func() {
-		s.closeListener()
-		s.cancelServe()
-		s.connWG.Wait()
-		close(s.queue)
-		s.poolWG.Wait()
-		if closeResources && s.CloseResources != nil {
-			if err := s.CloseResources(); err != nil {
-				s.Log.Warn("wire: close resources", "err", err)
-			}
-		}
-	})
+func (s *Server) serverHandshake(codec *Codec) (BuildIdentity, error) {
+	frame, err := codec.ReadFrame()
+	if err != nil {
+		return BuildIdentity{}, fmt.Errorf("%w: %w", ErrHandshake, err)
+	}
+	if frame.Kind != FrameHello || frame.ID != 0 || frame.Sequence != 0 || frame.Flags != FlagEnd || frame.Op != "" || frame.Tenant != "" {
+		return BuildIdentity{}, fmt.Errorf("%w: invalid hello frame", ErrHandshake)
+	}
+	var identity BuildIdentity
+	if err := decodeStrict(frame.Payload, &identity); err != nil {
+		return BuildIdentity{}, fmt.Errorf("%w: identity: %w", ErrHandshake, err)
+	}
+	if identity.Protocol != ProtocolVersion {
+		return BuildIdentity{}, fmt.Errorf("%w: identity got %d", ErrProtocolVersion, identity.Protocol)
+	}
+	if identity.Build == "" {
+		return BuildIdentity{}, fmt.Errorf("%w: empty build", ErrHandshake)
+	}
+	payload, err := json.Marshal(BuildIdentity{Protocol: ProtocolVersion, Build: s.Build})
+	if err != nil {
+		return BuildIdentity{}, err
+	}
+	if err := codec.WriteFrame(Frame{Kind: FrameHelloAck, Flags: FlagEnd, Payload: payload}); err != nil {
+		return BuildIdentity{}, fmt.Errorf("%w: acknowledge: %w", ErrHandshake, err)
+	}
+	return identity, nil
 }
 
 func (s *Server) worker() {
@@ -269,110 +343,35 @@ func (s *Server) worker() {
 	}
 }
 
-func (s *Server) handle(ctx context.Context, conn net.Conn) {
-	defer conn.Close()
-	unix, ok := conn.(*net.UnixConn)
-	if !ok {
-		return
-	}
-	f := NewFraming(conn)
-	f.ReadTimeout = s.requestTimeout()
-	f.WriteTimeout = s.writeTimeout()
-
-	peer, err := PeerFromConn(unix)
-	if err != nil {
-		_ = f.WriteJSON(s.errResp(fmt.Sprintf("peer: %v", err)))
-		return
-	}
-	// Unblock the pre-frame read on shutdown: an idle connection would otherwise
-	// hold connWG until its read deadline, delaying teardown.
-	readDone := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = conn.SetReadDeadline(time.Now())
-		case <-readDone:
-		}
-	}()
-	frame, err := f.ReadFrame()
-	close(readDone)
-	if err != nil {
-		return
-	}
-	// Trust gates the handler, checked after the frame read so a denial consumes
-	// the client's request and delivers the rejection instead of racing a close.
-	if terr := s.trust(peer); terr != nil {
-		_ = f.WriteJSON(s.errResp(terr.Error()))
-		return
-	}
-	op, tenant, rerr := s.Router(frame)
-	if rerr != nil {
-		_ = f.WriteJSON(s.errResp(fmt.Sprintf("route: %v", rerr)))
-		return
-	}
-	e, ok := s.handlers[op]
-	if !ok {
-		_ = f.WriteJSON(s.errResp(fmt.Sprintf("unknown op %q", op)))
-		return
-	}
-
-	reqCtx, cancel := s.requestContext(ctx, op)
-	defer cancel()
-	stop := s.watchDisconnect(reqCtx, cancel, conn)
-
-	req := Request{Op: op, Tenant: tenant, Peer: peer, Frame: frame}
-	resp := s.dispatch(reqCtx, e, req)
-
-	stop()
-	_ = f.WriteJSON(resp)
-}
-
-// requestContext derives the per-request context from the serve context,
-// bounding it by the op's server deadline when the ladder carries one.
-func (s *Server) requestContext(ctx context.Context, op Op) (context.Context, context.CancelFunc) {
-	if server, _, ok := s.Ladder.Deadlines(op); ok {
-		return context.WithTimeout(ctx, server)
-	}
-	return context.WithCancel(ctx)
-}
-
-func (s *Server) dispatch(ctx context.Context, e entry, req Request) Response {
-	// Gate the tenant on the connection goroutine, before any pool worker, so a
-	// same-tenant burst blocks its own connections, not other tenants' workers.
-	if req.Tenant != "" {
-		release, err := s.tenants.acquire(ctx, req.Tenant)
-		if err != nil {
-			return s.respond(nil, err)
-		}
-		defer release()
-	}
+func (s *Server) dispatch(ctx context.Context, e entry, req Request) (any, error) {
 	switch e.class {
 	case classControl:
-		val, err := s.invoke(ctx, req, e.h)
-		return s.respond(val, err)
-	case classExclusive:
-		s.exclusiveMu.Lock()
-		defer s.exclusiveMu.Unlock()
-		val, err := s.invoke(ctx, req, e.h)
-		return s.respond(val, err)
+		return s.invoke(ctx, req, e.h)
 	case classConcurrent:
-		j := job{ctx: ctx, req: req, h: e.h, done: make(chan result, 1)}
 		select {
 		case s.slots <- struct{}{}:
 		default:
-			return s.rejected("concurrent pool at capacity")
+			return nil, ErrQueueFull
 		}
-		// Admitted work always enqueues and drains, ctx cancellation included.
-		s.queue <- j
-		r := <-j.done
-		return s.respond(r.val, r.err)
+		j := job{ctx: ctx, req: req, h: e.h, done: make(chan result, 1)}
+		select {
+		case s.queue <- j:
+		case <-ctx.Done():
+			<-s.slots
+			return nil, ctx.Err()
+		}
+		select {
+		case r := <-j.done:
+			return r.val, r.err
+		case <-ctx.Done():
+			r := <-j.done
+			return r.val, r.err
+		}
 	default:
-		return s.errResp(fmt.Sprintf("unhandled dispatch class %d", e.class))
+		return nil, fmt.Errorf("wire: invalid dispatch class %d", e.class)
 	}
 }
 
-// invoke fires the activity signal once, then runs the handler. The tenant gate
-// is held by the caller so it never occupies a pool worker while waiting.
 func (s *Server) invoke(ctx context.Context, req Request, h Handler) (any, error) {
 	if s.onActivity != nil {
 		s.onActivity()
@@ -380,139 +379,152 @@ func (s *Server) invoke(ctx context.Context, req Request, h Handler) (any, error
 	return h(ctx, req)
 }
 
-func (s *Server) respond(val any, err error) Response {
-	if err != nil {
-		return Response{Version: s.Version, Err: err.Error()}
+func (s *Server) requestContext(parent context.Context, frame Frame) (context.Context, context.CancelFunc) {
+	deadline := time.Time{}
+	if frame.DeadlineUnixMilli > 0 {
+		deadline = time.UnixMilli(frame.DeadlineUnixMilli)
 	}
-	payload, merr := json.Marshal(val)
-	if merr != nil {
-		return Response{Version: s.Version, Err: fmt.Sprintf("wire: marshal response: %v", merr)}
+	if server, _, ok := s.Ladder.Deadlines(frame.Op); ok {
+		candidate := time.Now().Add(server)
+		if deadline.IsZero() || candidate.Before(deadline) {
+			deadline = candidate
+		}
 	}
-	return Response{Version: s.Version, Payload: payload}
+	if !deadline.IsZero() {
+		return context.WithDeadline(parent, deadline)
+	}
+	return context.WithCancel(parent)
 }
 
-func (s *Server) rejected(reason string) Response {
-	return Response{Version: s.Version, Rejected: true, Reason: reason}
+func (s *Server) lookup(op Op) (entry, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.handlers[op]
+	return e, ok
 }
 
-func (s *Server) errResp(msg string) Response {
-	return Response{Version: s.Version, Err: "wire: " + msg}
+func (s *Server) isDraining() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.draining
 }
 
-// trust enforces the same-effective-UID floor on every connection before any
-// stricter check, then runs the optional Trust callback. The floor is never
-// replaced by a non-nil callback — a callback augments it, never bypasses it.
-func (s *Server) trust(p Peer) error {
-	if p.UID != os.Geteuid() {
-		return fmt.Errorf("%w: uid %d != %d", ErrUntrustedPeer, p.UID, os.Geteuid())
+func (s *Server) addSession(sess *session) {
+	s.mu.Lock()
+	s.sessions[sess] = struct{}{}
+	s.mu.Unlock()
+}
+
+func (s *Server) removeSession(sess *session) {
+	s.mu.Lock()
+	delete(s.sessions, sess)
+	s.mu.Unlock()
+}
+
+func (s *Server) closeSessions() {
+	s.mu.Lock()
+	sessions := make([]*session, 0, len(s.sessions))
+	for sess := range s.sessions {
+		sessions = append(sessions, sess)
+	}
+	s.mu.Unlock()
+	for _, sess := range sessions {
+		sess.close()
+	}
+}
+
+func (s *Server) trust(peer Peer) error {
+	if peer.UID != os.Geteuid() {
+		return fmt.Errorf("%w: uid %d != %d", ErrUntrustedPeer, peer.UID, os.Geteuid())
 	}
 	if s.Trust != nil {
-		return s.Trust(p)
+		return s.Trust(peer)
 	}
 	return nil
 }
 
-func (s *Server) requestTimeout() time.Duration {
-	if s.RequestTimeout > 0 {
-		return s.RequestTimeout
+func (s *Server) maxFrame() int {
+	if s.MaxFrame > 0 {
+		return s.MaxFrame
 	}
-	return requestGrace
+	return DefaultMaxFrame
+}
+
+func (s *Server) handshakeTimeout() time.Duration {
+	if s.HandshakeTimeout > 0 {
+		return s.HandshakeTimeout
+	}
+	return defaultHandshakeTimeout
 }
 
 func (s *Server) writeTimeout() time.Duration {
 	if s.WriteTimeout > 0 {
 		return s.WriteTimeout
 	}
-	return writeGrace
+	return defaultWriteTimeout
 }
 
-// watchDisconnect starts a goroutine that polls conn's read side while the
-// handler runs and cancels the request context the moment the peer goes away.
-// Detection is a short-read-deadline poke: a repeated one-byte read that times
-// out while the peer is present and returns EOF/reset once it disconnects (a
-// one-request-per-connection peer sends nothing more after its frame). The
-// returned stop drains the watcher and clears the read deadline before the reply
-// write. cancel doubles as the op-deadline cancel, so a fired deadline stops the
-// watcher too.
-func (s *Server) watchDisconnect(ctx context.Context, cancel context.CancelFunc, conn net.Conn) func() {
-	stopped := make(chan struct{})
-	exited := make(chan struct{})
-	go func() {
-		defer close(exited)
-		buf := make([]byte, 1)
-		for {
-			select {
-			case <-stopped:
-				return
-			case <-ctx.Done():
-				return
-			default:
-			}
-			_ = conn.SetReadDeadline(time.Now().Add(disconnectPoke))
-			_, err := conn.Read(buf)
-			switch {
-			case err == nil:
-				continue
-			case errors.Is(err, os.ErrDeadlineExceeded):
-				continue
-			default:
-				cancel()
-				return
-			}
-		}
-	}()
-	return func() {
-		close(stopped)
-		_ = conn.SetReadDeadline(time.Now())
-		<-exited
-		_ = conn.SetReadDeadline(time.Time{})
+func (s *Server) inboundQueue() int {
+	if s.InboundQueue > 0 {
+		return s.InboundQueue
 	}
+	return defaultInboundQueue
 }
 
-// tenantGates serializes requests sharing a tenant key without blocking other
-// tenants. Each key maps to a capacity-1 channel used as a mutex, reference
-// counted so an idle key drops out of the map.
-type tenantGates struct {
-	mu    sync.Mutex
-	gates map[string]*tenantGate
-}
-
-type tenantGate struct {
-	ch   chan struct{}
-	refs int
-}
-
-func newTenantGates() *tenantGates {
-	return &tenantGates{gates: map[string]*tenantGate{}}
-}
-
-func (t *tenantGates) acquire(ctx context.Context, key string) (func(), error) {
-	t.mu.Lock()
-	g := t.gates[key]
-	if g == nil {
-		g = &tenantGate{ch: make(chan struct{}, 1)}
-		t.gates[key] = g
+func (s *Server) outboundQueue() int {
+	if s.OutboundQueue > 0 {
+		return s.OutboundQueue
 	}
-	g.refs++
-	t.mu.Unlock()
-
-	select {
-	case g.ch <- struct{}{}:
-		return func() { t.release(key, g, true) }, nil
-	case <-ctx.Done():
-		t.release(key, g, false)
-		return nil, ctx.Err()
-	}
+	return defaultOutboundQueue
 }
 
-func (t *tenantGates) release(key string, g *tenantGate, held bool) {
-	if held {
-		<-g.ch
+func (s *Server) streamQueue() int {
+	if s.StreamQueue > 0 {
+		return s.StreamQueue
 	}
-	t.mu.Lock()
-	g.refs--
-	if g.refs == 0 {
-		delete(t.gates, key)
+	return defaultStreamQueue
+}
+
+func (s *Server) maxSessions() int {
+	if s.MaxSessions > 0 {
+		return s.MaxSessions
 	}
-	t.mu.Unlock()
+	return defaultMaxSessions
+}
+
+func earlierDeadline(ctx context.Context, timeout time.Duration) time.Time {
+	deadline := time.Now().Add(timeout)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		return contextDeadline
+	}
+	return deadline
+}
+
+func decodeStrict(payload []byte, dst any) error {
+	dec := json.NewDecoder(bytesReader(payload))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("trailing JSON value")
+	}
+	return nil
+}
+
+func bytesReader(payload []byte) *sliceReader { return &sliceReader{payload: payload} }
+
+type sliceReader struct{ payload []byte }
+
+func (r *sliceReader) Read(p []byte) (int, error) {
+	if len(r.payload) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.payload)
+	r.payload = r.payload[n:]
+	return n, nil
+}
+
+func isDisconnect(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled)
 }

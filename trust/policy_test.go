@@ -9,7 +9,9 @@ import (
 )
 
 func TestRequirementDRString(t *testing.T) {
-	req := Requirement{TeamID: "SXKCTF23Q2", Identifier: "com.yasyf.daemonkit.holder"}
+	req := Requirement{
+		TeamID: "SXKCTF23Q2", SigningIdentifier: "com.yasyf.daemonkit.holder",
+	}
 	got, err := req.DRString()
 	if err != nil {
 		t.Fatalf("DRString: %v", err)
@@ -28,10 +30,18 @@ func TestRequirementValidation(t *testing.T) {
 		name string
 		req  Requirement
 	}{
-		{"no team", Requirement{Identifier: "com.yasyf.x"}},
+		{"no team", Requirement{SigningIdentifier: "com.yasyf.x"}},
 		{"no identifier", Requirement{TeamID: "SXKCTF23Q2"}},
-		{"quoted team", Requirement{TeamID: `SX"Q2`, Identifier: "com.yasyf.x"}},
-		{"backslash identifier", Requirement{TeamID: "SXKCTF23Q2", Identifier: `com\yasyf`}},
+		{"quoted team", Requirement{TeamID: `SX"Q2`, SigningIdentifier: "com.yasyf.x"}},
+		{"backslash identifier", Requirement{TeamID: "SXKCTF23Q2", SigningIdentifier: `com\yasyf`}},
+		{"duplicate app group", Requirement{
+			TeamID: "SXKCTF23Q2", SigningIdentifier: "com.yasyf.x", RequiredAppGroup: "group.x",
+			RequiredEntitlements: map[string]EntitlementRequirement{appGroupsEntitlement: {Match: EntitlementStringArrayContains, String: "group.other"}},
+		}},
+		{"unknown match", Requirement{
+			TeamID: "SXKCTF23Q2", SigningIdentifier: "com.yasyf.x",
+			RequiredEntitlements: map[string]EntitlementRequirement{"com.yasyf.role": {Match: 99}},
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -70,9 +80,43 @@ func TestCheckConfiguredRequirementValidatesFields(t *testing.T) {
 }
 
 func TestCheckFailsClosedWithoutVerifier(t *testing.T) {
-	p := Policy{Requirement: &Requirement{TeamID: "SXKCTF23Q2", Identifier: "com.yasyf.daemonkit.x"}}
+	p := Policy{Requirement: &Requirement{
+		TeamID: "SXKCTF23Q2", SigningIdentifier: "com.yasyf.daemonkit.x",
+	}}
 	err := p.Check(wire.Peer{UID: os.Getuid()})
 	if !errors.Is(err, ErrNoVerifier) {
 		t.Errorf("Check(no verifier) = %v, want ErrNoVerifier (fail closed)", err)
+	}
+}
+
+func TestSignedRequirementWithoutAppGroupIsValid(t *testing.T) {
+	req := Requirement{TeamID: "SXKCTF23Q2", SigningIdentifier: "com.yasyf.daemonkit.x"}
+	if err := req.validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if got := req.entitlementRequirements(); len(got) != 0 {
+		t.Fatalf("entitlementRequirements = %v, want empty", got)
+	}
+}
+
+func TestRequirementExplicitlyIncludesAppGroupAndTypedExtras(t *testing.T) {
+	req := Requirement{
+		TeamID: "SXKCTF23Q2", SigningIdentifier: "com.yasyf.daemonkit.x",
+		RequiredAppGroup: "group.com.yasyf.daemonkit",
+		RequiredEntitlements: map[string]EntitlementRequirement{
+			"com.yasyf.role":    {Match: EntitlementString, String: "broker"},
+			"com.yasyf.enabled": {Match: EntitlementBoolean, Boolean: true},
+		},
+	}
+	if err := req.validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	got := req.entitlementRequirements()
+	wantGroup := EntitlementRequirement{Match: EntitlementStringArrayContains, String: req.RequiredAppGroup}
+	if got[appGroupsEntitlement] != wantGroup {
+		t.Fatalf("application-groups requirement = %+v, want %+v", got[appGroupsEntitlement], wantGroup)
+	}
+	if got["com.yasyf.role"] != req.RequiredEntitlements["com.yasyf.role"] || got["com.yasyf.enabled"] != req.RequiredEntitlements["com.yasyf.enabled"] {
+		t.Fatalf("typed extras changed: %v", got)
 	}
 }
