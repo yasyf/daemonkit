@@ -253,8 +253,12 @@ func TestPersistentSessionMultiplexesEventsAndStreams(t *testing.T) {
 	if err := call.SendChunk(context.Background(), []byte("late")); !errors.Is(err, wire.ErrCallDone) {
 		t.Fatalf("late SendChunk error = %v, want ErrCallDone", err)
 	}
+	deadline := time.Now().Add(time.Second)
+	for inflight.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
 	if got := inflight.Load(); got != 0 {
-		t.Fatalf("inflight = %d, want 0", got)
+		t.Fatalf("inflight = %d, want eventual 0", got)
 	}
 }
 
@@ -330,8 +334,13 @@ func TestAdmissionCompletesAfterTerminalFrameIsWritten(t *testing.T) {
 	if err := codec.WriteFrame(wire.Frame{Kind: wire.FrameHello, Flags: wire.FlagEnd, Payload: identity}); err != nil {
 		t.Fatalf("write hello: %v", err)
 	}
-	if _, err := codec.ReadFrame(); err != nil {
+	helloAck, err := codec.ReadFrame()
+	if err != nil {
 		t.Fatalf("read hello ack: %v", err)
+	}
+	var serverIdentity wire.BuildIdentity
+	if err := json.Unmarshal(helloAck.Payload, &serverIdentity); err != nil {
+		t.Fatalf("decode server identity: %v", err)
 	}
 	if err := codec.WriteFrame(wire.Frame{Kind: wire.FrameRequest, Flags: wire.FlagEnd, ID: 1, Op: "large"}); err != nil {
 		t.Fatalf("write request: %v", err)
@@ -355,8 +364,18 @@ func TestAdmissionCompletesAfterTerminalFrameIsWritten(t *testing.T) {
 	}
 	select {
 	case <-admissionDone:
+		t.Fatal("admission completed before terminal acknowledgement")
+	default:
+	}
+	if err := codec.WriteFrame(wire.Frame{
+		Kind: wire.FrameAck, Flags: wire.FlagEnd, ID: 1, Payload: serverIdentity.Session,
+	}); err != nil {
+		t.Fatalf("write terminal acknowledgement: %v", err)
+	}
+	select {
+	case <-admissionDone:
 	case <-time.After(time.Second):
-		t.Fatal("admission did not complete after terminal delivery")
+		t.Fatal("admission did not complete after terminal acknowledgement")
 	}
 	running.stop(t)
 	codec.ReadTimeout = 100 * time.Millisecond
@@ -376,6 +395,158 @@ func readSessionNonWindowFrame(t *testing.T, codec *wire.Codec) wire.Frame {
 			return frame
 		}
 	}
+}
+
+func openRawSession(t *testing.T, running *runningServer) (net.Conn, *wire.Codec, wire.BuildIdentity) {
+	t.Helper()
+	conn, err := net.Dial("unix", running.path)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	codec := wire.NewCodec(conn)
+	identity, err := json.Marshal(wire.BuildIdentity{Protocol: wire.ProtocolVersion, Build: "server-test"})
+	if err != nil {
+		_ = conn.Close()
+		t.Fatalf("Marshal identity: %v", err)
+	}
+	if err := codec.WriteFrame(wire.Frame{Kind: wire.FrameHello, Flags: wire.FlagEnd, Payload: identity}); err != nil {
+		_ = conn.Close()
+		t.Fatalf("write hello: %v", err)
+	}
+	frame, err := codec.ReadFrame()
+	if err != nil {
+		_ = conn.Close()
+		t.Fatalf("read hello acknowledgement: %v", err)
+	}
+	var serverIdentity wire.BuildIdentity
+	if err := json.Unmarshal(frame.Payload, &serverIdentity); err != nil {
+		_ = conn.Close()
+		t.Fatalf("decode server identity: %v", err)
+	}
+	return conn, codec, serverIdentity
+}
+
+func writeRawRequest(t *testing.T, codec *wire.Codec, id uint64, op string) {
+	t.Helper()
+	if err := codec.WriteFrame(wire.Frame{Kind: wire.FrameRequest, Flags: wire.FlagEnd, ID: id, Op: wire.Op(op)}); err != nil {
+		t.Fatalf("write request %d: %v", id, err)
+	}
+}
+
+func expectRawSessionClosed(t *testing.T, codec *wire.Codec) {
+	t.Helper()
+	codec.ReadTimeout = time.Second
+	for {
+		if _, err := codec.ReadFrame(); err != nil {
+			return
+		}
+	}
+}
+
+func waitNoAdmissions(t *testing.T, active *atomic.Int32) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for active.Load() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("active admissions = %d, want 0", active.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestTerminalAcknowledgementsAreBoundToWrittenRequestAndSession(t *testing.T) {
+	var active atomic.Int32
+	server := &wire.Server{Build: "server-test", WriteTimeout: time.Second}
+	server.RegisterConcurrent("ping", func(context.Context, wire.Request) (any, error) { return true, nil })
+	server.RegisterConcurrent("block", func(ctx context.Context, _ wire.Request) (any, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	running := startSessionServer(t, server, admitAll(&active))
+
+	t.Run("wrong generation", func(t *testing.T) {
+		conn, codec, identity := openRawSession(t, running)
+		defer conn.Close()
+		writeRawRequest(t, codec, 1, "ping")
+		_ = readSessionNonWindowFrame(t, codec)
+		generation := append([]byte(nil), identity.Session...)
+		generation[0] ^= 0xff
+		if err := codec.WriteFrame(wire.Frame{
+			Kind: wire.FrameAck, Flags: wire.FlagEnd, ID: 1, Payload: generation,
+		}); err != nil {
+			t.Fatalf("write acknowledgement: %v", err)
+		}
+		expectRawSessionClosed(t, codec)
+		waitNoAdmissions(t, &active)
+	})
+
+	t.Run("wrong active request", func(t *testing.T) {
+		conn, codec, identity := openRawSession(t, running)
+		defer conn.Close()
+		writeRawRequest(t, codec, 1, "ping")
+		writeRawRequest(t, codec, 2, "block")
+		response := readSessionNonWindowFrame(t, codec)
+		if response.ID != 1 {
+			t.Fatalf("terminal response ID = %d, want 1", response.ID)
+		}
+		if err := codec.WriteFrame(wire.Frame{
+			Kind: wire.FrameAck, Flags: wire.FlagEnd, ID: 2, Payload: identity.Session,
+		}); err != nil {
+			t.Fatalf("write acknowledgement: %v", err)
+		}
+		expectRawSessionClosed(t, codec)
+		waitNoAdmissions(t, &active)
+	})
+
+	t.Run("early acknowledgement", func(t *testing.T) {
+		conn, codec, identity := openRawSession(t, running)
+		defer conn.Close()
+		writeRawRequest(t, codec, 1, "block")
+		if err := codec.WriteFrame(wire.Frame{
+			Kind: wire.FrameAck, Flags: wire.FlagEnd, ID: 1, Payload: identity.Session,
+		}); err != nil {
+			t.Fatalf("write acknowledgement: %v", err)
+		}
+		expectRawSessionClosed(t, codec)
+		waitNoAdmissions(t, &active)
+	})
+
+	t.Run("duplicate acknowledgement", func(t *testing.T) {
+		conn, codec, identity := openRawSession(t, running)
+		defer conn.Close()
+		writeRawRequest(t, codec, 1, "ping")
+		_ = readSessionNonWindowFrame(t, codec)
+		ack := wire.Frame{Kind: wire.FrameAck, Flags: wire.FlagEnd, ID: 1, Payload: identity.Session}
+		if err := codec.WriteFrame(ack); err != nil {
+			t.Fatalf("write acknowledgement: %v", err)
+		}
+		waitNoAdmissions(t, &active)
+		if err := codec.WriteFrame(ack); err != nil {
+			t.Fatalf("write duplicate acknowledgement: %v", err)
+		}
+		expectRawSessionClosed(t, codec)
+	})
+
+	t.Run("acknowledgement after reconnect", func(t *testing.T) {
+		first, _, firstIdentity := openRawSession(t, running)
+		if err := first.Close(); err != nil {
+			t.Fatalf("close first session: %v", err)
+		}
+		second, codec, secondIdentity := openRawSession(t, running)
+		defer second.Close()
+		if bytes.Equal(firstIdentity.Session, secondIdentity.Session) {
+			t.Fatal("reconnected session reused generation")
+		}
+		writeRawRequest(t, codec, 1, "ping")
+		_ = readSessionNonWindowFrame(t, codec)
+		if err := codec.WriteFrame(wire.Frame{
+			Kind: wire.FrameAck, Flags: wire.FlagEnd, ID: 1, Payload: firstIdentity.Session,
+		}); err != nil {
+			t.Fatalf("write stale acknowledgement: %v", err)
+		}
+		expectRawSessionClosed(t, codec)
+		waitNoAdmissions(t, &active)
+	})
 }
 
 func TestBackpressuredResponseCancellationFailsSessionAndReleasesAdmission(t *testing.T) {
@@ -486,6 +657,49 @@ func TestTerminalWriteFailureSettlesEveryAdmission(t *testing.T) {
 	blocked.releaseReads()
 	if err := <-closeDone; err != nil {
 		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestTerminalAcknowledgementTimeoutClosesSessionAndReleasesAdmission(t *testing.T) {
+	admissionDone := make(chan struct{}, 1)
+	server := &wire.Server{Build: "server-test", WriteTimeout: 50 * time.Millisecond}
+	server.RegisterControl("ping", func(context.Context, wire.Request) (any, error) { return true, nil })
+	running := startSessionServer(t, server, func() (func(), error) {
+		return func() { admissionDone <- struct{}{} }, nil
+	})
+	conn, err := net.Dial("unix", running.path)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+	codec := wire.NewCodec(conn)
+	identity, _ := json.Marshal(wire.BuildIdentity{Protocol: wire.ProtocolVersion, Build: "server-test"})
+	if err := codec.WriteFrame(wire.Frame{Kind: wire.FrameHello, Flags: wire.FlagEnd, Payload: identity}); err != nil {
+		t.Fatalf("write hello: %v", err)
+	}
+	if _, err := codec.ReadFrame(); err != nil {
+		t.Fatalf("read hello ack: %v", err)
+	}
+	if err := codec.WriteFrame(wire.Frame{Kind: wire.FrameRequest, Flags: wire.FlagEnd, ID: 1, Op: "ping"}); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	frame := readSessionNonWindowFrame(t, codec)
+	if frame.Kind != wire.FrameResponse || frame.ID != 1 {
+		t.Fatalf("terminal frame = %#v", frame)
+	}
+	select {
+	case <-admissionDone:
+		t.Fatal("admission completed without terminal acknowledgement")
+	default:
+	}
+	select {
+	case <-admissionDone:
+	case <-time.After(time.Second):
+		t.Fatal("terminal acknowledgement timeout leaked admission")
+	}
+	codec.ReadTimeout = time.Second
+	if next, err := codec.ReadFrame(); err == nil {
+		t.Fatalf("session stayed open after acknowledgement timeout: %#v", next)
 	}
 }
 

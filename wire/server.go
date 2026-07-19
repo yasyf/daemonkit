@@ -2,6 +2,7 @@ package wire
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,7 +17,7 @@ import (
 var (
 	// ErrUntrustedPeer means the accepted unix peer failed the same-uid floor.
 	ErrUntrustedPeer = errors.New("wire: untrusted peer")
-	// ErrHandshake means the first frame did not establish a v3 session.
+	// ErrHandshake means the first frame did not establish a v4 session.
 	ErrHandshake = errors.New("wire: handshake failed")
 	// ErrServerStarted means Serve was called more than once.
 	ErrServerStarted = errors.New("wire: server already started")
@@ -66,7 +67,7 @@ type result struct {
 	err error
 }
 
-// Server serves persistent, multiplexed v3 sessions on a listener owned by its caller.
+// Server serves persistent, multiplexed v4 sessions on a listener owned by its caller.
 // Register handlers and lifecycle controls before Serve.
 type Server struct {
 	// Build is the server build identity sent during the mandatory handshake.
@@ -150,7 +151,7 @@ func (s *Server) OnActivity(f func()) {
 	s.onActivity = f
 }
 
-// Serve accepts v3 sessions until ctx is cancelled. admit runs for every
+// Serve accepts v4 sessions until ctx is cancelled. admit runs for every
 // request that clears the pre-admission checks; its done runs when the
 // request's execution settles, including cancellation and write-failure paths.
 func (s *Server) Serve(
@@ -290,7 +291,7 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn, admit, admitLifec
 	if err := codec.SetDeadline(earlierDeadline(ctx, s.handshakeTimeout())); err != nil {
 		return err
 	}
-	identity, err := s.serverHandshake(codec)
+	identity, generation, err := s.serverHandshake(codec)
 	if err != nil {
 		return err
 	}
@@ -308,6 +309,7 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn, admit, admitLifec
 		cancel:         cancel,
 		peer:           peer,
 		build:          identity.Build,
+		generation:     generation,
 		admit:          admit,
 		admitLifecycle: admitLifecycle,
 		outbound:       make(chan sessionOutbound, s.outboundQueue()),
@@ -323,32 +325,39 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn, admit, admitLifec
 	return sess.run(sessCtx)
 }
 
-func (s *Server) serverHandshake(codec *Codec) (BuildIdentity, error) {
+func (s *Server) serverHandshake(codec *Codec) (BuildIdentity, []byte, error) {
 	frame, err := codec.ReadFrame()
 	if err != nil {
-		return BuildIdentity{}, fmt.Errorf("%w: %w", ErrHandshake, err)
+		return BuildIdentity{}, nil, fmt.Errorf("%w: %w", ErrHandshake, err)
 	}
 	if frame.Kind != FrameHello || frame.ID != 0 || frame.Sequence != 0 || frame.Flags != FlagEnd || frame.Op != "" || frame.Tenant != "" {
-		return BuildIdentity{}, fmt.Errorf("%w: invalid hello frame", ErrHandshake)
+		return BuildIdentity{}, nil, fmt.Errorf("%w: invalid hello frame", ErrHandshake)
 	}
 	var identity BuildIdentity
 	if err := decodeStrict(frame.Payload, &identity); err != nil {
-		return BuildIdentity{}, fmt.Errorf("%w: identity: %w", ErrHandshake, err)
+		return BuildIdentity{}, nil, fmt.Errorf("%w: identity: %w", ErrHandshake, err)
 	}
 	if identity.Protocol != ProtocolVersion {
-		return BuildIdentity{}, fmt.Errorf("%w: identity got %d", ErrProtocolVersion, identity.Protocol)
+		return BuildIdentity{}, nil, fmt.Errorf("%w: identity got %d", ErrProtocolVersion, identity.Protocol)
 	}
 	if identity.Build == "" {
-		return BuildIdentity{}, fmt.Errorf("%w: empty build", ErrHandshake)
+		return BuildIdentity{}, nil, fmt.Errorf("%w: empty build", ErrHandshake)
 	}
-	payload, err := json.Marshal(BuildIdentity{Protocol: ProtocolVersion, Build: s.Build})
+	if len(identity.Session) != 0 {
+		return BuildIdentity{}, nil, fmt.Errorf("%w: client supplied a session generation", ErrHandshake)
+	}
+	generation := make([]byte, sessionGenerationBytes)
+	if _, err := rand.Read(generation); err != nil {
+		return BuildIdentity{}, nil, fmt.Errorf("%w: generate session: %w", ErrHandshake, err)
+	}
+	payload, err := json.Marshal(BuildIdentity{Protocol: ProtocolVersion, Build: s.Build, Session: generation})
 	if err != nil {
-		return BuildIdentity{}, err
+		return BuildIdentity{}, nil, err
 	}
 	if err := codec.WriteFrame(Frame{Kind: FrameHelloAck, Flags: FlagEnd, Payload: payload}); err != nil {
-		return BuildIdentity{}, fmt.Errorf("%w: acknowledge: %w", ErrHandshake, err)
+		return BuildIdentity{}, nil, fmt.Errorf("%w: acknowledge: %w", ErrHandshake, err)
 	}
-	return identity, nil
+	return identity, generation, nil
 }
 
 func (s *Server) worker() {

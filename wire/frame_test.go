@@ -12,8 +12,8 @@ import (
 	"time"
 )
 
-func TestFrameV3CrossLanguageGolden(t *testing.T) {
-	fixture, err := os.ReadFile("testdata/frame-v3.json")
+func TestFrameV4CrossLanguageGolden(t *testing.T) {
+	fixture, err := os.ReadFile("testdata/frame-v4.json")
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
@@ -161,6 +161,9 @@ func TestFrameKindStructuralValidation(t *testing.T) {
 		{name: "event tenant", frame: Frame{Kind: FrameEvent, Flags: FlagEnd, Op: "changed", Tenant: "acct-18"}},
 		{name: "request negative deadline", frame: Frame{Kind: FrameRequest, Flags: FlagEnd, ID: 1, DeadlineUnixMilli: -1, Op: "mutate"}},
 		{name: "response routing", frame: Frame{Kind: FrameResponse, Flags: FlagEnd, ID: 1, Op: "mutate", Payload: []byte(`{}`)}},
+		{name: "ack missing generation", frame: Frame{Kind: FrameAck, Flags: FlagEnd, ID: 1}},
+		{name: "ack short generation", frame: Frame{Kind: FrameAck, Flags: FlagEnd, ID: 1, Payload: make([]byte, sessionGenerationBytes-1)}},
+		{name: "ack routing", frame: Frame{Kind: FrameAck, Flags: FlagEnd, ID: 1, Op: "mutate", Payload: make([]byte, sessionGenerationBytes)}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

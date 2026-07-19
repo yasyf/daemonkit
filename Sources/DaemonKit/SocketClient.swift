@@ -85,7 +85,7 @@ public final class SocketCall: @unchecked Sendable {
     }
 }
 
-/// A persistent, multiplexed exact-v3 unix-socket client.
+/// A persistent, multiplexed exact-v4 unix-socket client.
 public final class SocketClient: @unchecked Sendable {
     public struct Configuration: Sendable {
         public var maximumFrameBytes: Int
@@ -124,6 +124,7 @@ public final class SocketClient: @unchecked Sendable {
 
     /// Server build identity established by the mandatory handshake.
     public let peerBuild: String
+    private let sessionGeneration: Data
 
     private let descriptor: Int32
     private let codec: SessionFrameCodec
@@ -146,7 +147,12 @@ public final class SocketClient: @unchecked Sendable {
         eventChannel = SocketBoundedChannel(capacity: configuration.eventQueueDepth)
         Self.configure(descriptor, receive: configuration.handshakeTimeout, send: configuration.writeTimeout)
         do {
-            peerBuild = try Self.handshake(codec: codec, build: build)
+            let identity = try Self.handshake(codec: codec, build: build)
+            peerBuild = identity.build
+            guard let session = identity.session, session.count == 16 else {
+                throw SessionTransportError.handshake("invalid session generation")
+            }
+            sessionGeneration = session
         } catch {
             Darwin.close(descriptor)
             throw error
@@ -294,9 +300,15 @@ public final class SocketClient: @unchecked Sendable {
         guard frame.id != 0, frame.flags == .end, frame.operation.isEmpty, frame.tenant.isEmpty else {
             throw SessionTransportError.invalidFrame("response")
         }
-        let result = try Self.decodeResponse(frame.payload)
-        guard let state = remove(frame.id) else { return }
-        state.finish(returning: result)
+        let response = try Self.decodeResponse(frame.payload)
+        let state = remove(frame.id)
+        if response.acknowledge {
+            try write(SessionFrame(
+                kind: .acknowledgment, flags: .end, id: frame.id, payload: sessionGeneration
+            ))
+        }
+        guard let state else { return }
+        state.finish(returning: response.terminal)
     }
 
     private func receiveStream(_ frame: SessionFrame) async throws {
@@ -360,7 +372,7 @@ public final class SocketClient: @unchecked Sendable {
         Task { await eventChannel.finish(throwing: error) }
     }
 
-    private static func handshake(codec: SessionFrameCodec, build: String) throws -> String {
+    private static func handshake(codec: SessionFrameCodec, build: String) throws -> SessionBuildIdentity {
         let payload = try JSONEncoder().encode(SessionBuildIdentity(
             protocolVersion: daemonKitSessionProtocolVersion,
             build: build
@@ -377,10 +389,15 @@ public final class SocketClient: @unchecked Sendable {
             throw SessionTransportError.unsupportedProtocolVersion(identity.protocolVersion)
         }
         guard !identity.build.isEmpty else { throw SessionTransportError.handshake("empty server build") }
-        return identity.build
+        return identity
     }
 
-    private static func decodeResponse(_ data: Data) throws -> SocketTerminal {
+    private struct DecodedResponse {
+        let terminal: SocketTerminal
+        let acknowledge: Bool
+    }
+
+    private static func decodeResponse(_ data: Data) throws -> DecodedResponse {
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw SessionTransportError.invalidFrame("response JSON")
         }
@@ -389,12 +406,13 @@ public final class SocketClient: @unchecked Sendable {
         } else {
             nil
         }
-        return SocketTerminal(
+        let terminal = SocketTerminal(
             payload: payload,
             error: object["err"] as? String,
             rejected: object["rejected"] as? Bool ?? false,
             reason: object["reason"] as? String
         )
+        return DecodedResponse(terminal: terminal, acknowledge: object["ack"] as? Bool ?? false)
     }
 
     private static func connect(path: String) throws -> Int32 {

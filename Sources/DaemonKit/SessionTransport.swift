@@ -2,12 +2,12 @@ import Darwin
 import Foundation
 
 /// Exact protocol version shared by daemonkit's Go and Swift session transports.
-public let daemonKitSessionProtocolVersion: UInt16 = 3
+public let daemonKitSessionProtocolVersion: UInt16 = 4
 
 /// Default maximum encoded frame body: 4 MiB.
 public let daemonKitDefaultMaximumFrameBytes = 4 * 1024 * 1024
 
-/// A v3 session frame kind.
+/// A v4 session frame kind.
 public enum SessionFrameKind: UInt8, Sendable {
     case hello = 1
     case helloAck
@@ -18,9 +18,10 @@ public enum SessionFrameKind: UInt8, Sendable {
     case stream
     case goAway
     case window
+    case acknowledgment
 }
 
-/// Flags carried by a v3 session frame.
+/// Flags carried by a v4 session frame.
 public struct SessionFrameFlags: OptionSet, Sendable {
     public let rawValue: UInt8
 
@@ -32,7 +33,7 @@ public struct SessionFrameFlags: OptionSet, Sendable {
     public static let end = SessionFrameFlags(rawValue: 1)
 }
 
-/// One exact-v3 length-prefixed session frame.
+/// One exact-v4 length-prefixed session frame.
 public struct SessionFrame: Sendable {
     public var kind: SessionFrameKind
     public var flags: SessionFrameFlags
@@ -81,10 +82,18 @@ public enum SessionTransportError: Error, Equatable, Sendable {
 struct SessionBuildIdentity: Codable, Sendable {
     let protocolVersion: UInt16
     let build: String
+    let session: Data?
+
+    init(protocolVersion: UInt16, build: String, session: Data? = nil) {
+        self.protocolVersion = protocolVersion
+        self.build = build
+        self.session = session
+    }
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol"
         case build
+        case session
     }
 }
 
@@ -113,7 +122,7 @@ struct SessionSequence: Sendable {
 final class SessionFrameCodec: @unchecked Sendable {
     static let defaultMaximumFrameBytes = daemonKitDefaultMaximumFrameBytes
     private static let headerBytes = 32
-    private static let magic = Data("DKS3".utf8)
+    private static let magic = Data("DKS4".utf8)
 
     private let descriptor: Int32
     private let maximumFrameBytes: Int
@@ -259,6 +268,11 @@ final class SessionFrameCodec: @unchecked Sendable {
             guard frame.flags.isEmpty, frame.sequence > 0, frame.deadlineUnixMilliseconds == 0,
                   frame.operation.isEmpty, frame.tenant.isEmpty, frame.payload.isEmpty
             else { throw SessionTransportError.invalidFrame("window frame") }
+        case .acknowledgment:
+            guard frame.flags == .end, frame.id != 0, frame.sequence == 0,
+                  frame.deadlineUnixMilliseconds == 0, frame.operation.isEmpty,
+                  frame.tenant.isEmpty, frame.payload.count == 16
+            else { throw SessionTransportError.invalidFrame("acknowledgement frame") }
         }
     }
 

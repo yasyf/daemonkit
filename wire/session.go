@@ -1,6 +1,7 @@
 package wire
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 )
 
 // AcceptedSession is a server-authenticated persistent client session.
@@ -38,6 +40,7 @@ type session struct {
 	cancel         context.CancelFunc
 	peer           Peer
 	build          string
+	generation     []byte
 	admit          func() (func(), error)
 	admitLifecycle func() (func(), error)
 	accepted       *AcceptedSession
@@ -57,8 +60,9 @@ type session struct {
 }
 
 type sessionOutbound struct {
-	frame Frame
-	done  chan error
+	frame   Frame
+	done    chan error
+	written func()
 }
 
 type requestState struct {
@@ -68,11 +72,16 @@ type requestState struct {
 	responseCredits *creditWindow
 	deliveryDone    chan struct{}
 	deliveryOnce    sync.Once
+	terminalAck     chan struct{}
+	settled         chan struct{}
+	settledOnce     sync.Once
 
 	mu            sync.Mutex
 	inputSequence streamSequence
 	inputEnded    bool
 	transportErr  error
+	terminalSent  bool
+	terminalAcked bool
 }
 
 func (s *requestState) close() {
@@ -150,6 +159,9 @@ func (s *session) writeLoop() {
 			terminalErr = s.ctx.Err()
 		case outgoing := <-s.outbound:
 			err := s.codec.WriteFrame(outgoing.frame)
+			if err == nil && outgoing.written != nil {
+				outgoing.written()
+			}
 			if outgoing.done != nil {
 				outgoing.done <- err
 			}
@@ -182,6 +194,10 @@ func (s *session) readLoop(ctx context.Context) error {
 			}
 		case FrameWindow:
 			if err := s.receiveWindow(frame); err != nil {
+				return err
+			}
+		case FrameAck:
+			if err := s.receiveAck(frame); err != nil {
 				return err
 			}
 		case FrameGoAway:
@@ -239,6 +255,8 @@ func (s *session) receiveRequest(ctx context.Context, frame Frame) error {
 		inbound:         newBoundedStream[Chunk](s.server.streamQueue()),
 		responseCredits: newCreditWindow(),
 		deliveryDone:    make(chan struct{}),
+		terminalAck:     make(chan struct{}),
+		settled:         make(chan struct{}),
 	}
 	if frame.Flags&FlagEnd != 0 {
 		state.inputEnded = true
@@ -266,6 +284,7 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 		if finishAdmission != nil {
 			finishAdmission()
 		}
+		state.settledOnce.Do(func() { close(state.settled) })
 		s.requestWG.Done()
 	}()
 
@@ -321,7 +340,11 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 		err = transportErr
 	}
 	if errors.Is(err, ErrQueueFull) {
-		if err := s.sendRejected(sessionCtx, frame.ID, err.Error()); err != nil {
+		if err := s.sendAdmittedRejected(sessionCtx, frame.ID, state, err.Error()); err != nil {
+			s.close()
+			return
+		}
+		if err := s.waitTerminalAck(sessionCtx, state); err != nil {
 			s.close()
 		}
 		return
@@ -376,7 +399,7 @@ func (s *session) sendValue(
 			}
 		}
 	}
-	response := Response{}
+	response := Response{Ack: true}
 	if handlerErr != nil {
 		response.Err = handlerErr.Error()
 	} else {
@@ -387,7 +410,10 @@ func (s *session) sendValue(
 			response.Payload = payload
 		}
 	}
-	return s.sendResponse(responseCtx, id, response)
+	if err := s.sendAdmittedResponse(responseCtx, id, state, response); err != nil {
+		return err
+	}
+	return s.waitTerminalAck(responseCtx, state)
 }
 
 func (s *session) receiveCancel(frame Frame) error {
@@ -472,6 +498,51 @@ func (s *session) receiveWindow(frame Frame) error {
 	return err
 }
 
+func (s *session) receiveAck(frame Frame) error {
+	if frame.Flags != FlagEnd || frame.ID == 0 || frame.Sequence != 0 || frame.Op != "" ||
+		frame.Tenant != "" || len(frame.Payload) != sessionGenerationBytes {
+		return fmt.Errorf("%w: acknowledgement frame", ErrInvalidFrame)
+	}
+	if !bytes.Equal(frame.Payload, s.generation) {
+		return fmt.Errorf("%w: acknowledgement session generation", ErrInvalidFrame)
+	}
+	s.mu.Lock()
+	state := s.active[frame.ID]
+	s.mu.Unlock()
+	if state == nil {
+		return fmt.Errorf("%w: acknowledgement request %d", ErrInvalidFrame, frame.ID)
+	}
+	state.mu.Lock()
+	if !state.terminalSent || state.terminalAcked {
+		state.mu.Unlock()
+		return fmt.Errorf("%w: duplicate acknowledgement %d", ErrInvalidFrame, frame.ID)
+	}
+	state.terminalAcked = true
+	close(state.terminalAck)
+	state.mu.Unlock()
+	select {
+	case <-state.settled:
+	case <-s.ctx.Done():
+		return s.ctx.Err()
+	}
+	return nil
+}
+
+func (s *session) waitTerminalAck(ctx context.Context, state *requestState) error {
+	timer := time.NewTimer(s.server.writeTimeout())
+	defer timer.Stop()
+	select {
+	case <-state.terminalAck:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.ctx.Done():
+		return s.ctx.Err()
+	case <-timer.C:
+		return errors.New("wire: terminal acknowledgement timeout")
+	}
+}
+
 func (s *session) deliverRequestChunks(id uint64, state *requestState) {
 	defer s.requestWG.Done()
 	defer close(state.chunks)
@@ -526,12 +597,43 @@ func (s *session) sendRejected(ctx context.Context, id uint64, reason string) er
 	return s.sendResponse(ctx, id, Response{Rejected: true, Reason: reason})
 }
 
+func (s *session) sendAdmittedRejected(
+	ctx context.Context,
+	id uint64,
+	state *requestState,
+	reason string,
+) error {
+	return s.sendAdmittedResponse(ctx, id, state, Response{Rejected: true, Ack: true, Reason: reason})
+}
+
 func (s *session) sendResponse(ctx context.Context, id uint64, response Response) error {
+	return s.sendResponseWritten(ctx, id, response, nil)
+}
+
+func (s *session) sendAdmittedResponse(
+	ctx context.Context,
+	id uint64,
+	state *requestState,
+	response Response,
+) error {
+	return s.sendResponseWritten(ctx, id, response, func() {
+		state.mu.Lock()
+		state.terminalSent = true
+		state.mu.Unlock()
+	})
+}
+
+func (s *session) sendResponseWritten(
+	ctx context.Context,
+	id uint64,
+	response Response,
+	written func(),
+) error {
 	payload, err := json.Marshal(response)
 	if err != nil {
 		return fmt.Errorf("wire: marshal envelope: %w", err)
 	}
-	return s.enqueueAndWait(ctx, Frame{Kind: FrameResponse, Flags: FlagEnd, ID: id, Payload: payload})
+	return s.enqueueAndWait(ctx, Frame{Kind: FrameResponse, Flags: FlagEnd, ID: id, Payload: payload}, written)
 }
 
 func (s *session) enqueue(ctx context.Context, frame Frame) error {
@@ -552,10 +654,10 @@ func (s *session) enqueue(ctx context.Context, frame Frame) error {
 	}
 }
 
-func (s *session) enqueueAndWait(ctx context.Context, frame Frame) error {
+func (s *session) enqueueAndWait(ctx context.Context, frame Frame, written func()) error {
 	done := make(chan error, 1)
 	select {
-	case s.outbound <- sessionOutbound{frame: frame, done: done}:
+	case s.outbound <- sessionOutbound{frame: frame, done: done, written: written}:
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-s.ctx.Done():

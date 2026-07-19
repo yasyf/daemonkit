@@ -70,13 +70,13 @@ private actor PullChunks {
 extension SocketTransportTests {
     @Suite(.timeLimit(.minutes(1)))
     struct SocketServerTests {
-        @Test func frameV3MatchesSharedGoGolden() throws {
+        @Test func frameV4MatchesSharedGoGolden() throws {
             let repository = URL(fileURLWithPath: #filePath)
                 .deletingLastPathComponent()
                 .deletingLastPathComponent()
                 .deletingLastPathComponent()
             let fixture = try JSONSerialization.jsonObject(
-                with: Data(contentsOf: repository.appendingPathComponent("wire/testdata/frame-v3.json"))
+                with: Data(contentsOf: repository.appendingPathComponent("wire/testdata/frame-v4.json"))
             ) as? [String: String]
             let hex = try #require(fixture?["hex"])
             var encoded = Data()
@@ -177,6 +177,15 @@ extension SocketTransportTests {
                 SessionFrame(kind: .event, flags: .end, sequence: 1, operation: "changed"),
                 SessionFrame(kind: .event, flags: .end, operation: "changed", tenant: "acct-18"),
                 SessionFrame(kind: .goAway, flags: .end, payload: Data("x".utf8)),
+                SessionFrame(kind: .acknowledgment, flags: .end, id: 1),
+                SessionFrame(kind: .acknowledgment, flags: .end, id: 1, payload: Data(repeating: 0, count: 15)),
+                SessionFrame(
+                    kind: .acknowledgment,
+                    flags: .end,
+                    id: 1,
+                    operation: "mutate",
+                    payload: Data(repeating: 0, count: 16)
+                ),
             ]
             for frame in invalid {
                 #expect(throws: SessionTransportError.self) { try SessionFrameCodec.encode(frame) }
@@ -186,6 +195,12 @@ extension SocketTransportTests {
                 flags: .end,
                 operation: "changed",
                 payload: Data("payload".utf8)
+            ))
+            _ = try SessionFrameCodec.encode(SessionFrame(
+                kind: .acknowledgment,
+                flags: .end,
+                id: 1,
+                payload: Data(repeating: 0, count: 16)
             ))
         }
 

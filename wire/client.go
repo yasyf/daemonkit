@@ -78,7 +78,7 @@ type ClientConfig struct {
 	CancelSettlementTimeout time.Duration
 }
 
-// Client is one persistent, concurrent v3 session.
+// Client is one persistent, concurrent v4 session.
 type Client struct {
 	conn   net.Conn
 	codec  *Codec
@@ -140,7 +140,7 @@ type callResult struct {
 	err    error
 }
 
-// NewClient dials and completes the mandatory exact-v3 handshake before returning.
+// NewClient dials and completes the mandatory exact-v4 handshake before returning.
 func NewClient(ctx context.Context, config ClientConfig) (*Client, error) {
 	if config.Dial == nil {
 		return nil, errors.New("wire: Dial is required")
@@ -530,6 +530,9 @@ func clientHandshake(codec *Codec, build string) (BuildIdentity, error) {
 	if identity.Build == "" {
 		return BuildIdentity{}, fmt.Errorf("%w: empty server build", ErrHandshake)
 	}
+	if len(identity.Session) != sessionGenerationBytes {
+		return BuildIdentity{}, fmt.Errorf("%w: invalid session generation", ErrHandshake)
+	}
 	return identity, nil
 }
 
@@ -610,8 +613,14 @@ func (c *Client) receiveResponse(frame Frame) error {
 		return fmt.Errorf("wire: decode response: %w", err)
 	}
 	call := c.removePending(frame.ID)
+	var ackErr error
+	if response.Ack {
+		ackErr = c.sendFrame(c.ctx, Frame{
+			Kind: FrameAck, Flags: FlagEnd, ID: frame.ID, Payload: c.peer.Session,
+		})
+	}
 	if call == nil {
-		return nil
+		return ackErr
 	}
 	call.mu.Lock()
 	if !call.receiveEnded {
@@ -624,7 +633,7 @@ func (c *Client) receiveResponse(frame Frame) error {
 		outcome = Rejected
 	}
 	call.finish(callResult{result: Result{Outcome: outcome, Response: response}})
-	return nil
+	return ackErr
 }
 
 func (c *Client) receiveStream(frame Frame) error {

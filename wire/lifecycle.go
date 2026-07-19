@@ -81,7 +81,7 @@ func decodeLifecycle(req Request, op string, dst any) error {
 	return nil
 }
 
-// LifecyclePeer is a persistent v3 session client implementing daemon.Peer.
+// LifecyclePeer is a persistent v4 session client implementing daemon.Peer.
 type LifecyclePeer struct {
 	Config ClientConfig
 

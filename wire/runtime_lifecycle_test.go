@@ -119,8 +119,13 @@ func TestRuntimeLifecycleAckPrecedesShutdownOrHandoff(t *testing.T) {
 			if err := codec.WriteFrame(wire.Frame{Kind: wire.FrameHello, Flags: wire.FlagEnd, Payload: identity}); err != nil {
 				t.Fatalf("write hello: %v", err)
 			}
-			if _, err := codec.ReadFrame(); err != nil {
+			helloAck, err := codec.ReadFrame()
+			if err != nil {
 				t.Fatalf("read hello ack: %v", err)
+			}
+			var serverIdentity wire.BuildIdentity
+			if err := json.Unmarshal(helloAck.Payload, &serverIdentity); err != nil {
+				t.Fatalf("decode server identity: %v", err)
 			}
 			if err := codec.WriteFrame(wire.Frame{Kind: wire.FrameWindow, Sequence: 1}); err != nil {
 				t.Fatalf("grant event window: %v", err)
@@ -162,6 +167,11 @@ func TestRuntimeLifecycleAckPrecedesShutdownOrHandoff(t *testing.T) {
 					lifecycleAck = true
 				default:
 					t.Fatalf("unexpected response = %#v", frame)
+				}
+				if err := codec.WriteFrame(wire.Frame{
+					Kind: wire.FrameAck, Flags: wire.FlagEnd, ID: frame.ID, Payload: serverIdentity.Session,
+				}); err != nil {
+					t.Fatalf("ack response %d: %v", frame.ID, err)
 				}
 			}
 			select {

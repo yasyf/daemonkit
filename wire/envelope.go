@@ -6,6 +6,8 @@ import (
 	"errors"
 )
 
+const sessionGenerationBytes = 16
+
 var (
 	// ErrDraining means intake is closed and the request was not dispatched.
 	ErrDraining = errors.New("wire: server is draining")
@@ -19,6 +21,7 @@ var (
 type BuildIdentity struct {
 	Protocol uint16 `json:"protocol"`
 	Build    string `json:"build"`
+	Session  []byte `json:"session,omitempty"`
 }
 
 // Request is one admitted request on a persistent session.
@@ -49,6 +52,7 @@ type Event struct {
 // Response is the terminal response for one request.
 type Response struct {
 	Rejected bool            `json:"rejected,omitempty"`
+	Ack      bool            `json:"ack,omitempty"`
 	Reason   string          `json:"reason,omitempty"`
 	Err      string          `json:"err,omitempty"`
 	Payload  json.RawMessage `json:"payload,omitempty"`

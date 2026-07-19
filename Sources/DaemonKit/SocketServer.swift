@@ -112,7 +112,7 @@ private final class SocketSessionLifecycle: @unchecked Sendable {
     }
 }
 
-/// A unix-domain persistent v3 session server.
+/// A unix-domain persistent v4 session server.
 public final class SocketServer: @unchecked Sendable {
     public struct Configuration: Sendable {
         public var maximumFrameBytes: Int
@@ -415,6 +415,10 @@ private actor ServerRequestState {
     private var ended = false
     private var canceled = false
     private var transportError: Error?
+    private var terminalSent = false
+    private var terminalAcknowledged = false
+    private var terminalAckWaiter: CheckedContinuation<Void, Error>?
+    private var terminalAckTimer: Task<Void, Never>?
 
     init(capacity: Int) {
         channel = SocketBoundedChannel(capacity: capacity)
@@ -500,6 +504,15 @@ private actor ServerRequestState {
         await responseWindow.close()
     }
 
+    private func close() async {
+        await cancel()
+        let waiter = terminalAckWaiter
+        terminalAckWaiter = nil
+        terminalAckTimer?.cancel()
+        terminalAckTimer = nil
+        waiter?.resume(throwing: SessionTransportError.disconnected)
+    }
+
     func error() -> Error? {
         transportError
     }
@@ -508,8 +521,50 @@ private actor ServerRequestState {
         await responseWindow.grant(count)
     }
 
+    func acknowledgeTerminal() -> Bool {
+        guard terminalSent, !terminalAcknowledged else { return false }
+        terminalAcknowledged = true
+        let waiter = terminalAckWaiter
+        terminalAckWaiter = nil
+        terminalAckTimer?.cancel()
+        terminalAckTimer = nil
+        waiter?.resume()
+        return true
+    }
+
+    func writeTerminal(_ write: @Sendable () throws -> Void) throws {
+        try write()
+        terminalSent = true
+    }
+
+    func waitForTerminalAcknowledgement(timeout: TimeInterval) async throws {
+        if terminalAcknowledged {
+            return
+        }
+        try await withCheckedThrowingContinuation { continuation in
+            terminalAckWaiter = continuation
+            terminalAckTimer = Task {
+                let nanoseconds = UInt64(max(0, timeout) * 1_000_000_000)
+                do {
+                    try await Task.sleep(nanoseconds: nanoseconds)
+                } catch {
+                    return
+                }
+                self.expireTerminalAcknowledgement()
+            }
+        }
+    }
+
+    private func expireTerminalAcknowledgement() {
+        guard !terminalAcknowledged else { return }
+        let waiter = terminalAckWaiter
+        terminalAckWaiter = nil
+        terminalAckTimer = nil
+        waiter?.resume(throwing: SessionTransportError.disconnected)
+    }
+
     func settle() async {
-        await cancel()
+        await close()
         await task?.value
     }
 }
@@ -524,6 +579,7 @@ private final class ServerSession: @unchecked Sendable {
     private let readQueue: DispatchQueue
     private let eventWindow = SocketCreditWindow()
     private let lifecycle = SocketSessionLifecycle()
+    private let generation: Data
     private let lock = NSLock()
     private var active: [UInt64: ServerRequestState] = [:]
     private var seen: Set<UInt64> = []
@@ -542,6 +598,8 @@ private final class ServerSession: @unchecked Sendable {
         self.peer = peer
         self.configuration = configuration
         self.handler = handler
+        var uuid = UUID().uuid
+        generation = withUnsafeBytes(of: &uuid) { Data($0) }
         codec = SessionFrameCodec(descriptor: descriptor, maximumFrameBytes: configuration.maximumFrameBytes)
         readQueue = DispatchQueue(label: "com.yasyf.daemonkit.SocketServer.read.\(descriptor)")
     }
@@ -565,6 +623,8 @@ private final class ServerSession: @unchecked Sendable {
                     try await receiveStream(frame)
                 case .window:
                     try await receiveWindow(frame)
+                case .acknowledgment:
+                    try await receiveAcknowledgement(frame)
                 case .goAway:
                     close()
                     await eventWindow.close()
@@ -624,9 +684,13 @@ private final class ServerSession: @unchecked Sendable {
         guard !identity.build.isEmpty else {
             throw SessionTransportError.handshake("empty build")
         }
+        guard identity.session == nil else {
+            throw SessionTransportError.handshake("client supplied a session generation")
+        }
         let payload = try JSONEncoder().encode(SessionBuildIdentity(
             protocolVersion: daemonKitSessionProtocolVersion,
-            build: serverBuild
+            build: serverBuild,
+            session: generation
         ))
         try codec.write(SessionFrame(kind: .helloAck, flags: .end, payload: payload))
         return identity.build
@@ -754,24 +818,6 @@ private final class ServerSession: @unchecked Sendable {
         await request(frame.id)?.receive(frame)
     }
 
-    private func receiveWindow(_ frame: SessionFrame) async throws {
-        guard frame.flags.isEmpty, frame.sequence > 0, frame.operation.isEmpty,
-              frame.tenant.isEmpty, frame.payload.isEmpty
-        else { throw SessionTransportError.invalidFrame("response or event window") }
-        if frame.id == 0 {
-            await eventWindow.grant(frame.sequence)
-            return
-        }
-        await request(frame.id)?.grantResponseCredits(frame.sequence)
-    }
-
-    private func request(_ id: UInt64) -> ServerRequestState? {
-        lock.lock()
-        let state = active[id]
-        lock.unlock()
-        return state
-    }
-
     private func settleRequests() async {
         let requests = takeRequests()
         for request in requests {
@@ -790,10 +836,11 @@ private final class ServerSession: @unchecked Sendable {
     private func send(_ response: SocketResponse, id: UInt64, state: ServerRequestState) async throws {
         switch response {
         case let .terminal(terminal):
-            try sendTerminal(terminal, id: id)
+            try await sendTerminal(terminal, id: id, state: state)
         case let .stream(stream):
             try await send(stream, id: id, state: state)
         }
+        try await state.waitForTerminalAcknowledgement(timeout: configuration.writeTimeout)
     }
 
     private func send(_ stream: SocketResponseStream, id: UInt64, state: ServerRequestState) async throws {
@@ -810,15 +857,15 @@ private final class ServerSession: @unchecked Sendable {
                 }
                 let terminal = try await settlement.value().get()
                 try Task.checkCancellation()
-                try sendTerminal(terminal, id: id)
+                try await sendTerminal(terminal, id: id, state: state)
             } catch is CancellationError {
                 stream.cancel()
                 _ = await settlement.value()
-                try sendTerminal(SocketTerminal(error: "wire: request canceled"), id: id)
+                try await sendTerminal(SocketTerminal(error: "wire: request canceled"), id: id, state: state)
             } catch {
                 stream.cancel()
                 _ = await settlement.value()
-                try sendTerminal(SocketTerminal(error: String(describing: error)), id: id)
+                try await sendTerminal(SocketTerminal(error: String(describing: error)), id: id, state: state)
             }
         } onCancel: {
             stream.cancel()
@@ -831,9 +878,11 @@ private final class ServerSession: @unchecked Sendable {
         _ = await SocketResponseSettlement(stream: stream).value()
     }
 
-    private func sendTerminal(_ terminal: SocketTerminal, id: UInt64) throws {
-        let envelope = try responseEnvelope(terminal)
-        try write(SessionFrame(kind: .response, flags: .end, id: id, payload: envelope))
+    private func sendTerminal(_ terminal: SocketTerminal, id: UInt64, state: ServerRequestState) async throws {
+        let envelope = try responseEnvelope(terminal, acknowledge: true)
+        try await state.writeTerminal { [self] in
+            try write(SessionFrame(kind: .response, flags: .end, id: id, payload: envelope))
+        }
     }
 
     private func sendError(id: UInt64, _ error: Error) throws {
@@ -860,8 +909,11 @@ private final class ServerSession: @unchecked Sendable {
         lock.unlock()
     }
 
-    private func responseEnvelope(_ response: SocketTerminal) throws -> Data {
+    private func responseEnvelope(_ response: SocketTerminal, acknowledge: Bool = false) throws -> Data {
         var members: [String] = []
+        if acknowledge {
+            members.append("\"ack\":true")
+        }
         if response.rejected {
             members.append("\"rejected\":true")
         }
@@ -889,5 +941,32 @@ private final class ServerSession: @unchecked Sendable {
             throw SessionTransportError.invalidFrame("JSON string encoding is not UTF-8")
         }
         return String(array.dropFirst().dropLast())
+    }
+}
+
+private extension ServerSession {
+    func request(_ id: UInt64) -> ServerRequestState? {
+        lock.lock()
+        let state = active[id]
+        lock.unlock()
+        return state
+    }
+
+    func receiveWindow(_ frame: SessionFrame) async throws {
+        guard frame.flags.isEmpty, frame.sequence > 0, frame.operation.isEmpty,
+              frame.tenant.isEmpty, frame.payload.isEmpty
+        else { throw SessionTransportError.invalidFrame("response or event window") }
+        if frame.id == 0 {
+            await eventWindow.grant(frame.sequence)
+            return
+        }
+        await request(frame.id)?.grantResponseCredits(frame.sequence)
+    }
+
+    func receiveAcknowledgement(_ frame: SessionFrame) async throws {
+        guard frame.flags == .end, frame.id != 0, frame.sequence == 0,
+              frame.operation.isEmpty, frame.tenant.isEmpty, frame.payload == generation,
+              let state = request(frame.id), await state.acknowledgeTerminal()
+        else { throw SessionTransportError.invalidFrame("acknowledgement") }
     }
 }
