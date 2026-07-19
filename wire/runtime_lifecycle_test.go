@@ -181,6 +181,54 @@ func TestRuntimeLifecycleAckPrecedesShutdownOrHandoff(t *testing.T) {
 	}
 }
 
+func TestRuntimeHandoffResponseSurvivesImmediateSessionClosure(t *testing.T) {
+	for iteration := range 100 {
+		dir, err := os.MkdirTemp("/tmp", "dkr-handoff-")
+		if err != nil {
+			t.Fatalf("iteration %d: MkdirTemp: %v", iteration, err)
+		}
+		path := filepath.Join(dir, "runtime.sock")
+		server := &wire.Server{Build: "server-test"}
+		intake := &drain.Intake{}
+		cfg := daemon.RuntimeConfig{
+			Socket: path, Build: "server-test", Protocol: int(wire.ProtocolVersion),
+			Peer: absentPeer{}, Contract: daemon.ResourceOwner, WaitMode: daemon.SocketRelease,
+			Admission: intake, Server: server, Workers: settledWorkers{},
+			State: lifecycleCloser{}, Resources: lifecycleCloser{},
+			Handoff: func(context.Context) error { return nil },
+			Signals: make(chan os.Signal),
+		}
+		runtime, err := daemon.NewRuntime(cfg)
+		if err != nil {
+			t.Fatalf("iteration %d: NewRuntime: %v", iteration, err)
+		}
+		server.RegisterLifecycle(runtime)
+		runDone := make(chan error, 1)
+		go func() { runDone <- runtime.Run(context.Background()) }()
+		client := newRuntimeClient(t, path, "server-test")
+		payload, err := lifeproto.Encode(lifeproto.NewHandoffRequest())
+		if err != nil {
+			t.Fatalf("iteration %d: Encode: %v", iteration, err)
+		}
+		result, callErr := client.Call(context.Background(), wire.Op(lifeproto.OpHandoff), "", payload)
+		_ = client.Close()
+		if callErr != nil || result.Outcome != wire.Delivered || result.Response.Err != "" {
+			t.Fatalf("iteration %d: Handoff = %#v, %v", iteration, result, callErr)
+		}
+		select {
+		case runErr := <-runDone:
+			if runErr != nil {
+				t.Fatalf("iteration %d: Runtime.Run: %v", iteration, runErr)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("iteration %d: runtime did not exit", iteration)
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			t.Fatalf("iteration %d: RemoveAll: %v", iteration, err)
+		}
+	}
+}
+
 func TestResourceOwnerSocketReleaseKeepsLifecycleAvailableWhileDraining(t *testing.T) {
 	const (
 		incumbentBuild = "v1.0.0"

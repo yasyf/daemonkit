@@ -312,6 +312,8 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn, admit, admitLifec
 		admitLifecycle: admitLifecycle,
 		outbound:       make(chan sessionOutbound, s.outboundQueue()),
 		eventCredits:   newCreditWindow(),
+		requestsDone:   make(chan struct{}),
+		writerDone:     make(chan struct{}),
 		active:         make(map[uint64]*requestState),
 		seen:           make(map[uint64]struct{}),
 	}

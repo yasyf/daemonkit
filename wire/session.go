@@ -43,6 +43,8 @@ type session struct {
 	accepted       *AcceptedSession
 	outbound       chan sessionOutbound
 	eventCredits   *creditWindow
+	requestsDone   chan struct{}
+	writerDone     chan struct{}
 
 	mu        sync.Mutex
 	active    map[uint64]*requestState
@@ -96,6 +98,7 @@ func (s *session) run(ctx context.Context) error {
 	s.close()
 	s.closeRequestInputs()
 	s.requestWG.Wait()
+	close(s.requestsDone)
 	s.writerWG.Wait()
 	return err
 }
@@ -119,10 +122,32 @@ func (s *session) close() {
 
 func (s *session) writeLoop() {
 	defer s.writerWG.Done()
+	defer close(s.writerDone)
+	var terminalErr error
 	for {
+		if terminalErr != nil {
+			select {
+			case outgoing := <-s.outbound:
+				if outgoing.done != nil {
+					outgoing.done <- terminalErr
+				}
+			case <-s.requestsDone:
+				for {
+					select {
+					case outgoing := <-s.outbound:
+						if outgoing.done != nil {
+							outgoing.done <- terminalErr
+						}
+					default:
+						return
+					}
+				}
+			}
+			continue
+		}
 		select {
 		case <-s.ctx.Done():
-			return
+			terminalErr = s.ctx.Err()
 		case outgoing := <-s.outbound:
 			err := s.codec.WriteFrame(outgoing.frame)
 			if outgoing.done != nil {
@@ -130,7 +155,7 @@ func (s *session) writeLoop() {
 			}
 			if err != nil {
 				s.close()
-				return
+				terminalErr = err
 			}
 		}
 	}
@@ -234,9 +259,15 @@ func (s *session) receiveRequest(ctx context.Context, frame Frame) error {
 }
 
 func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, entry entry, state *requestState) {
-	defer s.requestWG.Done()
-	defer state.close()
-	defer s.removeRequest(frame.ID)
+	var finishAdmission func()
+	defer func() {
+		state.close()
+		s.removeRequest(frame.ID)
+		if finishAdmission != nil {
+			finishAdmission()
+		}
+		s.requestWG.Done()
+	}()
 
 	if !entry.lifecycle {
 		if s.build != s.server.Build {
@@ -269,7 +300,7 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 		}
 		return
 	}
-	defer done()
+	finishAdmission = done
 
 	req := Request{
 		ID:      frame.ID,
@@ -506,10 +537,17 @@ func (s *session) sendResponse(ctx context.Context, id uint64, response Response
 func (s *session) enqueue(ctx context.Context, frame Frame) error {
 	select {
 	case s.outbound <- sessionOutbound{frame: frame}:
+		select {
+		case <-s.writerDone:
+			return s.ctx.Err()
+		default:
+		}
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-s.ctx.Done():
+		return s.ctx.Err()
+	case <-s.writerDone:
 		return s.ctx.Err()
 	}
 }
@@ -522,13 +560,8 @@ func (s *session) enqueueAndWait(ctx context.Context, frame Frame) error {
 		return ctx.Err()
 	case <-s.ctx.Done():
 		return s.ctx.Err()
-	}
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-s.ctx.Done():
+	case <-s.writerDone:
 		return s.ctx.Err()
 	}
+	return <-done
 }

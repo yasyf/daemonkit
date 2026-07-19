@@ -433,6 +433,62 @@ func TestBackpressuredResponseCancellationFailsSessionAndReleasesAdmission(t *te
 	}
 }
 
+func TestTerminalWriteFailureSettlesEveryAdmission(t *testing.T) {
+	const (
+		requests = 32
+		maxFrame = 2 << 20
+	)
+	var active atomic.Int32
+	server := &wire.Server{
+		Build: "server-test", MaxFrame: maxFrame, Workers: requests, Backlog: requests,
+		InboundQueue: requests + 1, OutboundQueue: requests + 1,
+	}
+	server.RegisterConcurrent("large", func(context.Context, wire.Request) (any, error) {
+		return strings.Repeat("x", 1<<20), nil
+	})
+	running := startSessionServer(t, server, admitAll(&active))
+	var blocked *blockAfterHandshakeConn
+	client, err := wire.NewClient(context.Background(), wire.ClientConfig{
+		Build: "server-test", MaxFrame: maxFrame, OutboundQueue: requests + 1,
+		Dial: func(ctx context.Context) (net.Conn, error) {
+			conn, err := wire.UnixDialer(running.path)(ctx)
+			if err != nil {
+				return nil, err
+			}
+			blocked = &blockAfterHandshakeConn{Conn: conn, release: make(chan struct{})}
+			return blocked, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	for range requests {
+		if _, err := client.Open(context.Background(), "large", "", nil, true); err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for active.Load() != requests {
+		if time.Now().After(deadline) {
+			t.Fatalf("active admissions = %d, want %d", active.Load(), requests)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- client.Close() }()
+	deadline = time.Now().Add(2 * time.Second)
+	for active.Load() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("admissions leaked after terminal write failure: %d", active.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	blocked.releaseReads()
+	if err := <-closeDone; err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
 func TestSlowEventConsumerBackpressuresWithoutDropping(t *testing.T) {
 	server := &wire.Server{Build: "server-test"}
 	server.RegisterControl("events", func(ctx context.Context, request wire.Request) (any, error) {
