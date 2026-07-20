@@ -42,7 +42,7 @@ func probeProc(pid int) (procInfo, error) {
 	return procInfo{startTime: fields[19], comm: comm, groupID: groupID, sessionID: sessionID, zombie: fields[0] == "Z"}, nil
 }
 
-func probeGroupMembers(groupID, sessionID int) ([]groupMember, error) {
+func probeGroupMembers(_ int, sessionID int) ([]groupMember, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return nil, fmt.Errorf("enumerate /proc: %w", err)
@@ -60,7 +60,7 @@ func probeGroupMembers(groupID, sessionID int) ([]groupMember, error) {
 		if err != nil {
 			return nil, err
 		}
-		if info.groupID == groupID && info.sessionID == sessionID {
+		if info.sessionID == sessionID {
 			members = append(members, groupMember{pid: pid, info: info})
 		}
 	}

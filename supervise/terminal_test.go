@@ -59,7 +59,18 @@ func startTerminalTest(t *testing.T, pool *Pool, script string, size TerminalSiz
 
 func attachTerminalTest(t *testing.T, terminal *Terminal, policy TerminalDisconnectPolicy) *TerminalAttachment {
 	t.Helper()
-	attachment, err := terminal.Attach(context.Background(), policy)
+	attachment, err := terminal.Attach(context.Background(), TerminalAttachmentSpec{
+		Role: TerminalController, DisconnectPolicy: policy,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return attachment
+}
+
+func observeTerminalTest(t *testing.T, terminal *Terminal) *TerminalAttachment {
+	t.Helper()
+	attachment, err := terminal.Attach(context.Background(), TerminalAttachmentSpec{Role: TerminalObserver})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +87,7 @@ func receiveUntil(t *testing.T, attachment *TerminalAttachment, want string) str
 		if err != nil {
 			t.Fatalf("receive %q after %q: %v", want, output.String(), err)
 		}
-		output.Write(chunk)
+		output.Write(chunk.Data)
 	}
 	return output.String()
 }
@@ -94,7 +105,7 @@ func receiveAll(t *testing.T, attachment *TerminalAttachment) string {
 		if err != nil {
 			t.Fatalf("receive terminal output: %v", err)
 		}
-		output.Write(chunk)
+		output.Write(chunk.Data)
 	}
 }
 
@@ -223,15 +234,216 @@ func TestTerminalLostAttachNeverDispatches(t *testing.T) {
 	assertTerminalStoreEmpty(t, store)
 }
 
-func TestTerminalCancelDisconnectSettlesBlockedOutput(t *testing.T) {
+func TestTerminalSlowObserverDoesNotStallController(t *testing.T) {
 	pool, store := newTerminalTestPool(t)
-	terminal := startTerminalTest(t, pool, `while :; do printf '01234567890123456789012345678901'; done`, TerminalSize{})
-	attachment := attachTerminalTest(t, terminal, CancelOnDisconnect)
-	time.Sleep(100 * time.Millisecond)
+	terminal := startTerminalTest(t, pool, `
+printf 'ready-start\n'
+IFS= read -r _
+i=0
+while [ "$i" -lt 40 ]; do printf '%032768d' 0; sleep 0.01; i=$((i+1)); done
+printf '\nready-end\n'
+IFS= read -r line
+printf 'done:%s\n' "$line"
+`, TerminalSize{})
+	observer := observeTerminalTest(t, terminal)
+	controller := attachTerminalTest(t, terminal, CancelOnDisconnect)
+	_ = receiveUntil(t, observer, "ready-start")
+	_ = receiveUntil(t, controller, "ready-start")
+	controllerOutput := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), terminalTestTimeout)
+		defer cancel()
+		var output strings.Builder
+		for !strings.Contains(output.String(), "ready-end") {
+			chunk, receiveErr := controller.Receive(ctx)
+			if receiveErr != nil {
+				controllerOutput <- receiveErr
+				return
+			}
+			output.Write(chunk.Data)
+		}
+		controllerOutput <- nil
+	}()
+	if err := controller.Send(context.Background(), TerminalInput{Kind: TerminalInputBytes, Data: []byte("go\n")}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-controllerOutput:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(terminalTestTimeout):
+		t.Fatal("controller stalled behind slow observer")
+	}
+	if _, err := observer.Receive(context.Background()); !errors.Is(err, ErrTerminalOutputLagged) {
+		t.Fatalf("slow observer receive = %v, want ErrTerminalOutputLagged", err)
+	}
 	owned, err := pool.registry.Owns(terminal.Record())
 	if err != nil || !owned {
-		t.Fatalf("terminal identity before disconnect: owned=%v err=%v", owned, err)
+		t.Fatalf("slow observer stopped terminal: owned=%v err=%v", owned, err)
 	}
+	if err := controller.Send(context.Background(), TerminalInput{Kind: TerminalInputBytes, Data: []byte("finish\n")}); err != nil {
+		t.Fatal(err)
+	}
+	_ = receiveAll(t, controller)
+	outcome := waitTerminalTest(t, terminal)
+	if outcome.Kind != TerminalExited || outcome.ExitCode != 0 {
+		t.Fatalf("outcome = %+v", outcome)
+	}
+	assertTerminalStoreEmpty(t, store)
+}
+
+func TestTerminalObserversReplayAndControllerHandoff(t *testing.T) {
+	pool, store := newTerminalTestPool(t)
+	terminal := startTerminalTest(t, pool, `printf 'ready\n'; IFS= read -r line; printf 'done:%s\n' "$line"`, TerminalSize{})
+	firstObserver := observeTerminalTest(t, terminal)
+	controller := attachTerminalTest(t, terminal, CancelOnDisconnect)
+	_ = receiveUntil(t, controller, "ready")
+	lateObserver := observeTerminalTest(t, terminal)
+	if output := receiveUntil(t, lateObserver, "ready"); !strings.Contains(output, "ready") {
+		t.Fatalf("late observer replay = %q", output)
+	}
+	_ = receiveUntil(t, firstObserver, "ready")
+	if _, err := controller.HandoffControl(firstObserver, DetachOnDisconnect, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.Send(context.Background(), TerminalInput{Kind: TerminalInputBytes, Data: []byte("stale\n")}); !errors.Is(err, ErrTerminalNotController) {
+		t.Fatalf("old controller send = %v, want ErrTerminalNotController", err)
+	}
+	if err := controller.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := firstObserver.Send(context.Background(), TerminalInput{Kind: TerminalInputBytes, Data: []byte("fresh\n")}); err != nil {
+		t.Fatal(err)
+	}
+	if output := receiveAll(t, firstObserver); !strings.Contains(output, "done:fresh") {
+		t.Fatalf("handoff output = %q", output)
+	}
+	if output := receiveAll(t, lateObserver); !strings.Contains(output, "done:fresh") {
+		t.Fatalf("observer output = %q", output)
+	}
+	outcome := waitTerminalTest(t, terminal)
+	if outcome.Kind != TerminalExited || outcome.ExitCode != 0 {
+		t.Fatalf("outcome = %+v", outcome)
+	}
+	assertTerminalStoreEmpty(t, store)
+}
+
+func TestTerminalExactReplayCursorAndSettledAcknowledgement(t *testing.T) {
+	terminal := &Terminal{
+		attachments: make(map[uint64]*terminalAttachmentState),
+		outputs:     [][]byte{[]byte("seven"), []byte("eight")},
+		outputBase:  7,
+		outputNext:  9,
+		settled:     true,
+		result:      TerminalOutcome{Digest: [32]byte{9}},
+		retired:     make(chan struct{}),
+	}
+	if _, err := terminal.Attach(context.Background(), TerminalAttachmentSpec{
+		Role: TerminalController, DisconnectPolicy: DetachOnDisconnect,
+	}); !errors.Is(err, ErrTerminalSettled) {
+		t.Fatalf("controller attach after settlement = %v", err)
+	}
+	cursor := TerminalOutputCursor{NextSequence: 8}
+	attachment, err := terminal.Attach(context.Background(), TerminalAttachmentSpec{
+		Role: TerminalObserver, Cursor: &cursor,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := attachment.Receive(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output.Sequence != 8 || string(output.Data) != "eight" || output.NextCursor().NextSequence != 9 {
+		t.Fatalf("resumed output = %+v", output)
+	}
+	if _, err := attachment.Receive(context.Background()); !errors.Is(err, io.EOF) {
+		t.Fatalf("settled replay terminal = %v, want EOF", err)
+	}
+	if err := attachment.Close(); err != nil {
+		t.Fatal(err)
+	}
+	missing := TerminalOutputCursor{NextSequence: 6}
+	if _, err := terminal.Attach(context.Background(), TerminalAttachmentSpec{
+		Role: TerminalObserver, Cursor: &missing,
+	}); !errors.Is(err, ErrTerminalOutputCursor) {
+		t.Fatalf("expired cursor attach = %v", err)
+	}
+	if err := terminal.Acknowledge(context.Background(), [32]byte{8}); !errors.Is(err, ErrTerminalOutcomeMismatch) {
+		t.Fatalf("wrong outcome acknowledgement = %v", err)
+	}
+	if err := terminal.Acknowledge(context.Background(), [32]byte{9}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-terminal.Retired():
+	default:
+		t.Fatal("acknowledged terminal was not retired")
+	}
+	if _, err := terminal.Attach(context.Background(), TerminalAttachmentSpec{Role: TerminalObserver}); !errors.Is(err, ErrTerminalRetentionExpired) {
+		t.Fatalf("attach after acknowledgement = %v", err)
+	}
+}
+
+func TestTerminalControllerLeaseRenewalAndExpiryFence(t *testing.T) {
+	pool, store := newTerminalTestPool(t)
+	terminal := startTerminalTest(t, pool, `IFS= read -r line; printf 'done:%s\n' "$line"`, TerminalSize{})
+	observer := observeTerminalTest(t, terminal)
+	first, err := observer.ClaimControl(context.Background(), DetachOnDisconnect, 80*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	renewed, err := observer.RenewControl(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renewed.Fence != first.Fence || !renewed.Expires.After(first.Expires) {
+		t.Fatalf("renewed lease = %+v, first = %+v", renewed, first)
+	}
+	select {
+	case <-observer.state.closed:
+	case <-time.After(time.Second):
+		t.Fatal("controller lease did not expire")
+	}
+	if err := observer.Send(context.Background(), TerminalInput{Kind: TerminalInputBytes, Data: []byte("stale\n")}); !errors.Is(err, ErrTerminalControlExpired) {
+		t.Fatalf("expired controller send = %v", err)
+	}
+	replacement := attachTerminalTest(t, terminal, CancelOnDisconnect)
+	second, err := replacement.ControllerLease()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Fence == first.Fence {
+		t.Fatalf("replacement reused fence %d", second.Fence)
+	}
+	if err := replacement.Send(context.Background(), TerminalInput{Kind: TerminalInputBytes, Data: []byte("fresh\n")}); err != nil {
+		t.Fatal(err)
+	}
+	_ = receiveAll(t, replacement)
+	outcome := waitTerminalTest(t, terminal)
+	if outcome.Kind != TerminalExited {
+		t.Fatalf("outcome = %+v", outcome)
+	}
+	assertTerminalStoreEmpty(t, store)
+}
+
+func TestTerminalDetachedSessionExpiresAndReaps(t *testing.T) {
+	pool, store := newTerminalTestPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), terminalTestTimeout)
+	defer cancel()
+	terminal, err := pool.StartTerminal(ctx, TerminalSpec{
+		RecoveryClass: proc.RecoveryTask,
+		Path:          "/bin/sh",
+		Args:          []string{"-c", "sleep 60"},
+		AttachTimeout: time.Second,
+		DetachTimeout: 40 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachment := attachTerminalTest(t, terminal, DetachOnDisconnect)
 	if err := attachment.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -239,10 +451,60 @@ func TestTerminalCancelDisconnectSettlesBlockedOutput(t *testing.T) {
 	if outcome.Kind != TerminalCanceled {
 		t.Fatalf("outcome = %+v", outcome)
 	}
+	if _, err := terminal.Attach(context.Background(), TerminalAttachmentSpec{Role: TerminalObserver}); !errors.Is(err, ErrTerminalDetachExpired) {
+		t.Fatalf("attach after detached deadline = %v", err)
+	}
 	assertTerminalStoreEmpty(t, store)
 }
 
-func TestTerminalInputBackpressureIsContextAware(t *testing.T) {
+func TestTerminalOutcomeDigestBindsCompleteRecord(t *testing.T) {
+	base := TerminalOutcome{
+		Kind: TerminalExited, ExitCode: 0,
+		Record: proc.Record{
+			RecoveryClass: proc.RecoveryTask, PID: 42, StartTime: "start", Boot: "boot-a",
+			Comm: "task", Executable: "/bin/task", Generation: "generation", ProcessGroup: true, SessionID: 42,
+		},
+	}
+	changed := base
+	changed.Record.Boot = "boot-b"
+	if terminalOutcomeDigest(base) == terminalOutcomeDigest(changed) {
+		t.Fatal("terminal digest ignored boot identity")
+	}
+}
+
+func TestTerminalAttachmentLimitAndReleasedControllerClaim(t *testing.T) {
+	pool, store := newTerminalTestPool(t)
+	terminal := startTerminalTest(t, pool, `IFS= read -r line; printf 'done:%s\n' "$line"`, TerminalSize{})
+	attachments := make([]*TerminalAttachment, 0, TerminalAttachmentLimit)
+	for range TerminalAttachmentLimit - 1 {
+		attachments = append(attachments, observeTerminalTest(t, terminal))
+	}
+	controller := attachTerminalTest(t, terminal, DetachOnDisconnect)
+	attachments = append(attachments, controller)
+	if _, err := terminal.Attach(context.Background(), TerminalAttachmentSpec{Role: TerminalObserver}); !errors.Is(err, ErrTerminalAttachmentLimit) {
+		t.Fatalf("attachment above limit = %v", err)
+	}
+	if err := controller.ReleaseControl(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := attachments[0].ClaimControl(context.Background(), DetachOnDisconnect, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.Send(context.Background(), TerminalInput{Kind: TerminalInputBytes, Data: []byte("stale\n")}); !errors.Is(err, ErrTerminalNotController) {
+		t.Fatalf("released controller send = %v", err)
+	}
+	if err := attachments[0].Send(context.Background(), TerminalInput{Kind: TerminalInputBytes, Data: []byte("claimed\n")}); err != nil {
+		t.Fatal(err)
+	}
+	_ = receiveAll(t, attachments[0])
+	outcome := waitTerminalTest(t, terminal)
+	if outcome.Kind != TerminalExited || outcome.ExitCode != 0 {
+		t.Fatalf("outcome = %+v", outcome)
+	}
+	assertTerminalStoreEmpty(t, store)
+}
+
+func TestTerminalAcceptedInputSettlesAfterContextCancellation(t *testing.T) {
 	pool, store := newTerminalTestPool(t)
 	terminal := startTerminalTest(t, pool, `sleep 60`, TerminalSize{})
 	writeStarted := make(chan struct{})
@@ -257,24 +519,27 @@ func TestTerminalInputBackpressureIsContextAware(t *testing.T) {
 		return nil
 	}
 	attachment := attachTerminalTest(t, terminal, CancelOnDisconnect)
-	payload := make([]byte, TerminalChunkSize)
-	blocked := false
-	for range TerminalQueueDepth + 2 {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-		err := attachment.Send(ctx, TerminalInput{Kind: TerminalInputBytes, Data: payload})
-		cancel()
-		if errors.Is(err, context.DeadlineExceeded) {
-			blocked = true
-			break
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	sendDone := make(chan error, 1)
+	go func() {
+		sendDone <- attachment.Send(ctx, TerminalInput{Kind: TerminalInputBytes, Data: []byte("accepted")})
+	}()
+	select {
+	case <-writeStarted:
+	case <-time.After(terminalTestTimeout):
+		t.Fatal("terminal write did not start")
 	}
-	if !blocked {
-		t.Fatal("terminal input did not apply bounded backpressure")
+	<-ctx.Done()
+	select {
+	case err := <-sendDone:
+		t.Fatalf("accepted send returned before settlement: %v", err)
+	default:
 	}
 	close(releaseWrite)
+	if err := <-sendDone; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("settled canceled send = %v, want context deadline", err)
+	}
 	_ = attachment.Close()
 	outcome := waitTerminalTest(t, terminal)
 	if outcome.Kind != TerminalCanceled {

@@ -31,7 +31,7 @@ func probeProc(pid int) (procInfo, error) {
 	return procInfoFromKinfo(kp, sid), nil
 }
 
-func probeGroupMembers(groupID, sessionID int) ([]groupMember, error) {
+func probeGroupMembers(_ int, sessionID int) ([]groupMember, error) {
 	procs, err := unix.SysctlKinfoProcSlice("kern.proc.all")
 	if err != nil {
 		return nil, fmt.Errorf("sysctl kern.proc.all: %w", err)
@@ -39,7 +39,7 @@ func probeGroupMembers(groupID, sessionID int) ([]groupMember, error) {
 	members := make([]groupMember, 0)
 	for _, kp := range procs {
 		pid := int(kp.Proc.P_pid)
-		if pid <= 1 || int(kp.Eproc.Pgid) != groupID {
+		if pid <= 1 {
 			continue
 		}
 		sid, err := unix.Getsid(pid)
@@ -47,7 +47,7 @@ func probeGroupMembers(groupID, sessionID int) ([]groupMember, error) {
 			continue
 		}
 		if err != nil {
-			return nil, fmt.Errorf("getsid %d while enumerating group %d: %w", pid, groupID, err)
+			return nil, fmt.Errorf("getsid %d while enumerating session %d: %w", pid, sessionID, err)
 		}
 		if sid != sessionID {
 			continue

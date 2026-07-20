@@ -922,6 +922,88 @@ func TestReapLeaderlessGroupUsesDurableSessionMembers(t *testing.T) {
 	}
 }
 
+func TestReapSignalsEveryGroupInDedicatedSession(t *testing.T) {
+	ctx := context.Background()
+	store := &memStore{}
+	leaderPID := 4171
+	descendantGroup := 4172
+	leader := groupInfo(leaderPID, liveInfo().startTime, liveInfo().comm)
+	descendant := groupInfo(leaderPID, "333.444", "descendant")
+	descendant.groupID = descendantGroup
+	members := []groupMember{{pid: leaderPID, info: leader}, {pid: descendantGroup, info: descendant}}
+	prober := &fakeProber{
+		info: leader,
+		byPID: map[int]probeResult{
+			leaderPID:       {info: leader},
+			descendantGroup: {info: descendant},
+		},
+		memberSets: [][]groupMember{members, members, nil},
+	}
+	signals := &recSignaler{}
+	record := matchingGroupRecord(leaderPID, "old-gen")
+	mustAdd(t, store, record)
+	reaper := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: signals, clock: newFakeClock()}
+	if err := reaper.Reap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	want := []signalCall{
+		{pid: -leaderPID, sig: syscall.SIGTERM},
+		{pid: -descendantGroup, sig: syscall.SIGTERM},
+		{pid: -leaderPID, sig: syscall.SIGKILL},
+		{pid: -descendantGroup, sig: syscall.SIGKILL},
+	}
+	got := signals.calls()
+	if len(got) != len(want) {
+		t.Fatalf("signals = %v, want %v", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("signals = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestReapKillsGroupAppearingDuringDedicatedSessionSettlement(t *testing.T) {
+	ctx := context.Background()
+	store := &memStore{}
+	leaderPID := 4181
+	descendantGroup := 4182
+	leader := groupInfo(leaderPID, liveInfo().startTime, liveInfo().comm)
+	descendant := groupInfo(leaderPID, "444.555", "late-descendant")
+	descendant.groupID = descendantGroup
+	leaderMember := groupMember{pid: leaderPID, info: leader}
+	descendantMember := groupMember{pid: descendantGroup, info: descendant}
+	prober := &fakeProber{
+		info: leader,
+		byPID: map[int]probeResult{
+			leaderPID:       {info: leader},
+			descendantGroup: {info: descendant},
+		},
+		memberSets: [][]groupMember{
+			{leaderMember},
+			{leaderMember},
+			{descendantMember},
+			nil,
+		},
+	}
+	signals := &recSignaler{}
+	record := matchingGroupRecord(leaderPID, "old-gen")
+	mustAdd(t, store, record)
+	reaper := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: signals, clock: newFakeClock()}
+	if err := reaper.Reap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	want := []signalCall{
+		{pid: -leaderPID, sig: syscall.SIGTERM},
+		{pid: -leaderPID, sig: syscall.SIGKILL},
+		{pid: -descendantGroup, sig: syscall.SIGKILL},
+	}
+	got := signals.calls()
+	if !slices.Equal(got, want) {
+		t.Fatalf("signals = %v, want %v", got, want)
+	}
+}
+
 func TestReapLeaderlessGroupEnumerationFailureFailsRecovery(t *testing.T) {
 	store := &memStore{}
 	rec := matchingGroupRecord(4161, "old-gen")

@@ -677,33 +677,13 @@ func (r *Reaper) reapGroupOutcome(
 	if len(members) == 0 {
 		return true, ReapAbsent, nil
 	}
-	gone, err := r.sendSignal(-rec.PID, syscall.SIGTERM)
-	if err != nil {
+	if _, err := r.signalSessionGroups(members, syscall.SIGTERM); err != nil {
 		return false, 0, err
-	}
-	if gone {
-		reaped, err := r.groupGone(rec)
-		return reaped, ReapTerminated, err
 	}
 	select {
 	case <-ctx.Done():
 		return false, 0, ctx.Err()
 	case <-clockOrReal(r.clock).After(r.graceDur()):
-	}
-	members, err = r.verifiedGroupMembers(rec)
-	if err != nil {
-		return false, 0, err
-	}
-	if len(members) == 0 {
-		return true, ReapTerminated, nil
-	}
-	gone, err = r.sendSignal(-rec.PID, syscall.SIGKILL)
-	if err != nil {
-		return false, 0, err
-	}
-	if gone {
-		reaped, err := r.groupGone(rec)
-		return reaped, ReapTerminated, err
 	}
 	reaped, err := r.awaitGroupSettlement(ctx, rec)
 	return reaped, ReapTerminated, err
@@ -749,6 +729,9 @@ func (r *Reaper) awaitGroupSettlement(ctx context.Context, rec Record) (bool, er
 		if !clock.Now().Before(deadline) {
 			return false, errors.New("killed process group remained live through settlement deadline")
 		}
+		if _, err := r.signalSessionGroups(members, syscall.SIGKILL); err != nil {
+			return false, err
+		}
 		select {
 		case <-ctx.Done():
 			return false, ctx.Err()
@@ -757,22 +740,11 @@ func (r *Reaper) awaitGroupSettlement(ctx context.Context, rec Record) (bool, er
 	}
 }
 
-func (r *Reaper) groupGone(rec Record) (bool, error) {
-	members, err := r.verifiedGroupMembers(rec)
-	if err != nil {
-		return false, err
-	}
-	if len(members) != 0 {
-		return false, errors.New("process group remained enumerable after ESRCH")
-	}
-	return true, nil
-}
-
 func (r *Reaper) verifiedGroupMembers(rec Record) ([]groupMember, error) {
 	for range 3 {
 		members, err := r.prb().groupMembers(rec.PID, rec.SessionID)
 		if err != nil {
-			return nil, fmt.Errorf("enumerate process group %d session %d: %w", rec.PID, rec.SessionID, err)
+			return nil, fmt.Errorf("enumerate dedicated session %d: %w", rec.SessionID, err)
 		}
 		stable := make([]groupMember, 0, len(members))
 		changed := false
@@ -783,7 +755,7 @@ func (r *Reaper) verifiedGroupMembers(rec Record) ([]groupMember, error) {
 				changed = true
 			case err != nil:
 				return nil, fmt.Errorf("revalidate process-group member %d: %w", member.pid, err)
-			case info.startTime != member.info.startTime || info.groupID != rec.PID || info.sessionID != rec.SessionID:
+			case info.startTime != member.info.startTime || info.sessionID != rec.SessionID:
 				changed = true
 			case info.zombie:
 			default:
@@ -794,7 +766,32 @@ func (r *Reaper) verifiedGroupMembers(rec Record) ([]groupMember, error) {
 			return stable, nil
 		}
 	}
-	return nil, errors.New("process-group membership changed during identity verification")
+	return nil, errors.New("dedicated-session membership changed during identity verification")
+}
+
+func (r *Reaper) signalSessionGroups(members []groupMember, signal syscall.Signal) (bool, error) {
+	groups := make([]int, 0, len(members))
+	seen := make(map[int]struct{}, len(members))
+	for _, member := range members {
+		if member.info.groupID <= 1 {
+			return false, errors.New("dedicated-session member has an invalid process group")
+		}
+		if _, ok := seen[member.info.groupID]; ok {
+			continue
+		}
+		seen[member.info.groupID] = struct{}{}
+		groups = append(groups, member.info.groupID)
+	}
+	slices.Sort(groups)
+	allGone := true
+	for _, group := range groups {
+		gone, err := r.sendSignal(-group, signal)
+		if err != nil {
+			return false, err
+		}
+		allGone = allGone && gone
+	}
+	return allGone, nil
 }
 
 // sendSignal delivers sig to pid, mapping ESRCH (already gone) to gone=true.

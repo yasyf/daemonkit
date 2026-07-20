@@ -3,6 +3,7 @@ package supervise
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -21,20 +22,46 @@ const (
 	TerminalChunkSize = 32 * 1024
 	// TerminalQueueDepth bounds each direction of a terminal session.
 	TerminalQueueDepth = 32
+	// TerminalAttachmentLimit bounds observers plus the current controller.
+	TerminalAttachmentLimit = 32
 	// DefaultTerminalAttachTimeout bounds the durable but undispatched state.
 	DefaultTerminalAttachTimeout = 5 * time.Second
+	// DefaultTerminalControlLease bounds an unrenewed input-controller claim.
+	DefaultTerminalControlLease = 30 * time.Second
+	// DefaultTerminalSettledRetention bounds unacknowledged output replay.
+	DefaultTerminalSettledRetention = 5 * time.Minute
+	// DefaultTerminalDetachTimeout bounds a dispatched terminal without a controller.
+	DefaultTerminalDetachTimeout = 5 * time.Minute
 
 	defaultTerminalRows uint16 = 24
 	defaultTerminalCols uint16 = 80
 )
 
 var (
-	// ErrTerminalAttached means a terminal already has a live attachment.
-	ErrTerminalAttached = errors.New("terminal already attached")
+	// ErrTerminalControllerAttached means a terminal already has an input controller.
+	ErrTerminalControllerAttached = errors.New("terminal controller already attached")
 	// ErrTerminalDetached means an operation targeted a closed attachment.
 	ErrTerminalDetached = errors.New("terminal attachment is closed")
+	// ErrTerminalNotController means an observer attempted an input operation.
+	ErrTerminalNotController = errors.New("terminal attachment is not the controller")
+	// ErrTerminalOutputLagged means an attachment fell behind the bounded replay window.
+	ErrTerminalOutputLagged = errors.New("terminal attachment exceeded the output replay window")
+	// ErrTerminalAttachmentLimit means the bounded attachment set is full.
+	ErrTerminalAttachmentLimit = errors.New("terminal attachment limit reached")
 	// ErrTerminalInputClosed means EOF has already closed terminal input.
 	ErrTerminalInputClosed = errors.New("terminal input is closed")
+	// ErrTerminalControlExpired means an unrenewed controller lease elapsed.
+	ErrTerminalControlExpired = errors.New("terminal controller lease expired")
+	// ErrTerminalOutputCursor means requested replay is outside the retained window.
+	ErrTerminalOutputCursor = errors.New("terminal output cursor is unavailable")
+	// ErrTerminalRetentionExpired means unacknowledged settled output was retired.
+	ErrTerminalRetentionExpired = errors.New("terminal settled output retention expired")
+	// ErrTerminalOutcomeMismatch means acknowledgement named another settlement.
+	ErrTerminalOutcomeMismatch = errors.New("terminal outcome acknowledgement mismatch")
+	// ErrTerminalSettled means a controller or input operation targeted a settled terminal.
+	ErrTerminalSettled = errors.New("terminal is settled")
+	// ErrTerminalDetachExpired means the terminal exceeded its no-controller deadline.
+	ErrTerminalDetachExpired = errors.New("terminal detached deadline expired")
 )
 
 const terminalWrapper = `
@@ -72,6 +99,8 @@ type TerminalSpec struct {
 	Env           []string
 	Size          TerminalSize
 	AttachTimeout time.Duration
+	DetachTimeout time.Duration
+	Retention     time.Duration
 }
 
 // TerminalInputKind identifies one ordered client-to-PTY event.
@@ -103,6 +132,46 @@ const (
 	DetachOnDisconnect
 )
 
+// TerminalAttachmentRole defines whether an attachment can write terminal input.
+type TerminalAttachmentRole uint8
+
+const (
+	// TerminalObserver receives the bounded output stream without controlling input.
+	TerminalObserver TerminalAttachmentRole = iota + 1
+	// TerminalController is the terminal's single exact-fenced input owner.
+	TerminalController
+)
+
+// TerminalAttachmentSpec describes one observer or input controller.
+type TerminalAttachmentSpec struct {
+	Role             TerminalAttachmentRole
+	DisconnectPolicy TerminalDisconnectPolicy
+	ControlLease     time.Duration
+	Cursor           *TerminalOutputCursor
+}
+
+// TerminalOutputCursor identifies the next output sequence an attachment expects.
+type TerminalOutputCursor struct {
+	NextSequence uint64
+}
+
+// TerminalOutput is one sequenced terminal output chunk.
+type TerminalOutput struct {
+	Sequence uint64
+	Data     []byte
+}
+
+// NextCursor returns the exact reconnect cursor after this chunk.
+func (o TerminalOutput) NextCursor() TerminalOutputCursor {
+	return TerminalOutputCursor{NextSequence: o.Sequence + 1}
+}
+
+// TerminalControllerLease is the current input-controller fence and expiry.
+type TerminalControllerLease struct {
+	Fence   uint64
+	Expires time.Time
+}
+
 // TerminalOutcomeKind identifies how the interactive task ended.
 type TerminalOutcomeKind uint8
 
@@ -124,8 +193,8 @@ type TerminalOutcome struct {
 	Digest   [32]byte
 }
 
-// Terminal is one durably tracked PTY task. It supports one attachment at a
-// time and retains only bounded in-memory I/O between attachments.
+// Terminal is one durably tracked PTY task with bounded output replay,
+// multiple observers, and one exact-fenced input controller.
 type Terminal struct {
 	pool     *Pool
 	record   proc.Record
@@ -135,34 +204,68 @@ type Terminal struct {
 	gate     *os.File
 	write    func([]byte) error
 
-	input   chan TerminalInput
-	output  chan []byte
+	input   chan terminalInputRequest
 	ioErr   chan error
 	ioStop  chan struct{}
 	inDone  chan struct{}
 	outDone chan struct{}
 	done    chan struct{}
 
-	gateOnce      sync.Once
-	sendMu        sync.Mutex
-	mu            sync.Mutex
-	nextID        uint64
-	activeID      uint64
-	inputEOF      bool
-	result        TerminalOutcome
-	resultErr     error
-	attachExpired bool
-	attachTimer   *time.Timer
+	gateOnce         sync.Once
+	mu               sync.Mutex
+	nextID           uint64
+	nextFence        uint64
+	controllerID     uint64
+	attachments      map[uint64]*terminalAttachmentState
+	outputs          [][]byte
+	outputBase       uint64
+	outputNext       uint64
+	inputEOF         bool
+	result           TerminalOutcome
+	resultErr        error
+	settled          bool
+	retention        time.Duration
+	retentionTimer   *time.Timer
+	acknowledged     bool
+	retentionExpired bool
+	retired          chan struct{}
+	retireOnce       sync.Once
+	detachTimeout    time.Duration
+	detachTimer      *time.Timer
+	detachEpoch      uint64
+	detachExpired    bool
+	attachExpired    bool
+	attachTimer      *time.Timer
 }
 
-// TerminalAttachment is an exclusive view of a terminal's bounded I/O queues.
+type terminalAttachmentState struct {
+	sendMu     sync.Mutex
+	role       TerminalAttachmentRole
+	policy     TerminalDisconnectPolicy
+	fence      uint64
+	lease      time.Duration
+	expires    time.Time
+	leaseTimer *time.Timer
+	cursor     uint64
+	notify     chan struct{}
+	closed     chan struct{}
+	closeError error
+}
+
+type terminalInputRequest struct {
+	attachmentID uint64
+	fence        uint64
+	event        TerminalInput
+	result       chan error
+}
+
+// TerminalAttachment is one exact-fenced view of a terminal's bounded output.
 type TerminalAttachment struct {
 	terminal *Terminal
 	id       uint64
-	policy   TerminalDisconnectPolicy
+	state    *terminalAttachmentState
 	stopCtx  func() bool
 	once     sync.Once
-	closed   chan struct{}
 }
 
 // StartTerminal creates a tracked PTY task behind a dispatch gate. Attach must
@@ -177,6 +280,14 @@ func (p *Pool) StartTerminal(startup context.Context, spec TerminalSpec) (*Termi
 	attachTimeout := spec.AttachTimeout
 	if attachTimeout <= 0 {
 		attachTimeout = DefaultTerminalAttachTimeout
+	}
+	retention := spec.Retention
+	if retention <= 0 {
+		retention = DefaultTerminalSettledRetention
+	}
+	detachTimeout := spec.DetachTimeout
+	if detachTimeout <= 0 {
+		detachTimeout = DefaultTerminalDetachTimeout
 	}
 	lifetime := context.WithoutCancel(startup)
 	terminalCtx, workerID, cancel, err := p.acquire(startup, lifetime)
@@ -245,8 +356,10 @@ func (p *Pool) StartTerminal(startup context.Context, spec TerminalSpec) (*Termi
 
 	t := &Terminal{
 		pool: p, record: record, workerID: workerID, cancel: cancel, master: master, gate: gateW,
-		input: make(chan TerminalInput, TerminalQueueDepth), output: make(chan []byte, TerminalQueueDepth), ioErr: make(chan error, 1),
+		input: make(chan terminalInputRequest, TerminalQueueDepth), ioErr: make(chan error, 1),
 		ioStop: make(chan struct{}), inDone: make(chan struct{}), outDone: make(chan struct{}), done: make(chan struct{}),
+		attachments: make(map[uint64]*terminalAttachmentState), retention: retention, retired: make(chan struct{}),
+		detachTimeout: detachTimeout,
 	}
 	t.write = func(data []byte) error { return writeTerminal(master, data) }
 	waited := make(chan error, 1)
@@ -262,100 +375,302 @@ func (p *Pool) StartTerminal(startup context.Context, spec TerminalSpec) (*Termi
 // Record returns the immutable process-group identity recorded before dispatch.
 func (t *Terminal) Record() proc.Record { return t.record }
 
-// Attach exclusively attaches to the session and dispatches it on first use.
-func (t *Terminal) Attach(ctx context.Context, policy TerminalDisconnectPolicy) (*TerminalAttachment, error) {
-	if policy != CancelOnDisconnect && policy != DetachOnDisconnect {
-		return nil, errors.New("supervise: terminal disconnect policy is required")
+// Attach adds one bounded observer or claims the single input-controller fence.
+// The task dispatches only after a controller is attached or claimed.
+func (t *Terminal) Attach(ctx context.Context, spec TerminalAttachmentSpec) (*TerminalAttachment, error) {
+	if err := validateTerminalAttachmentSpec(spec); err != nil {
+		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("supervise: attach terminal: %w", err)
 	}
 	t.mu.Lock()
+	if t.acknowledged || t.retentionExpired {
+		t.mu.Unlock()
+		return nil, ErrTerminalRetentionExpired
+	}
+	if t.detachExpired {
+		t.mu.Unlock()
+		return nil, ErrTerminalDetachExpired
+	}
 	if t.attachExpired {
 		t.mu.Unlock()
 		return nil, errors.New("supervise: terminal attach deadline expired")
 	}
-	if t.activeID != 0 {
+	if len(t.attachments) >= TerminalAttachmentLimit {
 		t.mu.Unlock()
-		return nil, ErrTerminalAttached
+		return nil, ErrTerminalAttachmentLimit
 	}
-	select {
-	case <-t.done:
+	if spec.Role == TerminalController && t.controllerID != 0 {
 		t.mu.Unlock()
-		return nil, errors.New("supervise: terminal already settled")
-	default:
+		return nil, ErrTerminalControllerAttached
+	}
+	if spec.Role == TerminalController && t.settled {
+		t.mu.Unlock()
+		return nil, ErrTerminalSettled
+	}
+	cursor := t.outputBase
+	if spec.Cursor != nil {
+		cursor = spec.Cursor.NextSequence
+		if cursor < t.outputBase || cursor > t.outputNext {
+			t.mu.Unlock()
+			return nil, fmt.Errorf("%w: retained=[%d,%d] requested=%d", ErrTerminalOutputCursor, t.outputBase, t.outputNext, cursor)
+		}
 	}
 	t.nextID++
 	id := t.nextID
-	t.activeID = id
-	if t.attachTimer != nil {
-		t.attachTimer.Stop()
-		t.attachTimer = nil
+	state := &terminalAttachmentState{
+		role: spec.Role, policy: spec.DisconnectPolicy, cursor: cursor,
+		notify: make(chan struct{}, 1), closed: make(chan struct{}),
+	}
+	t.attachments[id] = state
+	controller := spec.Role == TerminalController
+	if controller {
+		t.claimControllerLocked(id, spec.DisconnectPolicy, spec.ControlLease)
 	}
 	t.mu.Unlock()
 
-	var gateErr error
-	t.gateOnce.Do(func() {
-		gateErr = writePayload(t.gate, []byte("start\n"))
-	})
-	if gateErr != nil {
-		t.cancel()
-		<-t.done
-		return nil, errors.Join(fmt.Errorf("supervise: release terminal dispatch gate: %w", gateErr), t.resultErr)
+	if controller {
+		if err := t.releaseDispatchGate(); err != nil {
+			t.detach(id, err)
+			return nil, err
+		}
 	}
-	a := &TerminalAttachment{terminal: t, id: id, policy: policy, closed: make(chan struct{})}
+	a := &TerminalAttachment{terminal: t, id: id, state: state}
 	a.stopCtx = context.AfterFunc(ctx, func() { _ = a.Close() })
 	return a, nil
 }
 
+// ClaimControl atomically promotes an observer when no controller is attached.
+func (a *TerminalAttachment) ClaimControl(
+	ctx context.Context,
+	policy TerminalDisconnectPolicy,
+	lease time.Duration,
+) (TerminalControllerLease, error) {
+	if err := validateTerminalDisconnectPolicy(policy); err != nil {
+		return TerminalControllerLease{}, err
+	}
+	lease = normalizeTerminalControlLease(lease)
+	if err := ctx.Err(); err != nil {
+		return TerminalControllerLease{}, fmt.Errorf("supervise: claim terminal control: %w", err)
+	}
+	t := a.terminal
+	t.mu.Lock()
+	state, ok := t.attachments[a.id]
+	if !ok || state != a.state {
+		t.mu.Unlock()
+		return TerminalControllerLease{}, a.detachedError()
+	}
+	if t.attachExpired {
+		t.mu.Unlock()
+		return TerminalControllerLease{}, errors.New("supervise: terminal attach deadline expired")
+	}
+	if t.detachExpired {
+		t.mu.Unlock()
+		return TerminalControllerLease{}, ErrTerminalDetachExpired
+	}
+	if t.settled {
+		t.mu.Unlock()
+		return TerminalControllerLease{}, ErrTerminalSettled
+	}
+	if t.controllerID != 0 {
+		t.mu.Unlock()
+		return TerminalControllerLease{}, ErrTerminalControllerAttached
+	}
+	control := t.claimControllerLocked(a.id, policy, lease)
+	t.mu.Unlock()
+	if err := t.releaseDispatchGate(); err != nil {
+		t.detach(a.id, err)
+		return TerminalControllerLease{}, err
+	}
+	return control, nil
+}
+
+// HandoffControl atomically transfers the controller fence to an attached observer.
+func (a *TerminalAttachment) HandoffControl(
+	target *TerminalAttachment,
+	policy TerminalDisconnectPolicy,
+	lease time.Duration,
+) (TerminalControllerLease, error) {
+	if err := validateTerminalDisconnectPolicy(policy); err != nil {
+		return TerminalControllerLease{}, err
+	}
+	lease = normalizeTerminalControlLease(lease)
+	if target == nil || target.terminal != a.terminal || target.id == a.id {
+		return TerminalControllerLease{}, errors.New("supervise: terminal control target must be a distinct attachment on the same terminal")
+	}
+	t := a.terminal
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	current, currentOK := t.attachments[a.id]
+	next, nextOK := t.attachments[target.id]
+	if !currentOK || current != a.state {
+		return TerminalControllerLease{}, a.detachedErrorLocked()
+	}
+	if !nextOK || next != target.state {
+		return TerminalControllerLease{}, target.detachedErrorLocked()
+	}
+	if t.controllerID != a.id || current.role != TerminalController {
+		return TerminalControllerLease{}, ErrTerminalNotController
+	}
+	if next.role != TerminalObserver {
+		return TerminalControllerLease{}, ErrTerminalControllerAttached
+	}
+	stopTerminalLease(current)
+	current.role = TerminalObserver
+	current.policy = 0
+	current.fence = 0
+	return t.claimControllerLocked(target.id, policy, lease), nil
+}
+
+// ReleaseControl atomically demotes the controller to an observer without canceling the task.
+func (a *TerminalAttachment) ReleaseControl() error {
+	t := a.terminal
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	state, ok := t.attachments[a.id]
+	if !ok || state != a.state {
+		return a.detachedErrorLocked()
+	}
+	if t.controllerID != a.id || state.role != TerminalController {
+		return ErrTerminalNotController
+	}
+	stopTerminalLease(state)
+	state.role = TerminalObserver
+	state.policy = 0
+	state.fence = 0
+	t.controllerID = 0
+	t.armDetachedTimeoutLocked()
+	return nil
+}
+
+// ControllerLease returns the attachment's exact live input-controller fence.
+func (a *TerminalAttachment) ControllerLease() (TerminalControllerLease, error) {
+	t := a.terminal
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	state, ok := t.attachments[a.id]
+	if !ok || state != a.state {
+		return TerminalControllerLease{}, a.detachedErrorLocked()
+	}
+	if t.controllerID != a.id || state.role != TerminalController {
+		return TerminalControllerLease{}, ErrTerminalNotController
+	}
+	return TerminalControllerLease{Fence: state.fence, Expires: state.expires}, nil
+}
+
+// RenewControl renews the same exact controller fence.
+func (a *TerminalAttachment) RenewControl(ctx context.Context) (TerminalControllerLease, error) {
+	if err := ctx.Err(); err != nil {
+		return TerminalControllerLease{}, fmt.Errorf("supervise: renew terminal control: %w", err)
+	}
+	t := a.terminal
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	state, ok := t.attachments[a.id]
+	if !ok || state != a.state {
+		return TerminalControllerLease{}, a.detachedErrorLocked()
+	}
+	if t.controllerID != a.id || state.role != TerminalController {
+		return TerminalControllerLease{}, ErrTerminalNotController
+	}
+	t.armControllerLeaseLocked(a.id, state)
+	return TerminalControllerLease{Fence: state.fence, Expires: state.expires}, nil
+}
+
 // Send enqueues one ordered input event with context-aware backpressure.
 func (a *TerminalAttachment) Send(ctx context.Context, event TerminalInput) error {
-	a.terminal.sendMu.Lock()
-	defer a.terminal.sendMu.Unlock()
-	if err := a.terminal.validateInput(a.id, event); err != nil {
+	a.state.sendMu.Lock()
+	defer a.state.sendMu.Unlock()
+	fence, err := a.terminal.validateInput(a.id, event)
+	if err != nil {
+		if errors.Is(err, ErrTerminalDetached) {
+			return a.detachedError()
+		}
 		return err
 	}
+	request := terminalInputRequest{
+		attachmentID: a.id,
+		fence:        fence,
+		event:        cloneTerminalInput(event),
+		result:       make(chan error, 1),
+	}
 	select {
-	case a.terminal.input <- cloneTerminalInput(event):
-		if event.Kind == TerminalInputEOF {
-			a.terminal.markInputEOF()
-		}
-		return nil
-	case <-a.closed:
-		return ErrTerminalDetached
+	case a.terminal.input <- request:
+	case <-a.state.closed:
+		return a.detachedError()
 	case <-a.terminal.done:
-		return errors.New("supervise: terminal settled")
+		return ErrTerminalSettled
 	case <-ctx.Done():
 		return fmt.Errorf("supervise: send terminal input: %w", ctx.Err())
 	}
+	var contextErr error
+	done := ctx.Done()
+	for {
+		select {
+		case err := <-request.result:
+			return errors.Join(err, contextErr)
+		case <-a.terminal.done:
+			select {
+			case err := <-request.result:
+				return errors.Join(err, contextErr)
+			default:
+				return errors.Join(ErrTerminalSettled, contextErr)
+			}
+		case <-done:
+			contextErr = fmt.Errorf("supervise: send terminal input: %w", ctx.Err())
+			done = nil
+		}
+	}
 }
 
-// Receive returns the next raw merged PTY output chunk.
-func (a *TerminalAttachment) Receive(ctx context.Context) ([]byte, error) {
-	if !a.terminal.attached(a.id) {
-		return nil, ErrTerminalDetached
-	}
-	select {
-	case chunk, ok := <-a.terminal.output:
-		if !ok {
-			return nil, io.EOF
+// Receive returns the next sequenced raw merged PTY output chunk.
+func (a *TerminalAttachment) Receive(ctx context.Context) (TerminalOutput, error) {
+	for {
+		t := a.terminal
+		t.mu.Lock()
+		state, ok := t.attachments[a.id]
+		if !ok || state != a.state {
+			t.mu.Unlock()
+			return TerminalOutput{}, a.detachedError()
 		}
-		return chunk, nil
-	case <-a.closed:
-		return nil, ErrTerminalDetached
-	case <-ctx.Done():
-		return nil, fmt.Errorf("supervise: receive terminal output: %w", ctx.Err())
+		if state.cursor < t.outputNext {
+			if state.cursor < t.outputBase {
+				t.mu.Unlock()
+				t.detach(a.id, ErrTerminalOutputLagged)
+				return TerminalOutput{}, ErrTerminalOutputLagged
+			}
+			output := TerminalOutput{
+				Sequence: state.cursor,
+				Data:     append([]byte(nil), t.outputs[state.cursor-t.outputBase]...),
+			}
+			state.cursor++
+			t.mu.Unlock()
+			return output, nil
+		}
+		if t.settled {
+			t.mu.Unlock()
+			return TerminalOutput{}, io.EOF
+		}
+		notify, closed := state.notify, state.closed
+		t.mu.Unlock()
+		select {
+		case <-notify:
+		case <-closed:
+			return TerminalOutput{}, a.detachedError()
+		case <-ctx.Done():
+			return TerminalOutput{}, fmt.Errorf("supervise: receive terminal output: %w", ctx.Err())
+		}
 	}
 }
 
 // Close applies the attachment's explicit disconnect policy.
 func (a *TerminalAttachment) Close() error {
 	a.once.Do(func() {
-		close(a.closed)
 		if a.stopCtx != nil {
 			a.stopCtx()
 		}
-		a.terminal.detach(a.id, a.policy)
+		a.terminal.detach(a.id, nil)
 	})
 	return nil
 }
@@ -391,44 +706,102 @@ func (t *Terminal) Wait(ctx context.Context) (TerminalOutcome, error) {
 	}
 }
 
-func (t *Terminal) validateInput(id uint64, event TerminalInput) error {
+// Acknowledge retires replay only after the exact outcome was delivered.
+func (t *Terminal) Acknowledge(ctx context.Context, digest [32]byte) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("supervise: acknowledge terminal outcome: %w", err)
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.activeID != id {
-		return ErrTerminalDetached
+	if !t.settled {
+		return errors.New("supervise: terminal is not settled")
+	}
+	if digest != t.result.Digest {
+		return ErrTerminalOutcomeMismatch
+	}
+	if t.acknowledged {
+		return nil
+	}
+	if len(t.attachments) != 0 {
+		return errors.New("supervise: terminal attachments remain during acknowledgement")
+	}
+	t.acknowledged = true
+	if t.retentionTimer != nil {
+		t.retentionTimer.Stop()
+		t.retentionTimer = nil
+	}
+	t.clearOutputLocked()
+	t.retireOnce.Do(func() { close(t.retired) })
+	return nil
+}
+
+// Retired closes after exact acknowledgement or bounded retention expiry.
+func (t *Terminal) Retired() <-chan struct{} { return t.retired }
+
+func (t *Terminal) validateInput(id uint64, event TerminalInput) (uint64, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	state, ok := t.attachments[id]
+	if !ok {
+		return 0, ErrTerminalDetached
+	}
+	if t.controllerID != id || state.role != TerminalController {
+		return 0, ErrTerminalNotController
+	}
+	if t.settled {
+		return 0, ErrTerminalSettled
 	}
 	switch event.Kind {
 	case TerminalInputBytes:
 		if t.inputEOF {
-			return ErrTerminalInputClosed
+			return 0, ErrTerminalInputClosed
 		}
 		if len(event.Data) == 0 || len(event.Data) > TerminalChunkSize {
-			return fmt.Errorf("supervise: terminal input must contain 1..%d bytes", TerminalChunkSize)
+			return 0, fmt.Errorf("supervise: terminal input must contain 1..%d bytes", TerminalChunkSize)
 		}
 	case TerminalInputResize:
 		size := event.Size.normalized()
 		if size != event.Size {
-			return errors.New("supervise: terminal resize requires non-zero rows and columns")
+			return 0, errors.New("supervise: terminal resize requires non-zero rows and columns")
 		}
 	case TerminalInputEOF:
 		if t.inputEOF {
-			return ErrTerminalInputClosed
+			return 0, ErrTerminalInputClosed
 		}
 	default:
-		return errors.New("supervise: unknown terminal input event")
+		return 0, errors.New("supervise: unknown terminal input event")
+	}
+	return state.fence, nil
+}
+
+func (t *Terminal) validateInputFence(request terminalInputRequest) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	state, ok := t.attachments[request.attachmentID]
+	if !ok {
+		return ErrTerminalDetached
+	}
+	if t.controllerID != request.attachmentID || state.role != TerminalController || state.fence != request.fence {
+		return ErrTerminalNotController
+	}
+	if t.settled {
+		return ErrTerminalSettled
+	}
+	if t.inputEOF && request.event.Kind != TerminalInputResize {
+		return ErrTerminalInputClosed
 	}
 	return nil
 }
 
 func (t *Terminal) markInputEOF() {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	t.inputEOF = true
+	t.mu.Unlock()
 }
 
 func (t *Terminal) expireAttach() {
 	t.mu.Lock()
-	if t.activeID != 0 || t.attachExpired {
+	if t.controllerID != 0 || t.attachExpired {
 		t.mu.Unlock()
 		return
 	}
@@ -437,23 +810,152 @@ func (t *Terminal) expireAttach() {
 	t.cancel()
 }
 
-func (t *Terminal) attached(id uint64) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.activeID == id
+func validateTerminalAttachmentSpec(spec TerminalAttachmentSpec) error {
+	switch spec.Role {
+	case TerminalObserver:
+		if spec.DisconnectPolicy != 0 || spec.ControlLease != 0 {
+			return errors.New("supervise: terminal observers cannot define controller policy")
+		}
+	case TerminalController:
+		if err := validateTerminalDisconnectPolicy(spec.DisconnectPolicy); err != nil {
+			return err
+		}
+	default:
+		return errors.New("supervise: terminal attachment role is required")
+	}
+	return nil
 }
 
-func (t *Terminal) detach(id uint64, policy TerminalDisconnectPolicy) {
-	t.mu.Lock()
-	owned := false
-	if t.activeID == id {
-		t.activeID = 0
-		owned = true
+func validateTerminalDisconnectPolicy(policy TerminalDisconnectPolicy) error {
+	if policy != CancelOnDisconnect && policy != DetachOnDisconnect {
+		return errors.New("supervise: terminal controller disconnect policy is required")
 	}
+	return nil
+}
+
+func normalizeTerminalControlLease(lease time.Duration) time.Duration {
+	if lease <= 0 {
+		return DefaultTerminalControlLease
+	}
+	return lease
+}
+
+func (t *Terminal) claimControllerLocked(
+	id uint64,
+	policy TerminalDisconnectPolicy,
+	lease time.Duration,
+) TerminalControllerLease {
+	state := t.attachments[id]
+	t.nextFence++
+	state.role = TerminalController
+	state.policy = policy
+	state.fence = t.nextFence
+	state.lease = normalizeTerminalControlLease(lease)
+	t.controllerID = id
+	t.detachEpoch++
+	if t.detachTimer != nil {
+		t.detachTimer.Stop()
+		t.detachTimer = nil
+	}
+	t.armControllerLeaseLocked(id, state)
+	if t.attachTimer != nil {
+		t.attachTimer.Stop()
+		t.attachTimer = nil
+	}
+	return TerminalControllerLease{Fence: state.fence, Expires: state.expires}
+}
+
+func (t *Terminal) armControllerLeaseLocked(id uint64, state *terminalAttachmentState) {
+	if state.leaseTimer != nil {
+		state.leaseTimer.Stop()
+	}
+	state.expires = time.Now().Add(state.lease)
+	fence := state.fence
+	state.leaseTimer = time.AfterFunc(state.lease, func() { t.expireController(id, fence) })
+}
+
+func stopTerminalLease(state *terminalAttachmentState) {
+	if state.leaseTimer != nil {
+		state.leaseTimer.Stop()
+		state.leaseTimer = nil
+	}
+	state.expires = time.Time{}
+	state.lease = 0
+}
+
+func (t *Terminal) expireController(id, fence uint64) {
+	t.mu.Lock()
+	state, ok := t.attachments[id]
+	if !ok || state.fence != fence || t.controllerID != id || time.Now().Before(state.expires) {
+		t.mu.Unlock()
+		return
+	}
+	cancel := t.detachLocked(id, ErrTerminalControlExpired)
 	t.mu.Unlock()
-	if owned && policy == CancelOnDisconnect {
+	if cancel {
 		t.cancel()
 	}
+}
+
+func (t *Terminal) releaseDispatchGate() error {
+	var gateErr error
+	t.gateOnce.Do(func() {
+		gateErr = writePayload(t.gate, []byte("start\n"))
+	})
+	if gateErr == nil {
+		return nil
+	}
+	t.cancel()
+	<-t.done
+	t.mu.Lock()
+	resultErr := t.resultErr
+	t.mu.Unlock()
+	return errors.Join(fmt.Errorf("supervise: release terminal dispatch gate: %w", gateErr), resultErr)
+}
+
+func (a *TerminalAttachment) detachedError() error {
+	a.terminal.mu.Lock()
+	defer a.terminal.mu.Unlock()
+	return a.detachedErrorLocked()
+}
+
+func (a *TerminalAttachment) detachedErrorLocked() error {
+	if a.state.closeError != nil {
+		return a.state.closeError
+	}
+	return ErrTerminalDetached
+}
+
+func (t *Terminal) detach(id uint64, cause error) {
+	t.mu.Lock()
+	cancel := t.detachLocked(id, cause)
+	t.mu.Unlock()
+	if cancel {
+		t.cancel()
+	}
+}
+
+func (t *Terminal) detachLocked(id uint64, cause error) bool {
+	state, ok := t.attachments[id]
+	if !ok {
+		return false
+	}
+	delete(t.attachments, id)
+	stopTerminalLease(state)
+	cancel := false
+	if t.controllerID == id {
+		t.controllerID = 0
+		cancel = state.policy == CancelOnDisconnect
+		if !cancel {
+			t.armDetachedTimeoutLocked()
+		}
+	}
+	if cause == nil {
+		cause = ErrTerminalDetached
+	}
+	state.closeError = cause
+	close(state.closed)
+	return cancel
 }
 
 func (t *Terminal) run(ctx context.Context, waited <-chan error) {
@@ -502,13 +1004,73 @@ func (t *Terminal) run(ctx context.Context, waited <-chan error) {
 	}
 	_ = t.master.Close()
 	<-t.inDone
-	close(t.output)
 	outcome.Digest = terminalOutcomeDigest(outcome)
 	t.mu.Lock()
 	t.result = outcome
 	t.resultErr = resultErr
-	t.activeID = 0
+	t.controllerID = 0
+	t.settled = true
+	if t.detachTimer != nil {
+		t.detachTimer.Stop()
+		t.detachTimer = nil
+	}
+	for _, state := range t.attachments {
+		stopTerminalLease(state)
+		notifyTerminalAttachment(state)
+	}
+	t.retentionTimer = time.AfterFunc(t.retention, t.expireRetention)
 	t.mu.Unlock()
+}
+
+func (t *Terminal) expireRetention() {
+	t.mu.Lock()
+	if t.acknowledged || t.retentionExpired {
+		t.mu.Unlock()
+		return
+	}
+	t.retentionExpired = true
+	t.controllerID = 0
+	for id, state := range t.attachments {
+		delete(t.attachments, id)
+		stopTerminalLease(state)
+		state.closeError = ErrTerminalRetentionExpired
+		close(state.closed)
+	}
+	t.clearOutputLocked()
+	t.mu.Unlock()
+	t.retireOnce.Do(func() { close(t.retired) })
+}
+
+func (t *Terminal) clearOutputLocked() {
+	for index := range t.outputs {
+		t.outputs[index] = nil
+	}
+	t.outputs = nil
+	t.outputBase = t.outputNext
+}
+
+func (t *Terminal) armDetachedTimeoutLocked() {
+	if t.settled || t.controllerID != 0 || t.detachExpired {
+		return
+	}
+	if t.detachTimer != nil {
+		t.detachTimer.Stop()
+	}
+	t.detachEpoch++
+	epoch := t.detachEpoch
+	t.detachTimer = time.AfterFunc(t.detachTimeout, func() { t.expireDetached(epoch) })
+}
+
+func (t *Terminal) expireDetached(epoch uint64) {
+	t.mu.Lock()
+	if t.settled || t.controllerID != 0 || t.detachExpired || t.detachEpoch != epoch {
+		t.mu.Unlock()
+		return
+	}
+	t.detachExpired = true
+	t.detachTimer = nil
+	t.mu.Unlock()
+	t.cancel()
 }
 
 func (t *Terminal) pumpInput() {
@@ -517,24 +1079,29 @@ func (t *Terminal) pumpInput() {
 		select {
 		case <-t.ioStop:
 			return
-		case event := <-t.input:
-			switch event.Kind {
+		case request := <-t.input:
+			if err := t.validateInputFence(request); err != nil {
+				request.result <- err
+				continue
+			}
+			var err error
+			switch request.event.Kind {
 			case TerminalInputBytes:
-				if err := t.write(event.Data); err != nil {
-					t.failIO(fmt.Errorf("supervise: write terminal input: %w", err))
-					return
-				}
+				err = t.write(request.event.Data)
 			case TerminalInputResize:
-				if err := pty.Setsize(t.master, &pty.Winsize{Rows: event.Size.Rows, Cols: event.Size.Cols}); err != nil {
-					t.failIO(fmt.Errorf("supervise: resize terminal: %w", err))
-					return
-				}
+				err = pty.Setsize(t.master, &pty.Winsize{Rows: request.event.Size.Rows, Cols: request.event.Size.Cols})
 			case TerminalInputEOF:
-				if err := t.write([]byte{4}); err != nil {
-					t.failIO(fmt.Errorf("supervise: close terminal input: %w", err))
-					return
+				err = t.write([]byte{4})
+				if err == nil {
+					t.markInputEOF()
 				}
 			}
+			if err != nil {
+				request.result <- fmt.Errorf("supervise: apply terminal input: %w", err)
+				t.failIO(fmt.Errorf("supervise: apply terminal input: %w", err))
+				return
+			}
+			request.result <- nil
 		}
 	}
 }
@@ -572,16 +1139,52 @@ func (t *Terminal) pumpOutput() {
 	for {
 		n, err := t.master.Read(buf)
 		if n > 0 {
-			chunk := append([]byte(nil), buf[:n]...)
-			select {
-			case t.output <- chunk:
-			case <-t.ioStop:
-				return
-			}
+			t.publishOutput(buf[:n])
 		}
 		if err != nil {
+			if !errors.Is(err, io.EOF) && !errors.Is(err, syscall.EIO) {
+				select {
+				case <-t.ioStop:
+				default:
+					t.failIO(fmt.Errorf("supervise: read terminal output: %w", err))
+				}
+			}
 			return
 		}
+	}
+}
+
+func (t *Terminal) publishOutput(payload []byte) {
+	chunk := append([]byte(nil), payload...)
+	cancel := false
+	t.mu.Lock()
+	if len(t.outputs) == TerminalQueueDepth {
+		oldest := t.outputBase
+		for id, state := range t.attachments {
+			if state.cursor > oldest {
+				continue
+			}
+			cancel = t.detachLocked(id, ErrTerminalOutputLagged) || cancel
+		}
+		t.outputs[0] = nil
+		t.outputs = t.outputs[1:]
+		t.outputBase++
+	}
+	t.outputs = append(t.outputs, chunk)
+	t.outputNext++
+	for _, state := range t.attachments {
+		notifyTerminalAttachment(state)
+	}
+	t.mu.Unlock()
+	if cancel {
+		t.cancel()
+	}
+}
+
+func notifyTerminalAttachment(state *terminalAttachmentState) {
+	select {
+	case state.notify <- struct{}{}:
+	default:
 	}
 }
 
@@ -611,11 +1214,16 @@ func terminalOutcome(record proc.Record, err error, canceled bool) TerminalOutco
 }
 
 func terminalOutcomeDigest(out TerminalOutcome) [32]byte {
-	h := sha256.New()
-	_, _ = fmt.Fprintf(h, "%d\x00%d\x00%d\x00%d\x00%s", out.Kind, out.ExitCode, out.Signal, out.Record.PID, out.Record.Generation)
-	var digest [32]byte
-	copy(digest[:], h.Sum(nil))
-	return digest
+	payload, err := json.Marshal(struct {
+		Kind     TerminalOutcomeKind `json:"kind"`
+		ExitCode int                 `json:"exit_code"`
+		Signal   syscall.Signal      `json:"signal"`
+		Record   proc.Record         `json:"record"`
+	}{Kind: out.Kind, ExitCode: out.ExitCode, Signal: out.Signal, Record: out.Record})
+	if err != nil {
+		panic(err)
+	}
+	return sha256.Sum256(payload)
 }
 
 func cloneTerminalInput(event TerminalInput) TerminalInput {
