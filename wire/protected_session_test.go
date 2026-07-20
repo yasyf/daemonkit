@@ -15,13 +15,35 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
 )
+
+type protectedClassifier struct {
+	classify  func(context.Context, wire.Peer) (bool, error)
+	authorize func(string, string) bool
+	err       error
+}
+
+func (c protectedClassifier) Validate() error { return c.err }
+
+func (c protectedClassifier) Classify(ctx context.Context, peer wire.Peer) (bool, error) {
+	return c.classify(ctx, peer)
+}
+
+func (c protectedClassifier) AuthorizeBuild(serverBuild, peerBuild string) bool {
+	if c.authorize == nil {
+		return true
+	}
+	return c.authorize(serverBuild, peerBuild)
+}
 
 func TestProtectedSessionsSurviveIdleOrdinarySaturation(t *testing.T) {
 	server := &wire.Server{
 		Build: "server-test", MaxSessions: 3, ReservedProtectedSessions: 2,
-		ProtectedSession: func(_ context.Context, peer wire.Peer) (bool, error) { return peer.PID == os.Getpid(), nil },
+		ProtectedSessionClassifier: protectedClassifier{classify: func(_ context.Context, peer wire.Peer) (bool, error) {
+			return peer.PID == os.Getpid(), nil
+		}},
 	}
 	server.RegisterControl("native-bootstrap", func(context.Context, wire.Request) (any, error) {
 		return "ready", nil
@@ -61,9 +83,9 @@ func TestLifecycleRejectsOrdinarySameUIDSessionAndAcceptsProtectedSession(t *tes
 	lifecycleState := &countingProtectedLifecycle{}
 	server := &wire.Server{
 		Build: "server-test", MaxSessions: 2, ReservedProtectedSessions: 1,
-		ProtectedSession: func(context.Context, wire.Peer) (bool, error) {
+		ProtectedSessionClassifier: protectedClassifier{classify: func(context.Context, wire.Peer) (bool, error) {
 			return protect.Load(), nil
-		},
+		}},
 	}
 	server.RegisterLifecycle(lifecycleState)
 	running := startSessionServer(t, server, admitAll(&atomic.Int32{}))
@@ -91,6 +113,125 @@ func TestLifecycleRejectsOrdinarySameUIDSessionAndAcceptsProtectedSession(t *tes
 	}
 }
 
+func TestLifecycleAcceptsOnlySameOrNewerProtectedDaemonBuild(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	executable, err = filepath.EvalSymlinks(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &wire.Server{
+		Build: "v1.2.0", MaxSessions: 3, ReservedProtectedSessions: 1,
+		ProtectedSessionClassifier: trust.SessionClassifier{Executable: executable},
+	}
+	server.RegisterLifecycle(protectedTestLifecycle{})
+	running := startSessionServer(t, server, admitAll(&atomic.Int32{}))
+	for _, test := range []struct {
+		build string
+		ok    bool
+	}{
+		{build: "v1.1.0"},
+		{build: "v1.2.0", ok: true},
+		{build: "v1.3.0", ok: true},
+	} {
+		peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
+			Dial: wire.UnixDialer(running.path), Build: test.build,
+		}}
+		_, err := peer.Health(t.Context())
+		_ = peer.Close()
+		if test.ok && err != nil {
+			t.Fatalf("build %s lifecycle Health: %v", test.build, err)
+		}
+		if !test.ok && (err == nil || !strings.Contains(err.Error(), wire.ErrProtectedSessionRequired.Error())) {
+			t.Fatalf("build %s lifecycle Health = %v, want protected rejection", test.build, err)
+		}
+	}
+}
+
+func TestBusinessRoutesRequireExactBuildBeforeHandlerDispatch(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	executable, err = filepath.EvalSymlinks(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	server := &wire.Server{
+		Build: "v1.2.0", MaxSessions: 3, ReservedProtectedSessions: 1,
+		ProtectedSessionClassifier: trust.SessionClassifier{Executable: executable},
+	}
+	server.RegisterControl("business", func(context.Context, wire.Request) (any, error) {
+		calls.Add(1)
+		return true, nil
+	})
+	running := startSessionServer(t, server, admitAll(&atomic.Int32{}))
+	for _, build := range []string{"v1.1.0", "v1.3.0"} {
+		client, err := wire.NewClient(t.Context(), wire.ClientConfig{
+			Dial: wire.UnixDialer(running.path), Build: build,
+		})
+		if err != nil {
+			t.Fatalf("build %s client: %v", build, err)
+		}
+		result, callErr := client.Call(t.Context(), "business", "", []byte("not decoded"))
+		if closeErr := client.Close(); closeErr != nil {
+			t.Fatalf("build %s close: %v", build, closeErr)
+		}
+		if callErr != nil || result.Outcome != wire.Rejected ||
+			!strings.Contains(result.Response.Reason, wire.ErrBuildMismatch.Error()) {
+			t.Fatalf("build %s business call = %#v, %v, want build mismatch rejection", build, result, callErr)
+		}
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("skewed builds dispatched %d business handlers", got)
+	}
+
+	client, err := wire.NewClient(t.Context(), wire.ClientConfig{
+		Dial: wire.UnixDialer(running.path), Build: "v1.2.0",
+	})
+	if err != nil {
+		t.Fatalf("exact-build client: %v", err)
+	}
+	result, err := client.Call(t.Context(), "business", "", nil)
+	if err != nil || result.Outcome != wire.Delivered {
+		t.Fatalf("exact-build business call = %#v, %v", result, err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatalf("exact-build close: %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("exact-build handler calls = %d, want 1", got)
+	}
+}
+
+func TestGracefulCloseSettlesProtectedCapacityBeforeReturn(t *testing.T) {
+	server := &wire.Server{
+		Build: "server-test", MaxSessions: 1, ReservedProtectedSessions: 1,
+		ProtectedSessionClassifier: protectedClassifier{
+			classify: func(context.Context, wire.Peer) (bool, error) { return true, nil },
+		},
+	}
+	server.RegisterControl("probe", func(context.Context, wire.Request) (any, error) { return true, nil })
+	running := startSessionServer(t, server, admitAll(&atomic.Int32{}))
+	for iteration := range 100 {
+		client, err := wire.NewClient(t.Context(), wire.ClientConfig{
+			Dial: wire.UnixDialer(running.path), Build: "server-test",
+		})
+		if err != nil {
+			t.Fatalf("iteration %d client: %v", iteration, err)
+		}
+		if _, err := client.Call(t.Context(), "probe", "", nil); err != nil {
+			t.Fatalf("iteration %d probe: %v", iteration, err)
+		}
+		if err := client.Close(); err != nil {
+			t.Fatalf("iteration %d close: %v", iteration, err)
+		}
+	}
+}
+
 func TestUntrustedPeerIsRejectedBeforeProtectedCapacityClassification(t *testing.T) {
 	var classifications atomic.Int32
 	server := &wire.Server{
@@ -101,10 +242,10 @@ func TestUntrustedPeerIsRejectedBeforeProtectedCapacityClassification(t *testing
 			}
 			return nil
 		},
-		ProtectedSession: func(context.Context, wire.Peer) (bool, error) {
+		ProtectedSessionClassifier: protectedClassifier{classify: func(context.Context, wire.Peer) (bool, error) {
 			classifications.Add(1)
 			return true, nil
-		},
+		}},
 	}
 	server.RegisterControl("probe", func(context.Context, wire.Request) (any, error) { return true, nil })
 	running := startSessionServer(t, server, admitAll(&atomic.Int32{}))
@@ -140,7 +281,9 @@ func TestBlockingPeerVerifierIsTimedOutBeforeNextProtectedAdmission(t *testing.T
 			}
 			return nil
 		},
-		ProtectedSession: func(context.Context, wire.Peer) (bool, error) { return true, nil },
+		ProtectedSessionClassifier: protectedClassifier{classify: func(context.Context, wire.Peer) (bool, error) {
+			return true, nil
+		}},
 	}
 	server.RegisterControl("probe", func(context.Context, wire.Request) (any, error) { return true, nil })
 	running := startSessionServer(t, server, admitAll(&atomic.Int32{}))
@@ -175,7 +318,10 @@ func TestProtectedSessionCapacityConfigurationIsExact(t *testing.T) {
 	}{
 		{name: "negative", server: &wire.Server{Build: "test", ReservedProtectedSessions: -1}},
 		{name: "negative verification timeout", server: &wire.Server{Build: "test", PeerVerificationTimeout: -1}},
-		{name: "exceeds maximum", server: &wire.Server{Build: "test", MaxSessions: 1, ReservedProtectedSessions: 2, ProtectedSession: func(context.Context, wire.Peer) (bool, error) { return true, nil }}},
+		{name: "exceeds maximum", server: &wire.Server{
+			Build: "test", MaxSessions: 1, ReservedProtectedSessions: 2,
+			ProtectedSessionClassifier: protectedClassifier{classify: func(context.Context, wire.Peer) (bool, error) { return true, nil }},
+		}},
 		{name: "missing classifier", server: &wire.Server{Build: "test", ReservedProtectedSessions: 1}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -216,7 +362,9 @@ func (*countingProtectedLifecycle) Handoff(context.Context) error  { return nil 
 
 func protectAllLifecycleSessions(server *wire.Server) {
 	server.ReservedProtectedSessions = 1
-	server.ProtectedSession = func(context.Context, wire.Peer) (bool, error) { return true, nil }
+	server.ProtectedSessionClassifier = protectedClassifier{
+		classify: func(context.Context, wire.Peer) (bool, error) { return true, nil },
+	}
 }
 
 func (protectedTestLifecycle) Health(context.Context) (daemon.Health, error) {

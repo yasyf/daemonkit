@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"net"
 	"os"
@@ -85,13 +86,17 @@ func fixedAppFixture(t *testing.T) (AppKeepAlive, AppStopSpec, AuthenticatedAppP
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := NewAuthenticatedAppPeer(peer, validationDigest)
+	expected := AuthenticatedAppPeer{
+		PID: peer.PID, UID: peer.UID, StartTime: peer.StartTime, Boot: peer.Boot,
+		Executable: peer.Executable, AuditTokenDigest: sha256.Sum256(peer.Audit),
+		CodeIdentity: requirement.CodeIdentity(), EntitlementPolicyDigest: validationDigest,
+	}
 	now := time.Unix(100, 0)
 	spec := AppStopSpec{
-		ExecutableName:              "Fixed",
-		Requirement:                 requirement,
-		EntitlementValidationDigest: validationDigest,
-		Reaper:                      reaper, Dependents: recordingAppRecovery{events: events},
+		ExecutableName:          "Fixed",
+		CodeIdentity:            requirement.CodeIdentity(),
+		EntitlementPolicyDigest: validationDigest,
+		Reaper:                  reaper, Dependents: recordingAppRecovery{events: events},
 		Dial: func(context.Context) (net.Conn, error) {
 			*events = append(*events, "dial")
 			client, server := net.Pipe()
@@ -102,7 +107,7 @@ func fixedAppFixture(t *testing.T) (AppKeepAlive, AppStopSpec, AuthenticatedAppP
 			*events = append(*events, "peer")
 			return peer, nil
 		},
-		checkPeer: func(got wire.Peer, _ trust.Requirement) error {
+		checkPeer: func(got wire.Peer, _ trust.CodeIdentity) error {
 			*events = append(*events, "trust")
 			if got.UID != peer.UID || got.ProcessIdentity() != peer.ProcessIdentity() {
 				return errors.New("wrong peer")
@@ -209,7 +214,7 @@ func TestAppKeepAliveStopRejectsAuthenticatedReplacement(t *testing.T) {
 	spec.peerFromConn = func(net.Conn) (wire.Peer, error) {
 		return wire.Peer{PID: 4241 + generation, UID: os.Geteuid(), StartTime: time.Now().String(), Boot: "boot", Executable: executable, Audit: make([]byte, 32)}, nil
 	}
-	spec.checkPeer = func(wire.Peer, trust.Requirement) error { return nil }
+	spec.checkPeer = func(wire.Peer, trust.CodeIdentity) error { return nil }
 	spec.processes = func(string) ([]proc.Identity, error) {
 		if generation == 0 {
 			return nil, nil
@@ -347,7 +352,7 @@ func TestAppKeepAliveStopRejectsSignatureAndPIDReuseBeforeBootout(t *testing.T) 
 		set  func(*AppStopSpec)
 	}{
 		{"signature", func(spec *AppStopSpec) {
-			spec.checkPeer = func(wire.Peer, trust.Requirement) error { return trust.ErrUntrustedPeer }
+			spec.checkPeer = func(wire.Peer, trust.CodeIdentity) error { return trust.ErrUntrustedPeer }
 		}},
 		{"pid reuse", func(spec *AppStopSpec) { spec.Reaper.(*recordingAppReaper).trackErr = proc.ErrIdentityChanged }},
 	} {
@@ -366,14 +371,15 @@ func TestAppKeepAliveStopRejectsSignatureAndPIDReuseBeforeBootout(t *testing.T) 
 	}
 }
 
-func TestAppKeepAliveStopRejectsBootAuditAndValidationDigestMismatch(t *testing.T) {
+func TestAppKeepAliveStopRejectsExactProofMismatch(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		set  func(*AuthenticatedAppPeer)
 	}{
 		{"boot", func(peer *AuthenticatedAppPeer) { peer.Boot = "previous-boot" }},
 		{"audit token", func(peer *AuthenticatedAppPeer) { peer.AuditTokenDigest[0]++ }},
-		{"validation digest", func(peer *AuthenticatedAppPeer) { peer.EntitlementValidationDigest[0]++ }},
+		{"code identity", func(peer *AuthenticatedAppPeer) { peer.CodeIdentity.TeamID = "OTHER" }},
+		{"entitlement policy digest", func(peer *AuthenticatedAppPeer) { peer.EntitlementPolicyDigest[0]++ }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			keepalive, spec, expected, events, _ := fixedAppFixture(t)

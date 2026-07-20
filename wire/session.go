@@ -6,11 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"sync"
 	"time"
 )
+
+var errPeerGoAway = errors.New("wire: peer requested session close")
 
 // AcceptedSession is a server-authenticated persistent client session.
 type AcceptedSession struct{ s *session }
@@ -108,10 +109,24 @@ func (s *requestState) error() error {
 	return s.transportErr
 }
 
-func (s *session) run(ctx context.Context) error {
+func (s *session) run(ctx context.Context, releaseCapacity func()) error {
 	s.writerWG.Add(1)
 	go s.writeLoop()
 	err := s.readLoop(ctx)
+	if errors.Is(err, errPeerGoAway) {
+		s.stop()
+		s.closeRequestInputs()
+		s.requestWG.Wait()
+		close(s.requestsDone)
+		s.writerWG.Wait()
+		releaseCapacity()
+		if err := s.codec.WriteFrame(Frame{Kind: FrameGoAway, Flags: FlagEnd}); err != nil {
+			_ = s.conn.Close()
+			return err
+		}
+		_ = s.conn.Close()
+		return nil
+	}
 	s.close()
 	s.closeRequestInputs()
 	s.requestWG.Wait()
@@ -121,10 +136,14 @@ func (s *session) run(ctx context.Context) error {
 }
 
 func (s *session) close() {
+	s.stop()
+	_ = s.conn.Close()
+}
+
+func (s *session) stop() {
 	s.closeOnce.Do(func() {
 		s.cancel()
 		s.eventCredits.close()
-		_ = s.conn.Close()
 		s.mu.Lock()
 		states := make([]*requestState, 0, len(s.active))
 		for _, state := range s.active {
@@ -209,7 +228,7 @@ func (s *session) readLoop(ctx context.Context) error {
 				return err
 			}
 		case FrameGoAway:
-			return io.EOF
+			return errPeerGoAway
 		default:
 			return fmt.Errorf("%w: client frame kind %d", ErrInvalidFrame, frame.Kind)
 		}
@@ -296,13 +315,16 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 		s.requestWG.Done()
 	}()
 
-	if entry.lifecycle && !s.protected {
-		if err := s.sendRejected(sessionCtx, frame.ID, ErrProtectedSessionRequired.Error()); err != nil {
-			s.close()
+	switch entry.route {
+	case routeLifecycle:
+		if !s.protected ||
+			!s.server.ProtectedSessionClassifier.AuthorizeBuild(s.server.Build, s.build) {
+			if err := s.sendRejected(sessionCtx, frame.ID, ErrProtectedSessionRequired.Error()); err != nil {
+				s.close()
+			}
+			return
 		}
-		return
-	}
-	if !entry.lifecycle {
+	case routeBusiness:
 		if s.build != s.server.Build {
 			if err := s.sendRejected(sessionCtx, frame.ID, ErrBuildMismatch.Error()); err != nil {
 				s.close()
@@ -315,9 +337,11 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 			}
 			return
 		}
+	default:
+		panic("wire: invalid route class")
 	}
 	admit := s.admit
-	if entry.lifecycle {
+	if entry.route == routeLifecycle {
 		admit = s.admitLifecycle
 	}
 	done, err := admit()

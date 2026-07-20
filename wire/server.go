@@ -53,10 +53,17 @@ const (
 	classConcurrent
 )
 
+type routeClass uint8
+
+const (
+	routeBusiness routeClass = iota
+	routeLifecycle
+)
+
 type entry struct {
-	class     class
-	h         Handler
-	lifecycle bool
+	class class
+	route routeClass
+	h     Handler
 }
 
 type job struct {
@@ -103,9 +110,9 @@ type Server struct {
 	// ReservedProtectedSessions withholds capacity from ordinary peers so exact
 	// authenticated lifecycle and bootstrap peers cannot be starved.
 	ReservedProtectedSessions int
-	// ProtectedSession classifies an already identified and trusted peer without
-	// reading client-controlled frames. It must return when ctx is canceled.
-	ProtectedSession func(context.Context, Peer) (bool, error)
+	// ProtectedSessionClassifier authenticates protected peers and their
+	// lifecycle build relationship.
+	ProtectedSessionClassifier ProtectedSessionClassifier
 	// PeerVerificationTimeout bounds pre-capacity trust and classification.
 	PeerVerificationTimeout time.Duration
 	// MaxFrame caps each encoded frame.
@@ -137,16 +144,20 @@ type Server struct {
 }
 
 // RegisterControl registers a control handler outside the worker pool.
-func (s *Server) RegisterControl(op Op, h Handler) { s.register(op, classControl, h, false) }
+func (s *Server) RegisterControl(op Op, h Handler) {
+	s.register(op, classControl, routeBusiness, h)
+}
 
 // RegisterConcurrent registers a bounded worker-pool handler.
-func (s *Server) RegisterConcurrent(op Op, h Handler) { s.register(op, classConcurrent, h, false) }
+func (s *Server) RegisterConcurrent(op Op, h Handler) {
+	s.register(op, classConcurrent, routeBusiness, h)
+}
 
-func (s *Server) register(op Op, c class, h Handler, lifecycle bool) {
+func (s *Server) register(op Op, class class, route routeClass, h Handler) {
 	if op == "" || h == nil {
 		panic("wire: operation and handler are required")
 	}
-	if _, reserved := reservedOps[op]; reserved && !lifecycle {
+	if _, reserved := reservedOps[op]; reserved && route != routeLifecycle {
 		panic(fmt.Sprintf("wire: op %q is a reserved lifecycle op", op))
 	}
 	s.mu.Lock()
@@ -160,8 +171,8 @@ func (s *Server) register(op Op, c class, h Handler, lifecycle bool) {
 	if _, exists := s.handlers[op]; exists {
 		panic(fmt.Sprintf("wire: op %q already registered", op))
 	}
-	s.handlers[op] = entry{class: c, h: h, lifecycle: lifecycle}
-	if lifecycle {
+	s.handlers[op] = entry{class: class, route: route, h: h}
+	if route == routeLifecycle {
 		s.hasLifecycle = true
 	}
 }
@@ -240,21 +251,15 @@ func (s *Server) Serve(
 		go s.worker()
 	}
 
-	acceptDone := make(chan error, 1)
-	go func() { acceptDone <- s.accept(ctx, admit, admitLifecycle) }()
 	if err := ready(); err != nil {
 		_ = s.CloseIntake()
-		acceptErr := <-acceptDone
-		s.closeSessions()
-		s.sessionWG.Wait()
 		close(s.queue)
 		s.poolWG.Wait()
-		return errors.Join(
-			fmt.Errorf("wire: publish readiness: %w", err),
-			wrapAcceptError(acceptErr),
-		)
+		return fmt.Errorf("wire: publish readiness: %w", err)
 	}
 
+	acceptDone := make(chan error, 1)
+	go func() { acceptDone <- s.accept(ctx, admit, admitLifecycle) }()
 	var acceptErr error
 	select {
 	case <-ctx.Done():
@@ -329,11 +334,12 @@ func (s *Server) accept(ctx context.Context, admit, admitLifecycle func() (func(
 		}
 		s.sessionWG.Add(1)
 		go func(conn net.Conn, peer Peer, protected bool, capacity sessionCapacity) {
+			releaseCapacity := sync.OnceFunc(func() { s.releaseSessionCapacity(capacity) })
 			defer func() {
-				s.releaseSessionCapacity(capacity)
+				releaseCapacity()
 				s.sessionWG.Done()
 			}()
-			if err := s.serveConn(ctx, conn, peer, protected, admit, admitLifecycle); err != nil && !isDisconnect(err) {
+			if err := s.serveConn(ctx, conn, peer, protected, admit, admitLifecycle, releaseCapacity); err != nil && !isDisconnect(err) {
 				s.Log.Debug("wire: session ended", "err", err)
 			}
 		}(conn, peer, protected, capacity)
@@ -346,6 +352,7 @@ func (s *Server) serveConn(
 	peer Peer,
 	protected bool,
 	admit, admitLifecycle func() (func(), error),
+	releaseCapacity func(),
 ) error {
 	defer conn.Close()
 	codec := NewCodec(conn)
@@ -385,7 +392,7 @@ func (s *Server) serveConn(
 	sess.accepted = &AcceptedSession{s: sess}
 	s.addSession(sess)
 	defer s.removeSession(sess)
-	return sess.run(sessCtx)
+	return sess.run(sessCtx, releaseCapacity)
 }
 
 func (s *Server) serverHandshake(codec *Codec) (BuildIdentity, []byte, error) {
@@ -531,10 +538,10 @@ func (s *Server) verifyPeer(ctx context.Context, peer Peer) (bool, error) {
 			return false, err
 		}
 	}
-	if s.ProtectedSession == nil {
+	if s.ProtectedSessionClassifier == nil {
 		return false, nil
 	}
-	return s.ProtectedSession(ctx, peer)
+	return s.ProtectedSessionClassifier.Classify(ctx, peer)
 }
 
 func (s *Server) maxFrame() int {
@@ -602,12 +609,17 @@ func (s *Server) validateSessionCapacity() error {
 		return errors.New("wire: reserved protected sessions must not be negative")
 	case s.ReservedProtectedSessions > maximum:
 		return fmt.Errorf("wire: reserved protected sessions %d exceed maximum sessions %d", s.ReservedProtectedSessions, maximum)
-	case s.ReservedProtectedSessions != 0 && s.ProtectedSession == nil:
+	case s.ReservedProtectedSessions != 0 && s.ProtectedSessionClassifier == nil:
 		return errors.New("wire: protected session classifier is required when capacity is reserved")
-	case s.hasLifecycle && s.ProtectedSession == nil:
+	case s.hasLifecycle && s.ProtectedSessionClassifier == nil:
 		return errors.New("wire: lifecycle handlers require a protected session classifier")
 	case s.hasLifecycle && s.ReservedProtectedSessions == 0:
 		return errors.New("wire: lifecycle handlers require reserved protected capacity")
+	case s.ProtectedSessionClassifier != nil:
+		if err := s.ProtectedSessionClassifier.Validate(); err != nil {
+			return fmt.Errorf("wire: protected session classifier: %w", err)
+		}
+		return nil
 	default:
 		return nil
 	}

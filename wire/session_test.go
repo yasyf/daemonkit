@@ -166,6 +166,64 @@ func TestServeReadinessErrorClosesIntakeAndJoins(t *testing.T) {
 	}
 }
 
+func TestServeDoesNotAdmitSessionsBeforeReadinessPublication(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "dkw-ready-order-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	path := filepath.Join(dir, "ready.sock")
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	readyEntered := make(chan struct{})
+	publishReady := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	serveDone := make(chan error, 1)
+	server := &wire.Server{Build: "server-test"}
+	go func() {
+		serveDone <- server.Serve(
+			ctx,
+			listener,
+			func() error {
+				close(readyEntered)
+				<-publishReady
+				return nil
+			},
+			func() (func(), error) { return func() {}, nil },
+			func() (func(), error) { return func() {}, nil },
+		)
+	}()
+	<-readyEntered
+	clientDone := make(chan *wire.Client, 1)
+	clientErr := make(chan error, 1)
+	go func() {
+		client, err := wire.NewClient(context.Background(), wire.ClientConfig{
+			Dial: wire.UnixDialer(path), Build: "server-test",
+		})
+		clientDone <- client
+		clientErr <- err
+	}()
+	select {
+	case err := <-clientErr:
+		t.Fatalf("session admitted before readiness publication: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(publishReady)
+	client := <-clientDone
+	if err := <-clientErr; err != nil {
+		t.Fatalf("NewClient after readiness: %v", err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	cancel()
+	if err := <-serveDone; err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+}
+
 func TestCallDoesNotNegotiateResponseStream(t *testing.T) {
 	var calls atomic.Int32
 	server := &wire.Server{Build: "server-test"}
@@ -914,8 +972,8 @@ func TestTerminalWriteFailureSettlesEveryAdmission(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	blocked.releaseReads()
-	if err := <-closeDone; err != nil {
-		t.Fatalf("Close: %v", err)
+	if err := <-closeDone; err == nil {
+		t.Fatal("Close succeeded without a settled go-away acknowledgement")
 	}
 }
 

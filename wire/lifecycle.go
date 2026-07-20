@@ -22,12 +22,13 @@ type Lifecycle interface {
 
 // RegisterLifecycle installs the reserved lifecycle handlers: health, shutdown,
 // and handoff. They skip build-mismatch and drain rejection — a shutdown
-// request is acknowledged mid-drain — but still pass ordinary admission.
+// request is acknowledged mid-drain — but require protected admission and an
+// authorized same-or-newer daemon build.
 func (s *Server) RegisterLifecycle(lifecycle Lifecycle) {
 	if lifecycle == nil {
 		panic("wire: lifecycle is required")
 	}
-	s.register(Op(lifeproto.OpHealth), classControl, func(ctx context.Context, req Request) (any, error) {
+	s.register(Op(lifeproto.OpHealth), classControl, routeLifecycle, func(ctx context.Context, req Request) (any, error) {
 		var message lifeproto.HealthRequest
 		if err := decodeLifecycle(req, lifeproto.OpHealth, &message); err != nil {
 			return nil, err
@@ -44,8 +45,8 @@ func (s *Server) RegisterLifecycle(lifecycle Lifecycle) {
 			health.Draining,
 			health.Busy,
 		), nil
-	}, true)
-	s.register(Op(lifeproto.OpShutdown), classControl, func(ctx context.Context, req Request) (any, error) {
+	})
+	s.register(Op(lifeproto.OpShutdown), classControl, routeLifecycle, func(ctx context.Context, req Request) (any, error) {
 		var message lifeproto.ShutdownRequest
 		if err := decodeLifecycle(req, lifeproto.OpShutdown, &message); err != nil {
 			return nil, err
@@ -54,8 +55,8 @@ func (s *Server) RegisterLifecycle(lifecycle Lifecycle) {
 			return nil, err
 		}
 		return lifeproto.NewShutdownResponse(true), nil
-	}, true)
-	s.register(Op(lifeproto.OpHandoff), classControl, func(ctx context.Context, req Request) (any, error) {
+	})
+	s.register(Op(lifeproto.OpHandoff), classControl, routeLifecycle, func(ctx context.Context, req Request) (any, error) {
 		var message lifeproto.HandoffRequest
 		if err := decodeLifecycle(req, lifeproto.OpHandoff, &message); err != nil {
 			return nil, err
@@ -64,7 +65,7 @@ func (s *Server) RegisterLifecycle(lifecycle Lifecycle) {
 			return nil, err
 		}
 		return lifeproto.NewHandoffResponse(true), nil
-	}, true)
+	})
 }
 
 func decodeLifecycle(req Request, op string, dst any) error {

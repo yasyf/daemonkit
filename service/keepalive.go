@@ -59,16 +59,16 @@ type AppOwnedProcessRecovery interface {
 type AppStopSpec struct {
 	Dial           wire.Dialer
 	ExecutableName string
-	Requirement    trust.Requirement
-	// EntitlementValidationDigest is the opaque digest bound by the prior
-	// authenticated session; callers never disclose entitlement values here.
-	EntitlementValidationDigest [32]byte
-	Reaper                      AppProcessReaper
-	Dependents                  AppOwnedProcessRecovery
+	CodeIdentity   trust.CodeIdentity
+	// EntitlementPolicyDigest is the opaque digest bound by the prior
+	// signed-side accepted session.
+	EntitlementPolicyDigest [32]byte
+	Reaper                  AppProcessReaper
+	Dependents              AppOwnedProcessRecovery
 
 	peerFromConn func(net.Conn) (wire.Peer, error)
 	processes    func(string) ([]proc.Identity, error)
-	checkPeer    func(wire.Peer, trust.Requirement) error
+	checkPeer    func(wire.Peer, trust.CodeIdentity) error
 	now          func() time.Time
 	pause        func(context.Context, time.Duration) error
 	deadline     time.Duration
@@ -78,22 +78,25 @@ type AppStopSpec struct {
 // AuthenticatedAppPeer is the exact kernel and signed-policy identity proven
 // by a prior authenticated app session.
 type AuthenticatedAppPeer struct {
-	PID                         int
-	UID                         int
-	StartTime                   string
-	Boot                        string
-	Executable                  string
-	AuditTokenDigest            [32]byte
-	EntitlementValidationDigest [32]byte
+	PID                     int
+	UID                     int
+	StartTime               string
+	Boot                    string
+	Executable              string
+	AuditTokenDigest        [32]byte
+	CodeIdentity            trust.CodeIdentity
+	EntitlementPolicyDigest [32]byte
 }
 
-// NewAuthenticatedAppPeer binds one accepted peer to the opaque digest of the
-// full signed-side trust requirement already checked for that session.
-func NewAuthenticatedAppPeer(peer wire.Peer, validationDigest [32]byte) AuthenticatedAppPeer {
+// NewAuthenticatedAppPeer binds one signed-side accepted identity to an exact
+// daemon-facing process proof without exposing its entitlement policy.
+func NewAuthenticatedAppPeer(accepted trust.AcceptedIdentity) AuthenticatedAppPeer {
+	peer := accepted.Peer()
 	return AuthenticatedAppPeer{
 		PID: peer.PID, UID: peer.UID, StartTime: peer.StartTime, Boot: peer.Boot,
 		Executable: peer.Executable, AuditTokenDigest: sha256.Sum256(peer.Audit),
-		EntitlementValidationDigest: validationDigest,
+		CodeIdentity:            accepted.CodeIdentity(),
+		EntitlementPolicyDigest: accepted.EntitlementPolicyDigest(),
 	}
 }
 
@@ -212,7 +215,10 @@ func (k AppKeepAlive) Stop(ctx context.Context, spec AppStopSpec, expected Authe
 	if err := expected.validate(executable); err != nil {
 		return err
 	}
-	if expected.EntitlementValidationDigest != spec.EntitlementValidationDigest {
+	if expected.CodeIdentity != spec.CodeIdentity {
+		return errors.New("keepalive agent: authenticated app peer code identity changed")
+	}
+	if expected.EntitlementPolicyDigest != spec.EntitlementPolicyDigest {
 		return errors.New("keepalive agent: authenticated app peer trust requirement changed")
 	}
 	if err := spec.Reaper.Reap(ctx); err != nil {
@@ -297,8 +303,12 @@ func (k AppKeepAlive) Stop(ctx context.Context, spec AppStopSpec, expected Authe
 
 func (p AuthenticatedAppPeer) validate(executable string) error {
 	if p.PID <= 1 || p.UID < 0 || p.StartTime == "" || p.Boot == "" || p.Executable != executable ||
-		p.AuditTokenDigest == ([32]byte{}) || p.EntitlementValidationDigest == ([32]byte{}) {
+		p.AuditTokenDigest == ([32]byte{}) || p.CodeIdentity == (trust.CodeIdentity{}) ||
+		p.EntitlementPolicyDigest == ([32]byte{}) {
 		return errors.New("keepalive agent: authenticated app peer proof is incomplete")
+	}
+	if _, err := p.CodeIdentity.DRString(); err != nil {
+		return fmt.Errorf("keepalive agent: authenticated app peer code identity: %w", err)
 	}
 	return nil
 }
@@ -316,17 +326,17 @@ func (k AppKeepAlive) validateStop(spec AppStopSpec) (string, error) {
 	if spec.Dial == nil || spec.Reaper == nil || spec.Dependents == nil {
 		return "", errors.New("keepalive agent: app stop requires a dialer, durable reaper, and dependent recovery")
 	}
-	if spec.EntitlementValidationDigest == ([32]byte{}) {
-		return "", errors.New("keepalive agent: app stop entitlement validation digest is required")
+	if spec.EntitlementPolicyDigest == ([32]byte{}) {
+		return "", errors.New("keepalive agent: app stop entitlement policy digest is required")
 	}
 	if filepath.Base(spec.ExecutableName) != spec.ExecutableName || spec.ExecutableName == "." || spec.ExecutableName == "" {
 		return "", errors.New("keepalive agent: app stop executable name is invalid")
 	}
-	if k.BundleID == "" || spec.Requirement.SigningIdentifier != k.BundleID {
+	if k.BundleID == "" || spec.CodeIdentity.SigningIdentifier != k.BundleID {
 		return "", errors.New("keepalive agent: app stop signing identifier must equal BundleID")
 	}
-	if _, err := spec.Requirement.DRString(); err != nil {
-		return "", fmt.Errorf("keepalive agent: app stop trust requirement: %w", err)
+	if _, err := spec.CodeIdentity.DRString(); err != nil {
+		return "", fmt.Errorf("keepalive agent: app stop code identity: %w", err)
 	}
 	executable := filepath.Join(k.AppPath, "Contents", "MacOS", spec.ExecutableName)
 	if err := validateDirectAppPath(k.AppPath, executable); err != nil {
@@ -385,9 +395,9 @@ func (s AppStopSpec) executableProcesses(executable string) ([]proc.Identity, er
 
 func (s AppStopSpec) check(peer wire.Peer) error {
 	if s.checkPeer != nil {
-		return s.checkPeer(peer, s.Requirement)
+		return s.checkPeer(peer, s.CodeIdentity)
 	}
-	return (trust.Policy{Requirement: &s.Requirement}).Check(peer)
+	return (trust.CodePolicy{Identity: s.CodeIdentity}).Check(peer)
 }
 
 func (k AppKeepAlive) bootout(ctx context.Context) error {

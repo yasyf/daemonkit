@@ -55,7 +55,7 @@ const (
 	FrameEvent
 	// FrameStream carries one ordered stream chunk.
 	FrameStream
-	// FrameGoAway closes the session.
+	// FrameGoAway requests or acknowledges settled session closure.
 	FrameGoAway
 	// FrameWindow grants one stream additional bounded-delivery credits.
 	FrameWindow

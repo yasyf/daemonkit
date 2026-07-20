@@ -114,7 +114,11 @@ type Client struct {
 
 	loopWG                  sync.WaitGroup
 	closeOnce               sync.Once
+	closeErr                error
 	failOnce                sync.Once
+	closing                 atomic.Bool
+	goAwayOnce              sync.Once
+	goAway                  chan struct{}
 	streamCap               int
 	streamWindow            uint32
 	cancelSettlementTimeout time.Duration
@@ -208,6 +212,7 @@ func NewClient(ctx context.Context, config ClientConfig) (*Client, error) {
 		events:                  newBoundedStream[Event](eventCap),
 		eventOut:                make(chan Event),
 		pending:                 make(map[uint64]*ClientCall),
+		goAway:                  make(chan struct{}),
 		streamCap:               streamCap,
 		streamWindow:            streamWindow,
 		cancelSettlementTimeout: durationOr(config.CancelSettlementTimeout, defaultCancelSettlementTimeout),
@@ -537,12 +542,23 @@ func (c *Client) Close() error { return c.close(context.Background()) }
 func (c *Client) close(parent context.Context) error {
 	c.closeOnce.Do(func() {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), c.codec.WriteTimeout)
-		_ = c.sendFrame(ctx, Frame{Kind: FrameGoAway, Flags: FlagEnd})
-		cancel()
+		defer cancel()
+		c.closing.Store(true)
+		if err := c.sendFrame(ctx, Frame{Kind: FrameGoAway, Flags: FlagEnd}); err != nil {
+			c.closeErr = fmt.Errorf("wire: send go-away: %w", err)
+		} else {
+			select {
+			case <-c.goAway:
+			case <-ctx.Done():
+				c.closeErr = fmt.Errorf("wire: await go-away acknowledgement: %w", ctx.Err())
+			case <-c.ctx.Done():
+				c.closeErr = fmt.Errorf("wire: await go-away acknowledgement: %w", c.sessionErr())
+			}
+		}
 		c.fail(io.EOF)
 	})
 	c.loopWG.Wait()
-	return nil
+	return c.closeErr
 }
 
 func clientHandshake(codec *Codec, build string) (BuildIdentity, error) {
@@ -635,7 +651,11 @@ func (c *Client) readLoop(ctx context.Context) {
 				return
 			}
 		case FrameGoAway:
-			c.fail(io.EOF)
+			if !c.closing.Load() {
+				c.fail(io.EOF)
+				return
+			}
+			c.goAwayOnce.Do(func() { close(c.goAway) })
 			return
 		default:
 			c.fail(fmt.Errorf("%w: server frame kind %d", ErrInvalidFrame, frame.Kind))
