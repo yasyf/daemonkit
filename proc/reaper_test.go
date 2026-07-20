@@ -26,10 +26,12 @@ func mustAdd(t *testing.T, s Store, rec Record) {
 }
 
 type memStore struct {
-	mu       sync.Mutex
-	recs     []Record
-	claims   map[string]reapClaim
-	receipts []ReapReceipt
+	mu        sync.Mutex
+	recs      []Record
+	claims    map[string]reapClaim
+	receipts  []ReapReceipt
+	sequences map[RecoveryClass]uint64
+	floors    map[RecoveryClass]uint64
 }
 
 func (m *memStore) Add(_ context.Context, rec Record) error {
@@ -83,15 +85,25 @@ func (m *memStore) BeginReap(_ context.Context, rec Record, generation string) e
 	return nil
 }
 
-func (m *memStore) CommitReap(_ context.Context, rec Record, receipt ReapReceipt) error {
+func (m *memStore) CommitReap(
+	_ context.Context,
+	rec Record,
+	reaperGeneration string,
+	outcome ReapOutcome,
+) (ReapReceipt, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if receipt.Record != rec {
-		return ErrInvalidReapReceipt
+	if m.sequences == nil {
+		m.sequences = make(map[RecoveryClass]uint64)
+	}
+	sequence := m.sequences[rec.RecoveryClass] + 1
+	receipt, err := newReapReceipt(ReceiptLedgerID{1}, sequence, rec, reaperGeneration, outcome)
+	if err != nil {
+		return ReapReceipt{}, err
 	}
 	claim, claimed := m.claims[recordKey(rec)]
 	if !claimed || claim.Record != rec || claim.ReaperGeneration != receipt.ReaperGeneration {
-		return errors.New("missing exact reap claim")
+		return ReapReceipt{}, errors.New("missing exact reap claim")
 	}
 	present := false
 	records := m.recs[:0:0]
@@ -106,27 +118,42 @@ func (m *memStore) CommitReap(_ context.Context, rec Record, receipt ReapReceipt
 		if existing == receipt {
 			m.recs = records
 			delete(m.claims, recordKey(rec))
-			return nil
+			return existing, nil
 		}
 	}
 	if !present {
-		return errors.New("missing exact record")
+		return ReapReceipt{}, errors.New("missing exact record")
 	}
 	m.recs = records
 	delete(m.claims, recordKey(rec))
 	m.receipts = append(m.receipts, receipt)
-	return nil
+	m.sequences[rec.RecoveryClass] = sequence
+	return receipt, nil
 }
 
-func (m *memStore) LoadReapReceipts(_ context.Context, limit int) ([]ReapReceipt, bool, error) {
+func (m *memStore) LoadReapReceipts(
+	_ context.Context,
+	class RecoveryClass,
+	after ReapReceiptCursor,
+	limit int,
+) (ReapReceiptPage, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	more := len(m.receipts) > limit
-	receipts := m.receipts
-	if more {
-		receipts = receipts[:limit]
+	page := ReapReceiptPage{
+		Floor: ReapReceiptFloor{LedgerID: ReceiptLedgerID{1}, RecoveryClass: class, Sequence: m.floors[class]},
 	}
-	return append([]ReapReceipt(nil), receipts...), more, nil
+	for _, receipt := range m.receipts {
+		if receipt.Record.RecoveryClass != class || receipt.Sequence <= after.Sequence {
+			continue
+		}
+		if len(page.Receipts) == limit {
+			page.More = true
+			break
+		}
+		page.Receipts = append(page.Receipts, receipt)
+		page.Next = ReapReceiptCursor{LedgerID: receipt.LedgerID, Sequence: receipt.Sequence}
+	}
+	return page, nil
 }
 
 func (m *memStore) HasReapReceipt(_ context.Context, receipt ReapReceipt) (bool, error) {
@@ -149,13 +176,37 @@ func (m *memStore) FindReapReceipt(
 	return ReapReceipt{}, false, nil
 }
 
-func (m *memStore) AcknowledgeReap(_ context.Context, receipt ReapReceipt) error {
+func (m *memStore) AcknowledgeReap(_ context.Context, receipt ReapReceipt) (ReapReceiptFloor, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.floors == nil {
+		m.floors = make(map[RecoveryClass]uint64)
+	}
+	class := receipt.Record.RecoveryClass
+	floor := m.floors[class]
+	if receipt.Sequence < floor {
+		return ReapReceiptFloor{}, ErrReapReceiptStale
+	}
+	if receipt.Sequence == floor {
+		return ReapReceiptFloor{LedgerID: receipt.LedgerID, RecoveryClass: class, Sequence: floor}, nil
+	}
+	if receipt.Sequence != floor+1 {
+		return ReapReceiptFloor{}, ErrReapReceiptOrder
+	}
+	if !slices.Contains(m.receipts, receipt) {
+		return ReapReceiptFloor{}, ErrUnrecognizedReapReceipt
+	}
 	m.receipts = slices.DeleteFunc(m.receipts, func(existing ReapReceipt) bool {
 		return existing == receipt
 	})
-	return nil
+	m.floors[class] = receipt.Sequence
+	return ReapReceiptFloor{LedgerID: receipt.LedgerID, RecoveryClass: class, Sequence: receipt.Sequence}, nil
+}
+
+func (m *memStore) ReapReceiptFloor(_ context.Context, class RecoveryClass) (ReapReceiptFloor, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return ReapReceiptFloor{LedgerID: ReceiptLedgerID{1}, RecoveryClass: class, Sequence: m.floors[class]}, nil
 }
 
 func (m *memStore) len() int {
@@ -274,12 +325,12 @@ func liveInfo() procInfo { return procInfo{startTime: "111.222", comm: "worker"}
 
 func matchingRecord(pid int, gen string) Record {
 	i := liveInfo()
-	return Record{PID: pid, StartTime: i.startTime, Boot: testBoot, Comm: i.comm, Generation: gen}
+	return Record{RecoveryClass: RecoveryTask, PID: pid, StartTime: i.startTime, Boot: testBoot, Comm: i.comm, Generation: gen}
 }
 
 func TestReapReceiptPersistsAndReplaysByteIdenticallyUntilAcknowledged(t *testing.T) {
 	ctx := t.Context()
-	path := filepath.Join(t.TempDir(), "records.json")
+	path := filepath.Join(t.TempDir(), "recovery.db")
 	store := &FileStore{Path: path}
 	record := matchingRecord(4041, "prior-generation")
 	record.Executable = "/Applications/Fixed.app/Contents/MacOS/Fixed"
@@ -292,7 +343,10 @@ func TestReapReceiptPersistsAndReplaysByteIdenticallyUntilAcknowledged(t *testin
 			return "", ErrNoProcess
 		},
 	}
-	first, err := firstReaper.Reap(ctx)
+	if err := firstReaper.Reap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	first, err := firstReaper.ReapReceipts(ctx, RecoveryTask, ReapReceiptCursor{}, ReapReceiptPageLimit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,7 +369,10 @@ func TestReapReceiptPersistsAndReplaysByteIdenticallyUntilAcknowledged(t *testin
 		Store: &FileStore{Path: path}, Generation: "next-generation",
 		prober: &fakeProber{},
 	}
-	replayed, err := restarted.Reap(ctx)
+	if err := restarted.Reap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := restarted.ReapReceipts(ctx, RecoveryTask, ReapReceiptCursor{}, ReapReceiptPageLimit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,18 +386,21 @@ func TestReapReceiptPersistsAndReplaysByteIdenticallyUntilAcknowledged(t *testin
 	if !slices.Equal(firstBytes, replayedBytes) {
 		t.Fatalf("lost-response replay changed bytes:\nfirst=%s\nreplayed=%s", firstBytes, replayedBytes)
 	}
-	if err := restarted.AcknowledgeReap(ctx, receipt); err != nil {
+	if _, err := restarted.AcknowledgeReap(ctx, receipt); err != nil {
 		t.Fatalf("AcknowledgeReap: %v", err)
 	}
-	if err := restarted.AcknowledgeReap(ctx, receipt); err != nil {
+	if _, err := restarted.AcknowledgeReap(ctx, receipt); err != nil {
 		t.Fatalf("idempotent AcknowledgeReap: %v", err)
 	}
-	if err := restarted.VerifyReapReceipt(ctx, receipt); !errors.Is(err, ErrUnrecognizedReapReceipt) {
-		t.Fatalf("Verify acknowledged receipt = %v, want unrecognized", err)
+	if err := restarted.VerifyReapReceipt(ctx, receipt); !errors.Is(err, ErrReapReceiptStale) {
+		t.Fatalf("Verify acknowledged receipt = %v, want stale", err)
 	}
-	empty, err := restarted.Reap(ctx)
-	if err != nil || len(empty.Receipts) != 0 || empty.More {
-		t.Fatalf("Reap after acknowledgement = %+v, %v", empty, err)
+	if err := restarted.Reap(ctx); err != nil {
+		t.Fatalf("Reap after acknowledgement = %v", err)
+	}
+	empty, err := restarted.ReapReceipts(ctx, RecoveryTask, ReapReceiptCursor{}, ReapReceiptPageLimit)
+	if err != nil || len(empty.Receipts) != 0 || empty.More || empty.Floor.Sequence != receipt.Sequence {
+		t.Fatalf("receipts after acknowledgement = %+v, %v", empty, err)
 	}
 }
 
@@ -369,7 +429,10 @@ func TestReapReceiptRejectsForgeryWithoutForgettingDurableProof(t *testing.T) {
 		Store: store, Generation: "current-generation",
 		prober: &fakeProber{err: errNoProc},
 	}
-	result, err := reaper.Reap(ctx)
+	if err := reaper.Reap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	result, err := reaper.ReapReceipts(ctx, RecoveryTask, ReapReceiptCursor{}, ReapReceiptPageLimit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,6 +443,7 @@ func TestReapReceiptRejectsForgeryWithoutForgettingDurableProof(t *testing.T) {
 		t.Fatalf("Verify forged digest = %v, want invalid receipt", err)
 	}
 	other, err := newReapReceipt(
+		ReceiptLedgerID{1}, receipt.Sequence,
 		matchingRecord(4043, "prior-generation"), "current-generation", ReapAbsent,
 	)
 	if err != nil {
@@ -388,8 +452,8 @@ func TestReapReceiptRejectsForgeryWithoutForgettingDurableProof(t *testing.T) {
 	if err := reaper.VerifyReapReceipt(ctx, other); !errors.Is(err, ErrUnrecognizedReapReceipt) {
 		t.Fatalf("Verify uncommitted receipt = %v, want unrecognized", err)
 	}
-	if err := reaper.AcknowledgeReap(ctx, other); err != nil {
-		t.Fatalf("acknowledge absent receipt: %v", err)
+	if _, err := reaper.AcknowledgeReap(ctx, other); !errors.Is(err, ErrUnrecognizedReapReceipt) {
+		t.Fatalf("acknowledge absent receipt = %v, want unrecognized", err)
 	}
 	if err := reaper.VerifyReapReceipt(ctx, receipt); err != nil {
 		t.Fatalf("forged acknowledgement removed exact proof: %v", err)
@@ -410,13 +474,14 @@ func TestReapReceiptRejectsLiveSignedProcessSubstitution(t *testing.T) {
 			return "/Applications/Substituted.app/Contents/MacOS/Substituted", nil
 		},
 	}
-	result, err := reaper.Reap(t.Context())
+	err := reaper.Reap(t.Context())
 	if !errors.Is(err, ErrIdentityChanged) {
-		t.Fatalf("Reap substituted process = %+v, %v, want identity rejection", result, err)
+		t.Fatalf("Reap substituted process = %v, want identity rejection", err)
 	}
-	if len(result.Receipts) != 0 || store.len() != 1 {
-		t.Fatalf("substituted process produced proof or lost authority: result=%+v records=%d",
-			result, store.len())
+	page, pageErr := reaper.ReapReceipts(t.Context(), RecoveryTask, ReapReceiptCursor{}, ReapReceiptPageLimit)
+	if pageErr != nil || len(page.Receipts) != 0 || store.len() != 1 {
+		t.Fatalf("substituted process produced proof or lost authority: page=%+v err=%v records=%d",
+			page, pageErr, store.len())
 	}
 }
 
@@ -433,7 +498,10 @@ func TestReapReceiptsArePageBoundedWithoutDroppingKillAuthority(t *testing.T) {
 		Store: store, Generation: "current-generation",
 		prober: &fakeProber{boot: testBoot},
 	}
-	first, err := reaper.Reap(ctx)
+	if err := reaper.Reap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	first, err := reaper.ReapReceipts(ctx, RecoveryTask, ReapReceiptCursor{}, ReapReceiptPageLimit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -452,11 +520,11 @@ func TestReapReceiptsArePageBoundedWithoutDroppingKillAuthority(t *testing.T) {
 		t.Fatalf("exact hidden receipt = %+v, found %t, err %v", replayedHidden, found, err)
 	}
 	for _, receipt := range first.Receipts {
-		if err := reaper.AcknowledgeReap(ctx, receipt); err != nil {
+		if _, err := reaper.AcknowledgeReap(ctx, receipt); err != nil {
 			t.Fatal(err)
 		}
 	}
-	second, err := reaper.Reap(ctx)
+	second, err := reaper.ReapReceipts(ctx, RecoveryTask, first.Next, ReapReceiptPageLimit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -510,7 +578,7 @@ func TestReapRetainedAuthenticatedAppRecordUsesAuditTokenAuthority(t *testing.T)
 			return false, nil
 		},
 	}
-	if _, err := r.Reap(t.Context()); err != nil {
+	if err := r.Reap(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Equal(signals, []syscall.Signal{syscall.SIGTERM}) {
@@ -551,7 +619,7 @@ func TestTrackGroupAndUntrack(t *testing.T) {
 
 	store := &memStore{}
 	r := &Reaper{Store: store, Generation: "current-gen"}
-	rec, err := r.TrackGroup(ctx, cmd.Process.Pid)
+	rec, err := r.TrackGroup(ctx, cmd.Process.Pid, RecoveryTask)
 	if err != nil {
 		t.Fatalf("TrackGroup: %v", err)
 	}
@@ -601,7 +669,7 @@ func TestTrackGroupRejectsNonLeader(t *testing.T) {
 		Generation: "current-gen",
 		prober:     &fakeProber{info: liveInfo()},
 	}
-	if _, err := r.TrackGroup(context.Background(), cmd.Process.Pid); err == nil {
+	if _, err := r.TrackGroup(context.Background(), cmd.Process.Pid, RecoveryTask); err == nil {
 		t.Fatal("TrackGroup succeeded for a process-group member, want error")
 	}
 }
@@ -648,7 +716,7 @@ func TestTrackIdentityRejectsMismatchAndAbsence(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			store := &memStore{}
 			reaper := &Reaper{Store: store, Generation: "stop", prober: &fakeProber{perProbe: []probeResult{test.probe}}}
-			if _, err := reaper.TrackIdentity(t.Context(), identity); !errors.Is(err, test.want) {
+			if _, err := reaper.TrackIdentity(t.Context(), identity, RecoveryTrust); !errors.Is(err, test.want) {
 				t.Fatalf("TrackIdentity error = %v, want %v", err, test.want)
 			}
 			if store.len() != 0 {
@@ -672,7 +740,7 @@ func TestTerminateTrackedIdentityEscalatesAndSettles(t *testing.T) {
 		Grace: time.Millisecond, Settlement: time.Millisecond,
 	}
 	identity := Identity{PID: 4242, StartTime: liveInfo().startTime, Comm: liveInfo().comm, Boot: testBoot}
-	record, err := reaper.TrackIdentity(t.Context(), identity)
+	record, err := reaper.TrackIdentity(t.Context(), identity, RecoveryTrust)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -698,7 +766,7 @@ func TestTerminateTrackedIdentityNeverKillsReusedPID(t *testing.T) {
 	signaler := &recSignaler{}
 	reaper := &Reaper{Store: store, Generation: "stop", prober: prober, signaler: signaler, clock: newFakeClock()}
 	identity := Identity{PID: 4242, StartTime: liveInfo().startTime, Comm: liveInfo().comm, Boot: testBoot}
-	record, err := reaper.TrackIdentity(t.Context(), identity)
+	record, err := reaper.TrackIdentity(t.Context(), identity, RecoveryTrust)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -791,9 +859,13 @@ func TestReapSignalsProcessGroup(t *testing.T) {
 	mustAdd(t, store, rec)
 
 	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
-	result, err := r.Reap(ctx)
+	err := r.Reap(ctx)
 	if err != nil {
 		t.Fatalf("Reap: %v", err)
+	}
+	result, err := r.ReapReceipts(ctx, RecoveryTask, ReapReceiptCursor{}, ReapReceiptPageLimit)
+	if err != nil {
+		t.Fatalf("ReapReceipts: %v", err)
 	}
 	if len(result.Receipts) != 1 || result.Receipts[0].Outcome != ReapTerminated ||
 		result.Receipts[0].Record != rec {
@@ -828,9 +900,13 @@ func TestReapLeaderlessGroupUsesDurableSessionMembers(t *testing.T) {
 	mustAdd(t, store, rec)
 
 	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
-	result, err := r.Reap(ctx)
+	err := r.Reap(ctx)
 	if err != nil {
 		t.Fatalf("Reap: %v", err)
+	}
+	result, err := r.ReapReceipts(ctx, RecoveryTask, ReapReceiptCursor{}, ReapReceiptPageLimit)
+	if err != nil {
+		t.Fatalf("ReapReceipts: %v", err)
 	}
 	if len(result.Receipts) != 1 || result.Receipts[0].Record != rec ||
 		result.Receipts[0].Outcome != ReapTerminated {
@@ -856,7 +932,7 @@ func TestReapLeaderlessGroupEnumerationFailureFailsRecovery(t *testing.T) {
 	}
 	sig := &recSignaler{err: errors.New("signal must not be sent")}
 	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig}
-	if _, err := r.Reap(context.Background()); err == nil || !strings.Contains(err.Error(), "process table unavailable") {
+	if err := r.Reap(context.Background()); err == nil || !strings.Contains(err.Error(), "process table unavailable") {
 		t.Fatalf("Reap error = %v, want unresolved enumeration failure", err)
 	}
 	if len(sig.calls()) != 0 {
@@ -875,7 +951,7 @@ func TestReapRejectsLegacyGroupWithoutSessionIdentity(t *testing.T) {
 	prober := &fakeProber{byPID: map[int]probeResult{rec.PID: {err: errNoProc}}}
 	sig := &recSignaler{err: errors.New("signal must not be sent")}
 	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig}
-	if _, err := r.Reap(context.Background()); !errors.Is(err, ErrInvalidRecord) {
+	if err := r.Reap(context.Background()); !errors.Is(err, ErrInvalidRecord) {
 		t.Fatalf("Reap error = %v, want ErrInvalidRecord", err)
 	}
 	if got := prober.probedPIDs(); len(got) != 0 {
@@ -898,7 +974,7 @@ func TestReapDropsCrossBootRecordWithoutProbeOrSignal(t *testing.T) {
 	sig := &recSignaler{err: errors.New("signal must not be sent")}
 	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig}
 
-	if _, err := r.Reap(context.Background()); err != nil {
+	if err := r.Reap(context.Background()); err != nil {
 		t.Fatalf("Reap: %v", err)
 	}
 	if got := prober.probedPIDs(); len(got) != 0 {
@@ -923,9 +999,13 @@ func TestReapPIDReuseResistance(t *testing.T) {
 	mustAdd(t, store, rec)
 
 	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
-	result, err := r.Reap(ctx)
+	err := r.Reap(ctx)
 	if err != nil {
 		t.Fatalf("Reap: %v", err)
+	}
+	result, err := r.ReapReceipts(ctx, RecoveryTask, ReapReceiptCursor{}, ReapReceiptPageLimit)
+	if err != nil {
+		t.Fatalf("ReapReceipts: %v", err)
 	}
 	if len(result.Receipts) != 1 || result.Receipts[0].Record != rec ||
 		result.Receipts[0].Outcome != ReapIdentityReused {
@@ -947,7 +1027,7 @@ func TestReapProbeErrorFailsClosed(t *testing.T) {
 	mustAdd(t, store, matchingRecord(5252, "old-gen"))
 
 	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
-	if _, err := r.Reap(ctx); err == nil || !strings.Contains(err.Error(), "kern.proc probe failed") {
+	if err := r.Reap(ctx); err == nil || !strings.Contains(err.Error(), "kern.proc probe failed") {
 		t.Fatalf("Reap error = %v, want unresolved probe failure", err)
 	}
 	if got := sig.calls(); len(got) != 0 {
@@ -966,9 +1046,13 @@ func TestReapStaleRecordCleanup(t *testing.T) {
 	mustAdd(t, store, matchingRecord(6262, "old-gen"))
 
 	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
-	result, err := r.Reap(ctx)
+	err := r.Reap(ctx)
 	if err != nil {
 		t.Fatalf("Reap: %v", err)
+	}
+	result, err := r.ReapReceipts(ctx, RecoveryTask, ReapReceiptCursor{}, ReapReceiptPageLimit)
+	if err != nil {
+		t.Fatalf("ReapReceipts: %v", err)
 	}
 	if len(result.Receipts) != 1 || result.Receipts[0].Outcome != ReapAbsent {
 		t.Fatalf("stale-record Reap receipt = %+v", result)
@@ -989,9 +1073,13 @@ func TestReapESRCHOnSignalIsSuccess(t *testing.T) {
 	mustAdd(t, store, matchingRecord(7272, "old-gen"))
 
 	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
-	result, err := r.Reap(ctx)
+	err := r.Reap(ctx)
 	if err != nil {
 		t.Fatalf("Reap: %v", err)
+	}
+	result, err := r.ReapReceipts(ctx, RecoveryTask, ReapReceiptCursor{}, ReapReceiptPageLimit)
+	if err != nil {
+		t.Fatalf("ReapReceipts: %v", err)
 	}
 	if len(result.Receipts) != 1 || result.Receipts[0].Outcome != ReapAbsent {
 		t.Fatalf("ESRCH Reap receipt = %+v", result)
@@ -1015,7 +1103,7 @@ func TestReapRefusesSelfAndPID1(t *testing.T) {
 	mustAdd(t, store, matchingRecord(os.Getpid(), "old-gen"))
 
 	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
-	if _, err := r.Reap(ctx); err == nil || !strings.Contains(err.Error(), "refusing unsafe process identity") {
+	if err := r.Reap(ctx); err == nil || !strings.Contains(err.Error(), "refusing unsafe process identity") {
 		t.Fatalf("Reap error = %v, want unsafe identity refusal", err)
 	}
 	if got := sig.calls(); len(got) != 0 {
@@ -1037,9 +1125,13 @@ func TestReapSkipsOwnGeneration(t *testing.T) {
 	mustAdd(t, store, matchingRecord(8282, "current-gen"))
 
 	r := &Reaper{Store: store, Generation: "current-gen", prober: prober, signaler: sig, clock: newFakeClock()}
-	result, err := r.Reap(ctx)
+	err := r.Reap(ctx)
 	if err != nil {
 		t.Fatalf("Reap: %v", err)
+	}
+	result, err := r.ReapReceipts(ctx, RecoveryTask, ReapReceiptCursor{}, ReapReceiptPageLimit)
+	if err != nil {
+		t.Fatalf("ReapReceipts: %v", err)
 	}
 	if len(result.Receipts) != 0 {
 		t.Fatalf("own-generation Reap produced receipts: %+v", result)
@@ -1063,7 +1155,7 @@ func TestReapPIDReuseDuringGrace(t *testing.T) {
 	mustAdd(t, store, matchingRecord(9292, "old-gen"))
 
 	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
-	if _, err := r.Reap(ctx); err != nil {
+	if err := r.Reap(ctx); err != nil {
 		t.Fatalf("Reap: %v", err)
 	}
 	calls := sig.calls()
@@ -1086,7 +1178,7 @@ func TestReapExecWithStableStartIdentityStillEscalates(t *testing.T) {
 	mustAdd(t, store, matchingRecord(9393, "old-gen"))
 
 	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
-	if _, err := r.Reap(ctx); err != nil {
+	if err := r.Reap(ctx); err != nil {
 		t.Fatalf("Reap: %v", err)
 	}
 	calls := sig.calls()
@@ -1109,7 +1201,7 @@ func TestReapReprobeErrorFailsClosed(t *testing.T) {
 	mustAdd(t, store, matchingRecord(9494, "old-gen"))
 
 	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
-	if _, err := r.Reap(ctx); err == nil || !strings.Contains(err.Error(), "re-probe failed") {
+	if err := r.Reap(ctx); err == nil || !strings.Contains(err.Error(), "re-probe failed") {
 		t.Fatalf("Reap error = %v, want unresolved re-probe failure", err)
 	}
 	calls := sig.calls()
@@ -1134,7 +1226,7 @@ func TestReapRemovesRecordOnlyAfterPostKillAbsence(t *testing.T) {
 	}}
 	sig := &recSignaler{}
 	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock(), Settlement: 50 * time.Millisecond}
-	if _, err := r.Reap(context.Background()); err != nil {
+	if err := r.Reap(context.Background()); err != nil {
 		t.Fatalf("Reap: %v", err)
 	}
 	if store.len() != 0 {
@@ -1154,7 +1246,7 @@ func TestReapRetainsRecordWhenKilledProcessNeverSettles(t *testing.T) {
 		Store: store, Generation: "new-gen", prober: prober,
 		signaler: &recSignaler{}, clock: newFakeClock(), Settlement: 25 * time.Millisecond,
 	}
-	_, err := r.Reap(context.Background())
+	err := r.Reap(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "remained live through settlement deadline") {
 		t.Fatalf("Reap error = %v, want settlement deadline failure", err)
 	}
@@ -1174,7 +1266,7 @@ func TestReapRetainsRecordWhenKilledGroupNeverSettles(t *testing.T) {
 		Store: store, Generation: "new-gen", prober: prober,
 		signaler: &recSignaler{}, clock: newFakeClock(), Settlement: 25 * time.Millisecond,
 	}
-	_, err := r.Reap(context.Background())
+	err := r.Reap(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "group remained live through settlement deadline") {
 		t.Fatalf("Reap error = %v, want group settlement deadline failure", err)
 	}
@@ -1192,16 +1284,16 @@ func TestReapLadderRealChild(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
-	store := &FileStore{Path: filepath.Join(dir, "records.json")}
+	store := &FileStore{Path: filepath.Join(dir, "recovery.db")}
 
 	old := &Reaper{Store: store, Generation: "old-gen"}
-	if _, err := old.Track(ctx, pid); err != nil {
+	if _, err := old.Track(ctx, pid, RecoveryTask); err != nil {
 		t.Fatalf("Track: %v", err)
 	}
 
 	sig := &recSignaler{delegate: sysSignaler{}}
 	r := &Reaper{Store: store, Generation: "new-gen", signaler: sig, clock: newFakeClock()}
-	if _, err := r.Reap(ctx); err != nil {
+	if err := r.Reap(ctx); err != nil {
 		t.Fatalf("Reap: %v", err)
 	}
 
@@ -1279,7 +1371,7 @@ func TestFileStoreRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
-	store := &FileStore{Path: filepath.Join(dir, "records.json")}
+	store := &FileStore{Path: filepath.Join(dir, "recovery.db")}
 
 	got, err := store.Load(ctx)
 	if err != nil {
@@ -1289,8 +1381,8 @@ func TestFileStoreRoundTrip(t *testing.T) {
 		t.Errorf("Load missing = %v, want empty", got)
 	}
 
-	a := Record{PID: 100, StartTime: "1.1", Boot: testBoot, Comm: "a", Generation: "g1"}
-	b := Record{PID: 200, StartTime: "2.2", Boot: testBoot, Comm: "b", Generation: "g1"}
+	a := Record{RecoveryClass: RecoveryTask, PID: 100, StartTime: "1.1", Boot: testBoot, Comm: "a", Generation: "g1"}
+	b := Record{RecoveryClass: RecoveryTask, PID: 200, StartTime: "2.2", Boot: testBoot, Comm: "b", Generation: "g1"}
 	mustAdd(t, store, a)
 	mustAdd(t, store, b)
 	mustAdd(t, store, a)
@@ -1315,127 +1407,6 @@ func TestFileStoreRoundTrip(t *testing.T) {
 	}
 }
 
-func TestFileStoreFsyncsBeforeRenameAndDirectoryAfterMutation(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "records.json")
-	var events []string
-	ops := &recordFileOps{
-		syncTemp: func(file *os.File) error {
-			events = append(events, "sync-temp")
-			return file.Sync()
-		},
-		rename: func(oldPath, newPath string) error {
-			events = append(events, "rename")
-			return os.Rename(oldPath, newPath)
-		},
-		syncDir: func(path string) error {
-			events = append(events, "sync-dir")
-			return fsyncDir(path)
-		},
-	}
-	store := &FileStore{Path: path, ops: ops}
-	record := Record{
-		PID: 100, StartTime: "1.1", Boot: testBoot, Comm: "app", Generation: "stop",
-		Executable: "/Applications/Fixed.app/Contents/MacOS/Fixed", AuditToken: auditTokenForPID(100, 7),
-	}
-	assertMutation := func(operation string) {
-		t.Helper()
-		want := []string{"sync-temp", "rename", "sync-dir"}
-		if len(events) < len(want) || !slices.Equal(events[len(events)-len(want):], want) {
-			t.Fatalf("%s events = %v, want durability suffix %v", operation, events, want)
-		}
-		events = nil
-	}
-	if err := store.Add(t.Context(), record); err != nil {
-		t.Fatal(err)
-	}
-	assertMutation("add")
-	reopened, err := (&FileStore{Path: path}).Load(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(reopened) != 1 || reopened[0] != record {
-		t.Fatalf("reopened records = %v, want %v", reopened, record)
-	}
-	if err := store.Remove(t.Context(), []Record{record}); err != nil {
-		t.Fatal(err)
-	}
-	assertMutation("remove")
-	reopened, err = (&FileStore{Path: path}).Load(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(reopened) != 0 {
-		t.Fatalf("reopened records after remove = %v, want empty", reopened)
-	}
-}
-
-func TestTrackIdentityTempSyncFailureNeverPublishesAuthority(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "records.json")
-	syncErr := errors.New("temp sync failed")
-	store := &FileStore{Path: path, ops: &recordFileOps{syncTemp: func(*os.File) error { return syncErr }}}
-	token := auditTokenForPID(4242, 7)
-	executable := "/Applications/Fixed.app/Contents/MacOS/Fixed"
-	identity := Identity{
-		PID: 4242, StartTime: liveInfo().startTime, Comm: liveInfo().comm, Boot: testBoot,
-		Executable: executable, AuditToken: token,
-	}
-	reaper := &Reaper{
-		Store: store, Generation: "stop", prober: &fakeProber{info: liveInfo()},
-		auditPath: func(got AuditToken) (string, error) {
-			if got != token {
-				t.Fatalf("audit token = %v, want %v", got, token)
-			}
-			return executable, nil
-		},
-	}
-	if _, err := reaper.TrackIdentity(t.Context(), identity); !errors.Is(err, syncErr) {
-		t.Fatalf("TrackIdentity error = %v, want %v", err, syncErr)
-	}
-	if records, err := (&FileStore{Path: path}).Load(t.Context()); err != nil || len(records) != 0 {
-		t.Fatalf("reopened records after failed temp sync = %v, %v; want empty", records, err)
-	}
-	reaper.Store = &FileStore{Path: path}
-	record, err := reaper.TrackIdentity(t.Context(), identity)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reopened, err := (&FileStore{Path: path}).Load(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(reopened) != 1 || reopened[0] != record {
-		t.Fatalf("reopened authority = %v, want %v before terminate", reopened, record)
-	}
-}
-
-func TestFileStoreRemovalDirectorySyncFailureIsReopenRetryable(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "records.json")
-	record := matchingRecord(4242, "stop")
-	if err := (&FileStore{Path: path}).Add(t.Context(), record); err != nil {
-		t.Fatal(err)
-	}
-	syncErr := errors.New("directory sync failed")
-	failed := false
-	store := &FileStore{Path: path, ops: &recordFileOps{syncDir: func(path string) error {
-		if path == dir && !failed {
-			failed = true
-			return syncErr
-		}
-		return fsyncDir(path)
-	}}}
-	if err := store.Remove(t.Context(), []Record{record}); !errors.Is(err, syncErr) {
-		t.Fatalf("Remove error = %v, want %v", err, syncErr)
-	}
-	reopened := &FileStore{Path: path}
-	if records, err := reopened.Load(t.Context()); err != nil || len(records) != 0 {
-		t.Fatalf("reopened records after ambiguous remove = %v, %v; want empty", records, err)
-	}
-	if err := reopened.Remove(t.Context(), []Record{record}); err != nil {
-		t.Fatalf("retry Remove: %v", err)
-	}
-}
-
 func TestFileStoreRemoveByInstance(t *testing.T) {
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("/tmp", "reaper")
@@ -1443,10 +1414,10 @@ func TestFileStoreRemoveByInstance(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
-	store := &FileStore{Path: filepath.Join(dir, "records.json")}
+	store := &FileStore{Path: filepath.Join(dir, "recovery.db")}
 
-	current := Record{PID: 300, StartTime: "9.9", Boot: "current-boot", Comm: "new", Generation: "g2"}
-	prior := Record{PID: 300, StartTime: "9.9", Boot: "prior-boot", Comm: "old", Generation: "g1"}
+	current := Record{RecoveryClass: RecoveryTask, PID: 300, StartTime: "9.9", Boot: "current-boot", Comm: "new", Generation: "g2"}
+	prior := Record{RecoveryClass: RecoveryTask, PID: 300, StartTime: "9.9", Boot: "prior-boot", Comm: "old", Generation: "g1"}
 	mustAdd(t, store, prior)
 	mustAdd(t, store, current)
 
@@ -1460,98 +1431,4 @@ func TestFileStoreRemoveByInstance(t *testing.T) {
 	if len(got) != 1 || got[0] != current {
 		t.Errorf("Load = %v, want only current-boot instance %v", got, current)
 	}
-}
-
-func TestFileStoreRejectsLegacySchema(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "records.json")
-	legacy := `[{"pid":100,"start_time":"1.1","comm":"worker","generation":"old"}]`
-	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	_, err := (&FileStore{Path: path}).Load(context.Background())
-	if !errors.Is(err, ErrRecordSchema) {
-		t.Fatalf("Load error = %v, want ErrRecordSchema", err)
-	}
-}
-
-func TestFileStoreRejectsWrongSchemaVersion(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "records.json")
-	data, err := json.Marshal(recordFile{Schema: recordSchemaVersion + 1, Records: []Record{matchingRecord(100, "old")}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := (&FileStore{Path: path}).Load(t.Context()); !errors.Is(err, ErrRecordSchema) {
-		t.Fatalf("Load error = %v, want ErrRecordSchema", err)
-	}
-}
-
-func TestFileStoreRejectsCurrentSchemaRecordWithoutBoot(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "records.json")
-	incomplete := `{"schema":4,"records":[{"pid":100,"start_time":"1.1","comm":"worker","generation":"old"}],"receipts":[]}`
-	if err := os.WriteFile(path, []byte(incomplete), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	_, err := (&FileStore{Path: path}).Load(context.Background())
-	if !errors.Is(err, ErrInvalidRecord) {
-		t.Fatalf("Load error = %v, want ErrInvalidRecord", err)
-	}
-}
-
-func TestFileStoreRejectsMalformedAuditTokenRecords(t *testing.T) {
-	valid := auditTokenForPID(100, 7)
-	tests := []struct {
-		name   string
-		token  any
-		mutate func(map[string]any)
-		want   error
-	}{
-		{name: "short", token: byteValues(valid[:31]), want: ErrRecordSchema},
-		{name: "long", token: append(byteValues(valid[:]), byte(0)), want: ErrRecordSchema},
-		{name: "string element", token: append([]any{"bad"}, byteValues(valid[1:])...), want: ErrRecordSchema},
-		{name: "null element", token: append([]any{nil}, byteValues(valid[1:])...), want: ErrRecordSchema},
-		{name: "fractional element", token: append([]any{1.5}, byteValues(valid[1:])...), want: ErrRecordSchema},
-		{name: "overflow element", token: append([]any{256}, byteValues(valid[1:])...), want: ErrRecordSchema},
-		{name: "missing", mutate: func(record map[string]any) { delete(record, "audit_token") }, want: ErrInvalidRecord},
-		{name: "pid mismatch", token: auditTokenForPID(101, 7), want: ErrIdentityChanged},
-		{name: "missing pidversion", token: auditTokenForPID(100, 0), want: ErrNoAuditToken},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "records.json")
-			record := map[string]any{
-				"pid": 100, "start_time": "1.1", "boot": testBoot, "comm": "app",
-				"executable":  "/Applications/Fixed.app/Contents/MacOS/Fixed",
-				"audit_token": valid, "generation": "old", "process_group": false,
-			}
-			if test.token != nil {
-				record["audit_token"] = test.token
-			}
-			if test.mutate != nil {
-				test.mutate(record)
-			}
-			data, err := json.Marshal(map[string]any{"schema": recordSchemaVersion, "records": []any{record}})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(path, data, 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := (&FileStore{Path: path}).Load(t.Context()); !errors.Is(err, test.want) {
-				t.Fatalf("Load error = %v, want %v", err, test.want)
-			}
-		})
-	}
-}
-
-func byteValues(values []byte) []any {
-	out := make([]any, len(values))
-	for index, value := range values {
-		out[index] = value
-	}
-	return out
 }

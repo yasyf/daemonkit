@@ -36,9 +36,10 @@ func TestManagedProcessHelper(_ *testing.T) {
 func managedProcessSpec(t *testing.T, marker string) ProcessSpec {
 	t.Helper()
 	return ProcessSpec{
-		Path: os.Args[0],
-		Args: []string{"-test.run=^TestManagedProcessHelper$"},
-		Env:  append(os.Environ(), managedProcessMarkerEnv+"="+marker),
+		RecoveryClass: proc.RecoveryTask,
+		Path:          os.Args[0],
+		Args:          []string{"-test.run=^TestManagedProcessHelper$"},
+		Env:           append(os.Environ(), managedProcessMarkerEnv+"="+marker),
 	}
 }
 
@@ -343,7 +344,7 @@ func TestManagedProcessRecordIsRecoveredByNextGeneration(t *testing.T) {
 	newReaper := &proc.Reaper{
 		Store: store, Generation: "new-generation", Grace: 50 * time.Millisecond, Settlement: time.Second,
 	}
-	if _, err := newReaper.Reap(context.Background()); err != nil {
+	if err := newReaper.Reap(context.Background()); err != nil {
 		t.Fatalf("Reap: %v", err)
 	}
 	if err := process.Wait(context.Background()); err == nil {

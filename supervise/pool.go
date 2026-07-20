@@ -82,15 +82,17 @@ type Workers interface {
 // WorkerRegistry persists worker identities across daemon generations.
 // *proc.Reaper implements WorkerRegistry.
 type WorkerRegistry interface {
-	TrackGroup(ctx context.Context, pid int) (proc.Record, error)
+	TrackGroup(ctx context.Context, pid int, class proc.RecoveryClass) (proc.Record, error)
 	Untrack(ctx context.Context, rec proc.Record) error
 	Owns(rec proc.Record) (bool, error)
-	Reap(ctx context.Context) (proc.ReapResult, error)
+	Reap(ctx context.Context) error
 }
 
 // Task describes one disposable worker invocation. Stdin is withheld from the
 // worker until its process-group identity is durable.
 type Task struct {
+	// RecoveryClass names the exact recovery barrier for a crash receipt.
+	RecoveryClass proc.RecoveryClass
 	// Path is the worker executable.
 	Path string
 	// Args are the worker arguments after Path.
@@ -214,19 +216,21 @@ func (p *Pool) Wait(ctx context.Context) error {
 	}
 }
 
-// Recover returns one bounded page of durable exact retirement receipts from
-// prior daemon generations.
-func (p *Pool) Recover(ctx context.Context) (proc.ReapResult, error) {
-	result, err := p.registry.Reap(ctx)
+// Recover settles every durable prior-generation worker identity.
+func (p *Pool) Recover(ctx context.Context) error {
+	err := p.registry.Reap(ctx)
 	if err != nil {
-		return proc.ReapResult{}, fmt.Errorf("supervise: recover workers: %w", err)
+		return fmt.Errorf("supervise: recover workers: %w", err)
 	}
-	return result, nil
+	return nil
 }
 
 // Run executes one task and synchronously reaps its process. Cancellation and
 // deadlines terminate the entire worker process group before Run returns.
 func (p *Pool) Run(ctx context.Context, task Task) error {
+	if err := task.RecoveryClass.Validate(); err != nil {
+		return fmt.Errorf("supervise: worker recovery class: %w", err)
+	}
 	stdin := task.Stdin
 	if stdin == nil {
 		var err error
@@ -301,7 +305,7 @@ func (p *Pool) Run(ctx context.Context, task Task) error {
 		)
 	}
 
-	rec, err := p.registry.TrackGroup(workerCtx, cmd.Process.Pid)
+	rec, err := p.registry.TrackGroup(workerCtx, cmd.Process.Pid, task.RecoveryClass)
 	if err != nil {
 		_ = gateW.Close()
 		_ = statusR.Close()

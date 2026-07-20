@@ -45,7 +45,7 @@ func newFakeRegistry() *fakeRegistry {
 	return &fakeRegistry{owns: true, recordBoot: "test-boot", records: make(map[int]proc.Record)}
 }
 
-func (f *fakeRegistry) TrackGroup(ctx context.Context, pid int) (proc.Record, error) {
+func (f *fakeRegistry) TrackGroup(ctx context.Context, pid int, class proc.RecoveryClass) (proc.Record, error) {
 	if f.trackStarted != nil {
 		select {
 		case f.trackStarted <- pid:
@@ -64,13 +64,14 @@ func (f *fakeRegistry) TrackGroup(ctx context.Context, pid int) (proc.Record, er
 		return proc.Record{}, f.trackErr
 	}
 	rec := proc.Record{
-		PID:          pid,
-		StartTime:    "test-start",
-		Boot:         f.recordBoot,
-		Comm:         "worker",
-		Generation:   "test-generation",
-		ProcessGroup: true,
-		SessionID:    pid,
+		RecoveryClass: class,
+		PID:           pid,
+		StartTime:     "test-start",
+		Boot:          f.recordBoot,
+		Comm:          "worker",
+		Generation:    "test-generation",
+		ProcessGroup:  true,
+		SessionID:     pid,
 	}
 	f.mu.Lock()
 	f.records[pid] = rec
@@ -105,9 +106,7 @@ func (f *fakeRegistry) Owns(proc.Record) (bool, error) {
 	return result.owns, result.err
 }
 
-func (f *fakeRegistry) Reap(context.Context) (proc.ReapResult, error) {
-	return proc.ReapResult{}, f.reapErr
-}
+func (f *fakeRegistry) Reap(context.Context) error { return f.reapErr }
 
 func (f *fakeRegistry) recordCount() int {
 	f.mu.Lock()
@@ -211,9 +210,10 @@ func TestRunTracksBeforeDispatchAndReaps(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- pool.Run(context.Background(), Task{
-			Path:   "/bin/cat",
-			Stdin:  input,
-			Stdout: out,
+			RecoveryClass: proc.RecoveryTask,
+			Path:          "/bin/cat",
+			Stdin:         input,
+			Stdout:        out,
 		})
 	}()
 
@@ -259,9 +259,10 @@ func TestRunRejectsRecordWithoutBootBeforeDispatch(t *testing.T) {
 	}
 	out := &bytes.Buffer{}
 	err = pool.Run(context.Background(), Task{
-		Path:   "/bin/cat",
-		Stdin:  workerInput(t, "must not execute"),
-		Stdout: out,
+		RecoveryClass: proc.RecoveryTask,
+		Path:          "/bin/cat",
+		Stdin:         workerInput(t, "must not execute"),
+		Stdout:        out,
 	})
 	if !errors.Is(err, proc.ErrInvalidRecord) {
 		t.Fatalf("Run error = %v, want ErrInvalidRecord", err)
@@ -282,7 +283,7 @@ func TestRunOwnsInputOnValidationFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	input := workerInput(t, "unused")
-	if err := pool.Run(t.Context(), Task{Stdin: input}); err == nil {
+	if err := pool.Run(t.Context(), Task{RecoveryClass: proc.RecoveryTask, Stdin: input}); err == nil {
 		t.Fatal("Run accepted an empty worker path")
 	}
 	if _, err := input.Stat(); !errors.Is(err, os.ErrClosed) {
@@ -295,7 +296,7 @@ func TestRunReturnsWorkerFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = pool.Run(context.Background(), Task{Path: "/bin/sh", Args: []string{"-c", "exit 23"}})
+	err = pool.Run(context.Background(), Task{RecoveryClass: proc.RecoveryTask, Path: "/bin/sh", Args: []string{"-c", "exit 23"}})
 	var exitErr *ExitError
 	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 23 {
 		t.Fatalf("Run error = %v, want exit status 23", err)
@@ -312,7 +313,7 @@ func TestRunSurfacesDurableUntrackFailureAfterReap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = pool.Run(context.Background(), Task{Path: "/usr/bin/true"})
+	err = pool.Run(context.Background(), Task{RecoveryClass: proc.RecoveryTask, Path: "/usr/bin/true"})
 	if !errors.Is(err, registry.untrackErr) || !strings.Contains(err.Error(), "untrack worker") {
 		t.Fatalf("Run error = %v, want wrapped untrack failure", err)
 	}
@@ -335,7 +336,8 @@ func TestRunCleansDaemonizedDescendantBeforeReturning(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- pool.Run(context.Background(), Task{
-			Path: "/bin/sh",
+			RecoveryClass: proc.RecoveryTask,
+			Path:          "/bin/sh",
 			Args: []string{"-c", `
 /bin/sh -c 'trap "" TERM; echo $$ > "$1"; while :; do sleep 10; done' descendant "$1" &
 while [ ! -s "$1" ]; do sleep 0.01; done
@@ -381,9 +383,10 @@ func TestRunCancellationEscalatesAgainstProcessGroup(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- pool.Run(ctx, Task{
-			Path:   "/bin/sh",
-			Args:   []string{"-c", `trap "" TERM; echo ready; while :; do sleep 10; done`},
-			Stdout: out,
+			RecoveryClass: proc.RecoveryTask,
+			Path:          "/bin/sh",
+			Args:          []string{"-c", `trap "" TERM; echo ready; while :; do sleep 10; done`},
+			Stdout:        out,
 		})
 	}()
 	select {
@@ -422,7 +425,8 @@ func TestCancelReapsLeaderAndTermIgnoringDescendant(t *testing.T) {
 	runDone := make(chan error, 1)
 	go func() {
 		runDone <- pool.Run(context.Background(), Task{
-			Path: "/bin/sh",
+			RecoveryClass: proc.RecoveryTask,
+			Path:          "/bin/sh",
 			Args: []string{"-c", `
 /bin/sh -c 'trap "" TERM; echo $$ > "$1"; while :; do sleep 10; done' descendant "$1" &
 while [ ! -s "$1" ]; do sleep 0.01; done
@@ -474,9 +478,10 @@ func TestCancellationRetainsRecordUntilIdentityProofRecovers(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- pool.Run(ctx, Task{
-			Path:   "/bin/sh",
-			Args:   []string{"-c", `trap "" TERM; echo ready; while :; do :; done`},
-			Stdout: out,
+			RecoveryClass: proc.RecoveryTask,
+			Path:          "/bin/sh",
+			Args:          []string{"-c", `trap "" TERM; echo ready; while :; do :; done`},
+			Stdout:        out,
 		})
 	}()
 	select {
@@ -536,9 +541,10 @@ func TestCancellationReapsLeaderWhenGroupKillFails(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- pool.Run(ctx, Task{
-			Path:   "/bin/sh",
-			Args:   []string{"-c", `trap "" TERM; echo ready; while :; do :; done`},
-			Stdout: out,
+			RecoveryClass: proc.RecoveryTask,
+			Path:          "/bin/sh",
+			Args:          []string{"-c", `trap "" TERM; echo ready; while :; do :; done`},
+			Stdout:        out,
 		})
 	}()
 	select {
@@ -574,9 +580,10 @@ func TestTrackFailureKillsWithoutDispatch(t *testing.T) {
 	pool.signal = signals.signal
 	marker := filepath.Join(t.TempDir(), "dispatched")
 	err = pool.Run(context.Background(), Task{
-		Path:  "/bin/sh",
-		Args:  []string{"-c", `IFS= read -r line && : > "$1"`, "worker", marker},
-		Stdin: workerInput(t, "must-not-arrive\n"),
+		RecoveryClass: proc.RecoveryTask,
+		Path:          "/bin/sh",
+		Args:          []string{"-c", `IFS= read -r line && : > "$1"`, "worker", marker},
+		Stdin:         workerInput(t, "must-not-arrive\n"),
 	})
 	if err == nil || !strings.Contains(err.Error(), "track worker") {
 		t.Fatalf("Run error = %v, want track failure", err)
@@ -600,9 +607,10 @@ func TestCloseRejectsQueuedAndFutureWork(t *testing.T) {
 	active := make(chan error, 1)
 	go func() {
 		active <- pool.Run(ctx, Task{
-			Path:   "/bin/sh",
-			Args:   []string{"-c", `trap "exit 0" TERM; echo ready; while :; do sleep 10; done`},
-			Stdout: out,
+			RecoveryClass: proc.RecoveryTask,
+			Path:          "/bin/sh",
+			Args:          []string{"-c", `trap "exit 0" TERM; echo ready; while :; do sleep 10; done`},
+			Stdout:        out,
 		})
 	}()
 	select {
@@ -611,7 +619,9 @@ func TestCloseRejectsQueuedAndFutureWork(t *testing.T) {
 		t.Fatal("worker did not become ready")
 	}
 	queued := make(chan error, 1)
-	go func() { queued <- pool.Run(context.Background(), Task{Path: "/usr/bin/true"}) }()
+	go func() {
+		queued <- pool.Run(context.Background(), Task{RecoveryClass: proc.RecoveryTask, Path: "/usr/bin/true"})
+	}()
 	pool.Close()
 	select {
 	case err := <-queued:
@@ -621,7 +631,7 @@ func TestCloseRejectsQueuedAndFutureWork(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("queued Run was not rejected")
 	}
-	if err := pool.Run(context.Background(), Task{Path: "/usr/bin/true"}); !errors.Is(err, ErrClosed) {
+	if err := pool.Run(context.Background(), Task{RecoveryClass: proc.RecoveryTask, Path: "/usr/bin/true"}); !errors.Is(err, ErrClosed) {
 		t.Fatalf("future Run error = %v, want ErrClosed", err)
 	}
 	cancel()
@@ -642,9 +652,10 @@ func TestWaitDefersContextErrorUntilCancelSettlesWorkers(t *testing.T) {
 	runDone := make(chan error, 1)
 	go func() {
 		runDone <- pool.Run(context.Background(), Task{
-			Path:   "/bin/sh",
-			Args:   []string{"-c", `trap "" TERM; echo ready; while :; do sleep 10; done`},
-			Stdout: out,
+			RecoveryClass: proc.RecoveryTask,
+			Path:          "/bin/sh",
+			Args:          []string{"-c", `trap "" TERM; echo ready; while :; do sleep 10; done`},
+			Stdout:        out,
 		})
 	}()
 	select {
@@ -683,7 +694,7 @@ func TestWaitDefersContextErrorUntilCancelSettlesWorkers(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after Cancel")
 	}
-	if err := pool.Run(context.Background(), Task{Path: "/usr/bin/true"}); !errors.Is(err, ErrCanceled) {
+	if err := pool.Run(context.Background(), Task{RecoveryClass: proc.RecoveryTask, Path: "/usr/bin/true"}); !errors.Is(err, ErrCanceled) {
 		t.Fatalf("Run after Cancel error = %v, want ErrCanceled", err)
 	}
 }
@@ -701,9 +712,10 @@ func TestCancelTerminatesEveryActiveProcessGroup(t *testing.T) {
 	for _, out := range outputs {
 		go func() {
 			runs <- pool.Run(context.Background(), Task{
-				Path:   "/bin/sh",
-				Args:   []string{"-c", `trap "" TERM; echo ready; while :; do sleep 10; done`},
-				Stdout: out,
+				RecoveryClass: proc.RecoveryTask,
+				Path:          "/bin/sh",
+				Args:          []string{"-c", `trap "" TERM; echo ready; while :; do sleep 10; done`},
+				Stdout:        out,
 			})
 		}()
 	}
@@ -759,7 +771,7 @@ func TestRecoverDelegatesToRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = pool.Recover(context.Background())
+	err = pool.Recover(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "recover workers") || !errors.Is(err, registry.reapErr) {
 		t.Fatalf("Recover error = %v, want wrapped registry error", err)
 	}
@@ -791,7 +803,7 @@ func TestRecoverReapsLeaderlessTermIgnoringSession(t *testing.T) {
 	})
 
 	prior := &proc.Reaper{Store: store, Generation: "prior-generation"}
-	if _, err := prior.TrackGroup(ctx, leaderPID); err != nil {
+	if _, err := prior.TrackGroup(ctx, leaderPID, proc.RecoveryTask); err != nil {
 		t.Fatalf("TrackGroup: %v", err)
 	}
 	if _, err := stdin.Write([]byte("start\n")); err != nil {
@@ -818,9 +830,12 @@ func TestRecoverReapsLeaderlessTermIgnoringSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPool: %v", err)
 	}
-	recovered, err := pool.Recover(ctx)
-	if err != nil {
+	if err := pool.Recover(ctx); err != nil {
 		t.Fatalf("Recover: %v", err)
+	}
+	recovered, err := next.ReapReceipts(ctx, proc.RecoveryTask, proc.ReapReceiptCursor{}, proc.ReapReceiptPageLimit)
+	if err != nil {
+		t.Fatalf("ReapReceipts: %v", err)
 	}
 	if len(recovered.Receipts) != 1 || recovered.More {
 		t.Fatalf("Recover receipts = %+v, want one settled group", recovered)

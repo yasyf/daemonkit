@@ -675,9 +675,10 @@ func TestRuntimeOwnsManagedProcessThroughServingAndPostDrainShutdown(t *testing.
 	cfg.Activate = func(activation Activation) error {
 		var startErr error
 		process, startErr = pool.Start(activation.Startup, supervise.ProcessSpec{
-			Path: os.Args[0],
-			Args: []string{"-test.run=^TestRuntimeManagedProcessHelper$"},
-			Env:  append(os.Environ(), runtimeManagedProcessEnv+"=1"),
+			RecoveryClass: proc.RecoveryTask,
+			Path:          os.Args[0],
+			Args:          []string{"-test.run=^TestRuntimeManagedProcessHelper$"},
+			Env:           append(os.Environ(), runtimeManagedProcessEnv+"=1"),
 		})
 		events.add("activate")
 		return startErr

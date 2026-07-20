@@ -1,0 +1,760 @@
+package proc
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strconv"
+	"time"
+
+	bolt "go.etcd.io/bbolt"
+)
+
+const (
+	defaultMaxOutstanding = 4096
+	fileStoreOpenTimeout  = 5 * time.Second
+)
+
+var (
+	fileStoreMetaBucket         = []byte("meta")
+	fileStoreRecordsBucket      = []byte("records")
+	fileStoreClaimsBucket       = []byte("claims")
+	fileStoreReceiptsBucket     = []byte("receipts")
+	fileStoreReceiptIndexBucket = []byte("receipt-records")
+	fileStoreSequencesBucket    = []byte("sequences")
+	fileStoreFloorsBucket       = []byte("floors")
+	fileStoreSchemaKey          = []byte("schema")
+	fileStoreLedgerKey          = []byte("ledger")
+	fileStoreOutstandingKey     = []byte("outstanding")
+)
+
+// ErrReceiptBacklog means durable unacknowledged recovery liabilities reached
+// the configured admission bound.
+var ErrReceiptBacklog = errors.New("proc: recovery receipt backlog is full")
+
+// FileStore is a keyed, transactional process-record and retirement-receipt
+// ledger. Path is one bbolt database file and must remain stable across daemon
+// generations.
+type FileStore struct {
+	Path string
+	// MaxOutstanding bounds records plus unacknowledged receipts. Zero uses
+	// defaultMaxOutstanding.
+	MaxOutstanding uint64
+}
+
+func (s *FileStore) maximumOutstanding() uint64 {
+	if s.MaxOutstanding == 0 {
+		return defaultMaxOutstanding
+	}
+	return s.MaxOutstanding
+}
+
+func (s *FileStore) open(ctx context.Context) (*bolt.DB, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if s == nil || !filepath.IsAbs(s.Path) || filepath.Clean(s.Path) != s.Path {
+		return nil, fmt.Errorf("proc: file store path %q is not exact and absolute", s.Path)
+	}
+	directory := filepath.Dir(s.Path)
+	if err := mkdirAllDurable(directory, 0o700, fsyncDir); err != nil {
+		return nil, fmt.Errorf("proc: create file store directory: %w", err)
+	}
+	_, statErr := os.Stat(s.Path)
+	created := errors.Is(statErr, os.ErrNotExist)
+	if statErr != nil && !created {
+		return nil, fmt.Errorf("proc: inspect keyed file store: %w", statErr)
+	}
+	timeout := fileStoreOpenTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, ctx.Err()
+		}
+		if remaining < timeout {
+			timeout = remaining
+		}
+	}
+	db, err := bolt.Open(s.Path, 0o600, &bolt.Options{Timeout: timeout})
+	if err != nil {
+		return nil, fmt.Errorf("proc: open keyed file store: %w", err)
+	}
+	if err := db.Update(initializeFileStore); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	fileInfo, err := os.Stat(s.Path)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("proc: inspect opened keyed file store: %w", err)
+	}
+	if fileInfo.Mode().Perm() != 0o600 {
+		_ = db.Close()
+		return nil, fmt.Errorf("proc: keyed file store mode is %04o, want 0600", fileInfo.Mode().Perm())
+	}
+	if created {
+		if err := fsyncDir(directory); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("proc: persist keyed file store directory entry: %w", err)
+		}
+	}
+	return db, nil
+}
+
+func initializeFileStore(tx *bolt.Tx) error {
+	for _, name := range [][]byte{
+		fileStoreMetaBucket, fileStoreRecordsBucket, fileStoreClaimsBucket,
+		fileStoreReceiptsBucket, fileStoreReceiptIndexBucket,
+		fileStoreSequencesBucket, fileStoreFloorsBucket,
+	} {
+		if _, err := tx.CreateBucketIfNotExists(name); err != nil {
+			return fmt.Errorf("proc: create keyed store bucket %q: %w", name, err)
+		}
+	}
+	meta := tx.Bucket(fileStoreMetaBucket)
+	schema := meta.Get(fileStoreSchemaKey)
+	if schema == nil {
+		for _, bucketName := range [][]byte{
+			fileStoreMetaBucket, fileStoreRecordsBucket, fileStoreClaimsBucket,
+			fileStoreReceiptsBucket, fileStoreReceiptIndexBucket,
+			fileStoreSequencesBucket, fileStoreFloorsBucket,
+		} {
+			bucket := tx.Bucket(bucketName)
+			key, _ := bucket.Cursor().First()
+			if key != nil {
+				return fmt.Errorf("%w: uninitialized keyed store is not empty", ErrRecordSchema)
+			}
+		}
+		if err := meta.Put(fileStoreSchemaKey, uint64Bytes(recordSchemaVersion)); err != nil {
+			return err
+		}
+		var ledger ReceiptLedgerID
+		for ledger == (ReceiptLedgerID{}) {
+			if _, err := rand.Read(ledger[:]); err != nil {
+				return fmt.Errorf("proc: create receipt ledger identity: %w", err)
+			}
+		}
+		if err := meta.Put(fileStoreLedgerKey, ledger[:]); err != nil {
+			return err
+		}
+		return meta.Put(fileStoreOutstandingKey, uint64Bytes(0))
+	}
+	if len(schema) != 8 || binary.BigEndian.Uint64(schema) != recordSchemaVersion {
+		return fmt.Errorf("%w: keyed store schema is not %d", ErrRecordSchema, recordSchemaVersion)
+	}
+	if len(meta.Get(fileStoreLedgerKey)) != len(ReceiptLedgerID{}) || len(meta.Get(fileStoreOutstandingKey)) != 8 {
+		return fmt.Errorf("%w: keyed store metadata is incomplete", ErrRecordSchema)
+	}
+	return nil
+}
+
+func uint64Bytes(value uint64) []byte {
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], value)
+	return encoded[:]
+}
+
+func classKey(class RecoveryClass) []byte { return []byte{byte(class)} }
+
+func receiptKey(class RecoveryClass, sequence uint64) []byte {
+	key := make([]byte, 9)
+	key[0] = byte(class)
+	binary.BigEndian.PutUint64(key[1:], sequence)
+	return key
+}
+
+func recordKey(record Record) string {
+	return strconv.Itoa(record.PID) + "\x00" + record.Boot + "\x00" + record.StartTime
+}
+
+func fileStoreLedger(tx *bolt.Tx) (ReceiptLedgerID, error) {
+	var ledger ReceiptLedgerID
+	value := tx.Bucket(fileStoreMetaBucket).Get(fileStoreLedgerKey)
+	if len(value) != len(ledger) {
+		return ReceiptLedgerID{}, fmt.Errorf("%w: invalid receipt ledger identity", ErrRecordSchema)
+	}
+	copy(ledger[:], value)
+	return ledger, nil
+}
+
+func bucketSequence(bucket *bolt.Bucket, class RecoveryClass) (uint64, error) {
+	value := bucket.Get(classKey(class))
+	if value == nil {
+		return 0, nil
+	}
+	if len(value) != 8 {
+		return 0, ErrRecordSchema
+	}
+	return binary.BigEndian.Uint64(value), nil
+}
+
+func putBucketSequence(bucket *bolt.Bucket, class RecoveryClass, sequence uint64) error {
+	return bucket.Put(classKey(class), uint64Bytes(sequence))
+}
+
+func updateOutstanding(tx *bolt.Tx, delta int64) error {
+	meta := tx.Bucket(fileStoreMetaBucket)
+	current := meta.Get(fileStoreOutstandingKey)
+	if len(current) != 8 {
+		return ErrRecordSchema
+	}
+	value := binary.BigEndian.Uint64(current)
+	if delta < 0 {
+		magnitude := uint64(-delta)
+		if magnitude > value {
+			return fmt.Errorf("%w: outstanding recovery count underflow", ErrRecordSchema)
+		}
+		value -= magnitude
+	} else {
+		if uint64(delta) > ^uint64(0)-value {
+			return fmt.Errorf("%w: outstanding recovery count overflow", ErrRecordSchema)
+		}
+		value += uint64(delta)
+	}
+	return meta.Put(fileStoreOutstandingKey, uint64Bytes(value))
+}
+
+func decodeStored[T any](data []byte, value *T) error {
+	if data == nil {
+		return os.ErrNotExist
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil {
+		return fmt.Errorf("%w: decode keyed store value: %w", ErrRecordSchema, err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("%w: trailing keyed store value", ErrRecordSchema)
+	}
+	return nil
+}
+
+func encodeStored(value any) ([]byte, error) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return nil, fmt.Errorf("proc: encode keyed store value: %w", err)
+	}
+	return encoded, nil
+}
+
+// Add records rec, rejecting new process admission when the bounded recovery
+// backlog is full.
+func (s *FileStore) Add(ctx context.Context, rec Record) error {
+	if err := rec.Validate(); err != nil {
+		return err
+	}
+	maximum := s.maximumOutstanding()
+	db, err := s.open(ctx)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	return db.Update(func(tx *bolt.Tx) error {
+		key := []byte(recordKey(rec))
+		if tx.Bucket(fileStoreClaimsBucket).Get(key) != nil {
+			return errors.New("proc: process instance is claimed for reap")
+		}
+		if tx.Bucket(fileStoreReceiptIndexBucket).Get(key) != nil {
+			return errors.New("proc: process instance already has a retirement receipt")
+		}
+		records := tx.Bucket(fileStoreRecordsBucket)
+		if value := records.Get(key); value != nil {
+			var existing Record
+			if err := decodeStored(value, &existing); err != nil {
+				return err
+			}
+			if existing != rec {
+				return fmt.Errorf("%w: process instance record changed", ErrIdentityChanged)
+			}
+			return nil
+		}
+		outstanding := binary.BigEndian.Uint64(tx.Bucket(fileStoreMetaBucket).Get(fileStoreOutstandingKey))
+		if outstanding >= maximum {
+			return ErrReceiptBacklog
+		}
+		if err := updateOutstanding(tx, 1); err != nil {
+			return err
+		}
+		encoded, err := encodeStored(rec)
+		if err != nil {
+			return err
+		}
+		return records.Put(key, encoded)
+	})
+}
+
+// Load returns every durable process record in stable instance-key order.
+func (s *FileStore) Load(ctx context.Context) ([]Record, error) {
+	db, err := s.open(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	var records []Record
+	err = db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(fileStoreRecordsBucket).ForEach(func(key, value []byte) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			var record Record
+			if err := decodeStored(value, &record); err != nil {
+				return err
+			}
+			if err := record.Validate(); err != nil {
+				return err
+			}
+			if !bytes.Equal(key, []byte(recordKey(record))) {
+				return fmt.Errorf("%w: process record key does not match value", ErrRecordSchema)
+			}
+			records = append(records, record)
+			return nil
+		})
+	})
+	return records, err
+}
+
+// Remove deletes only exact, unclaimed records.
+func (s *FileStore) Remove(ctx context.Context, victims []Record) error {
+	for _, record := range victims {
+		if err := record.Validate(); err != nil {
+			return err
+		}
+	}
+	if len(victims) == 0 {
+		return nil
+	}
+	db, err := s.open(ctx)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	return db.Update(func(tx *bolt.Tx) error {
+		records := tx.Bucket(fileStoreRecordsBucket)
+		claims := tx.Bucket(fileStoreClaimsBucket)
+		for _, victim := range victims {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			key := []byte(recordKey(victim))
+			if claims.Get(key) != nil {
+				continue
+			}
+			value := records.Get(key)
+			if value == nil {
+				continue
+			}
+			var existing Record
+			if err := decodeStored(value, &existing); err != nil {
+				return err
+			}
+			if existing != victim {
+				continue
+			}
+			if err := records.Delete(key); err != nil {
+				return err
+			}
+			if err := updateOutstanding(tx, -1); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// BeginReap durably fences graceful untracking of rec.
+func (s *FileStore) BeginReap(ctx context.Context, rec Record, reaperGeneration string) error {
+	claim := reapClaim{Record: rec, ReaperGeneration: reaperGeneration}
+	if err := claim.validate(); err != nil {
+		return err
+	}
+	db, err := s.open(ctx)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	return db.Update(func(tx *bolt.Tx) error {
+		key := []byte(recordKey(rec))
+		value := tx.Bucket(fileStoreRecordsBucket).Get(key)
+		var existing Record
+		if err := decodeStored(value, &existing); err != nil {
+			return err
+		}
+		if existing != rec {
+			return errors.New("proc: reap claim has no exact durable process record")
+		}
+		claims := tx.Bucket(fileStoreClaimsBucket)
+		if prior := claims.Get(key); prior != nil {
+			var existingClaim reapClaim
+			if err := decodeStored(prior, &existingClaim); err != nil {
+				return err
+			}
+			if existingClaim != claim {
+				return errors.New("proc: process instance has a different reap claim")
+			}
+			return nil
+		}
+		encoded, err := encodeStored(claim)
+		if err != nil {
+			return err
+		}
+		return claims.Put(key, encoded)
+	})
+}
+
+// CommitReap replaces one claimed record with the next ordered class receipt.
+func (s *FileStore) CommitReap(
+	ctx context.Context,
+	rec Record,
+	reaperGeneration string,
+	outcome ReapOutcome,
+) (ReapReceipt, error) {
+	if err := rec.Validate(); err != nil {
+		return ReapReceipt{}, err
+	}
+	db, err := s.open(ctx)
+	if err != nil {
+		return ReapReceipt{}, err
+	}
+	defer db.Close()
+	var receipt ReapReceipt
+	err = db.Update(func(tx *bolt.Tx) error {
+		recordKeyBytes := []byte(recordKey(rec))
+		index := tx.Bucket(fileStoreReceiptIndexBucket)
+		if existingKey := index.Get(recordKeyBytes); existingKey != nil {
+			var existing ReapReceipt
+			if err := decodeStored(tx.Bucket(fileStoreReceiptsBucket).Get(existingKey), &existing); err != nil {
+				return err
+			}
+			if err := existing.Validate(); err != nil {
+				return err
+			}
+			if !bytes.Equal(existingKey, receiptKey(existing.Record.RecoveryClass, existing.Sequence)) {
+				return fmt.Errorf("%w: receipt index key does not match value", ErrRecordSchema)
+			}
+			if existing.Record != rec || existing.ReaperGeneration != reaperGeneration || existing.Outcome != outcome {
+				return fmt.Errorf("%w: receipt commit changed", ErrInvalidReapReceipt)
+			}
+			receipt = existing
+			return nil
+		}
+		var record Record
+		if err := decodeStored(tx.Bucket(fileStoreRecordsBucket).Get(recordKeyBytes), &record); err != nil {
+			return err
+		}
+		if record != rec {
+			return errors.New("proc: reap receipt has no exact durable process record")
+		}
+		var claim reapClaim
+		if err := decodeStored(tx.Bucket(fileStoreClaimsBucket).Get(recordKeyBytes), &claim); err != nil {
+			return err
+		}
+		if claim.Record != rec || claim.ReaperGeneration != reaperGeneration {
+			return errors.New("proc: reap receipt has no exact durable claim")
+		}
+		sequences := tx.Bucket(fileStoreSequencesBucket)
+		sequence, err := bucketSequence(sequences, rec.RecoveryClass)
+		if err != nil {
+			return err
+		}
+		if sequence == ^uint64(0) {
+			return errors.New("proc: reap receipt sequence exhausted")
+		}
+		sequence++
+		ledger, err := fileStoreLedger(tx)
+		if err != nil {
+			return err
+		}
+		receipt, err = newReapReceipt(ledger, sequence, rec, reaperGeneration, outcome)
+		if err != nil {
+			return err
+		}
+		encoded, err := encodeStored(receipt)
+		if err != nil {
+			return err
+		}
+		key := receiptKey(rec.RecoveryClass, sequence)
+		if err := tx.Bucket(fileStoreReceiptsBucket).Put(key, encoded); err != nil {
+			return err
+		}
+		if err := index.Put(recordKeyBytes, key); err != nil {
+			return err
+		}
+		if err := putBucketSequence(sequences, rec.RecoveryClass, sequence); err != nil {
+			return err
+		}
+		if err := tx.Bucket(fileStoreClaimsBucket).Delete(recordKeyBytes); err != nil {
+			return err
+		}
+		return tx.Bucket(fileStoreRecordsBucket).Delete(recordKeyBytes)
+	})
+	return receipt, err
+}
+
+// LoadReapReceipts returns an oldest-first class page without scanning another
+// class or rewriting prior receipts.
+func (s *FileStore) LoadReapReceipts(
+	ctx context.Context,
+	class RecoveryClass,
+	after ReapReceiptCursor,
+	limit int,
+) (ReapReceiptPage, error) {
+	if err := class.Validate(); err != nil {
+		return ReapReceiptPage{}, err
+	}
+	if limit <= 0 || limit > ReapReceiptPageLimit {
+		return ReapReceiptPage{}, fmt.Errorf("proc: reap receipt limit %d is out of bounds", limit)
+	}
+	db, err := s.open(ctx)
+	if err != nil {
+		return ReapReceiptPage{}, err
+	}
+	defer db.Close()
+	var page ReapReceiptPage
+	err = db.View(func(tx *bolt.Tx) error {
+		ledger, err := fileStoreLedger(tx)
+		if err != nil {
+			return err
+		}
+		if after.LedgerID != (ReceiptLedgerID{}) && after.LedgerID != ledger {
+			return fmt.Errorf("%w: receipt cursor ledger changed", ErrReapReceiptStale)
+		}
+		if after.Sequence != 0 && after.LedgerID == (ReceiptLedgerID{}) {
+			return fmt.Errorf("%w: receipt cursor sequence has no ledger", ErrReapReceiptStale)
+		}
+		floorSequence, err := bucketSequence(tx.Bucket(fileStoreFloorsBucket), class)
+		if err != nil {
+			return err
+		}
+		page.Floor = ReapReceiptFloor{LedgerID: ledger, RecoveryClass: class, Sequence: floorSequence}
+		if after.Sequence == ^uint64(0) {
+			return fmt.Errorf("%w: receipt cursor sequence exhausted", ErrReapReceiptStale)
+		}
+		if floorSequence == ^uint64(0) {
+			page.Next = ReapReceiptCursor{LedgerID: ledger, Sequence: floorSequence}
+			return nil
+		}
+		start := after.Sequence + 1
+		if start <= floorSequence {
+			start = floorSequence + 1
+		}
+		cursor := tx.Bucket(fileStoreReceiptsBucket).Cursor()
+		key, value := cursor.Seek(receiptKey(class, start))
+		for len(key) == 9 && key[0] == byte(class) && len(page.Receipts) <= limit {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			var receipt ReapReceipt
+			if err := decodeStored(value, &receipt); err != nil {
+				return err
+			}
+			if err := receipt.Validate(); err != nil {
+				return err
+			}
+			if receipt.LedgerID != ledger || receipt.Record.RecoveryClass != class ||
+				receipt.Sequence != binary.BigEndian.Uint64(key[1:]) {
+				return fmt.Errorf("%w: receipt key does not match value", ErrRecordSchema)
+			}
+			page.Receipts = append(page.Receipts, receipt)
+			key, value = cursor.Next()
+		}
+		if len(page.Receipts) > limit {
+			page.Receipts = page.Receipts[:limit]
+			page.More = true
+		}
+		if len(page.Receipts) != 0 {
+			last := page.Receipts[len(page.Receipts)-1]
+			page.Next = ReapReceiptCursor{LedgerID: last.LedgerID, Sequence: last.Sequence}
+		} else {
+			page.Next = ReapReceiptCursor{LedgerID: ledger, Sequence: after.Sequence}
+		}
+		return nil
+	})
+	return page, err
+}
+
+// HasReapReceipt reports whether the exact unacknowledged receipt is present.
+func (s *FileStore) HasReapReceipt(ctx context.Context, receipt ReapReceipt) (bool, error) {
+	if err := receipt.Validate(); err != nil {
+		return false, err
+	}
+	db, err := s.open(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer db.Close()
+	var found bool
+	err = db.View(func(tx *bolt.Tx) error {
+		ledger, err := fileStoreLedger(tx)
+		if err != nil {
+			return err
+		}
+		if ledger != receipt.LedgerID {
+			return nil
+		}
+		floor, err := bucketSequence(tx.Bucket(fileStoreFloorsBucket), receipt.Record.RecoveryClass)
+		if err != nil {
+			return err
+		}
+		if receipt.Sequence <= floor {
+			return ErrReapReceiptStale
+		}
+		var existing ReapReceipt
+		if err := decodeStored(
+			tx.Bucket(fileStoreReceiptsBucket).Get(receiptKey(receipt.Record.RecoveryClass, receipt.Sequence)),
+			&existing,
+		); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if err := existing.Validate(); err != nil {
+			return err
+		}
+		if existing.LedgerID != ledger || existing.Sequence != receipt.Sequence ||
+			existing.Record.RecoveryClass != receipt.Record.RecoveryClass {
+			return fmt.Errorf("%w: receipt key does not match value", ErrRecordSchema)
+		}
+		found = existing == receipt
+		return nil
+	})
+	return found, err
+}
+
+// FindReapReceipt returns the exact receipt indexed by one process record.
+func (s *FileStore) FindReapReceipt(ctx context.Context, record Record) (ReapReceipt, bool, error) {
+	if err := record.Validate(); err != nil {
+		return ReapReceipt{}, false, err
+	}
+	db, err := s.open(ctx)
+	if err != nil {
+		return ReapReceipt{}, false, err
+	}
+	defer db.Close()
+	var receipt ReapReceipt
+	var found bool
+	err = db.View(func(tx *bolt.Tx) error {
+		key := tx.Bucket(fileStoreReceiptIndexBucket).Get([]byte(recordKey(record)))
+		if key == nil {
+			return nil
+		}
+		if err := decodeStored(tx.Bucket(fileStoreReceiptsBucket).Get(key), &receipt); err != nil {
+			return err
+		}
+		if err := receipt.Validate(); err != nil {
+			return err
+		}
+		if !bytes.Equal(key, receiptKey(receipt.Record.RecoveryClass, receipt.Sequence)) {
+			return fmt.Errorf("%w: receipt index key does not match value", ErrRecordSchema)
+		}
+		if receipt.Record != record {
+			return fmt.Errorf("%w: receipt index does not match record", ErrRecordSchema)
+		}
+		found = true
+		return nil
+	})
+	return receipt, found, err
+}
+
+// AcknowledgeReap deletes only the exact next class receipt and advances its
+// durable contiguous floor.
+func (s *FileStore) AcknowledgeReap(
+	ctx context.Context,
+	receipt ReapReceipt,
+) (ReapReceiptFloor, error) {
+	if err := receipt.Validate(); err != nil {
+		return ReapReceiptFloor{}, err
+	}
+	db, err := s.open(ctx)
+	if err != nil {
+		return ReapReceiptFloor{}, err
+	}
+	defer db.Close()
+	class := receipt.Record.RecoveryClass
+	var result ReapReceiptFloor
+	err = db.Update(func(tx *bolt.Tx) error {
+		ledger, err := fileStoreLedger(tx)
+		if err != nil {
+			return err
+		}
+		if receipt.LedgerID != ledger {
+			return ErrReapReceiptStale
+		}
+		floors := tx.Bucket(fileStoreFloorsBucket)
+		floor, err := bucketSequence(floors, class)
+		if err != nil {
+			return err
+		}
+		result = ReapReceiptFloor{LedgerID: ledger, RecoveryClass: class, Sequence: floor}
+		switch {
+		case receipt.Sequence < floor:
+			return ErrReapReceiptStale
+		case receipt.Sequence == floor:
+			return nil
+		case receipt.Sequence != floor+1:
+			return ErrReapReceiptOrder
+		}
+		key := receiptKey(class, receipt.Sequence)
+		var existing ReapReceipt
+		if err := decodeStored(tx.Bucket(fileStoreReceiptsBucket).Get(key), &existing); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return ErrUnrecognizedReapReceipt
+			}
+			return err
+		}
+		if existing != receipt {
+			return ErrUnrecognizedReapReceipt
+		}
+		if err := tx.Bucket(fileStoreReceiptsBucket).Delete(key); err != nil {
+			return err
+		}
+		if err := tx.Bucket(fileStoreReceiptIndexBucket).Delete([]byte(recordKey(receipt.Record))); err != nil {
+			return err
+		}
+		if err := putBucketSequence(floors, class, receipt.Sequence); err != nil {
+			return err
+		}
+		if err := updateOutstanding(tx, -1); err != nil {
+			return err
+		}
+		result.Sequence = receipt.Sequence
+		return nil
+	})
+	return result, err
+}
+
+// ReapReceiptFloor returns the retained contiguous class floor.
+func (s *FileStore) ReapReceiptFloor(ctx context.Context, class RecoveryClass) (ReapReceiptFloor, error) {
+	if err := class.Validate(); err != nil {
+		return ReapReceiptFloor{}, err
+	}
+	db, err := s.open(ctx)
+	if err != nil {
+		return ReapReceiptFloor{}, err
+	}
+	defer db.Close()
+	var floor ReapReceiptFloor
+	err = db.View(func(tx *bolt.Tx) error {
+		ledger, err := fileStoreLedger(tx)
+		if err != nil {
+			return err
+		}
+		sequence, err := bucketSequence(tx.Bucket(fileStoreFloorsBucket), class)
+		if err != nil {
+			return err
+		}
+		floor = ReapReceiptFloor{LedgerID: ledger, RecoveryClass: class, Sequence: sequence}
+		return nil
+	})
+	return floor, err
+}
+
+var _ Store = (*FileStore)(nil)

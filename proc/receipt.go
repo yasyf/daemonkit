@@ -17,7 +17,27 @@ var (
 	// ErrUnrecognizedReapReceipt means no durable unacknowledged receipt
 	// exactly matches the supplied proof.
 	ErrUnrecognizedReapReceipt = errors.New("proc: unrecognized reap receipt")
+	// ErrReapReceiptOrder means an acknowledgement skipped a receipt sequence.
+	ErrReapReceiptOrder = errors.New("proc: reap receipt acknowledgement is out of order")
+	// ErrReapReceiptStale means a receipt predates the retained acknowledged floor.
+	ErrReapReceiptStale = errors.New("proc: stale reap receipt")
 )
+
+// ReceiptLedgerID identifies one durable receipt ledger across process restarts.
+type ReceiptLedgerID [16]byte
+
+// ReapReceiptCursor resumes a class page after one exact sequence.
+type ReapReceiptCursor struct {
+	LedgerID ReceiptLedgerID
+	Sequence uint64
+}
+
+// ReapReceiptFloor is the highest contiguously acknowledged class sequence.
+type ReapReceiptFloor struct {
+	LedgerID      ReceiptLedgerID
+	RecoveryClass RecoveryClass
+	Sequence      uint64
+}
 
 // ReapOutcome records how the exact prior process identity became retired.
 type ReapOutcome uint8
@@ -37,15 +57,20 @@ const (
 // Digest covers the complete Record and Outcome; no wall-clock field can make
 // replay produce different bytes.
 type ReapReceipt struct {
-	Record           Record      `json:"record"`
-	ReaperGeneration string      `json:"reaper_generation"`
-	Outcome          ReapOutcome `json:"outcome"`
-	Digest           [32]byte    `json:"digest"`
+	LedgerID         ReceiptLedgerID `json:"ledger_id"`
+	Sequence         uint64          `json:"sequence"`
+	Record           Record          `json:"record"`
+	ReaperGeneration string          `json:"reaper_generation"`
+	Outcome          ReapOutcome     `json:"outcome"`
+	Digest           [32]byte        `json:"digest"`
 }
 
 // Validate requires the exact canonical digest of a valid process record and
 // typed retirement outcome.
 func (r ReapReceipt) Validate() error {
+	if r.LedgerID == (ReceiptLedgerID{}) || r.Sequence == 0 {
+		return fmt.Errorf("%w: ledger identity and sequence are required", ErrInvalidReapReceipt)
+	}
 	if err := r.Record.Validate(); err != nil {
 		return errors.Join(ErrInvalidReapReceipt, err)
 	}
@@ -57,7 +82,9 @@ func (r ReapReceipt) Validate() error {
 	default:
 		return fmt.Errorf("%w: unknown outcome %d", ErrInvalidReapReceipt, r.Outcome)
 	}
-	digest, err := reapReceiptDigest(r.Record, r.ReaperGeneration, r.Outcome)
+	digest, err := reapReceiptDigest(
+		r.LedgerID, r.Sequence, r.Record, r.ReaperGeneration, r.Outcome,
+	)
 	if err != nil {
 		return err
 	}
@@ -67,22 +94,27 @@ func (r ReapReceipt) Validate() error {
 	return nil
 }
 
-// ReapResult is one bounded page of durable unacknowledged receipts.
-type ReapResult struct {
+// ReapReceiptPage is one stable class-filtered page of durable receipts.
+type ReapReceiptPage struct {
 	Receipts []ReapReceipt
+	Next     ReapReceiptCursor
 	More     bool
+	Floor    ReapReceiptFloor
 }
 
 func newReapReceipt(
+	ledgerID ReceiptLedgerID,
+	sequence uint64,
 	record Record,
 	reaperGeneration string,
 	outcome ReapOutcome,
 ) (ReapReceipt, error) {
-	digest, err := reapReceiptDigest(record, reaperGeneration, outcome)
+	digest, err := reapReceiptDigest(ledgerID, sequence, record, reaperGeneration, outcome)
 	if err != nil {
 		return ReapReceipt{}, err
 	}
 	receipt := ReapReceipt{
+		LedgerID: ledgerID, Sequence: sequence,
 		Record: record, ReaperGeneration: reaperGeneration,
 		Outcome: outcome, Digest: digest,
 	}
@@ -93,16 +125,21 @@ func newReapReceipt(
 }
 
 func reapReceiptDigest(
+	ledgerID ReceiptLedgerID,
+	sequence uint64,
 	record Record,
 	reaperGeneration string,
 	outcome ReapOutcome,
 ) ([32]byte, error) {
 	payload, err := json.Marshal(struct {
-		Record           Record      `json:"record"`
-		ReaperGeneration string      `json:"reaper_generation"`
-		Outcome          ReapOutcome `json:"outcome"`
+		LedgerID         ReceiptLedgerID `json:"ledger_id"`
+		Sequence         uint64          `json:"sequence"`
+		Record           Record          `json:"record"`
+		ReaperGeneration string          `json:"reaper_generation"`
+		Outcome          ReapOutcome     `json:"outcome"`
 	}{
-		Record: record, ReaperGeneration: reaperGeneration, Outcome: outcome,
+		LedgerID: ledgerID, Sequence: sequence, Record: record,
+		ReaperGeneration: reaperGeneration, Outcome: outcome,
 	})
 	if err != nil {
 		return [32]byte{}, fmt.Errorf("proc: encode reap receipt: %w", err)
@@ -143,12 +180,13 @@ func (r *Reaper) VerifyReapReceipt(ctx context.Context, receipt ReapReceipt) err
 
 // AcknowledgeReap forgets one exact durable receipt. Repeating an
 // acknowledgement after it is absent is a successful no-op.
-func (r *Reaper) AcknowledgeReap(ctx context.Context, receipt ReapReceipt) error {
+func (r *Reaper) AcknowledgeReap(ctx context.Context, receipt ReapReceipt) (ReapReceiptFloor, error) {
 	if err := receipt.Validate(); err != nil {
-		return err
+		return ReapReceiptFloor{}, err
 	}
-	if err := r.Store.AcknowledgeReap(ctx, receipt); err != nil {
-		return fmt.Errorf("proc: acknowledge reap receipt: %w", err)
+	floor, err := r.Store.AcknowledgeReap(ctx, receipt)
+	if err != nil {
+		return ReapReceiptFloor{}, fmt.Errorf("proc: acknowledge reap receipt: %w", err)
 	}
-	return nil
+	return floor, nil
 }

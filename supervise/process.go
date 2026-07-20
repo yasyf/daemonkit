@@ -33,6 +33,8 @@ var ErrProcessStopped = errors.New("managed process stopped")
 
 // ProcessSpec describes one durably tracked, long-lived child process.
 type ProcessSpec struct {
+	// RecoveryClass names the exact recovery barrier for a crash receipt.
+	RecoveryClass proc.RecoveryClass
 	// Path is the child executable.
 	Path string
 	// Args are the child arguments after Path.
@@ -106,6 +108,9 @@ func (p *Process) Stop(ctx context.Context) error {
 // bounds launch and readiness only; after success, only Process.Stop or pool
 // cancellation ends the process lifetime.
 func (p *Pool) Start(startup context.Context, spec ProcessSpec) (*Process, error) {
+	if err := spec.RecoveryClass.Validate(); err != nil {
+		return nil, fmt.Errorf("supervise: managed process recovery class: %w", err)
+	}
 	if spec.Path == "" {
 		return nil, errors.New("supervise: managed process path is required")
 	}
@@ -154,7 +159,7 @@ func (p *Pool) Start(startup context.Context, spec ProcessSpec) (*Process, error
 		)
 	}
 
-	record, err := p.registry.TrackGroup(startupCtx, cmd.Process.Pid)
+	record, err := p.registry.TrackGroup(startupCtx, cmd.Process.Pid, spec.RecoveryClass)
 	if err != nil {
 		_ = gateW.Close()
 		killErr := p.killUntrackedGroup(cmd.Process.Pid)

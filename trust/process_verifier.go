@@ -10,6 +10,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/wire"
 )
@@ -60,9 +61,10 @@ func (v ProcessVerifier) Check(ctx context.Context, peer wire.Peer) error {
 	var output boundedBuffer
 	output.limit = maxVerifierResponse
 	err = v.Runner.Run(ctx, supervise.Task{
-		Path:   v.Executable,
-		Args:   []string{verifierChildMode, base64.RawURLEncoding.EncodeToString(payload)},
-		Stdout: &output,
+		RecoveryClass: proc.RecoveryTrust,
+		Path:          v.Executable,
+		Args:          []string{verifierChildMode, base64.RawURLEncoding.EncodeToString(payload)},
+		Stdout:        &output,
 	})
 	if err != nil {
 		return fmt.Errorf("trust: run verifier child: %w", err)

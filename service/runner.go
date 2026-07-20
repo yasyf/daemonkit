@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/supervise"
 )
 
@@ -32,7 +33,8 @@ func runCombined(
 	}
 	output := &boundedCommandOutput{remaining: commandOutputLimit}
 	runErr := runner.Run(ctx, supervise.Task{
-		Path: path, Args: append([]string(nil), args...), Stdout: output, Stderr: output,
+		RecoveryClass: proc.RecoveryTask,
+		Path:          path, Args: append([]string(nil), args...), Stdout: output, Stderr: output,
 	})
 	return string(output.bytes()), errors.Join(runErr, output.err())
 }
@@ -54,7 +56,8 @@ func runSplit(
 	out := &boundedCommandOutput{remaining: commandOutputLimit}
 	errOut := &boundedCommandOutput{remaining: commandOutputLimit}
 	runErr := runner.Run(ctx, supervise.Task{
-		Path: path, Args: append([]string(nil), args...), Stdout: out, Stderr: errOut,
+		RecoveryClass: proc.RecoveryTask,
+		Path:          path, Args: append([]string(nil), args...), Stdout: out, Stderr: errOut,
 	})
 	var copyErr error
 	if stdout != nil {
