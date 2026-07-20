@@ -12,6 +12,23 @@ public struct AppGroupContainer: Sendable {
         case invalidLeaf(String)
     }
 
+    /// SocketLeaf is one validated non-directory socket filename.
+    public struct SocketLeaf: Hashable, Sendable {
+        public let rawValue: String
+
+        public init(_ rawValue: String) throws {
+            guard !rawValue.isEmpty,
+                  rawValue != ".",
+                  rawValue != "..",
+                  !rawValue.contains("/"),
+                  !rawValue.utf8.contains(0)
+            else {
+                throw ContainerError.invalidLeaf(rawValue)
+            }
+            self.rawValue = rawValue
+        }
+    }
+
     public let identifier: String
 
     public init(identifier: String) throws {
@@ -31,16 +48,8 @@ public struct AppGroupContainer: Sendable {
     }
 
     /// socketPath returns a socket path beneath the resolved container.
-    public func socketPath(leaf: String) throws -> String {
-        guard !leaf.isEmpty,
-              leaf != ".",
-              leaf != "..",
-              !leaf.contains("/"),
-              !leaf.utf8.contains(0)
-        else {
-            throw ContainerError.invalidLeaf(leaf)
-        }
-        return try directory().appendingPathComponent(leaf, isDirectory: false).path
+    public func socketPath(leaf: SocketLeaf) throws -> String {
+        try directory().appendingPathComponent(leaf.rawValue, isDirectory: false).path
     }
 
     static func resolve(

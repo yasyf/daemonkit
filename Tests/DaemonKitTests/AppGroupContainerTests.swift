@@ -43,10 +43,14 @@ struct AppGroupContainerTests {
 
     @Test(arguments: ["", ".", "..", "nested/socket", "/absolute"])
     func rejectsNonLeafSocketPath(_ leaf: String) throws {
-        let container = try AppGroupContainer(identifier: "group.example.unavailable")
         #expect(throws: AppGroupContainer.ContainerError.invalidLeaf(leaf)) {
-            try container.socketPath(leaf: leaf)
+            try AppGroupContainer.SocketLeaf(leaf)
         }
+    }
+
+    @Test func socketLeafIsValidBeforeProtectedContainerResolution() throws {
+        let leaf = try AppGroupContainer.SocketLeaf("catalog.sock")
+        #expect(leaf.rawValue == "catalog.sock")
     }
 
     @Test func entitlementMismatchFailsBeforeResolution() throws {

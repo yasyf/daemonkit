@@ -25,8 +25,8 @@ func (f identityAcceptorFunc) Accept(ctx context.Context, peer wire.Peer) (Accep
 	return f(ctx, peer)
 }
 
-func TestSessionClassifierDeniesOrdinaryAndAllowsSameOrNewerDaemon(t *testing.T) {
-	classifier := SessionClassifier{Executable: "/opt/example/bin/daemon"}
+func TestFixedClassifierDeniesOrdinaryAndAllowsSameOrNewerDaemon(t *testing.T) {
+	classifier := FixedClassifier{Executable: "/opt/example/bin/daemon"}
 	ordinary, err := classifier.Classify(t.Context(), wire.Peer{
 		PID: 42, UID: os.Geteuid(), StartTime: "start", Boot: "boot",
 		Executable: "/opt/example/bin/client",
@@ -48,7 +48,7 @@ func TestSessionClassifierDeniesOrdinaryAndAllowsSameOrNewerDaemon(t *testing.T)
 	}
 }
 
-func TestSignedSessionClassifierRejectsCodeDigestAndAuditSubstitution(t *testing.T) {
+func TestFixedClassifierRejectsCodeDigestAndAuditSubstitution(t *testing.T) {
 	peer := wire.Peer{
 		PID: 42, UID: os.Geteuid(), StartTime: "start", Boot: "boot",
 		Executable: "/Applications/Example.app/Contents/MacOS/Example",
@@ -57,7 +57,7 @@ func TestSignedSessionClassifierRejectsCodeDigestAndAuditSubstitution(t *testing
 	code := CodeIdentity{TeamID: "ABCDE12345", SigningIdentifier: "com.example.product"}
 	digest := PolicyDigest{1}
 	accepted := acceptedFixture{peer: peer, code: code, digest: digest}
-	classifier := SessionClassifier{
+	classifier := FixedClassifier{
 		Executable: peer.Executable, CodeIdentity: code, PolicyDigest: digest,
 		Acceptor: identityAcceptorFunc(func(context.Context, wire.Peer) (AcceptedIdentity, error) {
 			return accepted, nil

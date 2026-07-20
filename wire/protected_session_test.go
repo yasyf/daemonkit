@@ -124,7 +124,7 @@ func TestLifecycleAcceptsOnlySameOrNewerProtectedDaemonBuild(t *testing.T) {
 	}
 	server := &wire.Server{
 		Build: "v1.2.0", MaxSessions: 3, ReservedProtectedSessions: 1,
-		ProtectedSessionClassifier: codeidentity.SessionClassifier{Executable: executable},
+		ProtectedSessionClassifier: codeidentity.FixedClassifier{Executable: executable},
 	}
 	server.RegisterLifecycle(protectedTestLifecycle{})
 	running := startSessionServer(t, server, admitAll(&atomic.Int32{}))
@@ -162,7 +162,7 @@ func TestBusinessRoutesRequireExactBuildBeforeHandlerDispatch(t *testing.T) {
 	var calls atomic.Int32
 	server := &wire.Server{
 		Build: "v1.2.0", MaxSessions: 3, ReservedProtectedSessions: 1,
-		ProtectedSessionClassifier: codeidentity.SessionClassifier{Executable: executable},
+		ProtectedSessionClassifier: codeidentity.FixedClassifier{Executable: executable},
 	}
 	server.RegisterControl("business", func(context.Context, wire.Request) (any, error) {
 		calls.Add(1)

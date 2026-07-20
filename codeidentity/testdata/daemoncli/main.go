@@ -22,5 +22,5 @@ func main() {
 		PolicyDigest:   digest,
 	}
 	peer := wire.Peer{UID: os.Geteuid(), Audit: []byte(os.Getenv("DAEMONKIT_AUDIT_TOKEN"))}
-	fmt.Println(stop, codeidentity.CodePolicy{Identity: identity}.Check(peer))
+	fmt.Println(stop, codeidentity.FixedClassifier{}, codeidentity.CodePolicy{Identity: identity}.Check(peer))
 }

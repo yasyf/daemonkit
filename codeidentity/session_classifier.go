@@ -12,9 +12,9 @@ import (
 	"github.com/yasyf/daemonkit/wire"
 )
 
-// SessionClassifier is the production protected-session policy for one exact
-// daemon or signed-app executable.
-type SessionClassifier struct {
+// FixedClassifier is the protected-session policy for one fixed signed
+// executable. Versioned unsigned request daemons use daemonrole.Classifier.
+type FixedClassifier struct {
 	Executable   string
 	CodeIdentity CodeIdentity
 	Acceptor     IdentityAcceptor
@@ -22,7 +22,7 @@ type SessionClassifier struct {
 }
 
 // Validate rejects incomplete or ambiguous classifier configuration.
-func (c SessionClassifier) Validate() error {
+func (c FixedClassifier) Validate() error {
 	if !filepath.IsAbs(c.Executable) || filepath.Clean(c.Executable) != c.Executable {
 		return fmt.Errorf("codeidentity: protected executable %q is not an exact absolute path", c.Executable)
 	}
@@ -42,7 +42,7 @@ func (c SessionClassifier) Validate() error {
 
 // Classify authenticates a candidate without turning ordinary executable
 // mismatches into connection-level trust failures.
-func (c SessionClassifier) Classify(ctx context.Context, peer wire.Peer) (bool, error) {
+func (c FixedClassifier) Classify(ctx context.Context, peer wire.Peer) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
@@ -79,8 +79,8 @@ func (c SessionClassifier) Classify(ctx context.Context, peer wire.Peer) (bool, 
 
 // AuthorizeBuild admits only the same daemon build or a strictly newer
 // successor to lifecycle routes.
-func (SessionClassifier) AuthorizeBuild(serverBuild, peerBuild string) bool {
+func (FixedClassifier) AuthorizeBuild(serverBuild, peerBuild string) bool {
 	return peerBuild == serverBuild || version.Newer(peerBuild, serverBuild)
 }
 
-var _ wire.ProtectedSessionClassifier = SessionClassifier{}
+var _ wire.ProtectedSessionClassifier = FixedClassifier{}
