@@ -295,6 +295,9 @@ func encodeControllerAgent(agent Agent) ([]byte, error) {
 	if _, err := agent.Plist(); err != nil {
 		return nil, fmt.Errorf("service: validate stored agent %q: %w", agent.Label, err)
 	}
+	agent.AssociatedBundleIdentifiers, _ = canonicalAssociatedBundleIdentifiers(
+		agent.AssociatedBundleIdentifiers,
+	)
 	payload, err := json.Marshal(agent)
 	if err != nil {
 		return nil, fmt.Errorf("service: encode stored agent %q: %w", agent.Label, err)
@@ -317,6 +320,9 @@ func decodeControllerAgent(payload []byte) (Agent, error) {
 	}
 	agent.Args = append([]string(nil), agent.Args...)
 	agent.Env = cloneStrings(agent.Env)
+	agent.AssociatedBundleIdentifiers, _ = canonicalAssociatedBundleIdentifiers(
+		agent.AssociatedBundleIdentifiers,
+	)
 	return agent, nil
 }
 
@@ -325,6 +331,9 @@ func copyAgents(agents map[string]Agent) map[string]Agent {
 	for label, agent := range agents {
 		agent.Args = append([]string(nil), agent.Args...)
 		agent.Env = cloneStrings(agent.Env)
+		agent.AssociatedBundleIdentifiers = append(
+			[]string(nil), agent.AssociatedBundleIdentifiers...,
+		)
 		copied[label] = agent
 	}
 	return copied

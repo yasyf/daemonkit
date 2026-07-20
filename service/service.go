@@ -44,7 +44,11 @@ const plistTemplateText = `<?xml version="1.0" encoding="UTF-8"?>
     <string>{{.Log}}</string>
     <key>StandardErrorPath</key>
     <string>{{.Log}}</string>
-    <key>EnvironmentVariables</key>
+{{if .AssociatedBundleIdentifiers}}    <key>AssociatedBundleIdentifiers</key>
+    <array>
+{{range .AssociatedBundleIdentifiers}}        <string>{{.}}</string>
+{{end}}    </array>
+{{end}}    <key>EnvironmentVariables</key>
     <dict>
 {{range .Env}}        <key>{{.Key}}</key>
         <string>{{.Value}}</string>
@@ -65,14 +69,15 @@ func xmlEscape(s string) string {
 type plistKV struct{ Key, Value string }
 
 type plistData struct {
-	Label                  string
-	Args                   []string
-	Log                    string
-	Env                    []plistKV
-	Restart                string
-	StartInterval          int64
-	ProcessType            string
-	LimitLoadToSessionType string
+	Label                       string
+	Args                        []string
+	Log                         string
+	Env                         []plistKV
+	Restart                     string
+	StartInterval               int64
+	ProcessType                 string
+	LimitLoadToSessionType      string
+	AssociatedBundleIdentifiers []string
 }
 
 // Agent is one exact desired macOS user LaunchAgent specification.
@@ -91,6 +96,10 @@ type Agent struct {
 	// Env are EnvironmentVariables entries written into the plist. Keys are
 	// emitted in sorted order so the rendered plist is reproducible.
 	Env map[string]string
+	// AssociatedBundleIdentifiers attributes a launcher job to fixed signed
+	// application bundle identifiers. Entries are canonical, unique, and
+	// rendered in sorted order.
+	AssociatedBundleIdentifiers []string
 	// RestartPolicy defines when launchd restarts the daemon. Required.
 	RestartPolicy RestartPolicy
 	// StartInterval schedules the job at a whole-second interval. Zero omits
@@ -141,6 +150,10 @@ func (a Agent) Plist() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	associated, err := canonicalAssociatedBundleIdentifiers(a.AssociatedBundleIdentifiers)
+	if err != nil {
+		return nil, err
+	}
 	bin := a.Program
 	if bin == "" {
 		exe, err := os.Executable()
@@ -166,18 +179,53 @@ func (a Agent) Plist() ([]byte, error) {
 	}
 	var buf bytes.Buffer
 	if err := plistTemplate.Execute(&buf, plistData{
-		Label:                  xmlEscape(a.Label),
-		Args:                   args,
-		Log:                    xmlEscape(a.LogPath),
-		Env:                    env,
-		Restart:                restart,
-		StartInterval:          startInterval,
-		ProcessType:            processType,
-		LimitLoadToSessionType: sessionType,
+		Label:                       xmlEscape(a.Label),
+		Args:                        args,
+		Log:                         xmlEscape(a.LogPath),
+		Env:                         env,
+		Restart:                     restart,
+		StartInterval:               startInterval,
+		ProcessType:                 processType,
+		LimitLoadToSessionType:      sessionType,
+		AssociatedBundleIdentifiers: associated,
 	}); err != nil {
 		return nil, fmt.Errorf("render plist: %w", err)
 	}
 	return buf.Bytes(), nil
+}
+
+func canonicalAssociatedBundleIdentifiers(values []string) ([]string, error) {
+	canonical := append([]string(nil), values...)
+	slices.Sort(canonical)
+	for index, value := range canonical {
+		if !validBundleIdentifier(value) {
+			return nil, fmt.Errorf("service: associated bundle identifier %q is not canonical", value)
+		}
+		if index > 0 && canonical[index-1] == value {
+			return nil, fmt.Errorf("service: associated bundle identifier %q is duplicated", value)
+		}
+	}
+	return canonical, nil
+}
+
+func validBundleIdentifier(value string) bool {
+	parts := strings.Split(value, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" || part[0] == '-' || part[len(part)-1] == '-' {
+			return false
+		}
+		for _, char := range []byte(part) {
+			if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+				(char >= '0' && char <= '9') || char == '-' {
+				continue
+			}
+			return false
+		}
+	}
+	return true
 }
 
 func validateLabel(label string) error {

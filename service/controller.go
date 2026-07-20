@@ -464,6 +464,9 @@ func desiredAgents(agents []Agent) (map[string]Agent, error) {
 		}
 		agent.Args = append([]string(nil), agent.Args...)
 		agent.Env = cloneStrings(agent.Env)
+		agent.AssociatedBundleIdentifiers, _ = canonicalAssociatedBundleIdentifiers(
+			agent.AssociatedBundleIdentifiers,
+		)
 		desired[agent.Label] = agent
 	}
 	return desired, nil

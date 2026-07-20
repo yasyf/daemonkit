@@ -119,6 +119,47 @@ func TestAgentOptionalLaunchPolicy(t *testing.T) {
 	}
 }
 
+func TestAgentAssociatedBundleIdentifiersAreCanonicalAndDeterministic(t *testing.T) {
+	agent := testAgent(t)
+	plain, err := agent.Plist()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(plain), "<key>AssociatedBundleIdentifiers</key>") {
+		t.Fatalf("plist rendered absent association\n%s", plain)
+	}
+	agent.AssociatedBundleIdentifiers = []string{
+		"com.yasyf.product.helper",
+		"com.yasyf.product",
+	}
+	body, err := agent.Plist()
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	want := `<key>AssociatedBundleIdentifiers</key>
+    <array>
+        <string>com.yasyf.product</string>
+        <string>com.yasyf.product.helper</string>
+    </array>`
+	if !strings.Contains(text, want) {
+		t.Fatalf("plist missing sorted associated bundle identifiers\n%s", text)
+	}
+
+	for _, values := range [][]string{
+		{"product"},
+		{".com.yasyf.product"},
+		{"com..product"},
+		{"com.yasyf.product_1"},
+		{"com.yasyf.product", "com.yasyf.product"},
+	} {
+		agent.AssociatedBundleIdentifiers = values
+		if _, err := agent.Plist(); err == nil {
+			t.Fatalf("Plist() accepted associated bundle identifiers %q", values)
+		}
+	}
+}
+
 func TestAgentOptionalLaunchPolicyRejectsInvalidValues(t *testing.T) {
 	tests := []struct {
 		edit func(*Agent)

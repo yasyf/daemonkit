@@ -76,6 +76,37 @@ func TestControllerStorePersistsExactDesiredAndAppliedState(t *testing.T) {
 	}
 }
 
+func TestControllerStateCanonicalizesAndClonesAssociatedBundleIdentifiers(t *testing.T) {
+	agent := controllerAgent(t, "com.example.associated")
+	agent.AssociatedBundleIdentifiers = []string{"com.example.z", "com.example.a"}
+	desired, err := desiredAgents([]Agent{agent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent.AssociatedBundleIdentifiers[0] = "com.example.mutated"
+	want := []string{"com.example.a", "com.example.z"}
+	if got := desired[agent.Label].AssociatedBundleIdentifiers; !reflect.DeepEqual(got, want) {
+		t.Fatalf("canonical associated bundle identifiers = %v, want %v", got, want)
+	}
+
+	path := filepath.Join(t.TempDir(), "services.db")
+	store, err := openControllerStore(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.ReplaceDesired(context.Background(), desired); err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := state.Desired[agent.Label].AssociatedBundleIdentifiers; !reflect.DeepEqual(got, want) {
+		t.Fatalf("stored associated bundle identifiers = %v, want %v", got, want)
+	}
+}
+
 func TestControllerStoreRejectsConcurrentOwner(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "services.db")
 	first, err := openControllerStore(context.Background(), path)
