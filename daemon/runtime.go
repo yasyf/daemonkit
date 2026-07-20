@@ -31,7 +31,12 @@ type Admission interface {
 
 // SessionServer serves persistent sessions over a Runtime-owned listener.
 type SessionServer interface {
-	Serve(ctx context.Context, listener net.Listener, admit, admitLifecycle func() (func(), error)) error
+	Serve(
+		ctx context.Context,
+		listener net.Listener,
+		ready func() error,
+		admit, admitLifecycle func() (func(), error),
+	) error
 	CloseIntake() error
 }
 
@@ -108,8 +113,11 @@ type Runtime struct {
 	mu       sync.Mutex
 	started  bool
 	finished bool
+	stopping bool
 	runErr   error
 	done     chan struct{}
+	ready    chan struct{}
+	isReady  bool
 	stop     chan stopKind
 	stopOnce sync.Once
 }
@@ -120,9 +128,10 @@ func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
 		return nil, err
 	}
 	return &Runtime{
-		cfg:  cfg,
-		done: make(chan struct{}),
-		stop: make(chan stopKind, 1),
+		cfg:   cfg,
+		done:  make(chan struct{}),
+		ready: make(chan struct{}),
+		stop:  make(chan stopKind, 1),
 	}, nil
 }
 
@@ -215,15 +224,65 @@ func (r *Runtime) Close(ctx context.Context) error {
 		r.mu.Unlock()
 		return err
 	}
-	done := r.done
 	r.mu.Unlock()
 	if err := r.requestStop(ctx, stopShutdown); err != nil && !errors.Is(err, ErrRuntimeClosed) {
 		return err
 	}
+	return r.Wait(ctx)
+}
+
+// WaitReady waits for exact healthy serving readiness. Session servers publish
+// readiness once after every serving prerequisite is live; no polling occurs.
+func (r *Runtime) WaitReady(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		r.mu.Lock()
+		finished, stopping, runErr, ready := r.finished, r.stopping, r.runErr, r.isReady
+		r.mu.Unlock()
+		if finished {
+			return errors.Join(ErrRuntimeNotReady, runErr)
+		}
+		if stopping {
+			return ErrRuntimeNotReady
+		}
+		if ready {
+			health, err := r.Health(ctx)
+			if err != nil {
+				return err
+			}
+			if health.State != StateHealthy || health.Draining {
+				return fmt.Errorf(
+					"%w: state=%q draining=%t",
+					ErrRuntimeNotReady,
+					health.State,
+					health.Draining,
+				)
+			}
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-r.ready:
+		case <-r.done:
+		}
+	}
+}
+
+// Wait joins Run and replays its terminal result to every waiter.
+func (r *Runtime) Wait(ctx context.Context) error {
+	r.mu.Lock()
+	started := r.started
+	r.mu.Unlock()
+	if !started {
+		return ErrRuntimeNotRunning
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-done:
+	case <-r.done:
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		return r.runErr
@@ -262,6 +321,7 @@ func (r *Runtime) Run(ctx context.Context) (err error) {
 		serveDone <- r.cfg.Server.Serve(
 			serveCtx,
 			listener,
+			r.publishReady,
 			r.cfg.Admission.Admit,
 			r.cfg.Admission.AdmitLifecycle,
 		)
@@ -378,6 +438,32 @@ func (r *Runtime) finish(err error) {
 	r.mu.Unlock()
 }
 
+func (r *Runtime) publishReady() error {
+	health, err := r.Health(context.Background())
+	if err != nil {
+		return err
+	}
+	if health.State != StateHealthy || health.Draining {
+		return fmt.Errorf(
+			"%w: state=%q draining=%t",
+			ErrRuntimeNotReady,
+			health.State,
+			health.Draining,
+		)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stopping {
+		return ErrRuntimeNotReady
+	}
+	if r.isReady {
+		return ErrRuntimeReady
+	}
+	r.isReady = true
+	close(r.ready)
+	return nil
+}
+
 func (r *Runtime) requestStop(ctx context.Context, kind stopKind) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -391,7 +477,12 @@ func (r *Runtime) requestStop(ctx context.Context, kind stopKind) error {
 	if finished {
 		return ErrRuntimeClosed
 	}
-	r.stopOnce.Do(func() { r.stop <- kind })
+	r.stopOnce.Do(func() {
+		r.mu.Lock()
+		r.stopping = true
+		r.mu.Unlock()
+		r.stop <- kind
+	})
 	return nil
 }
 

@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -141,10 +142,11 @@ func (a *runtimeAdmission) Settle(ctx context.Context) error {
 }
 
 type runtimeServer struct {
-	events   *runtimeEvents
-	started  chan struct{}
-	serveErr error
-	closeErr error
+	events    *runtimeEvents
+	started   chan struct{}
+	serveErr  error
+	closeErr  error
+	readyGate <-chan struct{}
 
 	mu       sync.Mutex
 	listener net.Listener
@@ -157,12 +159,19 @@ func newRuntimeServer(events *runtimeEvents) *runtimeServer {
 func (s *runtimeServer) Serve(
 	ctx context.Context,
 	listener net.Listener,
+	ready func() error,
 	_, _ func() (func(), error),
 ) error {
 	s.mu.Lock()
 	s.listener = listener
 	s.mu.Unlock()
 	s.events.add("serve")
+	if s.readyGate != nil {
+		<-s.readyGate
+	}
+	if err := ready(); err != nil {
+		return err
+	}
 	close(s.started)
 	if s.serveErr != nil {
 		return s.serveErr
@@ -467,6 +476,93 @@ func TestRuntimeActivatesAfterListenerOwnershipBeforeServing(t *testing.T) {
 	}
 	if events.index("activate") < 0 || events.index("activate") >= events.index("serve") {
 		t.Fatalf("activation order = %v", events.snapshot())
+	}
+}
+
+func TestRuntimeWaitReadyUsesExactPublicationWithoutPolling(t *testing.T) {
+	cfg, events, server, _, _ := runtimeTestConfig(t, absentRuntimePeer())
+	releaseReady := make(chan struct{})
+	server.readyGate = releaseReady
+	var healthCalls atomic.Int32
+	cfg.HealthState = func() State {
+		healthCalls.Add(1)
+		return StateHealthy
+	}
+	runtime, err := NewRuntime(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- runtime.Run(context.Background()) }()
+	readyDone := make(chan error, 1)
+	go func() { readyDone <- runtime.WaitReady(context.Background()) }()
+	events.wait(t, "serve")
+	time.Sleep(30 * time.Millisecond)
+	if got := healthCalls.Load(); got != 0 {
+		t.Fatalf("health calls before exact readiness = %d, want 0", got)
+	}
+	select {
+	case err := <-readyDone:
+		t.Fatalf("WaitReady returned before publication: %v", err)
+	default:
+	}
+	close(releaseReady)
+	if err := <-readyDone; err != nil {
+		t.Fatalf("WaitReady = %v", err)
+	}
+	if got := healthCalls.Load(); got != 2 {
+		t.Fatalf("health calls after readiness = %d, want publish + verify", got)
+	}
+	if err := runtime.Close(context.Background()); err != nil {
+		t.Fatalf("Close = %v", err)
+	}
+	if err := waitRuntime(t, runDone); err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+}
+
+func TestRuntimeReadinessErrorStopsAndReplaysJoinedTerminal(t *testing.T) {
+	cfg, events, _, _, _ := runtimeTestConfig(t, absentRuntimePeer())
+	cfg.HealthState = func() State { return StateFailed }
+	runtime, err := NewRuntime(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runErr := runtime.Run(context.Background())
+	if !errors.Is(runErr, ErrRuntimeNotReady) {
+		t.Fatalf("Run = %v, want ErrRuntimeNotReady", runErr)
+	}
+	for i := range 3 {
+		if err := runtime.Wait(context.Background()); !errors.Is(err, ErrRuntimeNotReady) {
+			t.Fatalf("Wait %d = %v, want terminal readiness error", i, err)
+		}
+		if err := runtime.WaitReady(context.Background()); !errors.Is(err, ErrRuntimeNotReady) {
+			t.Fatalf("WaitReady %d = %v, want terminal readiness error", i, err)
+		}
+	}
+	if events.index("serve") < 0 || events.index("resources-close") < 0 {
+		t.Fatalf("readiness error did not run exact cleanup: %v", events.snapshot())
+	}
+}
+
+func TestRuntimeWaitReplaysServeTerminal(t *testing.T) {
+	boom := errors.New("serve terminal")
+	cfg, _, server, _, _ := runtimeTestConfig(t, absentRuntimePeer())
+	server.serveErr = boom
+	runtime, err := NewRuntime(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Run(context.Background()); !errors.Is(err, boom) {
+		t.Fatalf("Run = %v, want %v", err, boom)
+	}
+	for i := range 3 {
+		if err := runtime.Wait(context.Background()); !errors.Is(err, boom) {
+			t.Fatalf("Wait %d = %v, want %v", i, err, boom)
+		}
+		if err := runtime.Close(context.Background()); !errors.Is(err, boom) {
+			t.Fatalf("Close %d = %v, want %v", i, err, boom)
+		}
 	}
 }
 

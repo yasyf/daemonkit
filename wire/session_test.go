@@ -109,7 +109,7 @@ func startSessionServer(t *testing.T, server *wire.Server, admit func() (func(),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- server.Serve(ctx, listener, admit, admit) }()
+	go func() { done <- server.Serve(ctx, listener, func() error { return nil }, admit, admit) }()
 	running := &runningServer{path: path, cancel: cancel, done: done}
 	t.Cleanup(func() { running.stop(t) })
 	return running
@@ -127,6 +127,43 @@ func newClient(t *testing.T, running *runningServer, config func(*wire.ClientCon
 	}
 	t.Cleanup(func() { _ = client.Close() })
 	return client
+}
+
+func TestServeReadinessErrorClosesIntakeAndJoins(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "dkw-ready-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	path := filepath.Join(dir, "ready.sock")
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	want := errors.New("readiness refused")
+	var readyCalls atomic.Int32
+	server := &wire.Server{Build: "server-test"}
+	err = server.Serve(
+		context.Background(),
+		listener,
+		func() error {
+			readyCalls.Add(1)
+			return want
+		},
+		func() (func(), error) { return func() {}, nil },
+		func() (func(), error) { return func() {}, nil },
+	)
+	if !errors.Is(err, want) {
+		t.Fatalf("Serve = %v, want %v", err, want)
+	}
+	if got := readyCalls.Load(); got != 1 {
+		t.Fatalf("readiness calls = %d, want 1", got)
+	}
+	conn, dialErr := net.DialTimeout("unix", path, 25*time.Millisecond)
+	if dialErr == nil {
+		_ = conn.Close()
+		t.Fatal("readiness error left listener intake open")
+	}
 }
 
 func TestCallDoesNotNegotiateResponseStream(t *testing.T) {
@@ -294,7 +331,13 @@ func TestServerRejectsOversizedProtocolWindowBeforeStarting(t *testing.T) {
 	defer listener.Close()
 	server := &wire.Server{Build: "server-test", StreamQueue: window}
 	admit := func() (func(), error) { return func() {}, nil }
-	err = server.Serve(context.Background(), listener, admit, admit)
+	err = server.Serve(
+		context.Background(),
+		listener,
+		func() error { return nil },
+		admit,
+		admit,
+	)
 	if err == nil || err.Error() != "wire: stream queue exceeds protocol window" {
 		t.Fatalf("Serve error = %v, want oversized-window rejection", err)
 	}

@@ -182,6 +182,7 @@ func (s *Server) OnActivity(f func()) {
 func (s *Server) Serve(
 	ctx context.Context,
 	listener net.Listener,
+	ready func() error,
 	admit, admitLifecycle func() (func(), error),
 ) error {
 	if listener == nil {
@@ -192,6 +193,9 @@ func (s *Server) Serve(
 	}
 	if admitLifecycle == nil {
 		return errors.New("wire: lifecycle admission callback is required")
+	}
+	if ready == nil {
+		return errors.New("wire: readiness callback is required")
 	}
 	if s.Build == "" {
 		return errors.New("wire: Build is required")
@@ -238,6 +242,18 @@ func (s *Server) Serve(
 
 	acceptDone := make(chan error, 1)
 	go func() { acceptDone <- s.accept(ctx, admit, admitLifecycle) }()
+	if err := ready(); err != nil {
+		_ = s.CloseIntake()
+		acceptErr := <-acceptDone
+		s.closeSessions()
+		s.sessionWG.Wait()
+		close(s.queue)
+		s.poolWG.Wait()
+		return errors.Join(
+			fmt.Errorf("wire: publish readiness: %w", err),
+			wrapAcceptError(acceptErr),
+		)
+	}
 
 	var acceptErr error
 	select {
@@ -256,10 +272,14 @@ func (s *Server) Serve(
 	s.sessionWG.Wait()
 	close(s.queue)
 	s.poolWG.Wait()
-	if acceptErr != nil && !errors.Is(acceptErr, net.ErrClosed) {
-		return fmt.Errorf("wire: accept: %w", acceptErr)
+	return wrapAcceptError(acceptErr)
+}
+
+func wrapAcceptError(err error) error {
+	if err == nil || errors.Is(err, net.ErrClosed) {
+		return nil
 	}
-	return nil
+	return fmt.Errorf("wire: accept: %w", err)
 }
 
 // CloseIntake prevents new connections and new ordinary requests. Accepted

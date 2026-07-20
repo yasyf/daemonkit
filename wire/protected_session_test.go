@@ -189,7 +189,13 @@ func TestProtectedSessionCapacityConfigurationIsExact(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer listener.Close()
-			if err := test.server.Serve(t.Context(), listener, admitAll(&atomic.Int32{}), admitAll(&atomic.Int32{})); err == nil {
+			if err := test.server.Serve(
+				t.Context(),
+				listener,
+				func() error { return nil },
+				admitAll(&atomic.Int32{}),
+				admitAll(&atomic.Int32{}),
+			); err == nil {
 				t.Fatal("invalid protected capacity was accepted")
 			}
 		})
