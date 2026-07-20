@@ -8,21 +8,26 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/yasyf/daemonkit/supervise"
 )
 
 var errFakeLaunch = errors.New("fake launchctl failure")
 
-type fakeLauncher struct {
+type fakeTaskRunner struct {
 	failOn string
 	verbs  []string
 }
 
-func (f *fakeLauncher) Run(_ context.Context, args ...string) (string, error) {
-	f.verbs = append(f.verbs, args[0])
-	if args[0] == f.failOn {
-		return "boom", errFakeLaunch
+func (f *fakeTaskRunner) Run(_ context.Context, task supervise.Task) error {
+	f.verbs = append(f.verbs, task.Args[0])
+	if task.Args[0] == f.failOn {
+		if task.Stdout != nil {
+			_, _ = task.Stdout.Write([]byte("boom"))
+		}
+		return errFakeLaunch
 	}
-	return "", nil
+	return nil
 }
 
 func TestAgentInstall(t *testing.T) {
@@ -39,14 +44,14 @@ func TestAgentInstall(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())
-			f := &fakeLauncher{failOn: tc.failOn}
+			f := &fakeTaskRunner{failOn: tc.failOn}
 			a := Agent{
 				Label:         "com.yasyf.cc-pool",
 				Program:       "/opt/homebrew/bin/cc-pool",
 				Args:          []string{"daemon"},
 				LogPath:       filepath.Join(t.TempDir(), "daemon.log"),
 				RestartPolicy: RestartAlways,
-				Launcher:      f,
+				Runner:        f,
 			}
 			err := a.Install(context.Background())
 			if (err != nil) != tc.wantErr {

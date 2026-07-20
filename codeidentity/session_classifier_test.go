@@ -1,4 +1,4 @@
-package trust
+package codeidentity
 
 import (
 	"context"
@@ -8,6 +8,16 @@ import (
 
 	"github.com/yasyf/daemonkit/wire"
 )
+
+type acceptedFixture struct {
+	peer   wire.Peer
+	code   CodeIdentity
+	digest PolicyDigest
+}
+
+func (i acceptedFixture) Peer() wire.Peer            { return i.peer }
+func (i acceptedFixture) CodeIdentity() CodeIdentity { return i.code }
+func (i acceptedFixture) PolicyDigest() PolicyDigest { return i.digest }
 
 type identityAcceptorFunc func(context.Context, wire.Peer) (AcceptedIdentity, error)
 
@@ -45,13 +55,10 @@ func TestSignedSessionClassifierRejectsCodeDigestAndAuditSubstitution(t *testing
 		Audit:      []byte("accepted-audit"),
 	}
 	code := CodeIdentity{TeamID: "ABCDE12345", SigningIdentifier: "com.example.product"}
-	digest := [32]byte{1}
-	accepted := AcceptedIdentity{
-		peer: peer, code: code, entitlementPolicyDigest: digest,
-	}
+	digest := PolicyDigest{1}
+	accepted := acceptedFixture{peer: peer, code: code, digest: digest}
 	classifier := SessionClassifier{
-		Executable: peer.Executable, CodeIdentity: code,
-		EntitlementPolicyDigest: digest,
+		Executable: peer.Executable, CodeIdentity: code, PolicyDigest: digest,
 		Acceptor: identityAcceptorFunc(func(context.Context, wire.Peer) (AcceptedIdentity, error) {
 			return accepted, nil
 		}),
@@ -62,12 +69,12 @@ func TestSignedSessionClassifierRejectsCodeDigestAndAuditSubstitution(t *testing
 	}
 	tests := []struct {
 		name   string
-		mutate func(*AcceptedIdentity)
+		mutate func(*acceptedFixture)
 	}{
-		{"audit", func(identity *AcceptedIdentity) { identity.peer.Audit = []byte("substituted-audit") }},
-		{"code", func(identity *AcceptedIdentity) { identity.code.TeamID = "FGHIJ67890" }},
-		{"digest", func(identity *AcceptedIdentity) { identity.entitlementPolicyDigest[0]++ }},
-		{"executable", func(identity *AcceptedIdentity) { identity.peer.Executable += ".other" }},
+		{"audit", func(identity *acceptedFixture) { identity.peer.Audit = []byte("substituted-audit") }},
+		{"code", func(identity *acceptedFixture) { identity.code.TeamID = "FGHIJ67890" }},
+		{"digest", func(identity *acceptedFixture) { identity.digest[0]++ }},
+		{"executable", func(identity *acceptedFixture) { identity.peer.Executable += ".other" }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

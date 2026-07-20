@@ -7,14 +7,14 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/yasyf/daemonkit/codeidentity"
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/trust"
+	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/wire"
 )
 
@@ -41,6 +41,8 @@ type AppKeepAlive struct {
 	BundleID string
 	// RestartPolicy defines when launchd restarts the app waiter. Required.
 	RestartPolicy RestartPolicy
+	// Runner owns every launchctl invocation as a disposable process group.
+	Runner supervise.TaskRunner
 }
 
 // AppProcessReaper durably owns one exact app process through bounded termination.
@@ -59,16 +61,15 @@ type AppOwnedProcessRecovery interface {
 type AppStopSpec struct {
 	Dial           wire.Dialer
 	ExecutableName string
-	CodeIdentity   trust.CodeIdentity
-	// EntitlementPolicyDigest is the opaque digest bound by the prior
-	// signed-side accepted session.
-	EntitlementPolicyDigest [32]byte
-	Reaper                  AppProcessReaper
-	Dependents              AppOwnedProcessRecovery
+	CodeIdentity   codeidentity.CodeIdentity
+	// PolicyDigest is the opaque digest bound by the prior signed-side session.
+	PolicyDigest codeidentity.PolicyDigest
+	Reaper       AppProcessReaper
+	Dependents   AppOwnedProcessRecovery
 
 	peerFromConn func(net.Conn) (wire.Peer, error)
 	processes    func(string) ([]proc.Identity, error)
-	checkPeer    func(wire.Peer, trust.CodeIdentity) error
+	checkPeer    func(wire.Peer, codeidentity.CodeIdentity) error
 	now          func() time.Time
 	pause        func(context.Context, time.Duration) error
 	deadline     time.Duration
@@ -78,25 +79,29 @@ type AppStopSpec struct {
 // AuthenticatedAppPeer is the exact kernel and signed-policy identity proven
 // by a prior authenticated app session.
 type AuthenticatedAppPeer struct {
-	PID                     int
-	UID                     int
-	StartTime               string
-	Boot                    string
-	Executable              string
-	AuditTokenDigest        [32]byte
-	CodeIdentity            trust.CodeIdentity
-	EntitlementPolicyDigest [32]byte
+	PID              int
+	UID              int
+	StartTime        string
+	Boot             string
+	Executable       string
+	AuditTokenDigest [32]byte
+	CodeIdentity     codeidentity.CodeIdentity
+	PolicyDigest     codeidentity.PolicyDigest
+}
+
+func (k AppKeepAlive) launchctl(ctx context.Context, args ...string) (string, error) {
+	return runCombined(ctx, k.Runner, "/bin/launchctl", args...)
 }
 
 // NewAuthenticatedAppPeer binds one signed-side accepted identity to an exact
 // daemon-facing process proof without exposing its entitlement policy.
-func NewAuthenticatedAppPeer(accepted trust.AcceptedIdentity) AuthenticatedAppPeer {
+func NewAuthenticatedAppPeer(accepted codeidentity.AcceptedIdentity) AuthenticatedAppPeer {
 	peer := accepted.Peer()
 	return AuthenticatedAppPeer{
 		PID: peer.PID, UID: peer.UID, StartTime: peer.StartTime, Boot: peer.Boot,
 		Executable: peer.Executable, AuditTokenDigest: sha256.Sum256(peer.Audit),
-		CodeIdentity:            accepted.CodeIdentity(),
-		EntitlementPolicyDigest: accepted.EntitlementPolicyDigest(),
+		CodeIdentity: accepted.CodeIdentity(),
+		PolicyDigest: accepted.PolicyDigest(),
 	}
 }
 
@@ -185,20 +190,23 @@ func (k AppKeepAlive) WritePlist() (string, error) {
 // and at every login. Bootout kills only the blocked open waiter, and the
 // fresh open attaches via -W instead of starting a second copy.
 func (k AppKeepAlive) Install(ctx context.Context) error {
+	if k.Runner == nil {
+		return errors.New("service: disposable task runner is required")
+	}
 	plist, err := k.WritePlist()
 	if err != nil {
 		return err
 	}
-	_, _ = launchctl(ctx, "bootout", serviceTarget(k.Label))
+	_, _ = k.launchctl(ctx, "bootout", serviceTarget(k.Label))
 	// enable before bootstrap: it clears a user/MDM disable, and a disabled label fails bootstrap.
-	if out, err := launchctl(ctx, "enable", serviceTarget(k.Label)); err != nil {
+	if out, err := k.launchctl(ctx, "enable", serviceTarget(k.Label)); err != nil {
 		return fmt.Errorf("launchctl enable: %w: %s", err, out)
 	}
-	if out, err := launchctl(ctx, "bootstrap", domainTarget(), plist); err != nil {
+	if out, err := k.launchctl(ctx, "bootstrap", domainTarget(), plist); err != nil {
 		return fmt.Errorf("launchctl bootstrap: %w: %s", err, out)
 	}
 	// Plain kickstart (no -k) covers the loaded-but-not-running race and no-ops when already running.
-	if out, err := launchctl(ctx, "kickstart", serviceTarget(k.Label)); err != nil {
+	if out, err := k.launchctl(ctx, "kickstart", serviceTarget(k.Label)); err != nil {
 		return fmt.Errorf("launchctl kickstart: %w: %s", err, out)
 	}
 	return nil
@@ -222,7 +230,7 @@ func (k AppKeepAlive) Stop(
 	if expected.CodeIdentity != spec.CodeIdentity {
 		return proc.ReapResult{}, errors.New("keepalive agent: authenticated app peer code identity changed")
 	}
-	if expected.EntitlementPolicyDigest != spec.EntitlementPolicyDigest {
+	if expected.PolicyDigest != spec.PolicyDigest {
 		return proc.ReapResult{}, errors.New("keepalive agent: authenticated app peer trust requirement changed")
 	}
 	receipts, err := spec.Reaper.Reap(ctx)
@@ -311,8 +319,8 @@ func (k AppKeepAlive) Stop(
 
 func (p AuthenticatedAppPeer) validate(executable string) error {
 	if p.PID <= 1 || p.UID < 0 || p.StartTime == "" || p.Boot == "" || p.Executable != executable ||
-		p.AuditTokenDigest == ([32]byte{}) || p.CodeIdentity == (trust.CodeIdentity{}) ||
-		p.EntitlementPolicyDigest == ([32]byte{}) {
+		p.AuditTokenDigest == ([32]byte{}) || p.CodeIdentity == (codeidentity.CodeIdentity{}) ||
+		p.PolicyDigest == (codeidentity.PolicyDigest{}) {
 		return errors.New("keepalive agent: authenticated app peer proof is incomplete")
 	}
 	if _, err := p.CodeIdentity.DRString(); err != nil {
@@ -331,11 +339,14 @@ func (k AppKeepAlive) validateStop(spec AppStopSpec) (string, error) {
 	if err := k.validate(); err != nil {
 		return "", err
 	}
+	if k.Runner == nil {
+		return "", errors.New("service: disposable task runner is required")
+	}
 	if spec.Dial == nil || spec.Reaper == nil || spec.Dependents == nil {
 		return "", errors.New("keepalive agent: app stop requires a dialer, durable reaper, and dependent recovery")
 	}
-	if spec.EntitlementPolicyDigest == ([32]byte{}) {
-		return "", errors.New("keepalive agent: app stop entitlement policy digest is required")
+	if spec.PolicyDigest == (codeidentity.PolicyDigest{}) {
+		return "", errors.New("keepalive agent: app stop policy digest is required")
 	}
 	if filepath.Base(spec.ExecutableName) != spec.ExecutableName || spec.ExecutableName == "." || spec.ExecutableName == "" {
 		return "", errors.New("keepalive agent: app stop executable name is invalid")
@@ -405,11 +416,11 @@ func (s AppStopSpec) check(peer wire.Peer) error {
 	if s.checkPeer != nil {
 		return s.checkPeer(peer, s.CodeIdentity)
 	}
-	return (trust.CodePolicy{Identity: s.CodeIdentity}).Check(peer)
+	return (codeidentity.CodePolicy{Identity: s.CodeIdentity}).Check(peer)
 }
 
 func (k AppKeepAlive) bootout(ctx context.Context) error {
-	if out, err := launchctl(ctx, "bootout", serviceTarget(k.Label)); err != nil && !notLoaded(err) {
+	if out, err := k.launchctl(ctx, "bootout", serviceTarget(k.Label)); err != nil && !notLoaded(err) {
 		return fmt.Errorf("launchctl bootout: %w: %s", err, out)
 	}
 	return nil
@@ -437,7 +448,7 @@ func (k AppKeepAlive) ensureUnloaded(ctx context.Context) (bool, error) {
 }
 
 func (k AppKeepAlive) loaded(ctx context.Context) (bool, error) {
-	out, err := launchctl(ctx, "print", serviceTarget(k.Label))
+	out, err := k.launchctl(ctx, "print", serviceTarget(k.Label))
 	if err == nil {
 		return true, nil
 	}
@@ -493,6 +504,9 @@ func (k AppKeepAlive) Uninstall(ctx context.Context) error {
 	if err := k.validate(); err != nil {
 		return err
 	}
+	if k.Runner == nil {
+		return errors.New("service: disposable task runner is required")
+	}
 	if err := k.bootout(ctx); err != nil {
 		return err
 	}
@@ -508,12 +522,12 @@ func (k AppKeepAlive) Uninstall(ctx context.Context) error {
 
 // bootout exits 3 ("No such process") for an unloaded service target.
 func notLoaded(err error) bool {
-	var exit *exec.ExitError
+	var exit interface{ ExitCode() int }
 	return errors.As(err, &exit) && exit.ExitCode() == 3
 }
 
 // Loaded reports whether launchd currently knows about the agent.
 func (k AppKeepAlive) Loaded(ctx context.Context) bool {
-	_, err := launchctl(ctx, "print", serviceTarget(k.Label))
+	_, err := k.launchctl(ctx, "print", serviceTarget(k.Label))
 	return err == nil
 }

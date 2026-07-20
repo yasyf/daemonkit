@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/yasyf/daemonkit/codeidentity"
 	"github.com/yasyf/daemonkit/wire"
 )
 
@@ -58,9 +59,9 @@ type Requirement struct {
 
 // ValidationDigest returns the opaque canonical identity of every code-signing
 // and entitlement predicate checked by this requirement.
-func (r Requirement) ValidationDigest() ([32]byte, error) {
+func (r Requirement) ValidationDigest() (codeidentity.PolicyDigest, error) {
 	if err := r.validate(); err != nil {
-		return [32]byte{}, err
+		return codeidentity.PolicyDigest{}, err
 	}
 	h := sha256.New()
 	writeDigestString(h, r.TeamID)
@@ -82,9 +83,14 @@ func (r Requirement) ValidationDigest() ([32]byte, error) {
 		}
 		writeDigestString(h, requirement.String)
 	}
-	var digest [32]byte
+	var digest codeidentity.PolicyDigest
 	copy(digest[:], h.Sum(nil))
 	return digest, nil
+}
+
+// CodeIdentity returns the code-only portion of the signed requirement.
+func (r Requirement) CodeIdentity() codeidentity.CodeIdentity {
+	return codeidentity.CodeIdentity{TeamID: r.TeamID, SigningIdentifier: r.SigningIdentifier}
 }
 
 func writeDigestString(h hash.Hash, value string) {
@@ -146,15 +152,7 @@ func (r Requirement) DRString() (string, error) {
 	if err := r.validate(); err != nil {
 		return "", err
 	}
-	// 1.2.840.113635.100.6.2.6 = Developer ID CA; 1.2.840.113635.100.6.1.13 =
-	// Developer ID Application leaf. Together they mean "Developer ID", excluding
-	// Mac App Store and development signatures.
-	return fmt.Sprintf(
-		`identifier "%s" and anchor apple generic and certificate leaf[subject.OU] = "%s" `+
-			`and certificate 1[field.1.2.840.113635.100.6.2.6] exists `+
-			`and certificate leaf[field.1.2.840.113635.100.6.1.13] exists`,
-		r.SigningIdentifier, r.TeamID,
-	), nil
+	return r.CodeIdentity().DRString()
 }
 
 // Policy verifies a peer against an optional Requirement.

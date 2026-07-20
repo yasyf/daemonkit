@@ -15,11 +15,7 @@ public struct AppGroupContainer: Sendable {
     public let identifier: String
 
     public init(identifier: String) throws {
-        guard identifier.hasPrefix("group."),
-              identifier == identifier.trimmingCharacters(in: .whitespacesAndNewlines),
-              !identifier.contains("/"),
-              !identifier.utf8.contains(0)
-        else {
+        guard Self.isValidIdentifier(identifier) else {
             throw ContainerError.invalidIdentifier(identifier)
         }
         self.identifier = identifier
@@ -85,5 +81,39 @@ public struct AppGroupContainer: Sendable {
             return []
         }
         return Set(groups)
+    }
+
+    private static func isValidIdentifier(_ identifier: String) -> Bool {
+        let segments = identifier.split(separator: ".", omittingEmptySubsequences: false)
+        guard segments.count >= 2,
+              segments.dropFirst().allSatisfy(isValidSegment)
+        else {
+            return false
+        }
+        if segments[0] == "group" {
+            return true
+        }
+        return segments[0].utf8.count == 10 && segments[0].unicodeScalars.allSatisfy {
+            (48 ... 57).contains($0.value) || (65 ... 90).contains($0.value)
+        }
+    }
+
+    private static func isValidSegment(_ segment: Substring) -> Bool {
+        guard let first = segment.unicodeScalars.first,
+              let last = segment.unicodeScalars.last,
+              isASCIIAlphanumeric(first),
+              isASCIIAlphanumeric(last)
+        else {
+            return false
+        }
+        return segment.unicodeScalars.allSatisfy {
+            isASCIIAlphanumeric($0) || $0.value == 45
+        }
+    }
+
+    private static func isASCIIAlphanumeric(_ scalar: Unicode.Scalar) -> Bool {
+        (48 ... 57).contains(scalar.value) ||
+            (65 ... 90).contains(scalar.value) ||
+            (97 ... 122).contains(scalar.value)
     }
 }

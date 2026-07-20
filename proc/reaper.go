@@ -401,15 +401,6 @@ func (r *Reaper) Owns(rec Record) (bool, error) {
 // revalidates stored records and atomically replaces each settled prior
 // generation with its receipt before that kill authority is erased.
 func (r *Reaper) Reap(ctx context.Context) (ReapResult, error) {
-	receipts, moreReceipts, err := r.Store.LoadReapReceipts(ctx, ReapReceiptPageLimit)
-	if err != nil {
-		return ReapResult{}, fmt.Errorf("load reaper receipts: %w", err)
-	}
-	result := ReapResult{Receipts: receipts, More: moreReceipts}
-	if moreReceipts || len(receipts) == ReapReceiptPageLimit {
-		result.More = true
-		return result, nil
-	}
 	recs, err := r.Store.Load(ctx)
 	if err != nil {
 		return ReapResult{}, fmt.Errorf("load reaper records: %w", err)
@@ -419,7 +410,7 @@ func (r *Reaper) Reap(ctx context.Context) (ReapResult, error) {
 		return ReapResult{}, fmt.Errorf("load current boot identity: %w", err)
 	}
 	var unresolved []error
-	for index, rec := range recs {
+	for _, rec := range recs {
 		if err := ctx.Err(); err != nil {
 			return ReapResult{}, err
 		}
@@ -444,14 +435,13 @@ func (r *Reaper) Reap(ctx context.Context) (ReapResult, error) {
 				unresolved = append(unresolved, fmt.Errorf("commit receipt for child %d: %w", rec.PID, commitErr))
 				continue
 			}
-			result.Receipts = append(result.Receipts, receipt)
-			if len(result.Receipts) == ReapReceiptPageLimit {
-				result.More = index+1 < len(recs)
-				break
-			}
 		}
 	}
-	return result, errors.Join(unresolved...)
+	receipts, moreReceipts, receiptErr := r.Store.LoadReapReceipts(ctx, ReapReceiptPageLimit)
+	if receiptErr != nil {
+		unresolved = append(unresolved, fmt.Errorf("load reaper receipts: %w", receiptErr))
+	}
+	return ReapResult{Receipts: receipts, More: moreReceipts}, errors.Join(unresolved...)
 }
 
 // ReapReceipt returns the durable receipt for one exact process record,

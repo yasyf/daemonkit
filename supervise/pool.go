@@ -108,6 +108,11 @@ type Task struct {
 	Stderr io.Writer
 }
 
+// TaskRunner executes one killable, synchronously reaped disposable task.
+type TaskRunner interface {
+	Run(context.Context, Task) error
+}
+
 // Pool bounds concurrently running disposable worker processes.
 type Pool struct {
 	limit    int
@@ -143,7 +148,10 @@ func NewPool(limit int, registry WorkerRegistry) (*Pool, error) {
 	}, nil
 }
 
-var _ Workers = (*Pool)(nil)
+var (
+	_ Workers    = (*Pool)(nil)
+	_ TaskRunner = (*Pool)(nil)
+)
 
 // Close permanently stops new task admission. Running tasks are unchanged.
 func (p *Pool) Close() {

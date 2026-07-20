@@ -282,10 +282,15 @@ func TestReapReceiptPersistsAndReplaysByteIdenticallyUntilAcknowledged(t *testin
 	path := filepath.Join(t.TempDir(), "records.json")
 	store := &FileStore{Path: path}
 	record := matchingRecord(4041, "prior-generation")
+	record.Executable = "/Applications/Fixed.app/Contents/MacOS/Fixed"
+	record.AuditToken = auditTokenForPID(record.PID, 9)
 	mustAdd(t, store, record)
 	firstReaper := &Reaper{
 		Store: store, Generation: "current-generation",
 		prober: &fakeProber{err: errNoProc},
+		auditPath: func(AuditToken) (string, error) {
+			return "", ErrNoProcess
+		},
 	}
 	first, err := firstReaper.Reap(ctx)
 	if err != nil {
@@ -336,6 +341,22 @@ func TestReapReceiptPersistsAndReplaysByteIdenticallyUntilAcknowledged(t *testin
 	empty, err := restarted.Reap(ctx)
 	if err != nil || len(empty.Receipts) != 0 || empty.More {
 		t.Fatalf("Reap after acknowledgement = %+v, %v", empty, err)
+	}
+}
+
+func TestReapRecordRejectsVacuousAbsenceWithoutOwnedRecord(t *testing.T) {
+	record := matchingRecord(4045, "prior-generation")
+	reaper := &Reaper{
+		Store: &memStore{}, Generation: "current-generation",
+		prober: &fakeProber{err: errNoProc},
+	}
+
+	receipt, err := reaper.ReapRecord(t.Context(), record)
+	if err == nil {
+		t.Fatalf("ReapRecord without durable authority = %+v, want error", receipt)
+	}
+	if receipt != (ReapReceipt{}) {
+		t.Fatalf("ReapRecord without durable authority returned receipt %+v", receipt)
 	}
 }
 
@@ -416,15 +437,15 @@ func TestReapReceiptsArePageBoundedWithoutDroppingKillAuthority(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(first.Receipts) != ReapReceiptPageLimit || !first.More || store.len() != 1 {
+	if len(first.Receipts) != ReapReceiptPageLimit || !first.More || store.len() != 0 {
 		t.Fatalf("first bounded Reap = receipts:%d more:%t records:%d",
 			len(first.Receipts), first.More, store.len())
 	}
 	hiddenRecord := matchingRecord(5000+ReapReceiptPageLimit, "prior-generation")
 	hiddenRecord.Boot = "prior-boot"
-	hiddenReceipt, err := reaper.ReapRecord(ctx, hiddenRecord)
+	hiddenReceipt, found, err := reaper.ReapReceipt(ctx, hiddenRecord)
 	if err != nil || hiddenReceipt.Record != hiddenRecord {
-		t.Fatalf("exact hidden reap = %+v, err %v", hiddenReceipt, err)
+		t.Fatalf("exact hidden receipt = %+v, found %t, err %v", hiddenReceipt, found, err)
 	}
 	replayedHidden, found, err := reaper.ReapReceipt(ctx, hiddenRecord)
 	if err != nil || !found || replayedHidden != hiddenReceipt {

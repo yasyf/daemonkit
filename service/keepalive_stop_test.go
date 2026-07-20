@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/daemonkit/codeidentity"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
@@ -93,14 +94,14 @@ func fixedAppFixture(t *testing.T) (AppKeepAlive, AppStopSpec, AuthenticatedAppP
 	expected := AuthenticatedAppPeer{
 		PID: peer.PID, UID: peer.UID, StartTime: peer.StartTime, Boot: peer.Boot,
 		Executable: peer.Executable, AuditTokenDigest: sha256.Sum256(peer.Audit),
-		CodeIdentity: requirement.CodeIdentity(), EntitlementPolicyDigest: validationDigest,
+		CodeIdentity: requirement.CodeIdentity(), PolicyDigest: validationDigest,
 	}
 	now := time.Unix(100, 0)
 	spec := AppStopSpec{
-		ExecutableName:          "Fixed",
-		CodeIdentity:            requirement.CodeIdentity(),
-		EntitlementPolicyDigest: validationDigest,
-		Reaper:                  reaper, Dependents: recordingAppRecovery{events: events},
+		ExecutableName: "Fixed",
+		CodeIdentity:   requirement.CodeIdentity(),
+		PolicyDigest:   validationDigest,
+		Reaper:         reaper, Dependents: recordingAppRecovery{events: events},
 		Dial: func(context.Context) (net.Conn, error) {
 			*events = append(*events, "dial")
 			client, server := net.Pipe()
@@ -111,7 +112,7 @@ func fixedAppFixture(t *testing.T) (AppKeepAlive, AppStopSpec, AuthenticatedAppP
 			*events = append(*events, "peer")
 			return peer, nil
 		},
-		checkPeer: func(got wire.Peer, _ trust.CodeIdentity) error {
+		checkPeer: func(got wire.Peer, _ codeidentity.CodeIdentity) error {
 			*events = append(*events, "trust")
 			if got.UID != peer.UID || got.ProcessIdentity() != peer.ProcessIdentity() {
 				return errors.New("wrong peer")
@@ -130,13 +131,20 @@ func fixedAppFixture(t *testing.T) (AppKeepAlive, AppStopSpec, AuthenticatedAppP
 		deadline: 500 * time.Millisecond,
 		quiet:    50 * time.Millisecond,
 	}
-	return AppKeepAlive{Label: "com.example.fixed", AppPath: app, BundleID: "com.example.fixed", RestartPolicy: RestartAlways}, spec, expected, events, executable
+	keepalive := AppKeepAlive{
+		Label: "com.example.fixed", AppPath: app, BundleID: "com.example.fixed", RestartPolicy: RestartAlways,
+		Runner: launchctlRunner(func(context.Context, ...string) (string, error) {
+			t.Fatal("unexpected launchctl invocation")
+			return "", nil
+		}),
+	}
+	return keepalive, spec, expected, events, executable
 }
 
-func launchState(t *testing.T, keepalive AppKeepAlive, events *[]string, loaded *bool) {
+func launchState(t *testing.T, keepalive *AppKeepAlive, events *[]string, loaded *bool) {
 	t.Helper()
 	notLoadedErr := shExit(t, 3)
-	stubLaunchctl(t, func(_ context.Context, args ...string) (string, error) {
+	keepalive.Runner = launchctlRunner(func(_ context.Context, args ...string) (string, error) {
 		switch args[0] {
 		case "print":
 			*events = append(*events, "print")
@@ -180,7 +188,7 @@ func TestAppKeepAliveStopVerifiesTracksBootsOutTerminatesAndProvesAbsence(t *tes
 		}
 		return nil, nil
 	}
-	launchState(t, keepalive, events, &loaded)
+	launchState(t, &keepalive, events, &loaded)
 	reaperResult := proc.ReapResult{Receipts: []proc.ReapReceipt{{ReaperGeneration: "app"}}}
 	dependentResult := proc.ReapResult{Receipts: []proc.ReapReceipt{{ReaperGeneration: "dependent"}}, More: true}
 	reaper.reapResult = reaperResult
@@ -226,14 +234,14 @@ func TestAppKeepAliveStopRejectsAuthenticatedReplacement(t *testing.T) {
 	spec.peerFromConn = func(net.Conn) (wire.Peer, error) {
 		return wire.Peer{PID: 4241 + generation, UID: os.Geteuid(), StartTime: time.Now().String(), Boot: "boot", Executable: executable, Audit: make([]byte, 32)}, nil
 	}
-	spec.checkPeer = func(wire.Peer, trust.CodeIdentity) error { return nil }
+	spec.checkPeer = func(wire.Peer, codeidentity.CodeIdentity) error { return nil }
 	spec.processes = func(string) ([]proc.Identity, error) {
 		if generation == 0 {
 			return nil, nil
 		}
 		return []proc.Identity{{PID: 4241 + generation}}, nil
 	}
-	launchState(t, keepalive, events, &loaded)
+	launchState(t, &keepalive, events, &loaded)
 	if _, err := keepalive.Stop(t.Context(), spec, expected); err == nil {
 		t.Fatal("Stop accepted a replacement app that did not own the proof")
 	}
@@ -266,7 +274,7 @@ func TestAppKeepAliveStopWaitsForRebindingLiveAppBeforeBootout(t *testing.T) {
 		}
 		return nil, nil
 	}
-	launchState(t, keepalive, events, &loaded)
+	launchState(t, &keepalive, events, &loaded)
 	if _, err := keepalive.Stop(t.Context(), spec, expected); err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +288,7 @@ func TestAppKeepAliveStopNoSocketLiveProcessFailsClosed(t *testing.T) {
 	loaded := true
 	spec.Dial = func(context.Context) (net.Conn, error) { return nil, syscall.ENOENT }
 	spec.processes = func(string) ([]proc.Identity, error) { return []proc.Identity{{PID: 4242}}, nil }
-	launchState(t, keepalive, events, &loaded)
+	launchState(t, &keepalive, events, &loaded)
 	if _, err := keepalive.Stop(t.Context(), spec, expected); err == nil {
 		t.Fatal("Stop claimed absence while an exact executable process remained live without a socket")
 	}
@@ -294,7 +302,7 @@ func TestAppKeepAliveStopAbsentUsesServiceAndInventoryQuietProof(t *testing.T) {
 	loaded := true
 	spec.Dial = func(context.Context) (net.Conn, error) { return nil, syscall.ENOENT }
 	spec.processes = func(string) ([]proc.Identity, error) { return nil, nil }
-	launchState(t, keepalive, events, &loaded)
+	launchState(t, &keepalive, events, &loaded)
 	if _, err := keepalive.Stop(t.Context(), spec, expected); err != nil {
 		t.Fatal(err)
 	}
@@ -319,7 +327,7 @@ func TestAppKeepAliveStopRestartsQuietProofAfterServiceReload(t *testing.T) {
 		}
 		return nil
 	}
-	launchState(t, keepalive, events, &loaded)
+	launchState(t, &keepalive, events, &loaded)
 	if _, err := keepalive.Stop(t.Context(), spec, expected); err != nil {
 		t.Fatal(err)
 	}
@@ -346,7 +354,7 @@ func TestAppKeepAliveStopRepeatedServiceReloadFailsByDeadline(t *testing.T) {
 		loaded = true
 		return nil
 	}
-	launchState(t, keepalive, events, &loaded)
+	launchState(t, &keepalive, events, &loaded)
 	if _, err := keepalive.Stop(t.Context(), spec, expected); err == nil {
 		t.Fatal("Stop accepted a service that reloaded throughout the quiet window")
 	}
@@ -364,7 +372,7 @@ func TestAppKeepAliveStopRejectsSignatureAndPIDReuseBeforeBootout(t *testing.T) 
 		set  func(*AppStopSpec)
 	}{
 		{"signature", func(spec *AppStopSpec) {
-			spec.checkPeer = func(wire.Peer, trust.CodeIdentity) error { return trust.ErrUntrustedPeer }
+			spec.checkPeer = func(wire.Peer, codeidentity.CodeIdentity) error { return codeidentity.ErrUntrustedPeer }
 		}},
 		{"pid reuse", func(spec *AppStopSpec) { spec.Reaper.(*recordingAppReaper).trackErr = proc.ErrIdentityChanged }},
 	} {
@@ -372,7 +380,7 @@ func TestAppKeepAliveStopRejectsSignatureAndPIDReuseBeforeBootout(t *testing.T) 
 			keepalive, spec, expected, events, _ := fixedAppFixture(t)
 			tc.set(&spec)
 			loaded := true
-			launchState(t, keepalive, events, &loaded)
+			launchState(t, &keepalive, events, &loaded)
 			if _, err := keepalive.Stop(t.Context(), spec, expected); err == nil {
 				t.Fatal("Stop accepted untrusted or recycled peer identity")
 			}
@@ -391,13 +399,13 @@ func TestAppKeepAliveStopRejectsExactProofMismatch(t *testing.T) {
 		{"boot", func(peer *AuthenticatedAppPeer) { peer.Boot = "previous-boot" }},
 		{"audit token", func(peer *AuthenticatedAppPeer) { peer.AuditTokenDigest[0]++ }},
 		{"code identity", func(peer *AuthenticatedAppPeer) { peer.CodeIdentity.TeamID = "OTHER" }},
-		{"entitlement policy digest", func(peer *AuthenticatedAppPeer) { peer.EntitlementPolicyDigest[0]++ }},
+		{"policy digest", func(peer *AuthenticatedAppPeer) { peer.PolicyDigest[0]++ }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			keepalive, spec, expected, events, _ := fixedAppFixture(t)
 			tc.set(&expected)
 			loaded := true
-			launchState(t, keepalive, events, &loaded)
+			launchState(t, &keepalive, events, &loaded)
 			if _, err := keepalive.Stop(t.Context(), spec, expected); err == nil {
 				t.Fatal("Stop accepted changed authenticated proof identity")
 			}

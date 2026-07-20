@@ -1,4 +1,4 @@
-package trust
+package codeidentity
 
 import (
 	"bytes"
@@ -12,36 +12,30 @@ import (
 	"github.com/yasyf/daemonkit/wire"
 )
 
-// IdentityAcceptor verifies one exact signed peer and returns its accepted
-// code identity plus opaque entitlement-policy digest.
-type IdentityAcceptor interface {
-	Accept(context.Context, wire.Peer) (AcceptedIdentity, error)
-}
-
 // SessionClassifier is the production protected-session policy for one exact
 // daemon or signed-app executable.
 type SessionClassifier struct {
-	Executable              string
-	CodeIdentity            CodeIdentity
-	Acceptor                IdentityAcceptor
-	EntitlementPolicyDigest [32]byte
+	Executable   string
+	CodeIdentity CodeIdentity
+	Acceptor     IdentityAcceptor
+	PolicyDigest PolicyDigest
 }
 
 // Validate rejects incomplete or ambiguous classifier configuration.
 func (c SessionClassifier) Validate() error {
 	if !filepath.IsAbs(c.Executable) || filepath.Clean(c.Executable) != c.Executable {
-		return fmt.Errorf("trust: protected executable %q is not an exact absolute path", c.Executable)
+		return fmt.Errorf("codeidentity: protected executable %q is not an exact absolute path", c.Executable)
 	}
-	hasDigest := c.EntitlementPolicyDigest != ([32]byte{})
+	hasDigest := c.PolicyDigest != (PolicyDigest{})
 	if (c.Acceptor == nil) != !hasDigest {
-		return errors.New("trust: signed acceptor and entitlement policy digest must be configured together")
+		return errors.New("codeidentity: signed acceptor and policy digest must be configured together")
 	}
 	if c.Acceptor != nil {
-		if _, err := c.CodeIdentity.DRString(); err != nil {
-			return fmt.Errorf("trust: protected code identity: %w", err)
+		if err := c.CodeIdentity.Validate(); err != nil {
+			return fmt.Errorf("codeidentity: protected code identity: %w", err)
 		}
 	} else if c.CodeIdentity != (CodeIdentity{}) {
-		return errors.New("trust: protected code identity requires a signed acceptor")
+		return errors.New("codeidentity: protected code identity requires a signed acceptor")
 	}
 	return nil
 }
@@ -66,10 +60,10 @@ func (c SessionClassifier) Classify(ctx context.Context, peer wire.Peer) (bool, 
 	}
 	accepted, err := c.Acceptor.Accept(ctx, peer)
 	if err != nil {
-		return false, fmt.Errorf("trust: accept protected peer: %w", err)
+		return false, fmt.Errorf("codeidentity: accept protected peer: %w", err)
 	}
-	if accepted.EntitlementPolicyDigest() != c.EntitlementPolicyDigest {
-		return false, fmt.Errorf("%w: protected peer entitlement policy digest mismatch", ErrUntrustedPeer)
+	if accepted.PolicyDigest() != c.PolicyDigest {
+		return false, fmt.Errorf("%w: protected peer policy digest mismatch", ErrUntrustedPeer)
 	}
 	if accepted.CodeIdentity() != c.CodeIdentity {
 		return false, fmt.Errorf("%w: protected peer code identity mismatch", ErrUntrustedPeer)

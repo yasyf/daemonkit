@@ -4,7 +4,37 @@ import Testing
 
 @Suite(.timeLimit(.minutes(1)))
 struct AppGroupContainerTests {
-    @Test(arguments: ["", "group", " group.example", "group.example ", "group.example/nested"])
+    @Test(arguments: [
+        "group.example",
+        "group.com.example.product-name",
+        "SXKCTF23Q2.ccp",
+        "SXKCTF23Q2.com.example.ccp",
+    ])
+    func acceptsCanonicalAppGroupIdentifier(_ identifier: String) throws {
+        let container = try AppGroupContainer(identifier: identifier)
+        #expect(container.identifier == identifier)
+    }
+
+    @Test(arguments: [
+        "",
+        "group",
+        " group.example",
+        "group.example ",
+        "group.ex ample",
+        "group.example/nested",
+        "group.example\0nested",
+        "group..example",
+        "group.example.",
+        "group.-example",
+        "group.example-",
+        "group.ex_ample",
+        "group.exämple",
+        "SXKCTF23Q2",
+        "SXKCTF23Q.ccp",
+        "SXKCTF23Q23.ccp",
+        "sxkctf23q2.ccp",
+        "SXKCTF23Q2..ccp",
+    ])
     func rejectsInvalidIdentifier(_ identifier: String) {
         #expect(throws: AppGroupContainer.ContainerError.invalidIdentifier(identifier)) {
             try AppGroupContainer(identifier: identifier)
@@ -34,11 +64,12 @@ struct AppGroupContainerTests {
         #expect(!resolved)
     }
 
-    @Test func entitledResolutionReturnsSystemURL() throws {
+    @Test(arguments: ["group.example.expected", "SXKCTF23Q2.ccp"])
+    func entitledResolutionReturnsSystemURL(identifier: String) throws {
         let expected = URL(fileURLWithPath: "/group-container")
         let actual = try AppGroupContainer.resolve(
-            identifier: "group.example.expected",
-            entitledGroups: ["group.example.expected"],
+            identifier: identifier,
+            entitledGroups: [identifier],
             containerURL: { _ in expected }
         )
         #expect(actual == expected)

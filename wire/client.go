@@ -538,7 +538,7 @@ func (c *Client) deliverEvents() {
 	}
 }
 
-// Close terminates the session and all pending calls.
+// Close gracefully terminates the session after a GoAway acknowledgement.
 func (c *Client) Close() error { return c.close(context.Background()) }
 
 // Abort tears down the local session without a GoAway exchange. Pending calls
@@ -550,6 +550,7 @@ func (c *Client) Abort(cause error) error {
 		} else {
 			cause = errors.Join(ErrClientAbort, cause)
 		}
+		c.closeErr = cause
 		c.fail(cause)
 	})
 	c.loopWG.Wait()

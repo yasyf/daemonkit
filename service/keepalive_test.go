@@ -10,6 +10,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/yasyf/daemonkit/supervise"
 )
 
 const keepAliveGolden = `<?xml version="1.0" encoding="UTF-8"?>
@@ -148,11 +150,18 @@ func TestAppKeepAliveValidation(t *testing.T) {
 	}
 }
 
-func stubLaunchctl(t *testing.T, fn func(ctx context.Context, args ...string) (string, error)) {
-	t.Helper()
-	orig := launchctl
-	launchctl = fn
-	t.Cleanup(func() { launchctl = orig })
+type taskRunnerFunc func(context.Context, supervise.Task) error
+
+func (f taskRunnerFunc) Run(ctx context.Context, task supervise.Task) error { return f(ctx, task) }
+
+func launchctlRunner(fn func(context.Context, ...string) (string, error)) supervise.TaskRunner {
+	return taskRunnerFunc(func(ctx context.Context, task supervise.Task) error {
+		output, err := fn(ctx, task.Args...)
+		if task.Stdout != nil {
+			_, _ = task.Stdout.Write([]byte(output))
+		}
+		return err
+	})
 }
 
 func shExit(t *testing.T, code int) error {
@@ -189,7 +198,7 @@ func TestAppKeepAliveUninstallBootout(t *testing.T) {
 				t.Fatalf("WritePlist() = %v", err)
 			}
 			var gotArgs []string
-			stubLaunchctl(t, func(_ context.Context, args ...string) (string, error) {
+			k.Runner = launchctlRunner(func(_ context.Context, args ...string) (string, error) {
 				gotArgs = args
 				return "launchctl output", tc.bootoutErr
 			})
@@ -226,7 +235,7 @@ func TestAppKeepAliveInstallEnableBeforeBootstrap(t *testing.T) {
 	}
 
 	var verbs []string
-	stubLaunchctl(t, func(_ context.Context, args ...string) (string, error) {
+	k.Runner = launchctlRunner(func(_ context.Context, args ...string) (string, error) {
 		verbs = append(verbs, args[0])
 		return "", nil
 	})
@@ -239,7 +248,7 @@ func TestAppKeepAliveInstallEnableBeforeBootstrap(t *testing.T) {
 
 	errDisabled := errors.New("enable: Input/output error")
 	verbs = nil
-	stubLaunchctl(t, func(_ context.Context, args ...string) (string, error) {
+	k.Runner = launchctlRunner(func(_ context.Context, args ...string) (string, error) {
 		verbs = append(verbs, args[0])
 		if args[0] == "enable" {
 			return "", errDisabled

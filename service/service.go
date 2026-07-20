@@ -7,16 +7,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"text/template"
+
+	"github.com/yasyf/daemonkit/supervise"
 )
 
 const plistTemplateText = `<?xml version="1.0" encoding="UTF-8"?>
@@ -91,9 +93,8 @@ type Agent struct {
 	Env map[string]string
 	// RestartPolicy defines when launchd restarts the daemon. Required.
 	RestartPolicy RestartPolicy
-	// Launcher runs this Agent's launchctl invocations. A nil Launcher shells the
-	// real launchctl so struct-literal construction keeps its shape.
-	Launcher Launcher
+	// Runner owns every external service command as a disposable process group.
+	Runner supervise.TaskRunner
 }
 
 // PlistPath is the LaunchAgent plist location (~/Library/LaunchAgents/<Label>.plist).
@@ -165,45 +166,27 @@ func serviceTarget(label string) string { return domainTarget() + "/" + label }
 
 func (a Agent) serviceTarget() string { return serviceTarget(a.Label) }
 
-var launchctl = func(ctx context.Context, args ...string) (string, error) {
-	out, err := exec.CommandContext(ctx, "launchctl", args...).CombinedOutput()
-	return string(out), err
-}
-
-// Launcher runs a launchctl invocation and returns its combined output. Agent
-// shells the real launchctl by default.
-type Launcher interface {
-	Run(ctx context.Context, args ...string) (string, error)
-}
-
-type realLauncher struct{}
-
-func (realLauncher) Run(ctx context.Context, args ...string) (string, error) {
-	return launchctl(ctx, args...)
-}
-
-func (a Agent) launcher() Launcher {
-	if a.Launcher != nil {
-		return a.Launcher
-	}
-	return realLauncher{}
+func (a Agent) launchctl(ctx context.Context, args ...string) (string, error) {
+	return runCombined(ctx, a.Runner, "/bin/launchctl", args...)
 }
 
 // Install writes the plist and (re)bootstraps the agent so it runs now and at
 // every login. Idempotent: an existing instance is booted out first.
 func (a Agent) Install(ctx context.Context) error {
+	if a.Runner == nil {
+		return errors.New("service: disposable task runner is required")
+	}
 	plist, err := a.WritePlist()
 	if err != nil {
 		return err
 	}
-	l := a.launcher()
-	_, _ = l.Run(ctx, "bootout", a.serviceTarget())
-	if out, err := l.Run(ctx, "bootstrap", domainTarget(), plist); err != nil {
+	_, _ = a.launchctl(ctx, "bootout", a.serviceTarget())
+	if out, err := a.launchctl(ctx, "bootstrap", domainTarget(), plist); err != nil {
 		return fmt.Errorf("launchctl bootstrap: %w: %s", err, out)
 	}
-	_, _ = l.Run(ctx, "enable", a.serviceTarget())
+	_, _ = a.launchctl(ctx, "enable", a.serviceTarget())
 	// Plain kickstart (no -k) covers the loaded-but-not-running race and no-ops when already running.
-	if out, err := l.Run(ctx, "kickstart", a.serviceTarget()); err != nil {
+	if out, err := a.launchctl(ctx, "kickstart", a.serviceTarget()); err != nil {
 		return fmt.Errorf("launchctl kickstart: %w: %s", err, out)
 	}
 	return nil
@@ -212,7 +195,10 @@ func (a Agent) Install(ctx context.Context) error {
 // Uninstall boots out the agent and removes its plist. A missing plist is not
 // an error.
 func (a Agent) Uninstall(ctx context.Context) error {
-	_, _ = a.launcher().Run(ctx, "bootout", a.serviceTarget())
+	if a.Runner == nil {
+		return errors.New("service: disposable task runner is required")
+	}
+	_, _ = a.launchctl(ctx, "bootout", a.serviceTarget())
 	path, err := a.PlistPath()
 	if err != nil {
 		return err
@@ -225,7 +211,7 @@ func (a Agent) Uninstall(ctx context.Context) error {
 
 // Loaded reports whether launchd currently knows about the agent.
 func (a Agent) Loaded(ctx context.Context) bool {
-	_, err := a.launcher().Run(ctx, "print", a.serviceTarget())
+	_, err := a.launchctl(ctx, "print", a.serviceTarget())
 	return err == nil
 }
 
@@ -267,9 +253,7 @@ func brewPrefixes() []string {
 func (a Agent) brewLabel() string { return "homebrew.mxcl." + a.Formula }
 
 func (a Agent) brewServices(ctx context.Context, action string) error {
-	cmd := exec.CommandContext(ctx, "brew", "services", action, a.Formula)
-	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-	return cmd.Run()
+	return runSplit(ctx, a.Runner, "brew", os.Stdout, os.Stderr, "services", action, a.Formula)
 }
 
 // BrewStart starts the daemon via `brew services` (installs the user agent).
@@ -283,7 +267,7 @@ func (a Agent) BrewStop(ctx context.Context) error { return a.brewServices(ctx, 
 // loaded-but-never-running, so kick it explicitly.
 func (a Agent) BrewKickstart(ctx context.Context) error {
 	target := domainTarget() + "/" + a.brewLabel()
-	if out, err := a.launcher().Run(ctx, "kickstart", target); err != nil {
+	if out, err := a.launchctl(ctx, "kickstart", target); err != nil {
 		return fmt.Errorf("launchctl kickstart %s: %w: %s", target, err, out)
 	}
 	return nil
@@ -291,8 +275,8 @@ func (a Agent) BrewKickstart(ctx context.Context) error {
 
 // BrewInfo returns `brew services info <formula>` output for status display.
 func (a Agent) BrewInfo(ctx context.Context) (string, error) {
-	out, err := exec.CommandContext(ctx, "brew", "services", "info", a.Formula).CombinedOutput()
-	return strings.TrimSpace(string(out)), err
+	out, err := runCombined(ctx, a.Runner, "brew", "services", "info", a.Formula)
+	return strings.TrimSpace(out), err
 }
 
 // StatusLines is the management block a consumer's `service status` command
@@ -320,21 +304,25 @@ func selfStatus(loaded bool) string {
 // BrewReinstall runs `brew reinstall <formula>`, streaming brew's output to out
 // and errOut. Errors when Homebrew is absent or the reinstall fails.
 func (a Agent) BrewReinstall(ctx context.Context, out, errOut io.Writer) error {
-	return brewStream(ctx, out, errOut, "reinstall", a.Formula)
+	return brewStream(ctx, a.Runner, out, errOut, "reinstall", a.Formula)
 }
 
 // InstallCask runs `brew install --cask <ref>`, streaming brew's output to out
 // and errOut. ref may carry a tap, which brew auto-taps. Errors on failure.
-func InstallCask(ctx context.Context, ref string, out, errOut io.Writer) error {
-	return brewStream(ctx, out, errOut, "install", "-y", "--cask", ref)
+func InstallCask(
+	ctx context.Context,
+	runner supervise.TaskRunner,
+	ref string,
+	out, errOut io.Writer,
+) error {
+	return brewStream(ctx, runner, out, errOut, "install", "-y", "--cask", ref)
 }
 
-func brewStream(ctx context.Context, out, errOut io.Writer, args ...string) error {
-	if _, err := exec.LookPath("brew"); err != nil {
-		return fmt.Errorf("brew is not installed or not on PATH: %w", err)
-	}
-	//nolint:gosec // G204: fixed brew subcommand
-	cmd := exec.CommandContext(ctx, "brew", args...)
-	cmd.Stdout, cmd.Stderr = out, errOut
-	return cmd.Run()
+func brewStream(
+	ctx context.Context,
+	runner supervise.TaskRunner,
+	out, errOut io.Writer,
+	args ...string,
+) error {
+	return runSplit(ctx, runner, "brew", out, errOut, args...)
 }

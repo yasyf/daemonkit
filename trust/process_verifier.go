@@ -25,14 +25,9 @@ const (
 	verifierResultFailed  = "failed"
 )
 
-// TaskRunner executes one killable, synchronously reaped disposable task.
-type TaskRunner interface {
-	Run(context.Context, supervise.Task) error
-}
-
 // ProcessVerifier runs code-identity verification in a disposable child.
 type ProcessVerifier struct {
-	Runner     TaskRunner
+	Runner     supervise.TaskRunner
 	Executable string
 	Policy     Policy
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"net"
 	"os"
@@ -580,34 +581,74 @@ func TestAcceptedSessionDoneClosesOnServerShutdown(t *testing.T) {
 }
 
 func TestClientAbortIsTypedAndWaitsForAcceptedSessionSettlement(t *testing.T) {
+	const attempts = 32
 	sessions := make(chan *wire.AcceptedSession, 1)
-	started := make(chan struct{})
 	server := &wire.Server{Build: "server-test"}
 	server.RegisterControl("block", func(ctx context.Context, request wire.Request) (any, error) {
 		sessions <- request.Session
-		close(started)
 		<-ctx.Done()
 		return nil, ctx.Err()
 	})
 	running := startSessionServer(t, server, func() (func(), error) { return func() {}, nil })
-	client := newClient(t, running, nil)
-	call, err := client.Open(context.Background(), "block", "", nil, true)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
+	for attempt := range attempts {
+		client := newClient(t, running, nil)
+		call, err := client.Open(context.Background(), "block", "", nil, true)
+		if err != nil {
+			t.Fatalf("attempt %d Open: %v", attempt, err)
+		}
+		session := <-sessions
+		cause := fmt.Errorf("dispose child %d", attempt)
+		if err := client.Abort(cause); err != nil {
+			t.Fatalf("attempt %d Abort: %v", attempt, err)
+		}
+		if _, err := call.Response(context.Background()); !errors.Is(err, wire.ErrClientAbort) || !errors.Is(err, cause) {
+			t.Fatalf("attempt %d aborted call error = %v, want ErrClientAbort and cause", attempt, err)
+		}
+		if err := client.Close(); !errors.Is(err, wire.ErrClientAbort) || !errors.Is(err, cause) {
+			t.Fatalf("attempt %d Close after Abort = %v, want ErrClientAbort and cause", attempt, err)
+		}
+		select {
+		case <-session.Done():
+		case <-time.After(time.Second):
+			t.Fatalf("attempt %d accepted session did not settle after abort", attempt)
+		}
 	}
-	session := <-sessions
-	<-started
-	cause := errors.New("dispose child")
-	if err := client.Abort(cause); err != nil {
-		t.Fatalf("Abort: %v", err)
-	}
-	if _, err := call.Response(context.Background()); !errors.Is(err, wire.ErrClientAbort) || !errors.Is(err, cause) {
-		t.Fatalf("aborted call error = %v, want ErrClientAbort and cause", err)
-	}
-	select {
-	case <-session.Done():
-	case <-time.After(time.Second):
-		t.Fatal("accepted session did not settle after abort")
+}
+
+func TestNaturalClientCloseStrictlyAcknowledgesAndSettlesSession(t *testing.T) {
+	const attempts = 32
+	sessions := make(chan *wire.AcceptedSession, 1)
+	var active atomic.Int32
+	server := &wire.Server{Build: "server-test", MaxSessions: 1}
+	server.RegisterControl("ping", func(_ context.Context, request wire.Request) (any, error) {
+		sessions <- request.Session
+		return true, nil
+	})
+	running := startSessionServer(t, server, admitAll(&active))
+	for attempt := range attempts {
+		client := newClient(t, running, nil)
+		result, err := client.Call(context.Background(), "ping", "", nil)
+		if err != nil || result.Outcome != wire.Delivered {
+			t.Fatalf("attempt %d Call = %#v, %v", attempt, result, err)
+		}
+		session := <-sessions
+		waitNoAdmissions(t, &active)
+		select {
+		case <-session.Done():
+			t.Fatalf("attempt %d session ended before Close", attempt)
+		default:
+		}
+		if err := client.Close(); err != nil {
+			t.Fatalf("attempt %d Close: %v", attempt, err)
+		}
+		select {
+		case <-session.Done():
+		case <-time.After(time.Second):
+			t.Fatalf("attempt %d session did not settle after acknowledged Close", attempt)
+		}
+		if err := client.Close(); err != nil {
+			t.Fatalf("attempt %d repeated Close: %v", attempt, err)
+		}
 	}
 }
 
