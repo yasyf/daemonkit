@@ -26,8 +26,9 @@ func (s *AcceptedSession) Build() string { return s.s.build }
 // for lifecycle or other protected service traffic.
 func (s *AcceptedSession) Protected() bool { return s.s.protected }
 
-// Done closes when this exact authenticated session is torn down.
-func (s *AcceptedSession) Done() <-chan struct{} { return s.s.ctx.Done() }
+// Done closes after this exact authenticated session is fully settled and
+// removed from the server.
+func (s *AcceptedSession) Done() <-chan struct{} { return s.s.done }
 
 // PushEvent enqueues a server-pushed event with bounded backpressure.
 func (s *AcceptedSession) PushEvent(ctx context.Context, event Event) error {
@@ -57,6 +58,7 @@ type session struct {
 	eventCredits   *creditWindow
 	requestsDone   chan struct{}
 	writerDone     chan struct{}
+	done           chan struct{}
 
 	mu        sync.Mutex
 	active    map[uint64]*requestState

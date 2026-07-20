@@ -386,13 +386,16 @@ func (s *Server) serveConn(
 		eventCredits:   newCreditWindow(),
 		requestsDone:   make(chan struct{}),
 		writerDone:     make(chan struct{}),
+		done:           make(chan struct{}),
 		active:         make(map[uint64]*requestState),
 		seen:           make(map[uint64]struct{}),
 	}
 	sess.accepted = &AcceptedSession{s: sess}
 	s.addSession(sess)
-	defer s.removeSession(sess)
-	return sess.run(sessCtx, releaseCapacity)
+	err = sess.run(sessCtx, releaseCapacity)
+	s.removeSession(sess)
+	close(sess.done)
+	return err
 }
 
 func (s *Server) serverHandshake(codec *Codec) (BuildIdentity, []byte, error) {

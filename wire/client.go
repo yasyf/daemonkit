@@ -17,6 +17,8 @@ var (
 	ErrCallDone = errors.New("wire: call already settled")
 	// ErrCancelSettlement means a canceled request never produced a terminal response.
 	ErrCancelSettlement = errors.New("wire: canceled call did not settle")
+	// ErrClientAbort means the local owner intentionally tore down the session.
+	ErrClientAbort = errors.New("wire: client aborted session")
 )
 
 const defaultCancelSettlementTimeout = 5 * time.Second
@@ -538,6 +540,21 @@ func (c *Client) deliverEvents() {
 
 // Close terminates the session and all pending calls.
 func (c *Client) Close() error { return c.close(context.Background()) }
+
+// Abort tears down the local session without a GoAway exchange. Pending calls
+// fail with ErrClientAbort and the supplied cause.
+func (c *Client) Abort(cause error) error {
+	c.closeOnce.Do(func() {
+		if cause == nil {
+			cause = ErrClientAbort
+		} else {
+			cause = errors.Join(ErrClientAbort, cause)
+		}
+		c.fail(cause)
+	})
+	c.loopWG.Wait()
+	return nil
+}
 
 func (c *Client) close(parent context.Context) error {
 	c.closeOnce.Do(func() {

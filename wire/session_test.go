@@ -579,6 +579,38 @@ func TestAcceptedSessionDoneClosesOnServerShutdown(t *testing.T) {
 	}
 }
 
+func TestClientAbortIsTypedAndWaitsForAcceptedSessionSettlement(t *testing.T) {
+	sessions := make(chan *wire.AcceptedSession, 1)
+	started := make(chan struct{})
+	server := &wire.Server{Build: "server-test"}
+	server.RegisterControl("block", func(ctx context.Context, request wire.Request) (any, error) {
+		sessions <- request.Session
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	running := startSessionServer(t, server, func() (func(), error) { return func() {}, nil })
+	client := newClient(t, running, nil)
+	call, err := client.Open(context.Background(), "block", "", nil, true)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	session := <-sessions
+	<-started
+	cause := errors.New("dispose child")
+	if err := client.Abort(cause); err != nil {
+		t.Fatalf("Abort: %v", err)
+	}
+	if _, err := call.Response(context.Background()); !errors.Is(err, wire.ErrClientAbort) || !errors.Is(err, cause) {
+		t.Fatalf("aborted call error = %v, want ErrClientAbort and cause", err)
+	}
+	select {
+	case <-session.Done():
+	case <-time.After(time.Second):
+		t.Fatal("accepted session did not settle after abort")
+	}
+}
+
 func TestSessionSurvivesPastHandshakeDeadline(t *testing.T) {
 	const handshakeTimeout = 100 * time.Millisecond
 	server := &wire.Server{Build: "server-test", HandshakeTimeout: handshakeTimeout}
