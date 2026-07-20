@@ -105,7 +105,9 @@ func (f *fakeRegistry) Owns(proc.Record) (bool, error) {
 	return result.owns, result.err
 }
 
-func (f *fakeRegistry) Reap(context.Context) error { return f.reapErr }
+func (f *fakeRegistry) Reap(context.Context) (proc.ReapResult, error) {
+	return proc.ReapResult{}, f.reapErr
+}
 
 func (f *fakeRegistry) recordCount() int {
 	f.mu.Lock()
@@ -757,7 +759,7 @@ func TestRecoverDelegatesToRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = pool.Recover(context.Background())
+	_, err = pool.Recover(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "recover workers") || !errors.Is(err, registry.reapErr) {
 		t.Fatalf("Recover error = %v, want wrapped registry error", err)
 	}
@@ -816,8 +818,12 @@ func TestRecoverReapsLeaderlessTermIgnoringSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPool: %v", err)
 	}
-	if err := pool.Recover(ctx); err != nil {
+	recovered, err := pool.Recover(ctx)
+	if err != nil {
 		t.Fatalf("Recover: %v", err)
+	}
+	if len(recovered.Receipts) != 1 || recovered.More {
+		t.Fatalf("Recover receipts = %+v, want one settled group", recovered)
 	}
 	assertPIDGone(t, descendantPID)
 	records, err := store.Load(ctx)
@@ -836,10 +842,11 @@ func readPIDFile(t *testing.T, path string) int {
 		body, err := os.ReadFile(path)
 		if err == nil {
 			pid, err := strconv.Atoi(strings.TrimSpace(string(body)))
-			if err != nil {
-				t.Fatalf("parse pid file %s: %v", path, err)
+			if err == nil {
+				return pid
 			}
-			return pid
+			time.Sleep(10 * time.Millisecond)
+			continue
 		}
 		if !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("read pid file %s: %v", path, err)

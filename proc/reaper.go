@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"syscall"
 	"time"
@@ -22,7 +23,7 @@ const DefaultReapSettlement = 2 * time.Second
 
 const (
 	settlementPollInterval = 10 * time.Millisecond
-	recordSchemaVersion    = 3
+	recordSchemaVersion    = 4
 )
 
 // errNoProc is a definitive "gone", distinct from a probe failure (Undetermined, fails closed).
@@ -114,8 +115,21 @@ type Store interface {
 	Add(ctx context.Context, rec Record) error
 	// Load returns every stored record.
 	Load(ctx context.Context) ([]Record, error)
-	// Remove deletes the given records (matched by PID + StartTime + Boot).
+	// Remove deletes only complete exact record matches. A newer generation
+	// owning the same process instance is never removed by stale cleanup.
 	Remove(ctx context.Context, victims []Record) error
+	// BeginReap durably claims an exact prior-generation record so concurrent
+	// graceful untracking cannot erase it before receipt commit.
+	BeginReap(ctx context.Context, rec Record, reaperGeneration string) error
+	// CommitReap atomically replaces one exact process record with its durable
+	// retirement receipt.
+	CommitReap(ctx context.Context, rec Record, receipt ReapReceipt) error
+	// LoadReapReceipts returns a bounded stable page and whether more remain.
+	LoadReapReceipts(ctx context.Context, limit int) ([]ReapReceipt, bool, error)
+	// HasReapReceipt reports an exact durable receipt match.
+	HasReapReceipt(ctx context.Context, receipt ReapReceipt) (bool, error)
+	// AcknowledgeReap forgets an exact receipt; absence is idempotent.
+	AcknowledgeReap(ctx context.Context, receipt ReapReceipt) error
 }
 
 type procInfo struct {
@@ -380,156 +394,206 @@ func (r *Reaper) Owns(rec Record) (bool, error) {
 	return true, nil
 }
 
-// Reap revalidates every stored record and signals only provably-ours
-// orphans of a prior generation, dropping gone-or-reused records and keeping
-// unresolved ones. Run it once at cold start before accepting registrations.
-func (r *Reaper) Reap(ctx context.Context) error {
+// Reap returns one bounded stable page of durable retirement receipts. It
+// revalidates stored records and atomically replaces each settled prior
+// generation with its receipt before that kill authority is erased.
+func (r *Reaper) Reap(ctx context.Context) (ReapResult, error) {
+	receipts, moreReceipts, err := r.Store.LoadReapReceipts(ctx, ReapReceiptPageLimit)
+	if err != nil {
+		return ReapResult{}, fmt.Errorf("load reaper receipts: %w", err)
+	}
+	result := ReapResult{Receipts: receipts, More: moreReceipts}
+	if moreReceipts || len(receipts) == ReapReceiptPageLimit {
+		result.More = true
+		return result, nil
+	}
 	recs, err := r.Store.Load(ctx)
 	if err != nil {
-		return fmt.Errorf("load reaper records: %w", err)
+		return ReapResult{}, fmt.Errorf("load reaper records: %w", err)
 	}
 	boot, err := r.prb().bootID()
 	if err != nil {
-		return fmt.Errorf("load current boot identity: %w", err)
+		return ReapResult{}, fmt.Errorf("load current boot identity: %w", err)
 	}
-	drop := make([]Record, 0, len(recs))
 	var unresolved []error
-	for _, rec := range recs {
+	for index, rec := range recs {
 		if err := ctx.Err(); err != nil {
-			return err
+			return ReapResult{}, err
 		}
-		reaped, reapErr := r.reapOne(ctx, rec, boot)
+		if rec.Generation == r.Generation {
+			continue
+		}
+		if claimErr := r.Store.BeginReap(ctx, rec, r.Generation); claimErr != nil {
+			unresolved = append(unresolved, fmt.Errorf("claim child %d for reap: %w", rec.PID, claimErr))
+			continue
+		}
+		reaped, outcome, reapErr := r.reapOne(ctx, rec, boot)
 		if reapErr != nil {
 			unresolved = append(unresolved, fmt.Errorf("reap child %d: %w", rec.PID, reapErr))
 		}
 		if reaped {
-			drop = append(drop, rec)
+			receipt, receiptErr := newReapReceipt(rec, r.Generation, outcome)
+			if receiptErr != nil {
+				unresolved = append(unresolved, fmt.Errorf("receipt for child %d: %w", rec.PID, receiptErr))
+				continue
+			}
+			if commitErr := r.Store.CommitReap(ctx, rec, receipt); commitErr != nil {
+				unresolved = append(unresolved, fmt.Errorf("commit receipt for child %d: %w", rec.PID, commitErr))
+				continue
+			}
+			result.Receipts = append(result.Receipts, receipt)
+			if len(result.Receipts) == ReapReceiptPageLimit {
+				result.More = index+1 < len(recs)
+				break
+			}
 		}
 	}
-	if len(drop) > 0 {
-		if err := r.Store.Remove(ctx, drop); err != nil {
-			unresolved = append(unresolved, fmt.Errorf("prune reaped records: %w", err))
-		}
-	}
-	return errors.Join(unresolved...)
+	return result, errors.Join(unresolved...)
 }
 
 // Drop only on provably gone, reused, or reaped; our own live child or an Undetermined probe fails closed and keeps the record.
-func (r *Reaper) reapOne(ctx context.Context, rec Record, boot string) (bool, error) {
+func (r *Reaper) reapOne(
+	ctx context.Context,
+	rec Record,
+	boot string,
+) (bool, ReapOutcome, error) {
 	if err := rec.Validate(); err != nil {
-		return false, err
+		return false, 0, err
 	}
 	if rec.Boot != boot {
-		return true, nil
+		return true, ReapCrossBoot, nil
 	}
 	if rec.PID <= 1 || rec.PID == os.Getpid() {
-		return false, errors.New("refusing unsafe process identity")
+		return false, 0, errors.New("refusing unsafe process identity")
 	}
 	if gone, err := r.auditRecordGone(rec); gone || err != nil {
-		return gone, err
+		return gone, ReapAbsent, err
 	}
 	info, err := r.prb().probe(rec.PID)
 	if rec.ProcessGroup {
-		return r.reapGroup(ctx, rec, info, err, false)
+		return r.reapGroupOutcome(ctx, rec, info, err, false)
 	}
 	switch {
 	case errors.Is(err, errNoProc):
-		return true, nil // recorded process gone → stale record
+		return true, ReapAbsent, nil
 	case err != nil:
-		return false, err // Undetermined → fail closed, keep
+		return false, 0, err
 	case info.startTime != rec.StartTime:
-		return true, nil // pid reused: a different process holds it now → drop stale record
+		return true, ReapIdentityReused, nil
 	case info.zombie:
-		return true, nil
+		return true, ReapAbsent, nil
 	case rec.Generation == r.Generation:
-		return false, nil // our own current-generation child → never signal, keep
+		return false, 0, nil
 	}
-	return r.reapOrphan(ctx, rec)
+	return r.reapOrphanOutcome(ctx, rec)
 }
 
 // SIGTERM → grace → re-revalidate → SIGKILL; ESRCH is success, and a PID reused during grace is never SIGKILLed.
 func (r *Reaper) reapOrphan(ctx context.Context, rec Record) (bool, error) {
+	reaped, _, err := r.reapOrphanOutcome(ctx, rec)
+	return reaped, err
+}
+
+func (r *Reaper) reapOrphanOutcome(
+	ctx context.Context,
+	rec Record,
+) (bool, ReapOutcome, error) {
 	gone, err := r.sendRecordSignal(rec, syscall.SIGTERM)
 	if err != nil {
-		return false, err // Undetermined signal error → fail closed
+		return false, 0, err
 	}
 	if gone {
-		return true, nil // ESRCH: already gone
+		return true, ReapAbsent, nil
 	}
 	select {
 	case <-ctx.Done():
-		return false, ctx.Err() // aborted mid-grace; retry next pass
+		return false, 0, ctx.Err()
 	case <-clockOrReal(r.clock).After(r.graceDur()):
 	}
 	if gone, err := r.auditRecordGone(rec); gone || err != nil {
-		return gone, err
+		return gone, ReapTerminated, err
 	}
 	info, perr := r.prb().probe(rec.PID)
 	switch {
 	case errors.Is(perr, errNoProc):
-		return true, nil // exited during grace
+		return true, ReapTerminated, nil
 	case perr != nil:
-		return false, perr // Undetermined → do not escalate
+		return false, 0, perr
 	case info.startTime != rec.StartTime:
-		return true, nil // pid reused during grace: no longer provably ours; never SIGKILL it
+		return true, ReapIdentityReused, nil
 	case info.zombie:
-		return true, nil
+		return true, ReapTerminated, nil
 	}
 	if _, err := r.sendRecordSignal(rec, syscall.SIGKILL); err != nil {
-		return false, err // Undetermined → fail closed
+		return false, 0, err
 	}
-	return r.awaitProcessSettlement(ctx, rec)
+	reaped, err := r.awaitProcessSettlement(ctx, rec)
+	return reaped, ReapTerminated, err
 }
 
 func (r *Reaper) reapGroup(ctx context.Context, rec Record, leader procInfo, leaderErr error, permitCurrent bool) (bool, error) {
+	reaped, _, err := r.reapGroupOutcome(ctx, rec, leader, leaderErr, permitCurrent)
+	return reaped, err
+}
+
+func (r *Reaper) reapGroupOutcome(
+	ctx context.Context,
+	rec Record,
+	leader procInfo,
+	leaderErr error,
+	permitCurrent bool,
+) (bool, ReapOutcome, error) {
 	if rec.SessionID <= 1 || rec.SessionID != rec.PID {
-		return false, errors.New("process group has no durable dedicated-session identity")
+		return false, 0, errors.New("process group has no durable dedicated-session identity")
 	}
 	if !permitCurrent && rec.Generation == r.Generation {
-		return false, nil
+		return false, 0, nil
 	}
 	switch {
 	case leaderErr == nil && leader.startTime != rec.StartTime:
-		return true, nil
+		return true, ReapIdentityReused, nil
 	case leaderErr == nil && (leader.groupID != rec.PID || leader.sessionID != rec.SessionID):
-		return false, errors.New("process-group leader left its recorded group or session")
+		return false, 0, errors.New("process-group leader left its recorded group or session")
 	case leaderErr != nil && !errors.Is(leaderErr, errNoProc):
-		return false, leaderErr
+		return false, 0, leaderErr
 	}
 	members, err := r.verifiedGroupMembers(rec)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	if len(members) == 0 {
-		return true, nil
+		return true, ReapAbsent, nil
 	}
 	gone, err := r.sendSignal(-rec.PID, syscall.SIGTERM)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	if gone {
-		return r.groupGone(rec)
+		reaped, err := r.groupGone(rec)
+		return reaped, ReapTerminated, err
 	}
 	select {
 	case <-ctx.Done():
-		return false, ctx.Err()
+		return false, 0, ctx.Err()
 	case <-clockOrReal(r.clock).After(r.graceDur()):
 	}
 	members, err = r.verifiedGroupMembers(rec)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	if len(members) == 0 {
-		return true, nil
+		return true, ReapTerminated, nil
 	}
 	gone, err = r.sendSignal(-rec.PID, syscall.SIGKILL)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	if gone {
-		return r.groupGone(rec)
+		reaped, err := r.groupGone(rec)
+		return reaped, ReapTerminated, err
 	}
-	return r.awaitGroupSettlement(ctx, rec)
+	reaped, err := r.awaitGroupSettlement(ctx, rec)
+	return reaped, ReapTerminated, err
 }
 
 func (r *Reaper) awaitProcessSettlement(ctx context.Context, rec Record) (bool, error) {
@@ -732,14 +796,23 @@ func (s *FileStore) recordOps() recordFileOps {
 
 // Add records rec, replacing any prior record for the same process instance.
 func (s *FileStore) Add(ctx context.Context, rec Record) error {
-	return s.mutate(ctx, func(recs []Record) []Record {
-		out := recs[:0:0]
-		for _, e := range recs {
-			if recordKey(e) != recordKey(rec) {
-				out = append(out, e)
+	if err := rec.Validate(); err != nil {
+		return err
+	}
+	return s.mutateFile(ctx, func(file recordFile) (recordFile, error) {
+		for _, claim := range file.Claims {
+			if recordKey(claim.Record) == recordKey(rec) {
+				return recordFile{}, errors.New("proc: process instance is claimed for reap")
 			}
 		}
-		return append(out, rec)
+		out := file.Records[:0:0]
+		for _, existing := range file.Records {
+			if recordKey(existing) != recordKey(rec) {
+				out = append(out, existing)
+			}
+		}
+		file.Records = append(out, rec)
+		return file, nil
 	})
 }
 
@@ -748,21 +821,59 @@ func (s *FileStore) Remove(ctx context.Context, victims []Record) error {
 	if len(victims) == 0 {
 		return nil
 	}
-	drop := make(map[string]struct{}, len(victims))
+	drop := make(map[Record]struct{}, len(victims))
 	for _, v := range victims {
-		if err := validateRecordIdentity(v); err != nil {
+		if err := v.Validate(); err != nil {
 			return err
 		}
-		drop[recordKey(v)] = struct{}{}
+		drop[v] = struct{}{}
 	}
-	return s.mutate(ctx, func(recs []Record) []Record {
-		out := recs[:0:0]
-		for _, e := range recs {
-			if _, ok := drop[recordKey(e)]; !ok {
-				out = append(out, e)
+	return s.mutateFile(ctx, func(file recordFile) (recordFile, error) {
+		claimed := make(map[string]struct{}, len(file.Claims))
+		for _, claim := range file.Claims {
+			claimed[recordKey(claim.Record)] = struct{}{}
+		}
+		out := file.Records[:0:0]
+		for _, existing := range file.Records {
+			_, dropRequested := drop[existing]
+			_, reapClaimed := claimed[recordKey(existing)]
+			if !dropRequested || reapClaimed {
+				out = append(out, existing)
 			}
 		}
-		return out
+		file.Records = out
+		return file, nil
+	})
+}
+
+// BeginReap durably fences graceful untracking of rec.
+func (s *FileStore) BeginReap(
+	ctx context.Context,
+	rec Record,
+	reaperGeneration string,
+) error {
+	claim := reapClaim{Record: rec, ReaperGeneration: reaperGeneration}
+	if err := claim.validate(); err != nil {
+		return err
+	}
+	return s.mutateFile(ctx, func(file recordFile) (recordFile, error) {
+		present := false
+		for _, existing := range file.Records {
+			if existing == rec {
+				present = true
+			}
+		}
+		if !present {
+			return recordFile{}, errors.New("proc: reap claim has no exact durable process record")
+		}
+		claims := file.Claims[:0:0]
+		for _, existing := range file.Claims {
+			if recordKey(existing.Record) != recordKey(rec) {
+				claims = append(claims, existing)
+			}
+		}
+		file.Claims = append(claims, claim)
+		return file, nil
 	})
 }
 
@@ -780,7 +891,146 @@ func (s *FileStore) Load(ctx context.Context) ([]Record, error) {
 	return readRecords(s.Path)
 }
 
-func (s *FileStore) mutate(ctx context.Context, fn func([]Record) []Record) error {
+// CommitReap atomically replaces rec with its exact durable receipt.
+func (s *FileStore) CommitReap(ctx context.Context, rec Record, receipt ReapReceipt) error {
+	if err := rec.Validate(); err != nil {
+		return err
+	}
+	if err := receipt.Validate(); err != nil {
+		return err
+	}
+	if receipt.Record != rec {
+		return fmt.Errorf("%w: receipt record mismatch", ErrInvalidReapReceipt)
+	}
+	return s.mutateFile(ctx, func(file recordFile) (recordFile, error) {
+		receiptPresent := false
+		for _, existing := range file.Receipts {
+			if existing.Digest != receipt.Digest {
+				continue
+			}
+			if existing != receipt {
+				return recordFile{}, fmt.Errorf("%w: receipt digest collision", ErrInvalidReapReceipt)
+			}
+			receiptPresent = true
+		}
+		claimPresent := false
+		claims := file.Claims[:0:0]
+		for _, claim := range file.Claims {
+			if claim.Record == rec && claim.ReaperGeneration == receipt.ReaperGeneration {
+				claimPresent = true
+				continue
+			}
+			if recordKey(claim.Record) == recordKey(rec) {
+				return recordFile{}, errors.New("proc: reap claim generation changed before receipt commit")
+			}
+			claims = append(claims, claim)
+		}
+		if !claimPresent && !receiptPresent {
+			return recordFile{}, errors.New("proc: reap receipt has no exact durable claim")
+		}
+		recordPresent := false
+		records := file.Records[:0:0]
+		for _, existing := range file.Records {
+			if existing == rec {
+				recordPresent = true
+				continue
+			}
+			if recordKey(existing) == recordKey(rec) {
+				return recordFile{}, fmt.Errorf("%w: process record changed before receipt commit", ErrIdentityChanged)
+			}
+			records = append(records, existing)
+		}
+		if !recordPresent && !receiptPresent {
+			return recordFile{}, errors.New("proc: reap receipt has no exact durable process record")
+		}
+		file.Records = records
+		file.Claims = claims
+		if !receiptPresent {
+			file.Receipts = append(file.Receipts, receipt)
+		}
+		return file, nil
+	})
+}
+
+// LoadReapReceipts returns one stable bounded page.
+func (s *FileStore) LoadReapReceipts(
+	ctx context.Context,
+	limit int,
+) ([]ReapReceipt, bool, error) {
+	if limit <= 0 || limit > ReapReceiptPageLimit {
+		return nil, false, fmt.Errorf("proc: reap receipt limit %d is out of bounds", limit)
+	}
+	lock, err := (FileLockSpec{
+		Path:     s.Path + ".lock",
+		Mode:     FileLockExclusive,
+		Deadline: 5 * time.Second,
+	}).Acquire(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer lock.Close()
+	file, err := readRecordFile(s.Path)
+	if err != nil {
+		return nil, false, err
+	}
+	more := len(file.Receipts) > limit
+	receipts := file.Receipts
+	if more {
+		receipts = receipts[:limit]
+	}
+	return append([]ReapReceipt(nil), receipts...), more, nil
+}
+
+// HasReapReceipt reports an exact durable receipt match.
+func (s *FileStore) HasReapReceipt(ctx context.Context, receipt ReapReceipt) (bool, error) {
+	if err := receipt.Validate(); err != nil {
+		return false, err
+	}
+	lock, err := (FileLockSpec{
+		Path:     s.Path + ".lock",
+		Mode:     FileLockExclusive,
+		Deadline: 5 * time.Second,
+	}).Acquire(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer lock.Close()
+	file, err := readRecordFile(s.Path)
+	if err != nil {
+		return false, err
+	}
+	for _, existing := range file.Receipts {
+		if existing == receipt {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// AcknowledgeReap forgets an exact receipt; absence is a successful no-op.
+func (s *FileStore) AcknowledgeReap(ctx context.Context, receipt ReapReceipt) error {
+	if err := receipt.Validate(); err != nil {
+		return err
+	}
+	return s.mutateFile(ctx, func(file recordFile) (recordFile, error) {
+		receipts := file.Receipts[:0:0]
+		for _, existing := range file.Receipts {
+			if existing.Digest == receipt.Digest && existing != receipt {
+				return recordFile{}, fmt.Errorf("%w: receipt digest collision", ErrInvalidReapReceipt)
+			}
+			if existing != receipt {
+				receipts = append(receipts, existing)
+			}
+		}
+		file.Receipts = receipts
+		return file, nil
+	})
+}
+
+func (s *FileStore) mutateFile(
+	ctx context.Context,
+	fn func(recordFile) (recordFile, error),
+) error {
 	lock, err := (FileLockSpec{
 		Path:     s.Path + ".lock",
 		Mode:     FileLockExclusive,
@@ -790,11 +1040,15 @@ func (s *FileStore) mutate(ctx context.Context, fn func([]Record) []Record) erro
 		return err
 	}
 	defer lock.Close()
-	recs, err := readRecords(s.Path)
+	file, err := readRecordFile(s.Path)
 	if err != nil {
 		return err
 	}
-	return writeRecords(s.Path, fn(recs), s.recordOps())
+	file, err = fn(file)
+	if err != nil {
+		return err
+	}
+	return writeRecordFile(s.Path, file, s.recordOps())
 }
 
 // PID, boot, and start time: reuse within or across boots is a distinct instance.
@@ -803,49 +1057,111 @@ func recordKey(r Record) string {
 }
 
 type recordFile struct {
-	Schema  int      `json:"schema"`
-	Records []Record `json:"records"`
+	Schema   int           `json:"schema"`
+	Records  []Record      `json:"records"`
+	Claims   []reapClaim   `json:"claims"`
+	Receipts []ReapReceipt `json:"receipts"`
 }
 
 func readRecords(path string) ([]Record, error) {
+	file, err := readRecordFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return file.Records, nil
+}
+
+func readRecordFile(path string) (recordFile, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		return recordFile{Schema: recordSchemaVersion}, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("read records %s: %w", path, err)
+		return recordFile{}, fmt.Errorf("read records %s: %w", path, err)
 	}
 	var file recordFile
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&file); err != nil {
-		return nil, fmt.Errorf("%w: parse records %s: %w", ErrRecordSchema, path, err)
+		return recordFile{}, fmt.Errorf("%w: parse records %s: %w", ErrRecordSchema, path, err)
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("%w: trailing records data", ErrRecordSchema)
+		return recordFile{}, fmt.Errorf("%w: trailing records data", ErrRecordSchema)
 	}
 	if file.Schema != recordSchemaVersion {
-		return nil, fmt.Errorf("%w: got %d, want %d", ErrRecordSchema, file.Schema, recordSchemaVersion)
+		return recordFile{}, fmt.Errorf("%w: got %d, want %d", ErrRecordSchema, file.Schema, recordSchemaVersion)
 	}
 	for _, rec := range file.Records {
 		if err := rec.Validate(); err != nil {
-			return nil, err
+			return recordFile{}, err
 		}
 	}
-	return file.Records, nil
+	claims := make(map[string]struct{}, len(file.Claims))
+	for _, claim := range file.Claims {
+		if err := claim.validate(); err != nil {
+			return recordFile{}, err
+		}
+		key := recordKey(claim.Record)
+		if _, duplicate := claims[key]; duplicate {
+			return recordFile{}, fmt.Errorf("%w: duplicate reap claim", ErrRecordSchema)
+		}
+		claims[key] = struct{}{}
+		if !slices.Contains(file.Records, claim.Record) {
+			return recordFile{}, fmt.Errorf("%w: reap claim has no exact process record", ErrRecordSchema)
+		}
+	}
+	seen := make(map[[32]byte]struct{}, len(file.Receipts))
+	for _, receipt := range file.Receipts {
+		if err := receipt.Validate(); err != nil {
+			return recordFile{}, err
+		}
+		if _, duplicate := seen[receipt.Digest]; duplicate {
+			return recordFile{}, fmt.Errorf("%w: duplicate receipt", ErrRecordSchema)
+		}
+		seen[receipt.Digest] = struct{}{}
+	}
+	return file, nil
 }
 
-func writeRecords(path string, recs []Record, ops recordFileOps) error {
-	if recs == nil {
-		recs = []Record{}
+func writeRecordFile(path string, file recordFile, ops recordFileOps) error {
+	if file.Records == nil {
+		file.Records = []Record{}
 	}
-	for _, rec := range recs {
+	if file.Receipts == nil {
+		file.Receipts = []ReapReceipt{}
+	}
+	if file.Claims == nil {
+		file.Claims = []reapClaim{}
+	}
+	for _, rec := range file.Records {
 		if err := rec.Validate(); err != nil {
 			return err
 		}
 	}
-	data, err := json.MarshalIndent(recordFile{Schema: recordSchemaVersion, Records: recs}, "", "  ")
+	claims := make(map[string]struct{}, len(file.Claims))
+	for _, claim := range file.Claims {
+		if err := claim.validate(); err != nil {
+			return err
+		}
+		key := recordKey(claim.Record)
+		if _, duplicate := claims[key]; duplicate {
+			return fmt.Errorf("%w: duplicate reap claim", ErrRecordSchema)
+		}
+		claims[key] = struct{}{}
+	}
+	seen := make(map[[32]byte]struct{}, len(file.Receipts))
+	for _, receipt := range file.Receipts {
+		if err := receipt.Validate(); err != nil {
+			return err
+		}
+		if _, duplicate := seen[receipt.Digest]; duplicate {
+			return fmt.Errorf("%w: duplicate receipt", ErrRecordSchema)
+		}
+		seen[receipt.Digest] = struct{}{}
+	}
+	file.Schema = recordSchemaVersion
+	data, err := json.MarshalIndent(file, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode records: %w", err)
 	}

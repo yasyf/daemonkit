@@ -343,7 +343,7 @@ func TestManagedProcessRecordIsRecoveredByNextGeneration(t *testing.T) {
 	newReaper := &proc.Reaper{
 		Store: store, Generation: "new-generation", Grace: 50 * time.Millisecond, Settlement: time.Second,
 	}
-	if err := newReaper.Reap(context.Background()); err != nil {
+	if _, err := newReaper.Reap(context.Background()); err != nil {
 		t.Fatalf("Reap: %v", err)
 	}
 	if err := process.Wait(context.Background()); err == nil {

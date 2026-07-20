@@ -20,22 +20,26 @@ import (
 type recordingAppReaper struct {
 	events       *[]string
 	record       proc.Record
+	reapResult   proc.ReapResult
 	reapErr      error
 	trackErr     error
 	terminateErr error
 	onTerminate  func()
 }
 
-type recordingAppRecovery struct{ events *[]string }
-
-func (r recordingAppRecovery) Reap(context.Context) error {
-	*r.events = append(*r.events, "recover")
-	return nil
+type recordingAppRecovery struct {
+	events     *[]string
+	reapResult proc.ReapResult
 }
 
-func (r *recordingAppReaper) Reap(context.Context) error {
+func (r recordingAppRecovery) Reap(context.Context) (proc.ReapResult, error) {
+	*r.events = append(*r.events, "recover")
+	return r.reapResult, nil
+}
+
+func (r *recordingAppReaper) Reap(context.Context) (proc.ReapResult, error) {
 	*r.events = append(*r.events, "reap-workers")
-	return r.reapErr
+	return r.reapResult, r.reapErr
 }
 
 func (r *recordingAppReaper) TrackIdentity(_ context.Context, identity proc.Identity) (proc.Record, error) {
@@ -177,8 +181,16 @@ func TestAppKeepAliveStopVerifiesTracksBootsOutTerminatesAndProvesAbsence(t *tes
 		return nil, nil
 	}
 	launchState(t, keepalive, events, &loaded)
-	if err := keepalive.Stop(t.Context(), spec, expected); err != nil {
+	reaperResult := proc.ReapResult{Receipts: []proc.ReapReceipt{{ReaperGeneration: "app"}}}
+	dependentResult := proc.ReapResult{Receipts: []proc.ReapReceipt{{ReaperGeneration: "dependent"}}, More: true}
+	reaper.reapResult = reaperResult
+	spec.Dependents = recordingAppRecovery{events: events, reapResult: dependentResult}
+	result, err := keepalive.Stop(t.Context(), spec, expected)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !slices.Equal(result.Receipts, append(reaperResult.Receipts, dependentResult.Receipts...)) || !result.More {
+		t.Fatalf("result = %+v, want combined durable receipts", result)
 	}
 	for _, event := range []string{"reap-workers", "peer", "trust", "track", "bootout", "terminate", "recover"} {
 		if !slices.Contains(*events, event) {
@@ -222,7 +234,7 @@ func TestAppKeepAliveStopRejectsAuthenticatedReplacement(t *testing.T) {
 		return []proc.Identity{{PID: 4241 + generation}}, nil
 	}
 	launchState(t, keepalive, events, &loaded)
-	if err := keepalive.Stop(t.Context(), spec, expected); err == nil {
+	if _, err := keepalive.Stop(t.Context(), spec, expected); err == nil {
 		t.Fatal("Stop accepted a replacement app that did not own the proof")
 	}
 	if got := count(*events, "terminate"); got != 0 {
@@ -255,7 +267,7 @@ func TestAppKeepAliveStopWaitsForRebindingLiveAppBeforeBootout(t *testing.T) {
 		return nil, nil
 	}
 	launchState(t, keepalive, events, &loaded)
-	if err := keepalive.Stop(t.Context(), spec, expected); err != nil {
+	if _, err := keepalive.Stop(t.Context(), spec, expected); err != nil {
 		t.Fatal(err)
 	}
 	if slices.Index(*events, "bootout") < slices.Index(*events, "track") {
@@ -269,7 +281,7 @@ func TestAppKeepAliveStopNoSocketLiveProcessFailsClosed(t *testing.T) {
 	spec.Dial = func(context.Context) (net.Conn, error) { return nil, syscall.ENOENT }
 	spec.processes = func(string) ([]proc.Identity, error) { return []proc.Identity{{PID: 4242}}, nil }
 	launchState(t, keepalive, events, &loaded)
-	if err := keepalive.Stop(t.Context(), spec, expected); err == nil {
+	if _, err := keepalive.Stop(t.Context(), spec, expected); err == nil {
 		t.Fatal("Stop claimed absence while an exact executable process remained live without a socket")
 	}
 	if slices.Contains(*events, "bootout") || slices.Contains(*events, "terminate") {
@@ -283,7 +295,7 @@ func TestAppKeepAliveStopAbsentUsesServiceAndInventoryQuietProof(t *testing.T) {
 	spec.Dial = func(context.Context) (net.Conn, error) { return nil, syscall.ENOENT }
 	spec.processes = func(string) ([]proc.Identity, error) { return nil, nil }
 	launchState(t, keepalive, events, &loaded)
-	if err := keepalive.Stop(t.Context(), spec, expected); err != nil {
+	if _, err := keepalive.Stop(t.Context(), spec, expected); err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Contains(*events, "bootout") || !slices.Contains(*events, "recover") {
@@ -308,7 +320,7 @@ func TestAppKeepAliveStopRestartsQuietProofAfterServiceReload(t *testing.T) {
 		return nil
 	}
 	launchState(t, keepalive, events, &loaded)
-	if err := keepalive.Stop(t.Context(), spec, expected); err != nil {
+	if _, err := keepalive.Stop(t.Context(), spec, expected); err != nil {
 		t.Fatal(err)
 	}
 	if pauses < 4 {
@@ -335,7 +347,7 @@ func TestAppKeepAliveStopRepeatedServiceReloadFailsByDeadline(t *testing.T) {
 		return nil
 	}
 	launchState(t, keepalive, events, &loaded)
-	if err := keepalive.Stop(t.Context(), spec, expected); err == nil {
+	if _, err := keepalive.Stop(t.Context(), spec, expected); err == nil {
 		t.Fatal("Stop accepted a service that reloaded throughout the quiet window")
 	}
 	if got := count(*events, "bootout"); got < 2 {
@@ -361,7 +373,7 @@ func TestAppKeepAliveStopRejectsSignatureAndPIDReuseBeforeBootout(t *testing.T) 
 			tc.set(&spec)
 			loaded := true
 			launchState(t, keepalive, events, &loaded)
-			if err := keepalive.Stop(t.Context(), spec, expected); err == nil {
+			if _, err := keepalive.Stop(t.Context(), spec, expected); err == nil {
 				t.Fatal("Stop accepted untrusted or recycled peer identity")
 			}
 			if slices.Contains(*events, "bootout") || slices.Contains(*events, "terminate") {
@@ -386,7 +398,7 @@ func TestAppKeepAliveStopRejectsExactProofMismatch(t *testing.T) {
 			tc.set(&expected)
 			loaded := true
 			launchState(t, keepalive, events, &loaded)
-			if err := keepalive.Stop(t.Context(), spec, expected); err == nil {
+			if _, err := keepalive.Stop(t.Context(), spec, expected); err == nil {
 				t.Fatal("Stop accepted changed authenticated proof identity")
 			}
 			if slices.Contains(*events, "bootout") || slices.Contains(*events, "terminate") {
@@ -404,7 +416,7 @@ func TestAppKeepAliveStopReapsStaleWorkersBeforeDial(t *testing.T) {
 		t.Fatal("dialed before stale worker recovery")
 		return nil, nil
 	}
-	if err := keepalive.Stop(t.Context(), spec, expected); !errors.Is(err, want) {
+	if _, err := keepalive.Stop(t.Context(), spec, expected); !errors.Is(err, want) {
 		t.Fatalf("Stop error = %v, want %v", err, want)
 	}
 	if !slices.Equal(*events, []string{"reap-workers"}) {
@@ -420,7 +432,7 @@ func TestAppKeepAliveStopRejectsSymlinkedApp(t *testing.T) {
 		t.Fatal(err)
 	}
 	keepalive.AppPath = link
-	if err := keepalive.Stop(t.Context(), spec, expected); err == nil {
+	if _, err := keepalive.Stop(t.Context(), spec, expected); err == nil {
 		t.Fatal("Stop accepted symlinked fixed app")
 	}
 }

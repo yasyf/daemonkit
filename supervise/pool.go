@@ -85,7 +85,7 @@ type WorkerRegistry interface {
 	TrackGroup(ctx context.Context, pid int) (proc.Record, error)
 	Untrack(ctx context.Context, rec proc.Record) error
 	Owns(rec proc.Record) (bool, error)
-	Reap(ctx context.Context) error
+	Reap(ctx context.Context) (proc.ReapResult, error)
 }
 
 // Task describes one disposable worker invocation. Stdin is withheld from the
@@ -206,12 +206,14 @@ func (p *Pool) Wait(ctx context.Context) error {
 	}
 }
 
-// Recover reaps durably tracked workers from prior daemon generations.
-func (p *Pool) Recover(ctx context.Context) error {
-	if err := p.registry.Reap(ctx); err != nil {
-		return fmt.Errorf("supervise: recover workers: %w", err)
+// Recover returns one bounded page of durable exact retirement receipts from
+// prior daemon generations.
+func (p *Pool) Recover(ctx context.Context) (proc.ReapResult, error) {
+	result, err := p.registry.Reap(ctx)
+	if err != nil {
+		return proc.ReapResult{}, fmt.Errorf("supervise: recover workers: %w", err)
 	}
-	return nil
+	return result, nil
 }
 
 // Run executes one task and synchronously reaps its process. Cancellation and

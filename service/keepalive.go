@@ -45,14 +45,14 @@ type AppKeepAlive struct {
 
 // AppProcessReaper durably owns one exact app process through bounded termination.
 type AppProcessReaper interface {
-	Reap(context.Context) error
+	Reap(context.Context) (proc.ReapResult, error)
 	TrackIdentity(context.Context, proc.Identity) (proc.Record, error)
 	Terminate(context.Context, proc.Record) error
 }
 
 // AppOwnedProcessRecovery settles durable child and process-group records left by the app.
 type AppOwnedProcessRecovery interface {
-	Reap(context.Context) error
+	Reap(context.Context) (proc.ReapResult, error)
 }
 
 // AppStopSpec identifies the fixed signed app endpoint and durable process owner.
@@ -207,67 +207,72 @@ func (k AppKeepAlive) Install(ctx context.Context) error {
 // Stop settles prior durable workers, authenticates and terminates every exact
 // fixed-app execution, withdraws launchd ownership, and requires a bounded
 // quiet interval with both the service unloaded and the exact executable absent.
-func (k AppKeepAlive) Stop(ctx context.Context, spec AppStopSpec, expected AuthenticatedAppPeer) error {
+func (k AppKeepAlive) Stop(
+	ctx context.Context,
+	spec AppStopSpec,
+	expected AuthenticatedAppPeer,
+) (proc.ReapResult, error) {
 	executable, err := k.validateStop(spec)
 	if err != nil {
-		return err
+		return proc.ReapResult{}, err
 	}
 	if err := expected.validate(executable); err != nil {
-		return err
+		return proc.ReapResult{}, err
 	}
 	if expected.CodeIdentity != spec.CodeIdentity {
-		return errors.New("keepalive agent: authenticated app peer code identity changed")
+		return proc.ReapResult{}, errors.New("keepalive agent: authenticated app peer code identity changed")
 	}
 	if expected.EntitlementPolicyDigest != spec.EntitlementPolicyDigest {
-		return errors.New("keepalive agent: authenticated app peer trust requirement changed")
+		return proc.ReapResult{}, errors.New("keepalive agent: authenticated app peer trust requirement changed")
 	}
-	if err := spec.Reaper.Reap(ctx); err != nil {
-		return fmt.Errorf("reap preexisting fixed app workers: %w", err)
+	receipts, err := spec.Reaper.Reap(ctx)
+	if err != nil {
+		return proc.ReapResult{}, fmt.Errorf("reap preexisting fixed app workers: %w", err)
 	}
 	deadline := spec.timeNow().Add(spec.stopDeadline())
 	var quietSince time.Time
 	for {
 		conn, err := spec.Dial(ctx)
 		if err != nil && !appEndpointAbsent(err) {
-			return fmt.Errorf("dial fixed app: %w", err)
+			return receipts, fmt.Errorf("dial fixed app: %w", err)
 		}
 		processes, inspectErr := spec.executableProcesses(executable)
 		if inspectErr != nil {
 			if conn != nil {
 				_ = conn.Close()
 			}
-			return fmt.Errorf("inventory fixed app executable: %w", inspectErr)
+			return receipts, fmt.Errorf("inventory fixed app executable: %w", inspectErr)
 		}
 		if conn != nil {
 			quietSince = time.Time{}
 			peer, err := spec.peer(conn)
 			if err != nil {
 				_ = conn.Close()
-				return fmt.Errorf("identify fixed app peer: %w", err)
+				return receipts, fmt.Errorf("identify fixed app peer: %w", err)
 			}
 			if err := spec.check(peer); err != nil {
 				_ = conn.Close()
-				return fmt.Errorf("authenticate fixed app peer: %w", err)
+				return receipts, fmt.Errorf("authenticate fixed app peer: %w", err)
 			}
 			if !expected.matches(peer) {
 				_ = conn.Close()
-				return errors.New("fixed app peer changed after authenticated proof")
+				return receipts, errors.New("fixed app peer changed after authenticated proof")
 			}
 			record, err := spec.Reaper.TrackIdentity(ctx, peer.ProcessIdentity())
 			if err != nil {
 				_ = conn.Close()
-				return fmt.Errorf("durably track fixed app: %w", err)
+				return receipts, fmt.Errorf("durably track fixed app: %w", err)
 			}
 			if _, err := k.ensureUnloaded(ctx); err != nil {
 				_ = conn.Close()
-				return err
+				return receipts, err
 			}
 			closeErr := conn.Close()
 			if err := spec.Reaper.Terminate(ctx, record); err != nil {
-				return fmt.Errorf("terminate fixed app: %w", err)
+				return receipts, fmt.Errorf("terminate fixed app: %w", err)
 			}
 			if closeErr != nil {
-				return fmt.Errorf("close fixed app session: %w", closeErr)
+				return receipts, fmt.Errorf("close fixed app session: %w", closeErr)
 			}
 			continue
 		}
@@ -275,7 +280,7 @@ func (k AppKeepAlive) Stop(ctx context.Context, spec AppStopSpec, expected Authe
 		if len(processes) == 0 {
 			reloaded, err := k.ensureUnloaded(ctx)
 			if err != nil {
-				return err
+				return receipts, err
 			}
 			if reloaded {
 				quietSince = time.Time{}
@@ -284,19 +289,22 @@ func (k AppKeepAlive) Stop(ctx context.Context, spec AppStopSpec, expected Authe
 			if quietSince.IsZero() {
 				quietSince = now
 			} else if now.Sub(quietSince) >= spec.stopQuiet() {
-				if err := spec.Dependents.Reap(ctx); err != nil {
-					return fmt.Errorf("reap fixed app dependents: %w", err)
+				dependentReceipts, err := spec.Dependents.Reap(ctx)
+				if err != nil {
+					return receipts, fmt.Errorf("reap fixed app dependents: %w", err)
 				}
-				return nil
+				receipts.Receipts = append(receipts.Receipts, dependentReceipts.Receipts...)
+				receipts.More = receipts.More || dependentReceipts.More
+				return receipts, nil
 			}
 		} else {
 			quietSince = time.Time{}
 		}
 		if !spec.timeNow().Before(deadline) {
-			return fmt.Errorf("fixed app did not settle before deadline: %d exact executable process(es) remain", len(processes))
+			return receipts, fmt.Errorf("fixed app did not settle before deadline: %d exact executable process(es) remain", len(processes))
 		}
 		if err := spec.wait(ctx, appStopPoll); err != nil {
-			return err
+			return receipts, err
 		}
 	}
 }
