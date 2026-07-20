@@ -135,6 +135,20 @@ func (m *memStore) HasReapReceipt(_ context.Context, receipt ReapReceipt) (bool,
 	return slices.Contains(m.receipts, receipt), nil
 }
 
+func (m *memStore) FindReapReceipt(
+	_ context.Context,
+	record Record,
+) (ReapReceipt, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, receipt := range m.receipts {
+		if receipt.Record == record {
+			return receipt, true, nil
+		}
+	}
+	return ReapReceipt{}, false, nil
+}
+
 func (m *memStore) AcknowledgeReap(_ context.Context, receipt ReapReceipt) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -405,6 +419,16 @@ func TestReapReceiptsArePageBoundedWithoutDroppingKillAuthority(t *testing.T) {
 	if len(first.Receipts) != ReapReceiptPageLimit || !first.More || store.len() != 1 {
 		t.Fatalf("first bounded Reap = receipts:%d more:%t records:%d",
 			len(first.Receipts), first.More, store.len())
+	}
+	hiddenRecord := matchingRecord(5000+ReapReceiptPageLimit, "prior-generation")
+	hiddenRecord.Boot = "prior-boot"
+	hiddenReceipt, err := reaper.ReapRecord(ctx, hiddenRecord)
+	if err != nil || hiddenReceipt.Record != hiddenRecord {
+		t.Fatalf("exact hidden reap = %+v, err %v", hiddenReceipt, err)
+	}
+	replayedHidden, found, err := reaper.ReapReceipt(ctx, hiddenRecord)
+	if err != nil || !found || replayedHidden != hiddenReceipt {
+		t.Fatalf("exact hidden receipt = %+v, found %t, err %v", replayedHidden, found, err)
 	}
 	for _, receipt := range first.Receipts {
 		if err := reaper.AcknowledgeReap(ctx, receipt); err != nil {

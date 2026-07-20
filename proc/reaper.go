@@ -128,6 +128,9 @@ type Store interface {
 	LoadReapReceipts(ctx context.Context, limit int) ([]ReapReceipt, bool, error)
 	// HasReapReceipt reports an exact durable receipt match.
 	HasReapReceipt(ctx context.Context, receipt ReapReceipt) (bool, error)
+	// FindReapReceipt returns the durable receipt for one exact process record,
+	// independent of bounded page position.
+	FindReapReceipt(ctx context.Context, record Record) (ReapReceipt, bool, error)
 	// AcknowledgeReap forgets an exact receipt; absence is idempotent.
 	AcknowledgeReap(ctx context.Context, receipt ReapReceipt) error
 }
@@ -449,6 +452,69 @@ func (r *Reaper) Reap(ctx context.Context) (ReapResult, error) {
 		}
 	}
 	return result, errors.Join(unresolved...)
+}
+
+// ReapReceipt returns the durable receipt for one exact process record,
+// independent of the bounded replay page.
+func (r *Reaper) ReapReceipt(
+	ctx context.Context,
+	record Record,
+) (ReapReceipt, bool, error) {
+	if r == nil || r.Store == nil || r.Generation == "" {
+		return ReapReceipt{}, false, errors.New("proc: reap receipt lookup requires store and generation")
+	}
+	if err := record.Validate(); err != nil {
+		return ReapReceipt{}, false, err
+	}
+	return r.Store.FindReapReceipt(ctx, record)
+}
+
+// ReapRecord settles one exact prior-generation record independently of the
+// bounded replay page and returns its durable receipt.
+func (r *Reaper) ReapRecord(ctx context.Context, record Record) (ReapReceipt, error) {
+	if r == nil || r.Store == nil || r.Generation == "" {
+		return ReapReceipt{}, errors.New("proc: exact reap requires store and generation")
+	}
+	if err := record.Validate(); err != nil {
+		return ReapReceipt{}, err
+	}
+	if receipt, found, err := r.Store.FindReapReceipt(ctx, record); err != nil {
+		return ReapReceipt{}, err
+	} else if found {
+		return receipt, nil
+	}
+	if record.Generation == r.Generation {
+		return ReapReceipt{}, errors.New("proc: cannot reap current process generation")
+	}
+	records, err := r.Store.Load(ctx)
+	if err != nil {
+		return ReapReceipt{}, fmt.Errorf("load reaper records: %w", err)
+	}
+	if !slices.Contains(records, record) {
+		return ReapReceipt{}, errors.New("proc: exact process record has no durable reap authority")
+	}
+	if err := r.Store.BeginReap(ctx, record, r.Generation); err != nil {
+		return ReapReceipt{}, fmt.Errorf("claim child %d for reap: %w", record.PID, err)
+	}
+	boot, err := r.prb().bootID()
+	if err != nil {
+		return ReapReceipt{}, fmt.Errorf("load current boot identity: %w", err)
+	}
+	reaped, outcome, err := r.reapOne(ctx, record, boot)
+	if err != nil {
+		return ReapReceipt{}, fmt.Errorf("reap child %d: %w", record.PID, err)
+	}
+	if !reaped {
+		return ReapReceipt{}, fmt.Errorf("proc: exact process %d did not settle", record.PID)
+	}
+	receipt, err := newReapReceipt(record, r.Generation, outcome)
+	if err != nil {
+		return ReapReceipt{}, fmt.Errorf("receipt for child %d: %w", record.PID, err)
+	}
+	if err := r.Store.CommitReap(ctx, record, receipt); err != nil {
+		return ReapReceipt{}, fmt.Errorf("commit receipt for child %d: %w", record.PID, err)
+	}
+	return receipt, nil
 }
 
 // Drop only on provably gone, reused, or reaped; our own live child or an Undetermined probe fails closed and keeps the record.
@@ -1005,6 +1071,35 @@ func (s *FileStore) HasReapReceipt(ctx context.Context, receipt ReapReceipt) (bo
 		}
 	}
 	return false, nil
+}
+
+// FindReapReceipt returns the durable receipt for one exact process record.
+func (s *FileStore) FindReapReceipt(
+	ctx context.Context,
+	record Record,
+) (ReapReceipt, bool, error) {
+	if err := record.Validate(); err != nil {
+		return ReapReceipt{}, false, err
+	}
+	lock, err := (FileLockSpec{
+		Path:     s.Path + ".lock",
+		Mode:     FileLockExclusive,
+		Deadline: 5 * time.Second,
+	}).Acquire(ctx)
+	if err != nil {
+		return ReapReceipt{}, false, err
+	}
+	defer lock.Close()
+	file, err := readRecordFile(s.Path)
+	if err != nil {
+		return ReapReceipt{}, false, err
+	}
+	for _, receipt := range file.Receipts {
+		if receipt.Record == record {
+			return receipt, true, nil
+		}
+	}
+	return ReapReceipt{}, false, nil
 }
 
 // AcknowledgeReap forgets an exact receipt; absence is a successful no-op.
