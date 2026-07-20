@@ -2,6 +2,7 @@ package service
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -71,6 +72,24 @@ func (s SessionType) plistValue() (string, error) {
 		return "System", nil
 	default:
 		return "", fmt.Errorf("service: invalid session type %d", s)
+	}
+}
+
+// ParseSessionType parses launchctl's exact typed manager/session name.
+func ParseSessionType(value string) (SessionType, error) {
+	switch strings.TrimSpace(value) {
+	case "Aqua":
+		return SessionTypeAqua, nil
+	case "Background":
+		return SessionTypeBackground, nil
+	case "LoginWindow":
+		return SessionTypeLoginWindow, nil
+	case "StandardIO":
+		return SessionTypeStandardIO, nil
+	case "System":
+		return SessionTypeSystem, nil
+	default:
+		return sessionTypeUnset, fmt.Errorf("service: unknown launchd session type %q", strings.TrimSpace(value))
 	}
 }
 

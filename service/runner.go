@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os/exec"
 	"path/filepath"
 	"sync"
@@ -21,6 +20,7 @@ var errCommandOutputLimit = errors.New("service: command output exceeded limit")
 func runCombined(
 	ctx context.Context,
 	runner supervise.TaskRunner,
+	class proc.RecoveryClass,
 	path string,
 	args ...string,
 ) (string, error) {
@@ -33,41 +33,10 @@ func runCombined(
 	}
 	output := &boundedCommandOutput{remaining: commandOutputLimit}
 	runErr := runner.Run(ctx, supervise.Task{
-		RecoveryClass: proc.RecoveryTask,
+		RecoveryClass: class,
 		Path:          path, Args: append([]string(nil), args...), Stdout: output, Stderr: output,
 	})
 	return string(output.bytes()), errors.Join(runErr, output.err())
-}
-
-func runSplit(
-	ctx context.Context,
-	runner supervise.TaskRunner,
-	path string,
-	stdout, stderr io.Writer,
-	args ...string,
-) error {
-	if runner == nil {
-		return errors.New("service: disposable task runner is required")
-	}
-	path, err := exactCommandPath(path)
-	if err != nil {
-		return err
-	}
-	out := &boundedCommandOutput{remaining: commandOutputLimit}
-	errOut := &boundedCommandOutput{remaining: commandOutputLimit}
-	runErr := runner.Run(ctx, supervise.Task{
-		RecoveryClass: proc.RecoveryTask,
-		Path:          path, Args: append([]string(nil), args...), Stdout: out, Stderr: errOut,
-	})
-	var copyErr error
-	if stdout != nil {
-		_, copyErr = io.Copy(stdout, bytes.NewReader(out.bytes()))
-	}
-	if stderr != nil {
-		_, err := io.Copy(stderr, bytes.NewReader(errOut.bytes()))
-		copyErr = errors.Join(copyErr, err)
-	}
-	return errors.Join(runErr, out.err(), errOut.err(), copyErr)
 }
 
 func exactCommandPath(path string) (string, error) {

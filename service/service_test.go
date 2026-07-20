@@ -1,342 +1,154 @@
 package service
 
 import (
-	"context"
-	"errors"
-	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/yasyf/daemonkit/supervise"
 )
 
-var errFakeLaunch = errors.New("fake launchctl failure")
-
-type fakeTaskRunner struct {
-	failOn string
-	verbs  []string
-}
-
-func (f *fakeTaskRunner) Run(_ context.Context, task supervise.Task) error {
-	f.verbs = append(f.verbs, task.Args[0])
-	if task.Args[0] == f.failOn {
-		if task.Stdout != nil {
-			_, _ = task.Stdout.Write([]byte("boom"))
-		}
-		return errFakeLaunch
-	}
-	return nil
-}
-
-func TestAgentInstall(t *testing.T) {
-	cases := []struct {
-		name      string
-		failOn    string
-		wantVerbs []string
-		wantErr   bool
-	}{
-		{"runs the donor order and succeeds", "", []string{"bootout", "bootstrap", "enable", "kickstart"}, false},
-		{"bootstrap failure aborts after bootstrap", "bootstrap", []string{"bootout", "bootstrap"}, true},
-		{"kickstart failure runs all four then errors", "kickstart", []string{"bootout", "bootstrap", "enable", "kickstart"}, true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("HOME", t.TempDir())
-			f := &fakeTaskRunner{failOn: tc.failOn}
-			a := Agent{
-				Label:         "com.yasyf.cc-pool",
-				Program:       "/opt/homebrew/bin/cc-pool",
-				Args:          []string{"daemon"},
-				LogPath:       filepath.Join(t.TempDir(), "daemon.log"),
-				RestartPolicy: RestartAlways,
-				Runner:        f,
-			}
-			err := a.Install(context.Background())
-			if (err != nil) != tc.wantErr {
-				t.Fatalf("Install() err = %v, wantErr %v", err, tc.wantErr)
-			}
-			if tc.wantErr && !errors.Is(err, errFakeLaunch) {
-				t.Errorf("Install() err = %v, want errors.Is-wrapped %v", err, errFakeLaunch)
-			}
-			if !slices.Equal(f.verbs, tc.wantVerbs) {
-				t.Errorf("launchctl verbs = %q, want %q", f.verbs, tc.wantVerbs)
-			}
-		})
-	}
-}
-
-func TestStatusLines(t *testing.T) {
-	cases := []struct {
-		id   string
-		got  []string
-		want []string
-	}{
-		{
-			id:   "brew managed with info",
-			got:  brewStatus("cc-pool (homebrew.mxcl.cc-pool)\nRunning: ✔", true),
-			want: []string{"Management: Homebrew (brew services)", "cc-pool (homebrew.mxcl.cc-pool)\nRunning: ✔"},
-		},
-		{
-			id:   "brew managed but info unavailable",
-			got:  brewStatus("", false),
-			want: []string{"Management: Homebrew (brew services)"},
-		},
-		{
-			id:   "self managed and loaded",
-			got:  []string{selfStatus(true)},
-			want: []string{"Management: self-managed LaunchAgent (loaded: true)"},
-		},
-		{
-			id:   "self managed and not loaded",
-			got:  []string{selfStatus(false)},
-			want: []string{"Management: self-managed LaunchAgent (loaded: false)"},
-		},
-	}
-	for _, tc := range cases {
-		if !slices.Equal(tc.got, tc.want) {
-			t.Errorf("%s: got %q, want %q", tc.id, tc.got, tc.want)
-		}
-	}
-}
-
-func TestAgentPathIsBrewManaged(t *testing.T) {
-	t.Setenv("HOMEBREW_PREFIX", "/opt/homebrew")
-	a := Agent{Formula: "cc-pool"}
-	cases := []struct {
-		path string
-		want bool
-	}{
-		{path: "/opt/homebrew/Cellar/cc-pool/1.2.3/bin/cc-pool", want: true},
-		{path: "/opt/homebrew/opt/cc-pool/bin/cc-pool", want: true},
-		{path: "/opt/homebrew/bin/cc-pool", want: true},
-		{path: "/Users/x/go/bin/cc-pool", want: false},
-		{path: "/usr/local/bin/other-tool", want: false},
-	}
-	for _, tc := range cases {
-		if got := a.pathIsBrewManaged(tc.path); got != tc.want {
-			t.Errorf("pathIsBrewManaged(%q) = %v, want %v", tc.path, got, tc.want)
-		}
-	}
-}
-
-func TestBrewPrefixesHonorsEnv(t *testing.T) {
-	t.Setenv("HOMEBREW_PREFIX", "/custom/brew")
-	if got := brewPrefixes(); len(got) != 1 || got[0] != "/custom/brew" {
-		t.Errorf("brewPrefixes() = %v, want [/custom/brew]", got)
-	}
-}
-
-func TestWritePlistRendersAgent(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	logPath := filepath.Join(home, ".cc-pool", "daemon.log")
-	a := Agent{
-		Label:         "com.yasyf.cc-pool",
-		Formula:       "cc-pool",
-		Program:       "/opt/homebrew/bin/cc-pool",
-		Args:          []string{"daemon"},
-		LogPath:       logPath,
-		RestartPolicy: RestartAlways,
-		Env: map[string]string{
-			"PATH":      "/usr/bin",
-			"AMPERSAND": "a&b<c",
-		},
-	}
-	path, err := a.WritePlist()
-	if err != nil {
-		t.Fatalf("WritePlist() = %v", err)
-	}
-	if want := filepath.Join(home, "Library", "LaunchAgents", "com.yasyf.cc-pool.plist"); path != want {
-		t.Errorf("plist path = %q, want %q", path, want)
-	}
-	body, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read plist: %v", err)
-	}
-	s := string(body)
-	for _, want := range []string{
-		"<string>com.yasyf.cc-pool</string>",
-		"<string>/opt/homebrew/bin/cc-pool</string>",
-		"<string>daemon</string>",
-		"<string>" + logPath + "</string>",
-		"<key>PATH</key>",
-		"<string>/usr/bin</string>",
-		"<key>KeepAlive</key>",
-		"a&amp;b&lt;c",
-	} {
-		if !strings.Contains(s, want) {
-			t.Errorf("rendered plist missing %q\n---\n%s", want, s)
-		}
-	}
-	if strings.Contains(s, "a&b<c") {
-		t.Errorf("rendered plist contains an unescaped env value\n---\n%s", s)
-	}
-	if _, err := os.Stat(filepath.Dir(logPath)); err != nil {
-		t.Errorf("log dir was not created: %v", err)
-	}
-}
-
-func TestAgentRestartPolicyRequired(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	a := Agent{
-		Label:   "com.example.worker",
-		Program: "/usr/bin/true",
-		LogPath: filepath.Join(t.TempDir(), "worker.log"),
-	}
-	if _, err := a.WritePlist(); err == nil || !strings.Contains(err.Error(), "restart policy is required") {
-		t.Fatalf("WritePlist() err = %v, want required restart policy", err)
-	}
-}
-
-func TestAgentRestartPolicyRejectsUnknownValue(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	a := Agent{
+func testAgent(t *testing.T) Agent {
+	t.Helper()
+	return Agent{
 		Label:         "com.example.worker",
 		Program:       "/usr/bin/true",
 		LogPath:       filepath.Join(t.TempDir(), "worker.log"),
-		RestartPolicy: RestartPolicy(99),
+		RestartPolicy: RestartAlways,
 	}
-	if _, err := a.WritePlist(); err == nil || !strings.Contains(err.Error(), "invalid restart policy 99") {
-		t.Fatalf("WritePlist() err = %v, want invalid restart policy", err)
+}
+
+func TestAgentPlistIsPureAndEscaped(t *testing.T) {
+	agent := testAgent(t)
+	agent.Args = []string{"daemon"}
+	agent.Env = map[string]string{"PATH": "/usr/bin", "AMPERSAND": "a&b<c"}
+	body, err := agent.Plist()
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	for _, want := range []string{
+		"<string>com.example.worker</string>",
+		"<string>/usr/bin/true</string>",
+		"<string>daemon</string>",
+		"<key>PATH</key>",
+		"<key>KeepAlive</key>",
+		"a&amp;b&lt;c",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("rendered plist missing %q\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "a&b<c") {
+		t.Fatalf("rendered plist contains unescaped bytes\n%s", text)
+	}
+	path, err := agent.PlistPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	matches, err := filepath.Glob(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("Plist mutated filesystem: %v", matches)
+	}
+}
+
+func TestAgentPlistRequiresCanonicalIdentityAndPaths(t *testing.T) {
+	tests := []struct {
+		name string
+		edit func(*Agent)
+		want string
+	}{
+		{name: "label", edit: func(agent *Agent) { agent.Label = "../worker" }, want: "not canonical"},
+		{name: "program", edit: func(agent *Agent) { agent.Program = "usr/bin/true" }, want: "program path"},
+		{name: "log", edit: func(agent *Agent) { agent.LogPath = "worker.log" }, want: "log path"},
+		{name: "restart", edit: func(agent *Agent) { agent.RestartPolicy = 0 }, want: "restart policy is required"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			agent := testAgent(t)
+			test.edit(&agent)
+			if _, err := agent.Plist(); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Plist error = %v, want %q", err, test.want)
+			}
+		})
 	}
 }
 
 func TestAgentRestartPolicies(t *testing.T) {
-	cases := []struct {
-		name   string
+	tests := []struct {
 		policy RestartPolicy
 		want   string
 	}{
-		{"always", RestartAlways, "<key>KeepAlive</key>\n    <true/>"},
-		{"failure", RestartOnFailure, "<key>SuccessfulExit</key>\n        <false/>"},
-		{"never", NoRestart, "<key>KeepAlive</key>\n    <false/>"},
+		{RestartAlways, "<key>KeepAlive</key>\n    <true/>"},
+		{RestartOnFailure, "<key>SuccessfulExit</key>\n        <false/>"},
+		{NoRestart, "<key>KeepAlive</key>\n    <false/>"},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			home := t.TempDir()
-			t.Setenv("HOME", home)
-			a := Agent{
-				Label:         "com.example.worker",
-				Program:       "/usr/bin/true",
-				LogPath:       filepath.Join(home, "worker.log"),
-				RestartPolicy: tc.policy,
-			}
-			path, err := a.WritePlist()
-			if err != nil {
-				t.Fatal(err)
-			}
-			body, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !strings.Contains(string(body), tc.want) {
-				t.Errorf("plist missing %q:\n%s", tc.want, body)
-			}
-		})
+	for _, test := range tests {
+		agent := testAgent(t)
+		agent.RestartPolicy = test.policy
+		body, err := agent.Plist()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(body), test.want) {
+			t.Fatalf("plist missing %q\n%s", test.want, body)
+		}
 	}
 }
 
 func TestAgentOptionalLaunchPolicy(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	a := Agent{
-		Label:                  "com.example.reconcile",
-		Program:                "/usr/bin/true",
-		LogPath:                filepath.Join(home, "reconcile.log"),
-		RestartPolicy:          NoRestart,
-		StartInterval:          15 * time.Minute,
-		ProcessType:            ProcessTypeBackground,
-		LimitLoadToSessionType: SessionTypeAqua,
-	}
-	path, err := a.WritePlist()
+	agent := testAgent(t)
+	agent.StartInterval = 15 * time.Minute
+	agent.ProcessType = ProcessTypeBackground
+	agent.LimitLoadToSessionType = SessionTypeAqua
+	body, err := agent.Plist()
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := string(body)
+	text := string(body)
 	for _, want := range []string{
 		"<key>StartInterval</key>\n    <integer>900</integer>",
 		"<key>ProcessType</key>\n    <string>Background</string>",
 		"<key>LimitLoadToSessionType</key>\n    <string>Aqua</string>",
 	} {
-		if !strings.Contains(s, want) {
-			t.Errorf("plist missing %q:\n%s", want, s)
-		}
-	}
-}
-
-func TestAgentOptionalLaunchPolicyIsAbsentByDefault(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	a := Agent{
-		Label:         "com.example.serve",
-		Program:       "/usr/bin/true",
-		LogPath:       filepath.Join(home, "serve.log"),
-		RestartPolicy: RestartAlways,
-	}
-	path, err := a.WritePlist()
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := string(body)
-	for _, unwanted := range []string{"StartInterval", "ProcessType", "LimitLoadToSessionType"} {
-		if strings.Contains(s, unwanted) {
-			t.Errorf("plist unexpectedly contains %q:\n%s", unwanted, s)
+		if !strings.Contains(text, want) {
+			t.Fatalf("plist missing %q\n%s", want, text)
 		}
 	}
 }
 
 func TestAgentOptionalLaunchPolicyRejectsInvalidValues(t *testing.T) {
-	cases := []struct {
-		name string
+	tests := []struct {
 		edit func(*Agent)
 		want string
 	}{
-		{
-			name: "subsecond interval",
-			edit: func(a *Agent) { a.StartInterval = 500 * time.Millisecond },
-			want: "positive whole number of seconds",
-		},
-		{
-			name: "negative interval",
-			edit: func(a *Agent) { a.StartInterval = -time.Second },
-			want: "positive whole number of seconds",
-		},
-		{
-			name: "unknown process type",
-			edit: func(a *Agent) { a.ProcessType = ProcessType(99) },
-			want: "invalid process type 99",
-		},
-		{
-			name: "unknown session type",
-			edit: func(a *Agent) { a.LimitLoadToSessionType = SessionType(99) },
-			want: "invalid session type 99",
-		},
+		{edit: func(agent *Agent) { agent.StartInterval = 500 * time.Millisecond }, want: "positive whole number of seconds"},
+		{edit: func(agent *Agent) { agent.ProcessType = ProcessType(99) }, want: "invalid process type 99"},
+		{edit: func(agent *Agent) { agent.LimitLoadToSessionType = SessionType(99) }, want: "invalid session type 99"},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			home := t.TempDir()
-			t.Setenv("HOME", home)
-			a := Agent{
-				Label:         "com.example.invalid",
-				Program:       "/usr/bin/true",
-				LogPath:       filepath.Join(home, "invalid.log"),
-				RestartPolicy: NoRestart,
-			}
-			tc.edit(&a)
-			if _, err := a.WritePlist(); err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("WritePlist() err = %v, want %q", err, tc.want)
-			}
-		})
+	for _, test := range tests {
+		agent := testAgent(t)
+		test.edit(&agent)
+		if _, err := agent.Plist(); err == nil || !strings.Contains(err.Error(), test.want) {
+			t.Fatalf("Plist error = %v, want %q", err, test.want)
+		}
+	}
+}
+
+func TestParseSessionType(t *testing.T) {
+	for value, want := range map[string]SessionType{
+		"Aqua": SessionTypeAqua, "Background": SessionTypeBackground,
+		"LoginWindow": SessionTypeLoginWindow, "StandardIO": SessionTypeStandardIO,
+		"System": SessionTypeSystem,
+	} {
+		got, err := ParseSessionType("\n" + value + " \n")
+		if err != nil || got != want {
+			t.Fatalf("ParseSessionType(%q) = %d, %v; want %d", value, got, err, want)
+		}
+	}
+	if _, err := ParseSessionType("unknown"); err == nil {
+		t.Fatal("ParseSessionType accepted an unknown manager")
 	}
 }

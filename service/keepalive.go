@@ -93,7 +93,7 @@ type AuthenticatedAppPeer struct {
 }
 
 func (k AppKeepAlive) launchctl(ctx context.Context, args ...string) (string, error) {
-	return runCombined(ctx, k.Runner, "/bin/launchctl", args...)
+	return runCombined(ctx, k.Runner, proc.RecoveryService, "/bin/launchctl", args...)
 }
 
 // NewAuthenticatedAppPeer binds one signed-side accepted identity to an exact

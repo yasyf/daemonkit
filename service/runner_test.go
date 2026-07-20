@@ -31,7 +31,7 @@ func TestRunCombinedCancellationReapsDaemonizedDescendantAndRecord(t *testing.T)
 	ctx, cancel := context.WithCancel(t.Context())
 	result := make(chan error, 1)
 	go func() {
-		_, err := runCombined(ctx, pool, "/bin/sh", "-c",
+		_, err := runCombined(ctx, pool, proc.RecoveryTask, "/bin/sh", "-c",
 			`trap '' TERM; (trap '' TERM; while :; do sleep 1; done) & echo $! > "$1"; wait`,
 			"service-runner", pidFile)
 		result <- err
@@ -62,7 +62,7 @@ func TestRunCombinedBoundsOutputWithoutStrandingWorker(t *testing.T) {
 		_, _ = task.Stdout.Write([]byte(strings.Repeat("x", commandOutputLimit+1)))
 		return nil
 	})
-	output, err := runCombined(t.Context(), runner, "/usr/bin/true")
+	output, err := runCombined(t.Context(), runner, proc.RecoveryTask, "/usr/bin/true")
 	if !errors.Is(err, errCommandOutputLimit) {
 		t.Fatalf("runCombined oversized output error = %v", err)
 	}
