@@ -211,20 +211,125 @@ func (s *Server) Serve(
 	if ready == nil {
 		return errors.New("wire: readiness callback is required")
 	}
+	workers, err := s.start(listener)
+	if err != nil {
+		return err
+	}
+	s.startWorkers(workers)
+
+	if err := ready(); err != nil {
+		_ = s.CloseIntake()
+		s.stopWorkers()
+		return fmt.Errorf("wire: publish readiness: %w", err)
+	}
+
+	acceptDone := make(chan error, 1)
+	go func() { acceptDone <- s.accept(ctx, admit, admitLifecycle) }()
+	var acceptErr error
+	select {
+	case <-ctx.Done():
+		_ = s.CloseIntake()
+		acceptErr = <-acceptDone
+	case acceptErr = <-acceptDone:
+		if acceptErr == nil || errors.Is(acceptErr, net.ErrClosed) {
+			<-ctx.Done()
+		} else {
+			_ = s.CloseIntake()
+		}
+	}
+
+	s.closeSessions()
+	s.sessionWG.Wait()
+	s.stopWorkers()
+	return wrapAcceptError(acceptErr)
+}
+
+// ServeSession serves one daemonkit-issued existing duplex session through the
+// same handshake, capacity, admission, backpressure, cancellation, and drain
+// engine as listener sessions. It takes ownership of conn and joins the session
+// synchronously. Spawned-parent identities are always ordinary, so protected
+// lifecycle operations remain unavailable.
+func (s *Server) ServeSession(
+	ctx context.Context,
+	conn net.Conn,
+	identity SessionIdentity,
+	ready func() error,
+	admit, admitLifecycle func() (func(), error),
+) error {
+	if conn == nil {
+		return errors.New("wire: existing session connection is required")
+	}
+	if admit == nil {
+		return errors.New("wire: admission callback is required")
+	}
+	if admitLifecycle == nil {
+		return errors.New("wire: lifecycle admission callback is required")
+	}
+	if ready == nil {
+		return errors.New("wire: readiness callback is required")
+	}
+	defer conn.Close()
+	peer, allowProtected, err := identity.authenticatedPeer()
+	if err != nil {
+		return err
+	}
+	workers, err := s.start(nil)
+	if err != nil {
+		return err
+	}
+	s.startWorkers(workers)
+	if err := ready(); err != nil {
+		s.stopWorkers()
+		return fmt.Errorf("wire: publish readiness: %w", err)
+	}
+	verifyCtx, cancelVerify := context.WithTimeout(ctx, s.peerVerificationTimeout())
+	protected := false
+	if allowProtected {
+		protected, err = s.verifyPeer(verifyCtx, peer)
+	} else {
+		err = s.verifyOrdinaryPeer(verifyCtx, peer)
+	}
+	cancelVerify()
+	if err != nil {
+		s.stopWorkers()
+		return err
+	}
+	capacity, ok := s.acquireSessionCapacity(protected)
+	if !ok {
+		s.stopWorkers()
+		return errors.New("wire: existing session capacity exhausted")
+	}
+	releaseCapacity := sync.OnceFunc(func() { s.releaseSessionCapacity(capacity) })
+	s.sessionWG.Add(1)
+	sessionErr := func() error {
+		defer releaseCapacity()
+		defer s.sessionWG.Done()
+		return s.serveConn(ctx, conn, peer, protected, admit, admitLifecycle, releaseCapacity)
+	}()
+	s.closeSessions()
+	s.sessionWG.Wait()
+	s.stopWorkers()
+	if isDisconnect(sessionErr) {
+		return nil
+	}
+	return sessionErr
+}
+
+func (s *Server) start(listener net.Listener) (int, error) {
 	if s.Build == "" {
-		return errors.New("wire: Build is required")
+		return 0, errors.New("wire: Build is required")
 	}
 	if err := s.validateSessionCapacity(); err != nil {
-		return err
+		return 0, err
 	}
 	streamWindow, err := uint32Length("stream queue", s.streamQueue())
 	if err != nil {
-		return errors.New("wire: stream queue exceeds protocol window")
+		return 0, errors.New("wire: stream queue exceeds protocol window")
 	}
 	s.mu.Lock()
 	if s.started {
 		s.mu.Unlock()
-		return ErrServerStarted
+		return 0, ErrServerStarted
 	}
 	s.started = true
 	s.listener = listener
@@ -248,39 +353,19 @@ func (s *Server) Serve(
 	s.ordinarySessionSlots = make(chan struct{}, s.maxSessions()-s.ReservedProtectedSessions)
 	s.protectedSessionSlots = make(chan struct{}, s.ReservedProtectedSessions)
 	s.mu.Unlock()
+	return workers, nil
+}
 
+func (s *Server) startWorkers(workers int) {
 	for range workers {
 		s.poolWG.Add(1)
 		go s.worker()
 	}
+}
 
-	if err := ready(); err != nil {
-		_ = s.CloseIntake()
-		close(s.queue)
-		s.poolWG.Wait()
-		return fmt.Errorf("wire: publish readiness: %w", err)
-	}
-
-	acceptDone := make(chan error, 1)
-	go func() { acceptDone <- s.accept(ctx, admit, admitLifecycle) }()
-	var acceptErr error
-	select {
-	case <-ctx.Done():
-		_ = s.CloseIntake()
-		acceptErr = <-acceptDone
-	case acceptErr = <-acceptDone:
-		if acceptErr == nil || errors.Is(acceptErr, net.ErrClosed) {
-			<-ctx.Done()
-		} else {
-			_ = s.CloseIntake()
-		}
-	}
-
-	s.closeSessions()
-	s.sessionWG.Wait()
+func (s *Server) stopWorkers() {
 	close(s.queue)
 	s.poolWG.Wait()
-	return wrapAcceptError(acceptErr)
 }
 
 func wrapAcceptError(err error) error {
@@ -539,18 +624,25 @@ func (s *Server) closeSessions() {
 }
 
 func (s *Server) verifyPeer(ctx context.Context, peer Peer) (bool, error) {
-	if peer.UID != os.Geteuid() {
-		return false, fmt.Errorf("%w: uid %d != %d", ErrUntrustedPeer, peer.UID, os.Geteuid())
-	}
-	if s.Trust != nil {
-		if err := s.Trust(ctx, peer); err != nil {
-			return false, err
-		}
+	if err := s.verifyOrdinaryPeer(ctx, peer); err != nil {
+		return false, err
 	}
 	if s.ProtectedSessionClassifier == nil {
 		return false, nil
 	}
 	return s.ProtectedSessionClassifier.Classify(ctx, peer)
+}
+
+func (s *Server) verifyOrdinaryPeer(ctx context.Context, peer Peer) error {
+	if peer.UID != os.Geteuid() {
+		return fmt.Errorf("%w: uid %d != %d", ErrUntrustedPeer, peer.UID, os.Geteuid())
+	}
+	if s.Trust != nil {
+		if err := s.Trust(ctx, peer); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Server) maxFrame() int {
@@ -697,5 +789,6 @@ func (r *sliceReader) Read(p []byte) (int, error) {
 }
 
 func isDisconnect(err error) bool {
-	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled)
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled)
 }
