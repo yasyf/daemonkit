@@ -24,10 +24,10 @@ func TestManagedProcessHelper(_ *testing.T) {
 	if marker == "" {
 		return
 	}
+	signal.Ignore(syscall.SIGTERM)
 	if err := os.WriteFile(marker, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
 		panic(err)
 	}
-	signal.Ignore(syscall.SIGTERM)
 	for {
 		time.Sleep(time.Hour)
 	}

@@ -30,25 +30,8 @@ while ! IFS= read -r _ <&4; do
     :
 done
 exec 4<&-
-(
-    trap - TERM
-    exec "$@"
-) <&5 &
-exec 5<&-
-worker_pid=$!
-while :; do
-    wait "$worker_pid"
-    worker_status=$?
-    if ! kill -0 "$worker_pid" 2>/dev/null; then
-        break
-    fi
-done
-printf '%s\n' "$worker_status" >&6
-exec 6>&-
-while :; do
-    sleep 3600 &
-    wait $!
-done
+trap - TERM
+exec "$@" <&5
 `
 
 var (
@@ -228,7 +211,7 @@ func (p *Pool) Recover(ctx context.Context) error {
 
 // Run executes one task and synchronously reaps its process. Cancellation and
 // deadlines terminate the entire worker process group before Run returns.
-func (p *Pool) Run(ctx context.Context, task Task) error {
+func (p *Pool) Run(ctx context.Context, task Task) (runErr error) {
 	if err := task.RecoveryClass.Validate(); err != nil {
 		return fmt.Errorf("supervise: worker recovery class: %w", err)
 	}
@@ -260,9 +243,12 @@ func (p *Pool) Run(ctx context.Context, task Task) error {
 	cmd := exec.Command("/bin/sh", wrapperArgs...)
 	cmd.Dir = task.Dir
 	cmd.Env = task.Env
-	cmd.Stdout = task.Stdout
-	cmd.Stderr = task.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	outputs, err := newTaskOutputs(cmd, task.Stdout, task.Stderr)
+	if err != nil {
+		return err
+	}
+	defer func() { runErr = errors.Join(runErr, outputs.wait()) }()
 	readyR, readyW, err := os.Pipe()
 	if err != nil {
 		return fmt.Errorf("supervise: worker readiness pipe: %w", err)
@@ -273,30 +259,32 @@ func (p *Pool) Run(ctx context.Context, task Task) error {
 		_ = readyW.Close()
 		return fmt.Errorf("supervise: worker dispatch gate: %w", err)
 	}
-	statusR, statusW, err := os.Pipe()
+	ownerR, ownerW, err := os.Pipe()
 	if err != nil {
 		_ = readyR.Close()
 		_ = readyW.Close()
 		_ = gateR.Close()
 		_ = gateW.Close()
-		return fmt.Errorf("supervise: worker status pipe: %w", err)
+		return fmt.Errorf("supervise: worker owner pipe: %w", err)
 	}
-	cmd.ExtraFiles = []*os.File{readyW, gateR, stdin, statusW}
+	cmd.ExtraFiles = []*os.File{readyW, gateR, stdin, ownerR}
 	if err := cmd.Start(); err != nil {
+		outputs.closeUnstarted()
 		_ = readyR.Close()
 		_ = readyW.Close()
 		_ = gateR.Close()
 		_ = gateW.Close()
-		_ = statusR.Close()
-		_ = statusW.Close()
+		_ = ownerR.Close()
+		_ = ownerW.Close()
 		return fmt.Errorf("supervise: start worker: %w", err)
 	}
+	outputs.start()
 	_ = readyW.Close()
 	_ = gateR.Close()
-	_ = statusW.Close()
+	_ = ownerR.Close()
 	if err := awaitWrapperReady(workerCtx, readyR); err != nil {
 		_ = gateW.Close()
-		_ = statusR.Close()
+		_ = ownerW.Close()
 		killErr := p.killUntrackedGroup(cmd.Process.Pid)
 		waitErr := cmd.Wait()
 		return errors.Join(
@@ -309,7 +297,7 @@ func (p *Pool) Run(ctx context.Context, task Task) error {
 	rec, err := p.registry.TrackGroup(workerCtx, cmd.Process.Pid, task.RecoveryClass)
 	if err != nil {
 		_ = gateW.Close()
-		_ = statusR.Close()
+		_ = ownerW.Close()
 		killErr := p.killUntrackedGroup(cmd.Process.Pid)
 		waitErr := cmd.Wait()
 		return errors.Join(
@@ -321,7 +309,7 @@ func (p *Pool) Run(ctx context.Context, task Task) error {
 	if recordErr := rec.Validate(); recordErr != nil || rec.PID != cmd.Process.Pid ||
 		!rec.ProcessGroup || rec.SessionID != rec.PID {
 		_ = gateW.Close()
-		_ = statusR.Close()
+		_ = ownerW.Close()
 		untrackErr := p.registry.Untrack(context.WithoutCancel(workerCtx), rec)
 		if untrackErr != nil {
 			untrackErr = fmt.Errorf("supervise: untrack invalid worker process record: %w", untrackErr)
@@ -339,30 +327,35 @@ func (p *Pool) Run(ctx context.Context, task Task) error {
 
 	waited := make(chan error, 1)
 	go func() { waited <- cmd.Wait() }()
-	status := readWorkerStatus(statusR)
 	if err := workerCtx.Err(); err != nil {
 		stop := p.stop(rec, waited)
 		_ = gateW.Close()
-		statusResult := <-status
+		_ = ownerW.Close()
 		return p.finish(workerCtx, rec, errors.Join(
 			fmt.Errorf("supervise: worker canceled before dispatch: %w", err),
 			stop.err,
-			wrapStatusReadError(statusResult.err),
+			unexpectedWaitError(stop.waitErr),
+		), stop.settled)
+	}
+	if err := writeTrackedOwner(ownerW, rec); err != nil {
+		stop := p.stop(rec, waited)
+		_ = gateW.Close()
+		return p.finish(workerCtx, rec, errors.Join(
+			fmt.Errorf("supervise: deliver worker owner: %w", err),
+			stop.err,
 			unexpectedWaitError(stop.waitErr),
 		), stop.settled)
 	}
 	if err := writePayload(gateW, []byte("start\n")); err != nil {
 		stop := p.stop(rec, waited)
-		statusResult := <-status
 		return p.finish(workerCtx, rec, errors.Join(
 			fmt.Errorf("supervise: release worker dispatch gate: %w", err),
 			stop.err,
-			wrapStatusReadError(statusResult.err),
 			unexpectedWaitError(stop.waitErr),
 		), stop.settled)
 	}
 
-	return p.await(workerCtx, rec, status, waited)
+	return p.await(workerCtx, rec, waited)
 }
 
 func (p *Pool) acquire(
@@ -419,31 +412,34 @@ func (p *Pool) notifyLocked() {
 func (p *Pool) await(
 	ctx context.Context,
 	rec proc.Record,
-	status <-chan workerResult,
 	waited <-chan error,
 ) error {
 	select {
-	case statusResult := <-status:
-		stop := p.stop(rec, waited)
-		return p.finish(ctx, rec, errors.Join(
-			workerExitError(statusResult),
-			stop.err,
-			unexpectedWaitError(stop.waitErr),
-		), stop.settled)
 	case waitErr := <-waited:
-		statusResult := <-status
-		return p.finish(ctx, rec, errors.Join(
-			wrapWaitError(waitErr),
-			wrapStatusReadError(statusResult.err),
-		), false)
+		settleErr := p.registry.TerminateWithin(context.WithoutCancel(ctx), rec, p.grace)
+		if settleErr != nil {
+			settleErr = fmt.Errorf("supervise: settle completed worker: %w", settleErr)
+		}
+		return errors.Join(workerWaitError(waitErr), settleErr)
 	case <-ctx.Done():
 		stop := p.stop(rec, waited)
-		<-status
-		return p.finish(ctx, rec, errors.Join(
+		if stop.settled {
+			return p.finish(ctx, rec, errors.Join(
+				fmt.Errorf("supervise: worker canceled: %w", ctx.Err()),
+				stop.err,
+				unexpectedWaitError(stop.waitErr),
+			), true)
+		}
+		settleErr := p.registry.TerminateWithin(context.WithoutCancel(ctx), rec, p.grace)
+		if settleErr == nil {
+			return fmt.Errorf("supervise: worker canceled: %w", ctx.Err())
+		}
+		return errors.Join(
 			fmt.Errorf("supervise: worker canceled: %w", ctx.Err()),
 			stop.err,
-			unexpectedWaitError(stop.waitErr),
-		), stop.settled)
+			fmt.Errorf("supervise: settle leaderless worker session: %w", settleErr),
+			ErrUnsettledGroup,
+		)
 	}
 }
 
@@ -598,25 +594,6 @@ func (p *Pool) killUntrackedGroup(pid int) error {
 	}
 }
 
-type workerResult struct {
-	code int
-	err  error
-}
-
-func readWorkerStatus(status *os.File) <-chan workerResult {
-	result := make(chan workerResult, 1)
-	go func() {
-		defer status.Close()
-		var code int
-		_, err := fmt.Fscan(status, &code)
-		if err == nil && (code < 0 || code > 255) {
-			err = fmt.Errorf("invalid exit status %d", code)
-		}
-		result <- workerResult{code: code, err: err}
-	}()
-	return result
-}
-
 func writePayload(stdin io.WriteCloser, payload []byte) error {
 	_, writeErr := stdin.Write(payload)
 	closeErr := stdin.Close()
@@ -630,21 +607,15 @@ func wrapWaitError(err error) error {
 	return fmt.Errorf("supervise: worker exit: %w", err)
 }
 
-func workerExitError(result workerResult) error {
-	if result.err != nil {
-		return wrapStatusReadError(result.err)
-	}
-	if result.code == 0 {
-		return nil
-	}
-	return fmt.Errorf("supervise: worker exit: %w", &ExitError{Code: result.code})
-}
-
-func wrapStatusReadError(err error) error {
+func workerWaitError(err error) error {
 	if err == nil {
 		return nil
 	}
-	return fmt.Errorf("supervise: read worker exit status: %w", err)
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return fmt.Errorf("supervise: worker exit: %w", &ExitError{Code: exitErr.ExitCode()})
+	}
+	return wrapWaitError(err)
 }
 
 func wrapSignalError(action string, err error) error {

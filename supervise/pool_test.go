@@ -86,7 +86,24 @@ func (f *fakeRegistry) Untrack(_ context.Context, rec proc.Record) error {
 	return f.untrackErr
 }
 
-func (f *fakeRegistry) TerminateWithin(ctx context.Context, rec proc.Record, _ time.Duration) error {
+func (f *fakeRegistry) TerminateWithin(ctx context.Context, rec proc.Record, grace time.Duration) error {
+	termErr := syscall.Kill(-rec.PID, syscall.SIGTERM)
+	if termErr == nil {
+		timer := time.NewTimer(grace)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		}
+		if killErr := syscall.Kill(-rec.PID, syscall.SIGKILL); killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
+			return killErr
+		}
+	} else if !errors.Is(termErr, syscall.ESRCH) {
+		return termErr
+	}
 	return f.Untrack(ctx, rec)
 }
 
@@ -318,7 +335,7 @@ func TestRunSurfacesDurableUntrackFailureAfterReap(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = pool.Run(context.Background(), Task{RecoveryClass: proc.RecoveryTask, Path: "/usr/bin/true"})
-	if !errors.Is(err, registry.untrackErr) || !strings.Contains(err.Error(), "untrack worker") {
+	if !errors.Is(err, registry.untrackErr) || !strings.Contains(err.Error(), "settle completed worker") {
 		t.Fatalf("Run error = %v, want wrapped untrack failure", err)
 	}
 	pool.Close()
