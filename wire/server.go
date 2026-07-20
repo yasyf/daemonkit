@@ -90,6 +90,9 @@ const (
 type Server struct {
 	// Build is the server build identity sent during the mandatory handshake.
 	Build string
+	// LifecycleBuild is the daemon release identity used only for protected
+	// lifecycle authorization. It is required when lifecycle handlers exist.
+	LifecycleBuild string
 	// Trust augments the non-optional same-effective-uid trust floor. It must
 	// return when ctx is canceled.
 	Trust func(context.Context, Peer) error
@@ -379,6 +382,7 @@ func (s *Server) serveConn(
 		peer:           peer,
 		protected:      protected,
 		build:          identity.Build,
+		lifecycleBuild: identity.LifecycleBuild,
 		generation:     generation,
 		admit:          admit,
 		admitLifecycle: admitLifecycle,
@@ -423,7 +427,9 @@ func (s *Server) serverHandshake(codec *Codec) (BuildIdentity, []byte, error) {
 	if _, err := rand.Read(generation); err != nil {
 		return BuildIdentity{}, nil, fmt.Errorf("%w: generate session: %w", ErrHandshake, err)
 	}
-	payload, err := json.Marshal(BuildIdentity{Protocol: ProtocolVersion, Build: s.Build, Session: generation})
+	payload, err := json.Marshal(BuildIdentity{
+		Protocol: ProtocolVersion, Build: s.Build, LifecycleBuild: s.LifecycleBuild, Session: generation,
+	})
 	if err != nil {
 		return BuildIdentity{}, nil, err
 	}
@@ -616,6 +622,8 @@ func (s *Server) validateSessionCapacity() error {
 		return errors.New("wire: protected session classifier is required when capacity is reserved")
 	case s.hasLifecycle && s.ProtectedSessionClassifier == nil:
 		return errors.New("wire: lifecycle handlers require a protected session classifier")
+	case s.hasLifecycle && s.LifecycleBuild == "":
+		return errors.New("wire: lifecycle handlers require LifecycleBuild")
 	case s.hasLifecycle && s.ReservedProtectedSessions == 0:
 		return errors.New("wire: lifecycle handlers require reserved protected capacity")
 	case s.ProtectedSessionClassifier != nil:

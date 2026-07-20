@@ -36,7 +36,7 @@ func TestClassifierFollowsExactAtomicRoleRetargetAcrossUpgrade(t *testing.T) {
 			t.Fatalf("unrelated target %q classification = %t, %v", rejected, accepted, err)
 		}
 	}
-	if !classifier.AuthorizeBuild("v1.0.0", "v2.0.0") || classifier.AuthorizeBuild("v2.0.0", "v1.0.0") {
+	if !classifier.AuthorizeLifecycleBuild("v1.0.0", "v2.0.0") || classifier.AuthorizeLifecycleBuild("v2.0.0", "v1.0.0") {
 		t.Fatal("request-daemon same/newer build admission is not exact")
 	}
 }

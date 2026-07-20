@@ -19,21 +19,23 @@ var (
 
 // BuildIdentity is exchanged during the mandatory exact-version handshake.
 type BuildIdentity struct {
-	Protocol uint16 `json:"protocol"`
-	Build    string `json:"build"`
-	Session  []byte `json:"session,omitempty"`
+	Protocol       uint16 `json:"protocol"`
+	Build          string `json:"build"`
+	LifecycleBuild string `json:"lifecycle_build,omitempty"`
+	Session        []byte `json:"session,omitempty"`
 }
 
 // Request is one admitted request on a persistent session.
 type Request struct {
-	ID      uint64
-	Op      Op
-	Tenant  string
-	Peer    Peer
-	Build   string
-	Payload []byte
-	Chunks  <-chan Chunk
-	Session *AcceptedSession
+	ID             uint64
+	Op             Op
+	Tenant         string
+	Peer           Peer
+	Build          string
+	LifecycleBuild string
+	Payload        []byte
+	Chunks         <-chan Chunk
+	Session        *AcceptedSession
 }
 
 // Chunk is one ordered streaming payload.

@@ -31,8 +31,8 @@ func TestLifecyclePeerMapsOnlyProvenAbsentListener(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
-				Build: "client-test",
-				Dial:  func(context.Context) (net.Conn, error) { return nil, test.dialErr },
+				Build: "client-test", LifecycleBuild: "v2.0.0",
+				Dial: func(context.Context) (net.Conn, error) { return nil, test.dialErr },
 			}}
 			_, err := peer.Health(context.Background())
 			if errors.Is(err, daemon.ErrNoPeer) != test.wantNoPeer {
@@ -64,7 +64,7 @@ func TestLifecyclePeerDoesNotMapProtocolFailureToNoPeer(t *testing.T) {
 		}()
 		return client, nil
 	}
-	peer := &wire.LifecyclePeer{Config: wire.ClientConfig{Build: "client-test", Dial: dial}}
+	peer := &wire.LifecyclePeer{Config: wire.ClientConfig{Build: "client-test", LifecycleBuild: "v2.0.0", Dial: dial}}
 	_, err := peer.Health(context.Background())
 	if !errors.Is(err, wire.ErrProtocolVersion) {
 		t.Fatalf("Health error = %v, want ErrProtocolVersion", err)
@@ -132,7 +132,7 @@ func (c *armedWriteFailureConn) Write(p []byte) (int, error) {
 
 func TestLifecyclePeerReopensOnlyForProvenPreSendFailure(t *testing.T) {
 	lifecycle := &fakeLifecycle{}
-	server := &wire.Server{Build: "server-test"}
+	server := &wire.Server{Build: "server-test", LifecycleBuild: "v1.0.0"}
 	protectAllLifecycleSessions(server)
 	server.RegisterLifecycle(lifecycle)
 	running := startSessionServer(t, server, func() (func(), error) { return func() {}, nil })
@@ -140,7 +140,7 @@ func TestLifecyclePeerReopensOnlyForProvenPreSendFailure(t *testing.T) {
 	var dials atomic.Int32
 	var first *armedWriteFailureConn
 	peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
-		Build: "client-test",
+		Build: "client-test", LifecycleBuild: "v2.0.0",
 		Dial: func(ctx context.Context) (net.Conn, error) {
 			conn, err := wire.UnixDialer(running.path)(ctx)
 			if err != nil {
@@ -171,7 +171,7 @@ func TestLifecyclePeerReopensOnlyForProvenPreSendFailure(t *testing.T) {
 
 func TestLifecyclePeerDoesNotReplayPostSendHandoff(t *testing.T) {
 	lifecycle := &fakeLifecycle{}
-	server := &wire.Server{Build: "server-test"}
+	server := &wire.Server{Build: "server-test", LifecycleBuild: "v1.0.0"}
 	protectAllLifecycleSessions(server)
 	server.RegisterLifecycle(lifecycle)
 	running := startSessionServer(t, server, func() (func(), error) { return func() {}, nil })
@@ -179,7 +179,7 @@ func TestLifecyclePeerDoesNotReplayPostSendHandoff(t *testing.T) {
 	var dials atomic.Int32
 	var first *armedWriteFailureConn
 	peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
-		Build: "client-test",
+		Build: "client-test", LifecycleBuild: "v2.0.0",
 		Dial: func(ctx context.Context) (net.Conn, error) {
 			conn, err := wire.UnixDialer(running.path)(ctx)
 			if err != nil {
@@ -208,7 +208,7 @@ func TestLifecyclePeerDoesNotReplayPostSendHandoff(t *testing.T) {
 
 func TestLifecycleSkipsDrainRejectionButParticipatesInAdmission(t *testing.T) {
 	lifecycle := &fakeLifecycle{}
-	server := &wire.Server{Build: "server-test"}
+	server := &wire.Server{Build: "server-test", LifecycleBuild: "v1.0.0"}
 	protectAllLifecycleSessions(server)
 	server.RegisterLifecycle(lifecycle)
 	var admissions atomic.Int32
@@ -216,7 +216,9 @@ func TestLifecycleSkipsDrainRejectionButParticipatesInAdmission(t *testing.T) {
 		admissions.Add(1)
 		return func() {}, nil
 	})
-	peer := &wire.LifecyclePeer{Config: wire.ClientConfig{Dial: wire.UnixDialer(running.path), Build: "client-test"}}
+	peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
+		Dial: wire.UnixDialer(running.path), Build: "client-test", LifecycleBuild: "v2.0.0",
+	}}
 	t.Cleanup(func() { _ = peer.Close() })
 	health, err := peer.Health(context.Background())
 	if err != nil {

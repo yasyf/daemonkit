@@ -84,6 +84,7 @@ type Dialer func(ctx context.Context) (net.Conn, error)
 type ClientConfig struct {
 	Dial                    Dialer
 	Build                   string
+	LifecycleBuild          string
 	Ladder                  Ladder
 	MaxFrame                int
 	OutboundQueue           int
@@ -191,7 +192,7 @@ func NewClient(ctx context.Context, config ClientConfig) (*Client, error) {
 		_ = conn.Close()
 		return nil, err
 	}
-	peer, err := clientHandshake(codec, config.Build)
+	peer, err := clientHandshake(codec, config.Build, config.LifecycleBuild)
 	if err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -579,8 +580,10 @@ func (c *Client) close(parent context.Context) error {
 	return c.closeErr
 }
 
-func clientHandshake(codec *Codec, build string) (BuildIdentity, error) {
-	payload, err := json.Marshal(BuildIdentity{Protocol: ProtocolVersion, Build: build})
+func clientHandshake(codec *Codec, build, lifecycleBuild string) (BuildIdentity, error) {
+	payload, err := json.Marshal(BuildIdentity{
+		Protocol: ProtocolVersion, Build: build, LifecycleBuild: lifecycleBuild,
+	})
 	if err != nil {
 		return BuildIdentity{}, err
 	}
@@ -603,6 +606,9 @@ func clientHandshake(codec *Codec, build string) (BuildIdentity, error) {
 	}
 	if identity.Build == "" {
 		return BuildIdentity{}, fmt.Errorf("%w: empty server build", ErrHandshake)
+	}
+	if lifecycleBuild != "" && identity.LifecycleBuild == "" {
+		return BuildIdentity{}, fmt.Errorf("%w: empty server lifecycle build", ErrHandshake)
 	}
 	if len(identity.Session) != sessionGenerationBytes {
 		return BuildIdentity{}, fmt.Errorf("%w: invalid session generation", ErrHandshake)

@@ -22,6 +22,10 @@ func (s *AcceptedSession) Peer() Peer { return s.s.peer }
 // Build returns the client build supplied by the mandatory handshake.
 func (s *AcceptedSession) Build() string { return s.s.build }
 
+// LifecycleBuild returns the client release identity supplied for protected
+// lifecycle traffic. Ordinary sessions return an empty string.
+func (s *AcceptedSession) LifecycleBuild() string { return s.s.lifecycleBuild }
+
 // Protected reports whether pre-capacity trust classified this exact session
 // for lifecycle or other protected service traffic.
 func (s *AcceptedSession) Protected() bool { return s.s.protected }
@@ -50,6 +54,7 @@ type session struct {
 	peer           Peer
 	protected      bool
 	build          string
+	lifecycleBuild string
 	generation     []byte
 	admit          func() (func(), error)
 	admitLifecycle func() (func(), error)
@@ -319,8 +324,13 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 
 	switch entry.route {
 	case routeLifecycle:
-		if !s.protected ||
-			!s.server.ProtectedSessionClassifier.AuthorizeBuild(s.server.Build, s.build) {
+		authorized := s.protected && s.lifecycleBuild != ""
+		if authorized && frame.Op != Op("health") {
+			authorized = s.server.ProtectedSessionClassifier.AuthorizeLifecycleBuild(
+				s.server.LifecycleBuild, s.lifecycleBuild,
+			)
+		}
+		if !authorized {
 			if err := s.sendRejected(sessionCtx, frame.ID, ErrProtectedSessionRequired.Error()); err != nil {
 				s.close()
 			}
@@ -362,14 +372,15 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 	finishAdmission = done
 
 	req := Request{
-		ID:      frame.ID,
-		Op:      frame.Op,
-		Tenant:  frame.Tenant,
-		Peer:    s.peer,
-		Build:   s.build,
-		Payload: append([]byte(nil), frame.Payload...),
-		Chunks:  state.chunks,
-		Session: s.accepted,
+		ID:             frame.ID,
+		Op:             frame.Op,
+		Tenant:         frame.Tenant,
+		Peer:           s.peer,
+		Build:          s.build,
+		LifecycleBuild: s.lifecycleBuild,
+		Payload:        append([]byte(nil), frame.Payload...),
+		Chunks:         state.chunks,
+		Session:        s.accepted,
 	}
 	value, err := s.server.dispatch(requestCtx, entry, req)
 	if requestErr := requestCtx.Err(); requestErr != nil {

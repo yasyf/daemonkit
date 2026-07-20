@@ -71,8 +71,8 @@ func (c Classifier) Classify(ctx context.Context, peer wire.Peer) (bool, error) 
 	return peer.Executable == target, nil
 }
 
-// AuthorizeBuild admits only the same build or a strictly newer successor.
-func (Classifier) AuthorizeBuild(serverBuild, peerBuild string) bool {
+// AuthorizeLifecycleBuild admits only the same daemon release or a strictly newer successor.
+func (Classifier) AuthorizeLifecycleBuild(serverBuild, peerBuild string) bool {
 	return peerBuild == serverBuild || version.Newer(peerBuild, serverBuild)
 }
 

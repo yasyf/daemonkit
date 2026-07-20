@@ -60,7 +60,7 @@ func TestRuntimeLifecycleAckPrecedesShutdownOrHandoff(t *testing.T) {
 			}
 			t.Cleanup(func() { _ = os.RemoveAll(dir) })
 			path := filepath.Join(dir, "runtime.sock")
-			server := &wire.Server{Build: "server-test", MaxFrame: maxFrame}
+			server := &wire.Server{Build: "server-test", LifecycleBuild: "server-test", MaxFrame: maxFrame}
 			protectAllLifecycleSessions(server)
 			fillStarted := make(chan struct{})
 			server.RegisterControl("fill", func(ctx context.Context, request wire.Request) (any, error) {
@@ -114,7 +114,9 @@ func TestRuntimeLifecycleAckPrecedesShutdownOrHandoff(t *testing.T) {
 			defer conn.Close()
 			codec := wire.NewCodec(conn)
 			codec.MaxFrame = maxFrame
-			identity, err := json.Marshal(wire.BuildIdentity{Protocol: wire.ProtocolVersion, Build: "server-test"})
+			identity, err := json.Marshal(wire.BuildIdentity{
+				Protocol: wire.ProtocolVersion, Build: "server-test", LifecycleBuild: "server-test",
+			})
 			if err != nil {
 				t.Fatalf("Marshal identity: %v", err)
 			}
@@ -200,7 +202,7 @@ func TestRuntimeHandoffResponseSurvivesImmediateSessionClosure(t *testing.T) {
 			t.Fatalf("iteration %d: MkdirTemp: %v", iteration, err)
 		}
 		path := filepath.Join(dir, "runtime.sock")
-		server := &wire.Server{Build: "server-test"}
+		server := &wire.Server{Build: "server-test", LifecycleBuild: "server-test"}
 		protectAllLifecycleSessions(server)
 		intake := &drain.Intake{}
 		cfg := daemon.RuntimeConfig{
@@ -219,7 +221,7 @@ func TestRuntimeHandoffResponseSurvivesImmediateSessionClosure(t *testing.T) {
 		server.RegisterLifecycle(runtime)
 		runDone := make(chan error, 1)
 		go func() { runDone <- runtime.Run(context.Background()) }()
-		client := newRuntimeClientWithDial(t, "server-test", func(ctx context.Context) (net.Conn, error) {
+		client := newRuntimeLifecycleClientWithDial(t, "server-test", "server-test", func(ctx context.Context) (net.Conn, error) {
 			conn, err := wire.UnixDialer(path)(ctx)
 			if err != nil {
 				return nil, err
@@ -251,6 +253,7 @@ func TestRuntimeHandoffResponseSurvivesImmediateSessionClosure(t *testing.T) {
 
 func TestResourceOwnerSocketReleaseKeepsLifecycleAvailableWhileDraining(t *testing.T) {
 	const (
+		businessBuild  = "runtime.rpc.v4"
 		incumbentBuild = "v1.0.0"
 		successorBuild = "v1.1.0"
 	)
@@ -260,7 +263,7 @@ func TestResourceOwnerSocketReleaseKeepsLifecycleAvailableWhileDraining(t *testi
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	path := filepath.Join(dir, "runtime.sock")
-	server := &wire.Server{Build: incumbentBuild}
+	server := &wire.Server{Build: businessBuild, LifecycleBuild: incumbentBuild}
 	protectAllLifecycleSessions(server)
 	server.RegisterConcurrent("work", func(context.Context, wire.Request) (any, error) {
 		return true, nil
@@ -298,10 +301,10 @@ func TestResourceOwnerSocketReleaseKeepsLifecycleAvailableWhileDraining(t *testi
 		_ = runtime.Close(ctx)
 	})
 
-	business := newRuntimeClient(t, path, incumbentBuild)
+	business := newRuntimeClient(t, path, businessBuild)
 	defer business.Close()
 	observer := &wire.LifecyclePeer{Config: wire.ClientConfig{
-		Dial: wire.UnixDialer(path), Build: successorBuild,
+		Dial: wire.UnixDialer(path), Build: businessBuild, LifecycleBuild: successorBuild,
 	}}
 	defer observer.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -312,7 +315,7 @@ func TestResourceOwnerSocketReleaseKeepsLifecycleAvailableWhileDraining(t *testi
 	cancel()
 
 	takeoverPeer := &wire.LifecyclePeer{Config: wire.ClientConfig{
-		Dial: wire.UnixDialer(path), Build: successorBuild,
+		Dial: wire.UnixDialer(path), Build: businessBuild, LifecycleBuild: successorBuild,
 	}}
 	defer takeoverPeer.Close()
 	type takeoverResult struct {
@@ -414,11 +417,17 @@ func newRuntimeClient(t *testing.T, path, build string) *wire.Client {
 }
 
 func newRuntimeClientWithDial(t *testing.T, build string, dial wire.Dialer) *wire.Client {
+	return newRuntimeLifecycleClientWithDial(t, build, "", dial)
+}
+
+func newRuntimeLifecycleClientWithDial(t *testing.T, build, lifecycleBuild string, dial wire.Dialer) *wire.Client {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		client, err := wire.NewClient(ctx, wire.ClientConfig{Dial: dial, Build: build})
+		client, err := wire.NewClient(ctx, wire.ClientConfig{
+			Dial: dial, Build: build, LifecycleBuild: lifecycleBuild,
+		})
 		cancel()
 		if err == nil {
 			return client

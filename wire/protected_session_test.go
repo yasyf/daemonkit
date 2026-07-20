@@ -31,7 +31,7 @@ func (c protectedClassifier) Classify(ctx context.Context, peer wire.Peer) (bool
 	return c.classify(ctx, peer)
 }
 
-func (c protectedClassifier) AuthorizeBuild(serverBuild, peerBuild string) bool {
+func (c protectedClassifier) AuthorizeLifecycleBuild(serverBuild, peerBuild string) bool {
 	if c.authorize == nil {
 		return true
 	}
@@ -40,7 +40,7 @@ func (c protectedClassifier) AuthorizeBuild(serverBuild, peerBuild string) bool 
 
 func TestProtectedSessionsSurviveIdleOrdinarySaturation(t *testing.T) {
 	server := &wire.Server{
-		Build: "server-test", MaxSessions: 3, ReservedProtectedSessions: 2,
+		Build: "server-test", LifecycleBuild: "v1.0.0", MaxSessions: 3, ReservedProtectedSessions: 2,
 		ProtectedSessionClassifier: protectedClassifier{classify: func(_ context.Context, peer wire.Peer) (bool, error) {
 			return peer.PID == os.Getpid(), nil
 		}},
@@ -66,7 +66,7 @@ func TestProtectedSessionsSurviveIdleOrdinarySaturation(t *testing.T) {
 	}
 
 	lifecycle := &wire.LifecyclePeer{Config: wire.ClientConfig{
-		Dial: wire.UnixDialer(running.path), Build: "server-test",
+		Dial: wire.UnixDialer(running.path), Build: "server-test", LifecycleBuild: "v2.0.0",
 	}}
 	defer lifecycle.Close()
 	health, err := lifecycle.Health(t.Context())
@@ -82,7 +82,7 @@ func TestLifecycleRejectsOrdinarySameUIDSessionAndAcceptsProtectedSession(t *tes
 	var protect atomic.Bool
 	lifecycleState := &countingProtectedLifecycle{}
 	server := &wire.Server{
-		Build: "server-test", MaxSessions: 2, ReservedProtectedSessions: 1,
+		Build: "server-test", LifecycleBuild: "v1.0.0", MaxSessions: 2, ReservedProtectedSessions: 1,
 		ProtectedSessionClassifier: protectedClassifier{classify: func(context.Context, wire.Peer) (bool, error) {
 			return protect.Load(), nil
 		}},
@@ -90,7 +90,7 @@ func TestLifecycleRejectsOrdinarySameUIDSessionAndAcceptsProtectedSession(t *tes
 	server.RegisterLifecycle(lifecycleState)
 	running := startSessionServer(t, server, admitAll(&atomic.Int32{}))
 	ordinary := &wire.LifecyclePeer{Config: wire.ClientConfig{
-		Dial: wire.UnixDialer(running.path), Build: "server-test",
+		Dial: wire.UnixDialer(running.path), Build: "server-test", LifecycleBuild: "v2.0.0",
 	}}
 	if _, err := ordinary.Health(t.Context()); err == nil || !strings.Contains(err.Error(), wire.ErrProtectedSessionRequired.Error()) {
 		t.Fatalf("ordinary lifecycle Health = %v, want protected rejection", err)
@@ -102,7 +102,7 @@ func TestLifecycleRejectsOrdinarySameUIDSessionAndAcceptsProtectedSession(t *tes
 
 	protect.Store(true)
 	protected := &wire.LifecyclePeer{Config: wire.ClientConfig{
-		Dial: wire.UnixDialer(running.path), Build: "server-test",
+		Dial: wire.UnixDialer(running.path), Build: "server-test", LifecycleBuild: "v2.0.0",
 	}}
 	defer protected.Close()
 	if _, err := protected.Health(t.Context()); err != nil {
@@ -113,7 +113,7 @@ func TestLifecycleRejectsOrdinarySameUIDSessionAndAcceptsProtectedSession(t *tes
 	}
 }
 
-func TestLifecycleAcceptsOnlySameOrNewerProtectedDaemonBuild(t *testing.T) {
+func TestLifecycleHealthObservesAnyProtectedReleaseButMutationRequiresSameOrNewer(t *testing.T) {
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -123,7 +123,7 @@ func TestLifecycleAcceptsOnlySameOrNewerProtectedDaemonBuild(t *testing.T) {
 		t.Fatal(err)
 	}
 	server := &wire.Server{
-		Build: "v1.2.0", MaxSessions: 3, ReservedProtectedSessions: 1,
+		Build: "synckit.rpc.v4", LifecycleBuild: "v1.2.0", MaxSessions: 3, ReservedProtectedSessions: 1,
 		ProtectedSessionClassifier: codeidentity.FixedClassifier{Executable: executable},
 	}
 	server.RegisterLifecycle(protectedTestLifecycle{})
@@ -137,15 +137,18 @@ func TestLifecycleAcceptsOnlySameOrNewerProtectedDaemonBuild(t *testing.T) {
 		{build: "v1.3.0", ok: true},
 	} {
 		peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
-			Dial: wire.UnixDialer(running.path), Build: test.build,
+			Dial: wire.UnixDialer(running.path), Build: "synckit.rpc.v4", LifecycleBuild: test.build,
 		}}
-		_, err := peer.Health(t.Context())
-		_ = peer.Close()
-		if test.ok && err != nil {
+		if _, err := peer.Health(t.Context()); err != nil {
 			t.Fatalf("build %s lifecycle Health: %v", test.build, err)
 		}
+		err := peer.Handoff(t.Context())
+		_ = peer.Close()
+		if test.ok && err != nil {
+			t.Fatalf("build %s lifecycle Handoff: %v", test.build, err)
+		}
 		if !test.ok && (err == nil || !strings.Contains(err.Error(), wire.ErrProtectedSessionRequired.Error())) {
-			t.Fatalf("build %s lifecycle Health = %v, want protected rejection", test.build, err)
+			t.Fatalf("build %s lifecycle Handoff = %v, want protected rejection", test.build, err)
 		}
 	}
 }
@@ -361,6 +364,9 @@ func (*countingProtectedLifecycle) Shutdown(context.Context) error { return nil 
 func (*countingProtectedLifecycle) Handoff(context.Context) error  { return nil }
 
 func protectAllLifecycleSessions(server *wire.Server) {
+	if server.LifecycleBuild == "" {
+		server.LifecycleBuild = "v1.0.0"
+	}
 	server.ReservedProtectedSessions = 1
 	server.ProtectedSessionClassifier = protectedClassifier{
 		classify: func(context.Context, wire.Peer) (bool, error) { return true, nil },

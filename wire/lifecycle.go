@@ -206,6 +206,9 @@ func (p *LifecyclePeer) session(ctx context.Context) (*Client, error) {
 	if p.client != nil {
 		return p.client, nil
 	}
+	if p.Config.LifecycleBuild == "" {
+		return nil, errors.New("wire: lifecycle peer release build is required")
+	}
 	client, err := NewClient(ctx, p.Config)
 	if err != nil {
 		if provesNoListener(err) {

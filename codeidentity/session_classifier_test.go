@@ -41,9 +41,9 @@ func TestFixedClassifierDeniesOrdinaryAndAllowsSameOrNewerDaemon(t *testing.T) {
 	if err != nil || !protected {
 		t.Fatalf("daemon classification = %t, %v", protected, err)
 	}
-	if !classifier.AuthorizeBuild("v1.2.0", "v1.2.0") ||
-		!classifier.AuthorizeBuild("v1.2.0", "v1.3.0") ||
-		classifier.AuthorizeBuild("v1.2.0", "v1.1.0") {
+	if !classifier.AuthorizeLifecycleBuild("v1.2.0", "v1.2.0") ||
+		!classifier.AuthorizeLifecycleBuild("v1.2.0", "v1.3.0") ||
+		classifier.AuthorizeLifecycleBuild("v1.2.0", "v1.1.0") {
 		t.Fatal("same/newer protected build relationship is not exact")
 	}
 }
