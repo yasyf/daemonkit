@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"text/template"
+	"time"
 
 	"github.com/yasyf/daemonkit/supervise"
 )
@@ -34,10 +35,18 @@ const plistTemplateText = `<?xml version="1.0" encoding="UTF-8"?>
     <key>RunAtLoad</key>
     <true/>
 {{.Restart}}
+{{if .StartInterval}}    <key>StartInterval</key>
+    <integer>{{.StartInterval}}</integer>
+{{end}}
     <key>ThrottleInterval</key>
     <integer>10</integer>
+{{if .ProcessType}}
     <key>ProcessType</key>
-    <string>Background</string>
+    <string>{{.ProcessType}}</string>
+{{end}}{{if .LimitLoadToSessionType}}
+    <key>LimitLoadToSessionType</key>
+    <string>{{.LimitLoadToSessionType}}</string>
+{{end}}
     <key>StandardOutPath</key>
     <string>{{.Log}}</string>
     <key>StandardErrorPath</key>
@@ -63,11 +72,14 @@ func xmlEscape(s string) string {
 type plistKV struct{ Key, Value string }
 
 type plistData struct {
-	Label   string
-	Args    []string
-	Log     string
-	Env     []plistKV
-	Restart string
+	Label                  string
+	Args                   []string
+	Log                    string
+	Env                    []plistKV
+	Restart                string
+	StartInterval          int64
+	ProcessType            string
+	LimitLoadToSessionType string
 }
 
 // Agent is a consumer's background daemon as a macOS user LaunchAgent; the
@@ -93,6 +105,15 @@ type Agent struct {
 	Env map[string]string
 	// RestartPolicy defines when launchd restarts the daemon. Required.
 	RestartPolicy RestartPolicy
+	// StartInterval schedules the job at a whole-second interval. Zero omits
+	// the launchd key.
+	StartInterval time.Duration
+	// ProcessType declares launchd's resource policy. The zero value omits the
+	// launchd key.
+	ProcessType ProcessType
+	// LimitLoadToSessionType restricts the job to one launchd session type. The
+	// zero value omits the launchd key.
+	LimitLoadToSessionType SessionType
 	// Runner owns every external service command as a disposable process group.
 	Runner supervise.TaskRunner
 }
@@ -116,6 +137,18 @@ func (a Agent) WritePlist() (string, error) {
 	restart, err := a.RestartPolicy.plist()
 	if err != nil {
 		return "", fmt.Errorf("render restart policy: %w", err)
+	}
+	startInterval, err := startIntervalSeconds(a.StartInterval)
+	if err != nil {
+		return "", err
+	}
+	processType, err := a.ProcessType.plistValue()
+	if err != nil {
+		return "", err
+	}
+	sessionType, err := a.LimitLoadToSessionType.plistValue()
+	if err != nil {
+		return "", err
 	}
 	bin := a.Program
 	if bin == "" {
@@ -146,11 +179,14 @@ func (a Agent) WritePlist() (string, error) {
 	}
 	var buf bytes.Buffer
 	if err := plistTemplate.Execute(&buf, plistData{
-		Label:   xmlEscape(a.Label),
-		Args:    args,
-		Log:     xmlEscape(a.LogPath),
-		Env:     env,
-		Restart: restart,
+		Label:                  xmlEscape(a.Label),
+		Args:                   args,
+		Log:                    xmlEscape(a.LogPath),
+		Env:                    env,
+		Restart:                restart,
+		StartInterval:          startInterval,
+		ProcessType:            processType,
+		LimitLoadToSessionType: sessionType,
 	}); err != nil {
 		return "", fmt.Errorf("render plist: %w", err)
 	}

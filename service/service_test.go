@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yasyf/daemonkit/supervise"
 )
@@ -233,6 +234,108 @@ func TestAgentRestartPolicies(t *testing.T) {
 			}
 			if !strings.Contains(string(body), tc.want) {
 				t.Errorf("plist missing %q:\n%s", tc.want, body)
+			}
+		})
+	}
+}
+
+func TestAgentOptionalLaunchPolicy(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	a := Agent{
+		Label:                  "com.example.reconcile",
+		Program:                "/usr/bin/true",
+		LogPath:                filepath.Join(home, "reconcile.log"),
+		RestartPolicy:          NoRestart,
+		StartInterval:          15 * time.Minute,
+		ProcessType:            ProcessTypeBackground,
+		LimitLoadToSessionType: SessionTypeAqua,
+	}
+	path, err := a.WritePlist()
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(body)
+	for _, want := range []string{
+		"<key>StartInterval</key>\n    <integer>900</integer>",
+		"<key>ProcessType</key>\n    <string>Background</string>",
+		"<key>LimitLoadToSessionType</key>\n    <string>Aqua</string>",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("plist missing %q:\n%s", want, s)
+		}
+	}
+}
+
+func TestAgentOptionalLaunchPolicyIsAbsentByDefault(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	a := Agent{
+		Label:         "com.example.serve",
+		Program:       "/usr/bin/true",
+		LogPath:       filepath.Join(home, "serve.log"),
+		RestartPolicy: RestartAlways,
+	}
+	path, err := a.WritePlist()
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(body)
+	for _, unwanted := range []string{"StartInterval", "ProcessType", "LimitLoadToSessionType"} {
+		if strings.Contains(s, unwanted) {
+			t.Errorf("plist unexpectedly contains %q:\n%s", unwanted, s)
+		}
+	}
+}
+
+func TestAgentOptionalLaunchPolicyRejectsInvalidValues(t *testing.T) {
+	cases := []struct {
+		name string
+		edit func(*Agent)
+		want string
+	}{
+		{
+			name: "subsecond interval",
+			edit: func(a *Agent) { a.StartInterval = 500 * time.Millisecond },
+			want: "positive whole number of seconds",
+		},
+		{
+			name: "negative interval",
+			edit: func(a *Agent) { a.StartInterval = -time.Second },
+			want: "positive whole number of seconds",
+		},
+		{
+			name: "unknown process type",
+			edit: func(a *Agent) { a.ProcessType = ProcessType(99) },
+			want: "invalid process type 99",
+		},
+		{
+			name: "unknown session type",
+			edit: func(a *Agent) { a.LimitLoadToSessionType = SessionType(99) },
+			want: "invalid session type 99",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			a := Agent{
+				Label:         "com.example.invalid",
+				Program:       "/usr/bin/true",
+				LogPath:       filepath.Join(home, "invalid.log"),
+				RestartPolicy: NoRestart,
+			}
+			tc.edit(&a)
+			if _, err := a.WritePlist(); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("WritePlist() err = %v, want %q", err, tc.want)
 			}
 		})
 	}
