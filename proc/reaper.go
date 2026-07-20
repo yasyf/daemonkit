@@ -347,6 +347,17 @@ func (r *Reaper) Terminate(ctx context.Context, rec Record) error {
 	return nil
 }
 
+// TerminateWithin applies Terminate with an exact SIGTERM grace without
+// mutating the reaper's policy for any other process.
+func (r *Reaper) TerminateWithin(ctx context.Context, rec Record, grace time.Duration) error {
+	if grace <= 0 {
+		return errors.New("proc: termination grace must be positive")
+	}
+	clone := *r
+	clone.Grace = grace
+	return clone.Terminate(ctx, rec)
+}
+
 func (r *Reaper) terminateOne(ctx context.Context, rec Record, boot string) (bool, error) {
 	if rec.Boot != boot {
 		return true, nil

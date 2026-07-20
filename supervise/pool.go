@@ -84,6 +84,7 @@ type Workers interface {
 type WorkerRegistry interface {
 	TrackGroup(ctx context.Context, pid int, class proc.RecoveryClass) (proc.Record, error)
 	Untrack(ctx context.Context, rec proc.Record) error
+	TerminateWithin(ctx context.Context, rec proc.Record, grace time.Duration) error
 	Owns(rec proc.Record) (bool, error)
 	Reap(ctx context.Context) error
 }
@@ -453,9 +454,16 @@ type stopResult struct {
 }
 
 func (p *Pool) stop(rec proc.Record, waited <-chan error) stopResult {
+	return p.stopAfterTerm(rec, waited, nil)
+}
+
+func (p *Pool) stopAfterTerm(rec proc.Record, waited <-chan error, afterTerm func()) stopResult {
 	termErr := p.signal(-rec.PID, syscall.SIGTERM)
 	if errors.Is(termErr, syscall.ESRCH) {
 		termErr = nil
+	}
+	if afterTerm != nil {
+		afterTerm()
 	}
 	timer := time.NewTimer(p.grace)
 	defer timer.Stop()

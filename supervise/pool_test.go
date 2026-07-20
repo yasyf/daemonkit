@@ -86,6 +86,10 @@ func (f *fakeRegistry) Untrack(_ context.Context, rec proc.Record) error {
 	return f.untrackErr
 }
 
+func (f *fakeRegistry) TerminateWithin(ctx context.Context, rec proc.Record, _ time.Duration) error {
+	return f.Untrack(ctx, rec)
+}
+
 func (f *fakeRegistry) Owns(proc.Record) (bool, error) {
 	f.mu.Lock()
 	call := f.ownsCalls
