@@ -263,13 +263,39 @@ func absentRuntimePeer() Peer {
 }
 
 func startRuntime(ctx context.Context, t *testing.T, runtime *Runtime, server *runtimeServer) <-chan error {
+	return startRuntimeWithin(ctx, t, runtime, server, 2*time.Second)
+}
+
+func startRuntimeWithin(
+	ctx context.Context,
+	t *testing.T,
+	runtime *Runtime,
+	server *runtimeServer,
+	timeout time.Duration,
+) <-chan error {
 	t.Helper()
+	runCtx, cancel := context.WithCancel(ctx)
+	t.Cleanup(cancel)
 	done := make(chan error, 1)
-	go func() { done <- runtime.Run(ctx) }()
+	go func() { done <- runtime.Run(runCtx) }()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case <-server.started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("runtime did not start session server")
+	case err := <-done:
+		select {
+		case <-server.started:
+			done <- err
+		default:
+			t.Fatalf("runtime stopped before starting session server: %v", err)
+		}
+	case <-timer.C:
+		select {
+		case <-server.started:
+		default:
+			cancel()
+			t.Fatalf("runtime did not start session server within %s", timeout)
+		}
 	}
 	return done
 }
@@ -660,7 +686,7 @@ func TestRuntimeOwnsManagedProcessThroughServingAndPostDrainShutdown(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	runDone := startRuntime(context.Background(), t, runtime, server)
+	runDone := startRuntimeWithin(context.Background(), t, runtime, server, 10*time.Second)
 	if process == nil {
 		t.Fatal("activation did not publish managed process")
 	}
