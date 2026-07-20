@@ -285,6 +285,150 @@ func TestControllerRecoveryDoesNotAcknowledgeBeforeConvergence(t *testing.T) {
 	}
 }
 
+func TestControllerRecoveryVerifiesExactAgentWithoutRelaunch(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	agent := controllerAgent(t, "com.example.recover-exact")
+	plist, err := agent.Plist()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := agent.PlistPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, plist, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var events []string
+	run := launchctlStub(func(args []string) (string, error) {
+		if args[0] != "print" {
+			return "", fmt.Errorf("unexpected launchctl mutation: %v", args)
+		}
+		return "loaded", nil
+	})
+	controller, _, store, receipts := newTestController(t, controllerState{
+		Desired: map[string]Agent{agent.Label: agent},
+		Applied: map[string]Agent{agent.Label: agent},
+	}, run, &events)
+	_ = controller
+	want := []string{"recover", "load", "run:print " + serviceTarget(agent.Label), "recover-receipts"}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("recovery events = %v, want %v", events, want)
+	}
+	if receipts.calls != 1 {
+		t.Fatalf("receipt recovery calls = %d, want 1", receipts.calls)
+	}
+	if got := store.state.Applied[agent.Label]; !reflect.DeepEqual(got, agent) {
+		t.Fatalf("applied agent changed: %#v", got)
+	}
+}
+
+func TestControllerRejectsUnsafeProgramTreeBeforeEffects(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	realDir := filepath.Join(base, "real")
+	if err := os.MkdirAll(realDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	executable := filepath.Join(realDir, "executable")
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	nonExecutable := filepath.Join(realDir, "non-executable")
+	if err := os.WriteFile(nonExecutable, []byte("no"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	programLink := filepath.Join(realDir, "program-link")
+	if err := os.Symlink(executable, programLink); err != nil {
+		t.Fatal(err)
+	}
+	ancestorLink := filepath.Join(base, "ancestor-link")
+	if err := os.Symlink(realDir, ancestorLink); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name    string
+		program string
+	}{
+		{"symlink program", programLink},
+		{"symlink ancestor", filepath.Join(ancestorLink, "executable")},
+		{"directory program", realDir},
+		{"non-executable program", nonExecutable},
+		{"missing program", filepath.Join(realDir, "missing")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			agent := controllerAgent(t, "com.example.unsafe")
+			agent.Program = test.program
+			var events []string
+			controller, _, _, _ := newTestController(t, controllerState{
+				Desired: map[string]Agent{}, Applied: map[string]Agent{},
+			}, launchctlStub(func(args []string) (string, error) {
+				return "", fmt.Errorf("unexpected launchctl effect: %v", args)
+			}), &events)
+			events = nil
+			if err := controller.Converge(context.Background(), []Agent{agent}); err == nil {
+				t.Fatal("Converge() accepted unsafe program")
+			}
+			if !reflect.DeepEqual(events, []string{"replace-desired"}) {
+				t.Fatalf("events = %v, want durable desired only", events)
+			}
+			path, err := agent.PlistPath()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("unsafe program plist exists or stat failed unexpectedly: %v", err)
+			}
+		})
+	}
+}
+
+func TestControllerRecoveryRejectsUnsafeAppliedProgramBeforeReceiptAck(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	executable := filepath.Join(base, "holder")
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	linked := filepath.Join(base, "holder-link")
+	if err := os.Symlink(executable, linked); err != nil {
+		t.Fatal(err)
+	}
+	agent := controllerAgent(t, "com.example.unsafe-recovery")
+	agent.Program = linked
+	var events []string
+	runtime := &controllerRuntimeStub{events: &events, run: launchctlStub(func(args []string) (string, error) {
+		return "", fmt.Errorf("unexpected launchctl effect: %v", args)
+	})}
+	store := &controllerStoreStub{events: &events, state: controllerState{
+		Desired: map[string]Agent{agent.Label: agent},
+		Applied: map[string]Agent{agent.Label: agent},
+	}}
+	receipts := &controllerReceiptsStub{events: &events}
+	if _, err := newControllerWithRuntime(context.Background(), controllerConfig(t), runtime, receipts, store); err == nil {
+		t.Fatal("newControllerWithRuntime() accepted unsafe recovered program")
+	}
+	if receipts.calls != 0 {
+		t.Fatalf("receipt recovery calls = %d, want 0", receipts.calls)
+	}
+	for _, event := range events {
+		if strings.HasPrefix(event, "run:") {
+			t.Fatalf("unsafe recovery invoked launchctl: %v", events)
+		}
+	}
+}
+
 func TestControllerPersistsDesiredBeforeEffectsAndResumesAfterFailure(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	agent := controllerAgent(t, "com.example.persist")

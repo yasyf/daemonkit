@@ -154,16 +154,9 @@ func (a Agent) Plist() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	bin := a.Program
-	if bin == "" {
-		exe, err := os.Executable()
-		if err != nil {
-			return nil, fmt.Errorf("resolve executable: %w", err)
-		}
-		bin = exe
-	}
-	if !filepath.IsAbs(bin) || filepath.Clean(bin) != bin {
-		return nil, fmt.Errorf("service: program path %q is not exact and absolute", bin)
+	bin, err := a.programPath()
+	if err != nil {
+		return nil, err
 	}
 	if !filepath.IsAbs(a.LogPath) || filepath.Clean(a.LogPath) != a.LogPath {
 		return nil, fmt.Errorf("service: log path %q is not exact and absolute", a.LogPath)
@@ -192,6 +185,21 @@ func (a Agent) Plist() ([]byte, error) {
 		return nil, fmt.Errorf("render plist: %w", err)
 	}
 	return buf.Bytes(), nil
+}
+
+func (a Agent) programPath() (string, error) {
+	bin := a.Program
+	if bin == "" {
+		exe, err := os.Executable()
+		if err != nil {
+			return "", fmt.Errorf("resolve executable: %w", err)
+		}
+		bin = exe
+	}
+	if !filepath.IsAbs(bin) || filepath.Clean(bin) != bin {
+		return "", fmt.Errorf("service: program path %q is not exact and absolute", bin)
+	}
+	return bin, nil
 }
 
 func canonicalAssociatedBundleIdentifiers(values []string) ([]string, error) {

@@ -157,7 +157,7 @@ func newControllerWithRuntime(
 		return nil, err
 	}
 	controller.state = state
-	if err := controller.reconcile(ctx, state.Applied, state.Desired, true); err != nil {
+	if err := controller.reconcile(ctx, state.Applied, state.Desired); err != nil {
 		return nil, fmt.Errorf("service: recover desired set: %w", err)
 	}
 	if _, err := receipts.RecoverReapReceipts(
@@ -193,7 +193,7 @@ func (c *Controller) Converge(ctx context.Context, agents []Agent) error {
 		}
 		c.state = controllerState{Desired: copyAgents(desired), Applied: copyAgents(prior.Applied)}
 	}
-	return c.reconcile(opCtx, copyAgents(c.state.Applied), c.state.Desired, false)
+	return c.reconcile(opCtx, copyAgents(c.state.Applied), c.state.Desired)
 }
 
 // Close rejects new convergence, waits for admitted service workers, cancels
@@ -287,7 +287,6 @@ func (c *Controller) reconcile(
 	ctx context.Context,
 	applied map[string]Agent,
 	desired map[string]Agent,
-	force bool,
 ) error {
 	for _, label := range slices.Sorted(maps.Keys(applied)) {
 		if _, keep := desired[label]; keep {
@@ -302,7 +301,7 @@ func (c *Controller) reconcile(
 		delete(c.state.Applied, label)
 	}
 	for _, label := range slices.Sorted(maps.Keys(desired)) {
-		if previous, ok := applied[label]; !force && ok && reflect.DeepEqual(previous, desired[label]) {
+		if previous, ok := applied[label]; ok && reflect.DeepEqual(previous, desired[label]) {
 			verified, err := c.verify(ctx, desired[label])
 			if err != nil {
 				return fmt.Errorf("service: verify agent %q: %w", label, err)
@@ -324,6 +323,9 @@ func (c *Controller) reconcile(
 }
 
 func (c *Controller) verify(ctx context.Context, agent Agent) (bool, error) {
+	if err := validateProgramTree(agent); err != nil {
+		return false, err
+	}
 	want, err := agent.Plist()
 	if err != nil {
 		return false, err
@@ -357,6 +359,9 @@ func (c *Controller) verify(ctx context.Context, agent Agent) (bool, error) {
 }
 
 func (c *Controller) install(ctx context.Context, agent Agent) error {
+	if err := validateProgramTree(agent); err != nil {
+		return err
+	}
 	plist, err := agent.Plist()
 	if err != nil {
 		return err
@@ -379,6 +384,45 @@ func (c *Controller) install(ctx context.Context, agent Agent) error {
 	}
 	if out, err := c.launchctl(ctx, "kickstart", serviceTarget(agent.Label)); err != nil {
 		return fmt.Errorf("launchctl kickstart: %w: %s", err, strings.TrimSpace(out))
+	}
+	return nil
+}
+
+func validateProgramTree(agent Agent) error {
+	program, err := agent.programPath()
+	if err != nil {
+		return err
+	}
+	current := string(filepath.Separator)
+	root, err := os.Lstat(current)
+	if err != nil {
+		return fmt.Errorf("service: inspect program root: %w", err)
+	}
+	if root.Mode()&os.ModeSymlink != 0 || !root.IsDir() {
+		return errors.New("service: program root is not a real directory")
+	}
+	parts := strings.Split(strings.TrimPrefix(program, current), current)
+	for index, part := range parts {
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return fmt.Errorf("service: inspect program path %q: %w", current, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("service: program path %q is a symlink", current)
+		}
+		if index < len(parts)-1 {
+			if !info.IsDir() {
+				return fmt.Errorf("service: program ancestor %q is not a directory", current)
+			}
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("service: program %q is not a regular file", current)
+		}
+		if info.Mode().Perm()&0o111 == 0 {
+			return fmt.Errorf("service: program %q is not executable", current)
+		}
 	}
 	return nil
 }
