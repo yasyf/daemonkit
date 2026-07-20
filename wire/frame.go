@@ -152,20 +152,27 @@ func (c *Codec) ReadFrame() (Frame, error) {
 
 // WriteFrame writes one complete frame under the configured bound.
 func (c *Codec) WriteFrame(frame Frame) error {
+	_, err := c.writeFrame(frame)
+	return err
+}
+
+// writeFrame reports whether the complete length-framed packet reached the
+// connection writer. A partial packet cannot dispatch at the peer.
+func (c *Codec) writeFrame(frame Frame) (bool, error) {
 	body, err := encodeFrame(frame)
 	if err != nil {
-		return err
+		return false, err
 	}
 	limit := c.MaxFrame
 	if limit <= 0 {
 		limit = DefaultMaxFrame
 	}
 	if len(body) > limit {
-		return fmt.Errorf("%w: %d > %d", ErrFrameTooLarge, len(body), limit)
+		return false, fmt.Errorf("%w: %d > %d", ErrFrameTooLarge, len(body), limit)
 	}
 	bodyLength, err := uint32Length("body", len(body))
 	if err != nil {
-		return err
+		return false, err
 	}
 	packet := make([]byte, 4+len(body))
 	binary.BigEndian.PutUint32(packet[:4], bodyLength)
@@ -174,13 +181,15 @@ func (c *Codec) WriteFrame(frame Frame) error {
 	defer c.writeMu.Unlock()
 	if c.WriteTimeout > 0 {
 		if err := c.conn.SetWriteDeadline(time.Now().Add(c.WriteTimeout)); err != nil {
-			return fmt.Errorf("wire: set write deadline: %w", err)
+			return false, fmt.Errorf("wire: set write deadline: %w", err)
 		}
 	}
-	if err := writeFull(c.conn, packet); err != nil {
-		return fmt.Errorf("wire: write frame: %w", err)
+	written, err := writeFull(c.conn, packet)
+	complete := written == len(packet)
+	if err != nil {
+		return complete, fmt.Errorf("wire: write frame: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 func encodeFrame(frame Frame) ([]byte, error) {
@@ -358,16 +367,18 @@ func validateFrame(frame Frame) error {
 	return nil
 }
 
-func writeFull(w io.Writer, p []byte) error {
+func writeFull(w io.Writer, p []byte) (int, error) {
+	written := 0
 	for len(p) > 0 {
 		n, err := w.Write(p)
+		written += n
 		if err != nil {
-			return err
+			return written, err
 		}
 		if n == 0 {
-			return io.ErrShortWrite
+			return written, io.ErrShortWrite
 		}
 		p = p[n:]
 	}
-	return nil
+	return written, nil
 }

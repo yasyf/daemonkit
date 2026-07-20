@@ -36,6 +36,9 @@ const (
 	// PostSendFailure means the request was sent but no terminal response
 	// arrived; never auto-replay it.
 	PostSendFailure
+	// DeliveryUnknown means the transport accepted the request for writing but
+	// could not prove whether the peer observed it. It is never replayable.
+	DeliveryUnknown
 )
 
 // String names the outcome for diagnostics.
@@ -49,6 +52,8 @@ func (o Outcome) String() string {
 		return "rejected"
 	case PostSendFailure:
 		return "post-send-failure"
+	case DeliveryUnknown:
+		return "delivery-unknown"
 	default:
 		return fmt.Sprintf("outcome(%d)", int(o))
 	}
@@ -115,6 +120,9 @@ type Client struct {
 	pending map[uint64]*ClientCall
 	err     error
 
+	writerMu     sync.RWMutex
+	writerClosed bool
+
 	loopWG                  sync.WaitGroup
 	closeOnce               sync.Once
 	closeErr                error
@@ -130,7 +138,20 @@ type Client struct {
 type outboundFrame struct {
 	frame Frame
 	ctx   context.Context
-	done  chan error
+	done  chan frameSendResult
+}
+
+type frameSendState uint8
+
+const (
+	frameNotSent frameSendState = iota
+	frameDeliveryUnknown
+	frameCommitted
+)
+
+type frameSendResult struct {
+	state frameSendState
+	err   error
 }
 
 // ClientCall is one in-flight request on a Client.
@@ -299,15 +320,22 @@ func (c *Client) open(
 	if !deadline.IsZero() {
 		frame.DeadlineUnixMilli = deadline.UnixMilli()
 	}
-	requestOutcome := PreSendFailure
-	if err := c.sendFrame(callCtx, frame); err != nil {
+	state, err := c.sendFrame(callCtx, frame)
+	if err != nil {
 		cancel()
 		c.removePending(id)
-		return nil, &OpenError{Outcome: requestOutcome, Err: fmt.Errorf("wire: send request: %w", err)}
+		outcome := PreSendFailure
+		switch state {
+		case frameDeliveryUnknown:
+			outcome = DeliveryUnknown
+		case frameCommitted:
+			outcome = PostSendFailure
+		}
+		return nil, &OpenError{Outcome: outcome, Err: fmt.Errorf("wire: send request: %w", err)}
 	}
-	requestOutcome = PostSendFailure
+	requestOutcome := PostSendFailure
 	if responseStream {
-		if err := c.sendFrame(callCtx, Frame{Kind: FrameWindow, ID: id, Sequence: c.streamWindow}); err != nil {
+		if _, err := c.sendFrame(callCtx, Frame{Kind: FrameWindow, ID: id, Sequence: c.streamWindow}); err != nil {
 			cancel()
 			err = fmt.Errorf("wire: grant response window: %w", err)
 			c.fail(err)
@@ -373,7 +401,7 @@ func (c *ClientCall) SendChunk(ctx context.Context, payload []byte) error {
 	}
 	c.mu.Unlock()
 	frame := Frame{Kind: FrameStream, ID: c.id, Sequence: sequence, Payload: append([]byte(nil), payload...)}
-	if err := c.client.sendFrame(ctx, frame); err != nil {
+	if _, err := c.client.sendFrame(ctx, frame); err != nil {
 		return err
 	}
 	return nil
@@ -417,7 +445,7 @@ func (c *ClientCall) CloseSend(ctx context.Context) error {
 	}
 	c.sendEnded = true
 	c.mu.Unlock()
-	if err := c.client.sendFrame(ctx, Frame{Kind: FrameStream, Flags: FlagEnd, ID: c.id, Sequence: sequence}); err != nil {
+	if _, err := c.client.sendFrame(ctx, Frame{Kind: FrameStream, Flags: FlagEnd, ID: c.id, Sequence: sequence}); err != nil {
 		return err
 	}
 	return nil
@@ -466,7 +494,7 @@ func (c *ClientCall) cancel(parent context.Context) {
 		c.stopDelivery()
 		go func() {
 			ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), defaultWriteTimeout)
-			err := c.client.sendFrame(ctx, Frame{Kind: FrameCancel, Flags: FlagEnd, ID: c.id})
+			_, err := c.client.sendFrame(ctx, Frame{Kind: FrameCancel, Flags: FlagEnd, ID: c.id})
 			cancel()
 			if err != nil {
 				c.client.fail(fmt.Errorf("wire: cancel request: %w", err))
@@ -494,7 +522,7 @@ func (c *ClientCall) deliverChunks() {
 			}
 			select {
 			case c.chunks <- chunk:
-				if err := c.client.sendFrame(c.client.ctx, Frame{Kind: FrameWindow, ID: c.id, Sequence: 1}); err != nil {
+				if _, err := c.client.sendFrame(c.client.ctx, Frame{Kind: FrameWindow, ID: c.id, Sequence: 1}); err != nil {
 					c.client.fail(fmt.Errorf("wire: return response credit: %w", err))
 					return
 				}
@@ -526,7 +554,7 @@ func (c *Client) deliverEvents() {
 			}
 			select {
 			case c.eventOut <- event:
-				if err := c.sendFrame(c.ctx, Frame{Kind: FrameWindow, Sequence: 1}); err != nil {
+				if _, err := c.sendFrame(c.ctx, Frame{Kind: FrameWindow, Sequence: 1}); err != nil {
 					c.fail(fmt.Errorf("wire: return event credit: %w", err))
 					return
 				}
@@ -563,7 +591,7 @@ func (c *Client) close(parent context.Context) error {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), c.codec.WriteTimeout)
 		defer cancel()
 		c.closing.Store(true)
-		if err := c.sendFrame(ctx, Frame{Kind: FrameGoAway, Flags: FlagEnd}); err != nil {
+		if _, err := c.sendFrame(ctx, Frame{Kind: FrameGoAway, Flags: FlagEnd}); err != nil {
 			c.closeErr = fmt.Errorf("wire: send go-away: %w", err)
 		} else {
 			select {
@@ -618,22 +646,42 @@ func clientHandshake(codec *Codec, build, lifecycleBuild string) (BuildIdentity,
 
 func (c *Client) writeLoop() {
 	defer c.loopWG.Done()
+	defer c.closeWriter()
 	for {
 		select {
-		case <-c.ctx.Done():
-			return
 		case outgoing := <-c.outbound:
-			err := outgoing.ctx.Err()
-			if err == nil {
-				err = c.codec.WriteFrame(outgoing.frame)
+			result := frameSendResult{state: frameNotSent, err: outgoing.ctx.Err()}
+			if result.err == nil {
+				var committed bool
+				committed, result.err = c.codec.writeFrame(outgoing.frame)
+				switch {
+				case committed:
+					result.state = frameCommitted
+				}
 			}
-			outgoing.done <- err
-			if err != nil {
-				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-					c.fail(fmt.Errorf("wire: write: %w", err))
+			outgoing.done <- result
+			if result.err != nil {
+				if !errors.Is(result.err, context.Canceled) && !errors.Is(result.err, context.DeadlineExceeded) {
+					c.fail(fmt.Errorf("wire: write: %w", result.err))
 					return
 				}
 			}
+		case <-c.ctx.Done():
+			return
+		}
+	}
+}
+
+func (c *Client) closeWriter() {
+	c.writerMu.Lock()
+	defer c.writerMu.Unlock()
+	c.writerClosed = true
+	for {
+		select {
+		case outgoing := <-c.outbound:
+			outgoing.done <- frameSendResult{state: frameDeliveryUnknown, err: c.sessionErr()}
+		default:
+			return
 		}
 	}
 }
@@ -699,7 +747,7 @@ func (c *Client) receiveResponse(frame Frame) error {
 	call := c.removePending(frame.ID)
 	var ackErr error
 	if response.Ack {
-		ackErr = c.sendFrame(c.ctx, Frame{
+		_, ackErr = c.sendFrame(c.ctx, Frame{
 			Kind: FrameAck, Flags: FlagEnd, ID: frame.ID, Payload: c.peer.Session,
 		})
 	}
@@ -783,21 +831,25 @@ func (c *Client) receiveWindow(frame Frame) error {
 	return err
 }
 
-func (c *Client) sendFrame(ctx context.Context, frame Frame) error {
-	done := make(chan error, 1)
+func (c *Client) sendFrame(ctx context.Context, frame Frame) (frameSendState, error) {
+	done := make(chan frameSendResult, 1)
+	c.writerMu.RLock()
+	if c.writerClosed {
+		c.writerMu.RUnlock()
+		return frameNotSent, c.sessionErr()
+	}
 	select {
 	case c.outbound <- outboundFrame{frame: frame, ctx: ctx, done: done}:
 	case <-ctx.Done():
-		return ctx.Err()
+		c.writerMu.RUnlock()
+		return frameNotSent, ctx.Err()
 	case <-c.ctx.Done():
-		return c.sessionErr()
+		c.writerMu.RUnlock()
+		return frameNotSent, c.sessionErr()
 	}
-	select {
-	case err := <-done:
-		return err
-	case <-c.ctx.Done():
-		return c.sessionErr()
-	}
+	c.writerMu.RUnlock()
+	result := <-done
+	return result.state, result.err
 }
 
 func (c *Client) fail(err error) {

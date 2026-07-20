@@ -30,6 +30,31 @@ type failResponseWindowConn struct {
 	requestOnce    sync.Once
 }
 
+type committedBeforeReadFailureConn struct {
+	net.Conn
+	requestCommitted chan struct{}
+	readFailed       chan struct{}
+	requestOnce      sync.Once
+	readOnce         sync.Once
+}
+
+func (c *committedBeforeReadFailureConn) Write(payload []byte) (int, error) {
+	n, err := c.Conn.Write(payload)
+	if len(payload) > 20 && wire.FrameKind(payload[10]) == wire.FrameRequest && err == nil && n == len(payload) {
+		c.requestOnce.Do(func() { close(c.requestCommitted) })
+		<-c.readFailed
+	}
+	return n, err
+}
+
+func (c *committedBeforeReadFailureConn) Read(payload []byte) (int, error) {
+	n, err := c.Conn.Read(payload)
+	if err != nil {
+		c.readOnce.Do(func() { close(c.readFailed) })
+	}
+	return n, err
+}
+
 func (c *failResponseWindowConn) Write(p []byte) (int, error) {
 	if len(p) > 20 {
 		kind := wire.FrameKind(p[10])
@@ -302,6 +327,63 @@ func TestOpenClassifiesResponseWindowFailureAfterRequestCommitAsPostSend(t *test
 	}
 	if !errors.Is(err, errResponseWindowWrite) {
 		t.Fatalf("error = %v, want response-window write failure", err)
+	}
+}
+
+func TestCommittedRequestWinsConcurrentSessionFailure(t *testing.T) {
+	for attempt := range 100 {
+		clientConn, serverConn := net.Pipe()
+		wrapped := &committedBeforeReadFailureConn{
+			Conn: clientConn, requestCommitted: make(chan struct{}), readFailed: make(chan struct{}),
+		}
+		serverDone := make(chan error, 1)
+		go func() {
+			defer serverConn.Close()
+			codec := wire.NewCodec(serverConn)
+			if _, err := codec.ReadFrame(); err != nil {
+				serverDone <- err
+				return
+			}
+			identity, err := json.Marshal(wire.BuildIdentity{
+				Protocol: wire.ProtocolVersion, Build: "server-test", Session: make([]byte, 16),
+			})
+			if err != nil {
+				serverDone <- err
+				return
+			}
+			if err := codec.WriteFrame(wire.Frame{Kind: wire.FrameHelloAck, Flags: wire.FlagEnd, Payload: identity}); err != nil {
+				serverDone <- err
+				return
+			}
+			if _, err := codec.ReadFrame(); err != nil {
+				serverDone <- err
+				return
+			}
+			frame, err := codec.ReadFrame()
+			if err == nil && frame.Kind != wire.FrameRequest {
+				err = fmt.Errorf("frame kind = %d, want request", frame.Kind)
+			}
+			serverDone <- err
+		}()
+
+		client, err := wire.NewClient(t.Context(), wire.ClientConfig{
+			Build: "server-test",
+			Dial:  func(context.Context) (net.Conn, error) { return wrapped, nil },
+		})
+		if err != nil {
+			t.Fatalf("attempt %d NewClient: %v", attempt, err)
+		}
+		result, err := client.Call(t.Context(), "mutate", "", nil)
+		if err == nil || result.Outcome != wire.PostSendFailure {
+			t.Fatalf("attempt %d Call = %+v, %v; want committed post-send failure", attempt, result, err)
+		}
+		if result.Outcome.Replayable() {
+			t.Fatalf("attempt %d committed request was replayable", attempt)
+		}
+		if serverErr := <-serverDone; serverErr != nil {
+			t.Fatalf("attempt %d server: %v", attempt, serverErr)
+		}
+		_ = client.Abort(wire.ErrClientAbort)
 	}
 }
 
