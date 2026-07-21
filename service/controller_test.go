@@ -391,6 +391,40 @@ func TestControllerRejectsUnsafeProgramTreeBeforeEffects(t *testing.T) {
 	}
 }
 
+func TestControllerUsesCanonicalCurrentExecutableForEmptyProgram(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	agent := controllerAgent(t, "com.example.canonical-self")
+	agent.Program = ""
+	var events []string
+	controller, _, _, _ := newTestController(t, controllerState{
+		Desired: map[string]Agent{}, Applied: map[string]Agent{},
+	}, launchctlStub(func(args []string) (string, error) {
+		if args[0] == "bootout" {
+			return "not loaded", launchctlExit(launchctlNotLoadedExit)
+		}
+		return "", nil
+	}), &events)
+	if err := controller.Converge(context.Background(), []Agent{agent}); err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := CanonicalExecutable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := agent.PlistPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "<string>" + xmlEscape(canonical) + "</string>"
+	if !strings.Contains(string(body), want) {
+		t.Fatalf("controller plist does not use canonical executable %q\n%s", canonical, body)
+	}
+}
+
 func TestControllerRecoveryRejectsUnsafeAppliedProgramBeforeReceiptAck(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	base, err := filepath.EvalSymlinks(t.TempDir())

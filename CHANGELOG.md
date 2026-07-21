@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `service.CanonicalExecutable` resolves the current process to one exact regular executable without PATH lookup. Empty `service.Agent.Program` now uses that canonical target, while explicit programs retain strict no-symlink validation.
+
 ## [0.3.1] - 2026-07-21
 
 ### Fixed

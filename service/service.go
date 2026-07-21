@@ -85,9 +85,9 @@ type Agent struct {
 	// Label is the LaunchAgent label / reverse-DNS identifier naming the plist
 	// and the launchctl service target. Required.
 	Label string
-	// Program is the absolute path launchd execs; empty means os.Executable,
-	// deliberately WITHOUT EvalSymlinks so a Homebrew symlink stays a constant
-	// launchd program path across `brew upgrade`.
+	// Program is the exact absolute path launchd execs. Empty resolves the
+	// current process through CanonicalExecutable. Explicit paths remain subject
+	// to the controller's strict no-symlink validation.
 	Program string
 	// Args are the arguments passed after Program (e.g. {"daemon"}).
 	Args []string
@@ -190,11 +190,7 @@ func (a Agent) Plist() ([]byte, error) {
 func (a Agent) programPath() (string, error) {
 	bin := a.Program
 	if bin == "" {
-		exe, err := os.Executable()
-		if err != nil {
-			return "", fmt.Errorf("resolve executable: %w", err)
-		}
-		bin = exe
+		return CanonicalExecutable()
 	}
 	if !filepath.IsAbs(bin) || filepath.Clean(bin) != bin {
 		return "", fmt.Errorf("service: program path %q is not exact and absolute", bin)
