@@ -136,13 +136,25 @@ public final class SocketClient: @unchecked Sendable {
     private var closed = false
     private let eventChannel: SocketBoundedChannel<SocketEvent>
 
-    public init(path: String, build: String, configuration: Configuration = .init()) throws {
+    public init(
+        path: String,
+        build: String,
+        configuration: Configuration = .init(),
+        trust: PeerTrust
+    ) throws {
         guard !build.isEmpty else { throw SessionTransportError.handshake("empty build") }
         guard (1 ... Int(UInt32.max)).contains(configuration.streamQueueDepth),
               (1 ... Int(UInt32.max)).contains(configuration.eventQueueDepth)
         else { throw SessionTransportError.invalidFrame("stream queue exceeds protocol window") }
         self.configuration = configuration
-        descriptor = try Self.connect(path: path)
+        let connectedDescriptor = try Self.connect(path: path)
+        do {
+            try trust.check(descriptor: connectedDescriptor)
+        } catch {
+            Darwin.close(connectedDescriptor)
+            throw error
+        }
+        descriptor = connectedDescriptor
         codec = SessionFrameCodec(descriptor: descriptor, maximumFrameBytes: configuration.maximumFrameBytes)
         eventChannel = SocketBoundedChannel(capacity: configuration.eventQueueDepth)
         Self.configure(descriptor, receive: configuration.handshakeTimeout, send: configuration.writeTimeout)
@@ -414,7 +426,9 @@ public final class SocketClient: @unchecked Sendable {
         )
         return DecodedResponse(terminal: terminal, acknowledge: object["ack"] as? Bool ?? false)
     }
+}
 
+private extension SocketClient {
     private static func connect(path: String) throws -> Int32 {
         var address = try makeAddress(path: path)
         let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)

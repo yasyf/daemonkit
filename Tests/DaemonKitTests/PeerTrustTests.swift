@@ -58,6 +58,23 @@ private struct FixturePeer {
     }
 }
 
+private final class SocketReadProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count: Int?
+
+    func record(_ value: Int) {
+        lock.lock()
+        count = value
+        lock.unlock()
+    }
+
+    func value() -> Int? {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+}
+
 private func spawnFixture(_ name: String, in directory: URL) throws -> FixturePeer {
     let executable = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         .appendingPathComponent(".trust-fixtures")
@@ -142,7 +159,7 @@ extension SocketTransportTests {
             defer { try? FileManager.default.removeItem(at: directory) }
             let connection = acceptedConnection(at: directory.appendingPathComponent("s.sock").path)
             defer { close(connection.server); close(connection.client) }
-            try PeerTrust.testingUIDOnly.check(descriptor: connection.server)
+            try PeerTrust.sameEffectiveUser.check(descriptor: connection.server)
         }
 
         @Test func typedDeveloperIDRequirementRejectsTheAdHocTestProcess() throws {
@@ -159,6 +176,56 @@ extension SocketTransportTests {
                     return
                 }
             }
+        }
+
+        @Test func kernelPeerPIDMustMatchAuditTokenPID() {
+            #expect(throws: PeerTrust.TrustError.auditTokenPIDMismatch(peer: 41, audit: 42)) {
+                try PeerTrust.enforcePeerIdentity(peerPID: 41, auditPID: 42)
+            }
+        }
+
+        @Test func clientRejectsServerBeforeWritingProtocolBytes() throws {
+            let directory = try shortSocketDir()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let path = directory.appendingPathComponent("s.sock").path
+            var address = try #require(makeAddress(path: path))
+            let listener = socket(AF_UNIX, SOCK_STREAM, 0)
+            try #require(listener >= 0)
+            defer { close(listener) }
+            try #require(withAddress(&address) { Darwin.bind(listener, $0, $1) } == 0)
+            try #require(listen(listener, 1) == 0)
+
+            let probe = SocketReadProbe()
+            let settled = DispatchSemaphore(value: 0)
+            DispatchQueue.global().async {
+                let peer = accept(listener, nil, nil)
+                guard peer >= 0 else {
+                    probe.record(-1)
+                    settled.signal()
+                    return
+                }
+                defer {
+                    close(peer)
+                    settled.signal()
+                }
+                var poller = pollfd(fd: peer, events: Int16(POLLIN | POLLHUP), revents: 0)
+                guard poll(&poller, 1, 5000) == 1 else {
+                    probe.record(-2)
+                    return
+                }
+                var byte: UInt8 = 0
+                probe.record(read(peer, &byte, 1))
+            }
+
+            #expect(throws: PeerTrust.TrustError.self) {
+                _ = try SocketClient(
+                    path: path,
+                    build: "server-test",
+                    trust: PeerTrust(requirement: fixtureRequirement())
+                )
+            }
+            #expect(settled.wait(timeout: .now() + 5) == .success)
+            #expect(probe.value() == 0)
         }
 
         @Test func requiredEntitlementsMatchClosedTypedPredicates() throws {
@@ -206,12 +273,12 @@ extension SocketTransportTests {
             let directory = try shortSocketDir()
             defer { try? FileManager.default.removeItem(at: directory) }
             let path = directory.appendingPathComponent("s.sock").path
-            let server = SocketServer(path: path, build: "server-test", trust: .testingUIDOnly) { request in
+            let server = SocketServer(path: path, build: "server-test", trust: .sameEffectiveUser) { request in
                 .terminal(SocketTerminal(payload: request.payload))
             }
             try server.start()
             defer { server.stop() }
-            let client = try SocketClient(path: path, build: "server-test")
+            let client = try SocketClient(path: path, build: "server-test", trust: .sameEffectiveUser)
             defer { client.close() }
             let result = try await client.call(operation: "echo", payload: Data(#""hi""#.utf8))
             #expect(result.payload == Data(#""hi""#.utf8))
@@ -232,7 +299,7 @@ extension SocketTransportTests {
             try server.start()
             defer { server.stop() }
             #expect(throws: (any Error).self) {
-                _ = try SocketClient(path: path, build: "server-test")
+                _ = try SocketClient(path: path, build: "server-test", trust: .sameEffectiveUser)
             }
         }
 

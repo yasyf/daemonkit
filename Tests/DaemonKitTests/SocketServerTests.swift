@@ -100,7 +100,7 @@ extension SocketTransportTests {
             let directory = try shortSocketDir()
             defer { try? FileManager.default.removeItem(at: directory) }
             let path = directory.appendingPathComponent("s.sock").path
-            let server = SocketServer(path: path, build: "server-test", trust: .testingUIDOnly) { request in
+            let server = SocketServer(path: path, build: "server-test", trust: .sameEffectiveUser) { request in
                 if request.operation == "stream" {
                     try? await request.session.pushEvent(topic: "changed", payload: Data(request.tenant.utf8))
                     let chunks = PullChunks([Data("a".utf8), Data("b".utf8)])
@@ -114,7 +114,7 @@ extension SocketTransportTests {
             }
             try server.start()
             defer { server.stop() }
-            let client = try SocketClient(path: path, build: "server-test")
+            let client = try SocketClient(path: path, build: "server-test", trust: .sameEffectiveUser)
             defer { client.close() }
             #expect(client.peerBuild == "server-test")
 
@@ -153,7 +153,7 @@ extension SocketTransportTests {
                 path: path,
                 build: "server-test",
                 configuration: .init(handshakeTimeout: 0.1),
-                trust: .testingUIDOnly
+                trust: .sameEffectiveUser
             ) { _ in
                 .terminal(SocketTerminal(payload: Data(#""pong""#.utf8)))
             }
@@ -162,7 +162,8 @@ extension SocketTransportTests {
             let client = try SocketClient(
                 path: path,
                 build: "server-test",
-                configuration: .init(handshakeTimeout: 0.1)
+                configuration: .init(handshakeTimeout: 0.1),
+                trust: .sameEffectiveUser
             )
             defer { client.close() }
             try await Task.sleep(for: .milliseconds(300))
@@ -209,7 +210,7 @@ extension SocketTransportTests {
             defer { try? FileManager.default.removeItem(at: directory) }
             let path = directory.appendingPathComponent("s.sock").path
             let gate = ContinuationGate()
-            let server = SocketServer(path: path, build: "server-test", trust: .testingUIDOnly) { _ in
+            let server = SocketServer(path: path, build: "server-test", trust: .sameEffectiveUser) { _ in
                 await gate.wait()
                 return .terminal(SocketTerminal(payload: Data("null".utf8)))
             }
@@ -221,7 +222,8 @@ extension SocketTransportTests {
             let client = try SocketClient(
                 path: path,
                 build: "server-test",
-                configuration: .init(cancellationSettlementTimeout: 0.05)
+                configuration: .init(cancellationSettlementTimeout: 0.05),
+                trust: .sameEffectiveUser
             )
             defer { client.close() }
             let call = try client.open(operation: "wait")
@@ -239,7 +241,7 @@ extension SocketTransportTests {
             let directory = try shortSocketDir()
             defer { try? FileManager.default.removeItem(at: directory) }
             let path = directory.appendingPathComponent("s.sock").path
-            let server = SocketServer(path: path, build: "server-test", trust: .testingUIDOnly) { request in
+            let server = SocketServer(path: path, build: "server-test", trust: .sameEffectiveUser) { request in
                 var values: [String] = []
                 do {
                     for try await chunk in request.chunks where !chunk.end {
@@ -252,7 +254,7 @@ extension SocketTransportTests {
             }
             try server.start()
             defer { server.stop() }
-            let client = try SocketClient(path: path, build: "server-test")
+            let client = try SocketClient(path: path, build: "server-test", trust: .sameEffectiveUser)
             defer { client.close() }
             let call = try client.open(operation: "collect", endInput: false)
             try await call.sendChunk(Data("one".utf8))
@@ -267,13 +269,13 @@ extension SocketTransportTests {
             let directory = try shortSocketDir()
             defer { try? FileManager.default.removeItem(at: directory) }
             let path = directory.appendingPathComponent("s.sock").path
-            let server = SocketServer(path: path, build: "new-build", trust: .testingUIDOnly) { _ in
+            let server = SocketServer(path: path, build: "new-build", trust: .sameEffectiveUser) { _ in
                 Issue.record("mismatched-build mutation handler must not run")
                 return .terminal(SocketTerminal(payload: Data("true".utf8)))
             }
             try server.start()
             defer { server.stop() }
-            let client = try SocketClient(path: path, build: "old-build")
+            let client = try SocketClient(path: path, build: "old-build", trust: .sameEffectiveUser)
             defer { client.close() }
             let result = try await client.call(operation: "mutate")
             #expect(result.rejected)
@@ -288,7 +290,7 @@ extension SocketTransportTests {
                 path: path,
                 build: "server-test",
                 configuration: .init(maximumFrameBytes: 64),
-                trust: .testingUIDOnly
+                trust: .sameEffectiveUser
             ) { _ in .terminal(SocketTerminal(payload: Data("null".utf8))) }
             try server.start()
             defer { server.stop() }
@@ -313,7 +315,7 @@ extension SocketTransportTests {
             defer { try? FileManager.default.removeItem(at: directory) }
             let path = directory.appendingPathComponent("s.sock").path
             leaveStaleSocket(at: path)
-            let server = SocketServer(path: path, build: "server-test", trust: .testingUIDOnly) { _ in
+            let server = SocketServer(path: path, build: "server-test", trust: .sameEffectiveUser) { _ in
                 .terminal(SocketTerminal())
             }
             try server.start()
@@ -322,7 +324,7 @@ extension SocketTransportTests {
             #expect(stat(path, &status) == 0)
             #expect((status.st_mode & 0o777) == 0o600)
 
-            let intruder = SocketServer(path: path, build: "intruder", trust: .testingUIDOnly) { _ in
+            let intruder = SocketServer(path: path, build: "intruder", trust: .sameEffectiveUser) { _ in
                 .terminal(SocketTerminal())
             }
             #expect(throws: SocketServerError.self) { try intruder.start() }
@@ -332,7 +334,7 @@ extension SocketTransportTests {
             let directory = try shortSocketDir()
             defer { try? FileManager.default.removeItem(at: directory) }
             let path = directory.appendingPathComponent("s.sock").path
-            let server = SocketServer(path: path, build: "server-test", trust: .testingUIDOnly) { _ in
+            let server = SocketServer(path: path, build: "server-test", trust: .sameEffectiveUser) { _ in
                 .terminal(SocketTerminal())
             }
             try server.start()
@@ -340,7 +342,7 @@ extension SocketTransportTests {
             #expect(!FileManager.default.fileExists(atPath: path))
 
             let longPath = "/tmp/" + String(repeating: "a", count: 200) + ".sock"
-            let invalid = SocketServer(path: longPath, build: "server-test", trust: .testingUIDOnly) { _ in
+            let invalid = SocketServer(path: longPath, build: "server-test", trust: .sameEffectiveUser) { _ in
                 .terminal(SocketTerminal())
             }
             #expect(throws: SocketServerError.self) { try invalid.start() }

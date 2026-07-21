@@ -102,7 +102,9 @@ public struct PeerTrust: Sendable {
     public enum TrustError: Error, Equatable, Sendable {
         case peerCredentialsUnavailable(errno: Int32)
         case untrustedUID(peer: uid_t, expected: uid_t)
+        case peerPIDUnavailable(errno: Int32)
         case auditTokenUnavailable(errno: Int32)
+        case auditTokenPIDMismatch(peer: pid_t, audit: pid_t)
         case codeUnresolvable(OSStatus)
         case requirementInvalid(OSStatus)
         case untrustedPeer(OSStatus)
@@ -119,7 +121,7 @@ public struct PeerTrust: Sendable {
 
     private enum Mode: Sendable {
         case signed(Requirement)
-        case testingUIDOnly
+        case sameEffectiveUser
     }
 
     private let mode: Mode
@@ -128,8 +130,9 @@ public struct PeerTrust: Sendable {
         mode = .signed(requirement)
     }
 
-    static var testingUIDOnly: PeerTrust {
-        PeerTrust(mode: .testingUIDOnly)
+    /// sameEffectiveUser requires only the kernel-reported effective user.
+    public static var sameEffectiveUser: PeerTrust {
+        PeerTrust(mode: .sameEffectiveUser)
     }
 
     private init(mode: Mode) {
@@ -142,7 +145,7 @@ public struct PeerTrust: Sendable {
         switch mode {
         case let .signed(requirement):
             try enforceRequirement(descriptor, requirement)
-        case .testingUIDOnly:
+        case .sameEffectiveUser:
             return
         }
     }
@@ -160,7 +163,10 @@ public struct PeerTrust: Sendable {
     }
 
     private func enforceRequirement(_ descriptor: Int32, _ requirement: Requirement) throws {
+        let peerPID = try peerPID(descriptor)
         var token = try peerAuditToken(descriptor)
+        let auditPID = pid_t(bitPattern: token.val.5)
+        try Self.enforcePeerIdentity(peerPID: peerPID, auditPID: auditPID)
         let tokenData = withUnsafeBytes(of: &token) { Data($0) }
 
         var code: SecCode?
@@ -228,6 +234,12 @@ public struct PeerTrust: Sendable {
         }
     }
 
+    static func enforcePeerIdentity(peerPID: pid_t, auditPID: pid_t) throws {
+        guard auditPID == peerPID else {
+            throw TrustError.auditTokenPIDMismatch(peer: peerPID, audit: auditPID)
+        }
+    }
+
     static func enforceHardenedRuntime(info: NSDictionary) throws {
         guard let signingStatus = (info[kSecCodeInfoStatus] as? NSNumber)?.uint32Value else {
             throw TrustError.signingStatusUnavailable
@@ -286,5 +298,14 @@ public struct PeerTrust: Sendable {
             throw TrustError.auditTokenUnavailable(errno: errno)
         }
         return token
+    }
+
+    private func peerPID(_ descriptor: Int32) throws -> pid_t {
+        var process = pid_t()
+        var length = socklen_t(MemoryLayout<pid_t>.size)
+        guard getsockopt(descriptor, SOL_LOCAL, LOCAL_PEERPID, &process, &length) == 0 else {
+            throw TrustError.peerPIDUnavailable(errno: errno)
+        }
+        return process
     }
 }

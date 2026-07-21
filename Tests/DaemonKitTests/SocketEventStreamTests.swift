@@ -19,7 +19,7 @@ extension SocketTransportTests {
             let path = directory.appendingPathComponent("events.sock").path
             let eventCount = 128
             let eventSize = 64 * 1024
-            let server = SocketServer(path: path, build: "event-test", trust: .testingUIDOnly) { request in
+            let server = SocketServer(path: path, build: "event-test", trust: .sameEffectiveUser) { request in
                 if request.operation == "echo" {
                     return .terminal(SocketTerminal(payload: request.payload))
                 }
@@ -40,7 +40,8 @@ extension SocketTransportTests {
             let client = try SocketClient(
                 path: path,
                 build: "event-test",
-                configuration: .init(eventQueueDepth: 2)
+                configuration: .init(eventQueueDepth: 2),
+                trust: .sameEffectiveUser
             )
             defer { client.close() }
             let events = client.events
@@ -65,12 +66,12 @@ extension SocketTransportTests {
             let directory = try eventSocketDirectory()
             defer { try? FileManager.default.removeItem(at: directory) }
             let path = directory.appendingPathComponent("events.sock").path
-            let server = SocketServer(path: path, build: "event-test", trust: .testingUIDOnly) { _ in
+            let server = SocketServer(path: path, build: "event-test", trust: .sameEffectiveUser) { _ in
                 .terminal(SocketTerminal())
             }
             try server.start()
             defer { server.stop() }
-            let client = try SocketClient(path: path, build: "event-test")
+            let client = try SocketClient(path: path, build: "event-test", trust: .sameEffectiveUser)
             let waiting = Task {
                 var iterator = client.events.makeAsyncIterator()
                 return try await iterator.next()

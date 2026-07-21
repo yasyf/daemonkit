@@ -99,7 +99,7 @@ extension SocketTransportTests {
                 rejected: true,
                 reason: "terminal metadata"
             )
-            let upstream = SocketServer(path: upstreamPath, build: "relay-test", trust: .testingUIDOnly) { _ in
+            let upstream = SocketServer(path: upstreamPath, build: "relay-test", trust: .sameEffectiveUser) { _ in
                 .stream(SocketResponseStream(
                     nextChunk: { await chunks.next() },
                     terminal: { expectedTerminal },
@@ -111,7 +111,8 @@ extension SocketTransportTests {
             let upstreamClient = try SocketClient(
                 path: upstreamPath,
                 build: "relay-test",
-                configuration: .init(streamQueueDepth: 2)
+                configuration: .init(streamQueueDepth: 2),
+                trust: .sameEffectiveUser
             )
             defer { upstreamClient.close() }
             let relay = try makeRelay(path: relayPath, upstream: upstreamClient)
@@ -119,7 +120,8 @@ extension SocketTransportTests {
             let client = try SocketClient(
                 path: relayPath,
                 build: "relay-test",
-                configuration: .init(streamQueueDepth: 2)
+                configuration: .init(streamQueueDepth: 2),
+                trust: .sameEffectiveUser
             )
             defer { client.close() }
 
@@ -144,7 +146,7 @@ extension SocketTransportTests {
             let upstreamPath = directory.appendingPathComponent("up.sock").path
             let relayPath = directory.appendingPathComponent("relay.sock").path
             let chunks = CancelableChunks()
-            let upstream = SocketServer(path: upstreamPath, build: "relay-test", trust: .testingUIDOnly) { _ in
+            let upstream = SocketServer(path: upstreamPath, build: "relay-test", trust: .sameEffectiveUser) { _ in
                 .stream(SocketResponseStream(
                     nextChunk: { try await chunks.next() },
                     terminal: { await chunks.terminal() },
@@ -153,11 +155,11 @@ extension SocketTransportTests {
             }
             try upstream.start()
             defer { upstream.stop() }
-            let upstreamClient = try SocketClient(path: upstreamPath, build: "relay-test")
+            let upstreamClient = try SocketClient(path: upstreamPath, build: "relay-test", trust: .sameEffectiveUser)
             defer { upstreamClient.close() }
             let relay = try makeRelay(path: relayPath, upstream: upstreamClient)
             defer { relay.stop() }
-            let client = try SocketClient(path: relayPath, build: "relay-test")
+            let client = try SocketClient(path: relayPath, build: "relay-test", trust: .sameEffectiveUser)
             defer { client.close() }
 
             let call = try client.open(operation: "catalog.open_at")
@@ -183,7 +185,7 @@ extension SocketTransportTests {
             defer { try? FileManager.default.removeItem(at: directory) }
             let path = directory.appendingPathComponent("server.sock").path
             let unread = CountedChunks(count: 128, size: 64 * 1024)
-            let server = SocketServer(path: path, build: "relay-test", trust: .testingUIDOnly) { request in
+            let server = SocketServer(path: path, build: "relay-test", trust: .sameEffectiveUser) { request in
                 if request.operation == "unread" {
                     return .stream(SocketResponseStream(
                         nextChunk: { await unread.next() },
@@ -198,7 +200,8 @@ extension SocketTransportTests {
             let client = try SocketClient(
                 path: path,
                 build: "relay-test",
-                configuration: .init(streamQueueDepth: 1)
+                configuration: .init(streamQueueDepth: 1),
+                trust: .sameEffectiveUser
             )
             defer { client.close() }
 
@@ -215,7 +218,7 @@ extension SocketTransportTests {
             let directory = try relaySocketDirectory()
             defer { try? FileManager.default.removeItem(at: directory) }
             let path = directory.appendingPathComponent("server.sock").path
-            let server = SocketServer(path: path, build: "relay-test", trust: .testingUIDOnly) { _ in
+            let server = SocketServer(path: path, build: "relay-test", trust: .sameEffectiveUser) { _ in
                 .stream(SocketResponseStream(
                     nextChunk: { nil },
                     terminal: { SocketTerminal(payload: Data("true".utf8)) },
@@ -227,7 +230,8 @@ extension SocketTransportTests {
             let client = try SocketClient(
                 path: path,
                 build: "relay-test",
-                configuration: .init(streamQueueDepth: 1)
+                configuration: .init(streamQueueDepth: 1),
+                trust: .sameEffectiveUser
             )
             defer { client.close() }
             let call = try client.open(operation: "empty")
@@ -241,7 +245,7 @@ extension SocketTransportTests {
         }
 
         private func makeRelay(path: String, upstream: SocketClient) throws -> SocketServer {
-            let relay = SocketServer(path: path, build: "relay-test", trust: .testingUIDOnly) { request in
+            let relay = SocketServer(path: path, build: "relay-test", trust: .sameEffectiveUser) { request in
                 do {
                     return try .relaying(upstream.open(
                         operation: request.operation,

@@ -44,7 +44,7 @@ extension SocketTransportTests {
                 path: path,
                 build: "server-test",
                 configuration: .init(streamQueueDepth: depth),
-                trust: .testingUIDOnly
+                trust: .sameEffectiveUser
             ) { request in
                 var chunkCount = 0
                 var byteCount = 0
@@ -66,7 +66,7 @@ extension SocketTransportTests {
             }
             try server.start()
             defer { server.stop() }
-            let client = try SocketClient(path: path, build: "server-test")
+            let client = try SocketClient(path: path, build: "server-test", trust: .sameEffectiveUser)
             defer { client.close() }
 
             let payload = Data(repeating: 0xA5, count: 64 * 1024)
@@ -94,7 +94,7 @@ extension SocketTransportTests {
                 path: path,
                 build: "server-test",
                 configuration: .init(maximumActiveRequests: 1, streamQueueDepth: 1),
-                trust: .testingUIDOnly
+                trust: .sameEffectiveUser
             ) { request in
                 if request.operation == "upload" {
                     do {
@@ -106,7 +106,7 @@ extension SocketTransportTests {
             }
             try server.start()
             defer { server.stop() }
-            let client = try SocketClient(path: path, build: "server-test")
+            let client = try SocketClient(path: path, build: "server-test", trust: .sameEffectiveUser)
             defer { client.close() }
 
             let upload = try client.open(operation: "upload", endInput: false)
@@ -129,7 +129,7 @@ extension SocketTransportTests {
                 path: path,
                 build: "server-test",
                 configuration: .init(streamQueueDepth: 1),
-                trust: .testingUIDOnly
+                trust: .sameEffectiveUser
             ) { request in
                 if request.operation == "upload" {
                     do {
@@ -141,7 +141,7 @@ extension SocketTransportTests {
             }
             try server.start()
             defer { server.stop() }
-            let client = try SocketClient(path: path, build: "server-test")
+            let client = try SocketClient(path: path, build: "server-test", trust: .sameEffectiveUser)
             defer { client.close() }
 
             let upload = try client.open(operation: "upload", endInput: false)
