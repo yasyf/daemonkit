@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-07-21
+
 ### Fixed
 
 - `service.CanonicalExecutable` resolves the current process to one exact regular executable without PATH lookup. Empty `service.Agent.Program` now uses that canonical target, while explicit programs retain strict no-symlink validation.
@@ -67,7 +69,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/yasyf/daemonkit/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/yasyf/daemonkit/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/yasyf/daemonkit/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/yasyf/daemonkit/compare/v0.1.0...v0.2.0
