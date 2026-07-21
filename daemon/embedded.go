@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 )
 
@@ -59,17 +60,19 @@ func (p *EmbeddedProcess) Start(ctx context.Context, factory EmbeddedFactory) er
 	p.mu.Unlock()
 
 	runtime, factoryErr := factory(startup)
+	if embeddedRuntimeIsNil(runtime) {
+		cancelStartup()
+		p.setRuntime(nil, nil)
+		if factoryErr != nil {
+			return p.complete(factoryErr)
+		}
+		return p.complete(errors.New("daemon: embedded runtime factory returned nil"))
+	}
 	if factoryErr != nil {
 		cancelStartup()
 		settleErr := settleRejectedRuntime(startup, runtime)
 		p.setRuntime(nil, nil)
 		return p.complete(errors.Join(factoryErr, settleErr))
-	}
-	if runtime == nil {
-		cancelStartup()
-		err := errors.New("daemon: embedded runtime factory returned nil")
-		p.setRuntime(nil, nil)
-		return p.complete(err)
 	}
 
 	runCtx, cancelRun := context.WithCancel(context.WithoutCancel(ctx))
@@ -237,6 +240,19 @@ func settleRejectedRuntime(ctx context.Context, runtime EmbeddedRuntime) error {
 	}
 	settleCtx := context.WithoutCancel(ctx)
 	return errors.Join(runtime.Close(settleCtx), runtime.Wait(settleCtx))
+}
+
+func embeddedRuntimeIsNil(runtime EmbeddedRuntime) bool {
+	if runtime == nil {
+		return true
+	}
+	value := reflect.ValueOf(runtime)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
 
 var _ EmbeddedRuntime = (*Runtime)(nil)

@@ -188,6 +188,51 @@ func TestEmbeddedProcessSettlesRuntimeReturnedWithFactoryError(t *testing.T) {
 	}
 }
 
+func TestEmbeddedProcessRejectsTypedNilRuntimeWithoutInvokingIt(t *testing.T) {
+	factoryErr := errors.New("factory rejected typed nil")
+	var runtime *typedNilEmbeddedRuntime
+	process := &EmbeddedProcess{}
+	err := process.Start(context.Background(), func(context.Context) (EmbeddedRuntime, error) {
+		return runtime, factoryErr
+	})
+	if err != factoryErr {
+		t.Fatalf("Start = %v, want original factory error %v", err, factoryErr)
+	}
+	if err := process.Wait(context.Background()); err != factoryErr {
+		t.Fatalf("Wait = %v, want original factory error %v", err, factoryErr)
+	}
+}
+
+func TestEmbeddedProcessRejectsTypedNilRuntimeWithoutFactoryError(t *testing.T) {
+	var runtime *typedNilEmbeddedRuntime
+	process := &EmbeddedProcess{}
+	err := process.Start(context.Background(), func(context.Context) (EmbeddedRuntime, error) {
+		return runtime, nil
+	})
+	if got, want := err.Error(), "daemon: embedded runtime factory returned nil"; got != want {
+		t.Fatalf("Start = %q, want %q", got, want)
+	}
+}
+
+func TestEmbeddedRuntimeIsNil(t *testing.T) {
+	var nilPointer *typedNilEmbeddedRuntime
+	for _, test := range []struct {
+		name    string
+		runtime EmbeddedRuntime
+		want    bool
+	}{
+		{name: "nil interface", runtime: nil, want: true},
+		{name: "typed nil pointer", runtime: nilPointer, want: true},
+		{name: "non-nil pointer", runtime: newEmbeddedRuntime(nil), want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := embeddedRuntimeIsNil(test.runtime); got != test.want {
+				t.Fatalf("embeddedRuntimeIsNil() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestEmbeddedProcessRejectsSecondStartAndPrestartLifecycle(t *testing.T) {
 	process := &EmbeddedProcess{}
 	if err := process.Ready(context.Background()); !errors.Is(err, ErrEmbeddedProcessNotStarted) {
@@ -288,4 +333,22 @@ func (r *embeddedRuntime) Wait(ctx context.Context) error {
 
 func (r *embeddedRuntime) publishReady() {
 	r.readyOnce.Do(func() { close(r.ready) })
+}
+
+type typedNilEmbeddedRuntime struct{}
+
+func (*typedNilEmbeddedRuntime) Run(context.Context) error {
+	panic("Run called on typed-nil runtime")
+}
+
+func (*typedNilEmbeddedRuntime) WaitReady(context.Context) error {
+	panic("WaitReady called on typed-nil runtime")
+}
+
+func (*typedNilEmbeddedRuntime) Close(context.Context) error {
+	panic("Close called on typed-nil runtime")
+}
+
+func (*typedNilEmbeddedRuntime) Wait(context.Context) error {
+	panic("Wait called on typed-nil runtime")
 }
