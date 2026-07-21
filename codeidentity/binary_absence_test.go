@@ -27,7 +27,6 @@ func TestDaemonFacingBinaryExcludesSignedOnlyPackagesAndPolicyLiterals(t *testin
 	dependencies := runGo(t, root, "list", "-deps", "-f", "{{.ImportPath}}", "./codeidentity/testdata/daemoncli")
 	for _, forbidden := range []string{
 		"github.com/yasyf/daemonkit/trust",
-		"github.com/yasyf/daemonkit/appgroup",
 	} {
 		for _, dependency := range strings.Fields(dependencies) {
 			if dependency == forbidden || strings.HasPrefix(dependency, forbidden+"/") {

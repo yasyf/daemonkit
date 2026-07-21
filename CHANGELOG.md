@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **Breaking:** removed the Go `appgroup` package. App Group container resolution now exists only as Swift `AppGroupContainer` inside the signed application topology.
+
 ## [0.2.0] - 2026-07-20
 
 ### Added

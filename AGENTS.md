@@ -8,7 +8,7 @@ Daemons that spawn detached, trust by codesign, and drain on upgrade.
 ```
 daemonkit/
 ├── doc.go            # module godoc; the Go packages land beside it at the root
-│                     #   (proc/, service/, version/, paths/, appgroup/, bundle/,
+│                     #   (proc/, service/, version/, paths/, bundle/,
 │                     #   wire/, trust/, daemon/, drain/, supervise/)
 ├── Package.swift     # SPM manifest — stays at the repo root (SPM requires it)
 ├── Sources/DaemonKit/       # the Swift half: socket serving, peer trust,
@@ -22,8 +22,8 @@ daemonkit/
 └── README.md         # Project overview
 ```
 
-daemonkit is **extracted from the fleet** — fusekit (`proc/`, `service/`,
-`appgroup/`), cc-interact (`version/`, `paths/`), cc-orchestrate (`supervise/`),
+daemonkit is **extracted from the fleet** — fusekit (`proc/`, `service/`),
+cc-interact (`version/`, `paths/`), cc-orchestrate (`supervise/`),
 claude-pool (module `github.com/yasyf/cc-pool`), synckit, captain-hook, and
 authkit are the donors and the consumers.
 When porting code in, `cp` the file then edit in place — never recreate from
