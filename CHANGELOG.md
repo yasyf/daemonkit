@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-20
+
 ### Added
 
 - `service.RestartPolicy` is required by `Agent` and `AppKeepAlive`, with direct launchd plist rendering for `RestartAlways`, `RestartOnFailure`, and `NoRestart`.
@@ -13,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `wire` v1 session transport: a length-prefixed binary frame codec (`DKS1`, protocol version 1, 4 MiB default frame cap) multiplexing request/response/cancel/event/stream exchanges per connection with explicit per-stream window credits and session-bound terminal acknowledgements; `Server.RegisterLifecycle` serves `daemon.Peer` lifecycle ops over it, and `LifecyclePeer` (with `UnixDialer`) is the client side.
 - Swift `SessionTransport`: the exact-v1 counterpart to the Go codec, sharing the protocol version, frame cap, bounded delivery, per-stream flow control, and terminal acknowledgement contract.
 - `wire.Server.ServeSession` and `wire.NewDuplexConn`: the exact v1 engine can own one daemonkit-authenticated spawned-process session over independent streams without a synthetic listener; spawned-parent identities remain ordinary and cannot authorize lifecycle traffic.
+- `service.Controller`: durable, generation-fenced convergence for launchd agents and signed login apps, including typed bundle associations, verify-before-effect recovery, and exact stop acknowledgement.
+- `supervise.Terminal`: durable resumable PTY sessions with bounded output, authenticated reconnects, terminal-intent settlement, process-group recovery, and exact owner handoff.
+- `codeidentity` and `daemonrole`: typed executable identities and stable signed-app/daemon role classification for fail-closed launch and recovery decisions.
+- Swift `AppGroupContainer`: entitlement-checked protected-container resolution with validated socket leaves; unsigned Go processes do not need to traverse App Group containers.
 
 ### Changed
 
@@ -21,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replaced ticker-based `supervise.Supervisor` with a bounded process `Pool`. Disposable workers are durably identified before payload dispatch; long-lived `Process` handles cannot exec or report readiness before their process-group record is durable. Both paths synchronously reap through a fixed TERM/revalidate/KILL ladder, and startup recovery settles records from prior daemon generations.
 - Accepted Go `wire.Peer` values now include the kernel PID/start identity captured at accept and can be matched directly against a managed process record; executable-name changes across `exec` no longer invalidate the same kernel process instance.
 - `proc.Reaper` now tracks, revalidates, untracks, and reaps process-group records so worker recovery enumerates session members after a leader exits, while unresolved membership retains the forensic record and fails recovery.
+- Process recovery now uses a boot-fenced keyed receipt ledger with monotonic delivery outcomes; ownership can move only through recorded, exact-generation handoff rather than mutable PID files or unproved liveness.
 - Replaced Swift `PeerTrust`'s raw/optional requirement and unhardened bypass with one typed signed-peer policy: exact Developer ID Team + signing identifiers, mandatory Hardened Runtime and injection rejection, and closed consumer-owned entitlement predicates. Go `trust.Requirement` enforces the equivalent contract; consumers that share an App Group opt into its exact membership explicitly.
 - `SocketServer` now requires an explicit `PeerTrust`; there is no production UID-only default. `LOCAL_PEERTOKEN` remains documented as query-time identity, so substitution by another process satisfying the same policy before admission is a residual macOS limitation.
 - The one-JSON-per-line `wire.Framing` is replaced by the exact-v1 frame codec; `wire.Server` admits sessions over it and rejects legacy LF clients and oversized frames.
@@ -44,5 +51,6 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.1.0...main
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/yasyf/daemonkit/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/yasyf/daemonkit/releases/tag/v0.1.0

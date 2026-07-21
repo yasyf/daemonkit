@@ -17,6 +17,14 @@ permissions:
 # Timeouts kill a wedged test in minutes instead of GitHub's 6-hour cap
 # (ccn af9889a).
 jobs:
+  source-release-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify source-only release contract
+        run: ./scripts/release-check.sh --tree
+
   test:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
