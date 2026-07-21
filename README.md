@@ -21,7 +21,7 @@ go: added github.com/yasyf/daemonkit v<version>
 Add the package to your dependencies and link the `DaemonKit` library product into your app or helper target:
 
 ```swift
-.package(url: "https://github.com/yasyf/daemonkit", exact: "0.2.0"),
+.package(url: "https://github.com/yasyf/daemonkit", exact: "0.3.0"),
 ```
 
 </details>
@@ -72,7 +72,7 @@ One row per package; the Status column is each surface's live state.
 
 The LaunchAgents `service` writes use no socket activation — the daemon binds and flocks its own socket (`proc`); launchd only keeps the process alive. Every `Agent` and `AppKeepAlive` selects `RestartAlways`, `RestartOnFailure`, or `NoRestart`; the policy is rendered directly into the launchd plist. On the Swift side, `DaemonKit` reconciles `SMAppService` login items (opening the Login Items settings pane when the item needs approval), watches snapshot directories, and rides the signed `.app` bundle for a stable bundle + TCC identity.
 
-Status: v0.2.0 is the hard-cut release line consumed by FuseKit and the manually
+Status: v0.3.0 is the hard-cut release line consumed by FuseKit and the manually
 migrated fleet. Protocol and durable-state epochs begin at 1 with exact equality;
 the API stabilizes at v1.0.0.
 
