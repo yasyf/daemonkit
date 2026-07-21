@@ -23,6 +23,20 @@ func TestCaskTemplateRequiresExactStopHook(t *testing.T) {
 	}
 }
 
+func TestCaskTemplateUsesAuthoritativeAssetURL(t *testing.T) {
+	rendered, err := renderCaskTemplate("--stop-and-uninstall-service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const assetURL = "https://github.com/example/example-helper/releases/download/v1.2.3/example-helper-v1.2.3-darwin.zip"
+	if !strings.Contains(rendered, `url "`+assetURL+`"`) {
+		t.Fatal("cask does not use the authoritative release asset URL")
+	}
+	if strings.Contains(rendered, `releases/download/v#{version}`) {
+		t.Fatal("cask reconstructs the release asset URL")
+	}
+}
+
 func TestCaskTemplateGenerationFailsWithoutExactStopHook(t *testing.T) {
 	if _, err := renderCaskTemplate(""); !errors.Is(err, errMissingStopHook) {
 		t.Fatalf("render without stop hook = %v, want %v", err, errMissingStopHook)
@@ -58,6 +72,7 @@ func renderCaskTemplate(stopHook string) (string, error) {
 		"__DESC__": "Example", "__GH_REPO__": "example-helper", "__MACOS_MIN__": "sequoia",
 		"__BINARY_NAME__": "Example Helper", "__STOP_UNINSTALL_ARG__": stopHook,
 		"__BUNDLE_ID__": "com.example.helper", "__LAUNCHAGENT_LABEL__": "com.example.helper.agent",
+		"__ASSET_URL__": "https://github.com/example/example-helper/releases/download/v1.2.3/example-helper-v1.2.3-darwin.zip",
 	}
 	rendered := string(payload)
 	for token, value := range values {
