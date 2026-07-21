@@ -31,7 +31,7 @@ type healthFields struct {
 	Busy     bool   `json:"busy"`
 }
 
-func TestExactV2Golden(t *testing.T) {
+func TestExactV1Golden(t *testing.T) {
 	data, err := os.ReadFile("testdata/golden.json")
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
@@ -40,7 +40,7 @@ func TestExactV2Golden(t *testing.T) {
 	if err := json.Unmarshal(data, &golden); err != nil {
 		t.Fatalf("Unmarshal golden: %v", err)
 	}
-	if golden.Version != lifeproto.Version || lifeproto.Version != 2 {
+	if golden.Version != lifeproto.Version || lifeproto.Version != 1 {
 		t.Fatalf("golden=%d generated=%d", golden.Version, lifeproto.Version)
 	}
 	for _, test := range golden.Cases {
@@ -64,8 +64,8 @@ func TestExactV2Golden(t *testing.T) {
 	}
 }
 
-func TestDecodeEnvelopeRejectsOldProtocol(t *testing.T) {
-	_, err := lifeproto.DecodeEnvelope([]byte(`{"v":1,"op":"health"}`))
+func TestDecodeEnvelopeRejectsForeignProtocol(t *testing.T) {
+	_, err := lifeproto.DecodeEnvelope([]byte(`{"v":2,"op":"health"}`))
 	if !errors.Is(err, lifeproto.ErrProtocolVersion) {
 		t.Fatalf("DecodeEnvelope error = %v", err)
 	}

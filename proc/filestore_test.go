@@ -2,12 +2,46 @@ package proc
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"path/filepath"
 	"testing"
 
 	bolt "go.etcd.io/bbolt"
 )
+
+func TestFileStoreSchemaIsExactEpochOne(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "recovery.db")
+	store := &FileStore{Path: path}
+	if err := store.Add(t.Context(), storeRecord(RecoveryTask, 42)); err != nil {
+		t.Fatal(err)
+	}
+	db, err := bolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schema []byte
+	if err := db.View(func(tx *bolt.Tx) error {
+		schema = append([]byte(nil), tx.Bucket(fileStoreMetaBucket).Get(fileStoreSchemaKey)...)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(schema) != 8 || binary.BigEndian.Uint64(schema) != 1 {
+		t.Fatalf("schema = %x, want epoch 1", schema)
+	}
+	if err := db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(fileStoreMetaBucket).Put(fileStoreSchemaKey, uint64Bytes(2))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Load(t.Context()); !errors.Is(err, ErrRecordSchema) {
+		t.Fatalf("foreign schema load = %v, want ErrRecordSchema", err)
+	}
+}
 
 func storeRecord(class RecoveryClass, pid int) Record {
 	return Record{

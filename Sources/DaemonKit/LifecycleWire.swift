@@ -6,7 +6,7 @@ public extension DaemonKit {
     /// Version of the daemonkit-native lifecycle envelope (`"v"` in every flat
     /// frame). Generated from the shared lifeproto schema; the Go side pins the
     /// same `Version`.
-    static let lifeProtocolVersion = 2
+    static let lifeProtocolVersion = 1
 }
 
 /// A canonical lifecycle operation carried in a message's `op` field.
@@ -71,14 +71,14 @@ enum LifecycleJSON {
 }
 
 /// A flat lifecycle message: the shared `{v, op}` header plus op-specific
-/// fields, carried as a v2 request or response payload.
+/// fields, carried as a v1 request or response payload.
 public protocol LifecycleMessage: Decodable, Sendable {
     /// The compact JSON payload encoding of this message.
     func encoded() -> Data
 }
 
 public extension LifecycleMessage {
-    /// Decodes a message from one v2 frame payload.
+    /// Decodes a message from one v1 frame payload.
     static func decode(from data: Data) throws -> Self {
         try JSONDecoder().decode(Self.self, from: data)
     }

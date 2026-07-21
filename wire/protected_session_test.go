@@ -123,7 +123,7 @@ func TestLifecycleHealthObservesAnyProtectedReleaseButMutationRequiresSameOrNewe
 		t.Fatal(err)
 	}
 	server := &wire.Server{
-		Build: "synckit.rpc.v4", LifecycleBuild: "v1.2.0", MaxSessions: 3, ReservedProtectedSessions: 1,
+		Build: "synckit.rpc.v1", LifecycleBuild: "v1.2.0", MaxSessions: 3, ReservedProtectedSessions: 1,
 		ProtectedSessionClassifier: codeidentity.FixedClassifier{Executable: executable},
 	}
 	server.RegisterLifecycle(protectedTestLifecycle{})
@@ -137,7 +137,7 @@ func TestLifecycleHealthObservesAnyProtectedReleaseButMutationRequiresSameOrNewe
 		{build: "v1.3.0", ok: true},
 	} {
 		peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
-			Dial: wire.UnixDialer(running.path), Build: "synckit.rpc.v4", LifecycleBuild: test.build,
+			Dial: wire.UnixDialer(running.path), Build: "synckit.rpc.v1", LifecycleBuild: test.build,
 		}}
 		if _, err := peer.Health(t.Context()); err != nil {
 			t.Fatalf("build %s lifecycle Health: %v", test.build, err)

@@ -100,7 +100,7 @@ type ClientConfig struct {
 	CancelSettlementTimeout time.Duration
 }
 
-// Client is one persistent, concurrent v4 session.
+// Client is one persistent, concurrent v1 session.
 type Client struct {
 	conn   net.Conn
 	codec  *Codec
@@ -183,7 +183,7 @@ type callResult struct {
 	err    error
 }
 
-// NewClient dials and completes the mandatory exact-v4 handshake before returning.
+// NewClient dials and completes the mandatory exact-v1 handshake before returning.
 func NewClient(ctx context.Context, config ClientConfig) (*Client, error) {
 	if config.Dial == nil {
 		return nil, errors.New("wire: Dial is required")

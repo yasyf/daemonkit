@@ -2,12 +2,12 @@ import Darwin
 import Foundation
 
 /// Exact protocol version shared by daemonkit's Go and Swift session transports.
-public let daemonKitSessionProtocolVersion: UInt16 = 4
+public let daemonKitSessionProtocolVersion: UInt16 = 1
 
 /// Default maximum encoded frame body: 4 MiB.
 public let daemonKitDefaultMaximumFrameBytes = 4 * 1024 * 1024
 
-/// A v4 session frame kind.
+/// A v1 session frame kind.
 public enum SessionFrameKind: UInt8, Sendable {
     case hello = 1
     case helloAck
@@ -21,7 +21,7 @@ public enum SessionFrameKind: UInt8, Sendable {
     case acknowledgment
 }
 
-/// Flags carried by a v4 session frame.
+/// Flags carried by a v1 session frame.
 public struct SessionFrameFlags: OptionSet, Sendable {
     public let rawValue: UInt8
 
@@ -33,7 +33,7 @@ public struct SessionFrameFlags: OptionSet, Sendable {
     public static let end = SessionFrameFlags(rawValue: 1)
 }
 
-/// One exact-v4 length-prefixed session frame.
+/// One exact-v1 length-prefixed session frame.
 public struct SessionFrame: Sendable {
     public var kind: SessionFrameKind
     public var flags: SessionFrameFlags
@@ -65,7 +65,7 @@ public struct SessionFrame: Sendable {
     }
 }
 
-/// Fail-closed v3 codec errors.
+/// Fail-closed v1 codec errors.
 public enum SessionTransportError: Error, Equatable, Sendable {
     case truncatedFrame
     case frameTooLarge(actual: Int, maximum: Int)
@@ -122,7 +122,7 @@ struct SessionSequence: Sendable {
 final class SessionFrameCodec: @unchecked Sendable {
     static let defaultMaximumFrameBytes = daemonKitDefaultMaximumFrameBytes
     private static let headerBytes = 32
-    private static let magic = Data("DKS4".utf8)
+    private static let magic = Data("DKS1".utf8)
 
     private let descriptor: Int32
     private let maximumFrameBytes: Int

@@ -12,8 +12,8 @@ import (
 	"time"
 )
 
-func TestFrameV4CrossLanguageGolden(t *testing.T) {
-	fixture, err := os.ReadFile("testdata/frame-v4.json")
+func TestFrameV1CrossLanguageGolden(t *testing.T) {
+	fixture, err := os.ReadFile("testdata/frame-v1.json")
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}

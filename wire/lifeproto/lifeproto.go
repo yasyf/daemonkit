@@ -10,7 +10,7 @@ import (
 
 // Version is the lifecycle protocol version carried in every envelope's "v"
 // field. The Swift peer pins the same constant.
-const Version = 2
+const Version = 1
 
 // The op strings name each lifecycle operation. Frozen wire values.
 const (
@@ -103,7 +103,7 @@ func NewHandoffResponse(ok bool) HandoffResponse {
 	return HandoffResponse{V: Version, Op: OpHandoff, OK: ok}
 }
 
-// Encode marshals one lifecycle message for a v2 request or response payload.
+// Encode marshals one lifecycle message for a v1 request or response payload.
 func Encode(msg any) ([]byte, error) {
 	b, err := json.Marshal(msg)
 	if err != nil {

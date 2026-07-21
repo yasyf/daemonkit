@@ -85,7 +85,7 @@ public final class SocketCall: @unchecked Sendable {
     }
 }
 
-/// A persistent, multiplexed exact-v4 unix-socket client.
+/// A persistent, multiplexed exact-v1 unix-socket client.
 public final class SocketClient: @unchecked Sendable {
     public struct Configuration: Sendable {
         public var maximumFrameBytes: Int

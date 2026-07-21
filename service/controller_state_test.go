@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"os"
 	"path/filepath"
@@ -124,19 +125,28 @@ func TestControllerStoreRejectsConcurrentOwner(t *testing.T) {
 func TestControllerStoreRejectsUnknownSchemaSurfaces(t *testing.T) {
 	tests := []struct {
 		name   string
+		want   string
 		mutate func(*bolt.Tx) error
 	}{
 		{
-			name: "bucket",
+			name: "bucket", want: "unknown",
 			mutate: func(tx *bolt.Tx) error {
 				_, err := tx.CreateBucket([]byte("future"))
 				return err
 			},
 		},
 		{
-			name: "metadata",
+			name: "metadata", want: "unknown",
 			mutate: func(tx *bolt.Tx) error {
 				return tx.Bucket(controllerMetaBucket).Put([]byte("future"), []byte("1"))
+			},
+		},
+		{
+			name: "foreign epoch", want: "unsupported",
+			mutate: func(tx *bolt.Tx) error {
+				var schema [8]byte
+				binary.BigEndian.PutUint64(schema[:], 2)
+				return tx.Bucket(controllerMetaBucket).Put(controllerSchemaKey, schema[:])
 			},
 		},
 	}
@@ -162,8 +172,8 @@ func TestControllerStoreRejectsUnknownSchemaSurfaces(t *testing.T) {
 				t.Fatal(err)
 			}
 			if _, err := openControllerStore(context.Background(), path); err == nil ||
-				!strings.Contains(err.Error(), "unknown") {
-				t.Fatalf("openControllerStore() error = %v, want unknown schema rejection", err)
+				!strings.Contains(err.Error(), test.want) {
+				t.Fatalf("openControllerStore() error = %v, want %s schema rejection", err, test.want)
 			}
 		})
 	}

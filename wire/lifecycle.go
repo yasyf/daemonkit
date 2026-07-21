@@ -13,7 +13,7 @@ import (
 	"github.com/yasyf/daemonkit/wire/lifeproto"
 )
 
-// Lifecycle is the daemon runtime surface exposed through reserved v2 operations.
+// Lifecycle is the daemon runtime surface exposed through reserved v1 operations.
 type Lifecycle interface {
 	Health(context.Context) (daemon.Health, error)
 	Shutdown(context.Context) error
@@ -82,7 +82,7 @@ func decodeLifecycle(req Request, op string, dst any) error {
 	return nil
 }
 
-// LifecyclePeer is a persistent v4 session client implementing daemon.Peer.
+// LifecyclePeer is a persistent v1 session client implementing daemon.Peer.
 type LifecyclePeer struct {
 	Config ClientConfig
 

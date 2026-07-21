@@ -18,7 +18,7 @@ const DefaultReapSettlement = 2 * time.Second
 
 const (
 	settlementPollInterval = 10 * time.Millisecond
-	recordSchemaVersion    = 5
+	recordSchemaVersion    = 1
 )
 
 // errNoProc is a definitive "gone", distinct from a probe failure (Undetermined, fails closed).

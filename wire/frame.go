@@ -14,7 +14,7 @@ import (
 
 const (
 	// ProtocolVersion is the exact transport version accepted by every peer.
-	ProtocolVersion uint16 = 4
+	ProtocolVersion uint16 = 1
 	// DefaultMaxFrame caps one length-prefixed frame at 4 MiB.
 	DefaultMaxFrame = 4 << 20
 	frameHeaderSize = 32
@@ -27,7 +27,7 @@ var (
 	ErrFrameTruncated = errors.New("wire: truncated frame")
 	// ErrProtocolVersion means a frame carries a protocol other than ProtocolVersion.
 	ErrProtocolVersion = errors.New("wire: unsupported protocol version")
-	// ErrInvalidFrame means a frame violates the v4 structural contract.
+	// ErrInvalidFrame means a frame violates the v1 structural contract.
 	ErrInvalidFrame = errors.New("wire: invalid frame")
 	// ErrQueueFull means a bounded session queue cannot accept more work.
 	ErrQueueFull = errors.New("wire: queue at capacity")
@@ -35,9 +35,9 @@ var (
 	ErrFlowControl = errors.New("wire: peer exceeded granted stream window")
 )
 
-var frameMagic = [4]byte{'D', 'K', 'S', '4'}
+var frameMagic = [4]byte{'D', 'K', 'S', '1'}
 
-// FrameKind identifies one v4 session message.
+// FrameKind identifies one v1 session message.
 type FrameKind uint8
 
 const (
@@ -83,7 +83,7 @@ type Frame struct {
 	Payload           []byte
 }
 
-// Codec reads and writes exact-v4 length-prefixed frames over one connection.
+// Codec reads and writes exact-v1 length-prefixed frames over one connection.
 // Reads are single-goroutine; writes are serialized and safe from any goroutine.
 type Codec struct {
 	MaxFrame     int

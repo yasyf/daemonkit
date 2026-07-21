@@ -92,19 +92,19 @@ struct LifecycleWireTests {
     }
 
     @Test func protocolVersionIsPinned() {
-        #expect(DaemonKit.lifeProtocolVersion == 2)
+        #expect(DaemonKit.lifeProtocolVersion == 1)
     }
 
     @Test func envelopeRejectsForeignVersion() {
-        let foreign = Data(#"{"v":1,"op":"health"}"#.utf8)
+        let foreign = Data(#"{"v":2,"op":"health"}"#.utf8)
         #expect(throws: LifecycleWireError.self) {
             _ = try Envelope.decode(from: foreign)
         }
     }
 
     @Test func envelopePeeksOpAndVersion() throws {
-        let envelope = try Envelope.decode(from: Data(#"{"v":2,"op":"handoff"}"#.utf8))
-        #expect(envelope.v == 2)
+        let envelope = try Envelope.decode(from: Data(#"{"v":1,"op":"handoff"}"#.utf8))
+        #expect(envelope.v == 1)
         #expect(envelope.op == LifecycleOp.handoff.rawValue)
     }
 

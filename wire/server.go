@@ -17,7 +17,7 @@ import (
 var (
 	// ErrUntrustedPeer means the accepted unix peer failed the same-uid floor.
 	ErrUntrustedPeer = errors.New("wire: untrusted peer")
-	// ErrHandshake means the first frame did not establish a v4 session.
+	// ErrHandshake means the first frame did not establish a v1 session.
 	ErrHandshake = errors.New("wire: handshake failed")
 	// ErrServerStarted means Serve was called more than once.
 	ErrServerStarted = errors.New("wire: server already started")
@@ -85,7 +85,7 @@ const (
 	protectedSessionCapacity
 )
 
-// Server serves persistent, multiplexed v4 sessions on a listener owned by its caller.
+// Server serves persistent, multiplexed v1 sessions on a listener owned by its caller.
 // Register handlers and lifecycle controls before Serve.
 type Server struct {
 	// Build is the server build identity sent during the mandatory handshake.
@@ -190,7 +190,7 @@ func (s *Server) OnActivity(f func()) {
 	s.onActivity = f
 }
 
-// Serve accepts v4 sessions until ctx is cancelled. admit runs for every
+// Serve accepts v1 sessions until ctx is cancelled. admit runs for every
 // request that clears the pre-admission checks; its done runs when the
 // request's execution settles, including cancellation and write-failure paths.
 func (s *Server) Serve(

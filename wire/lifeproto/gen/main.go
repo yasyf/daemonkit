@@ -90,7 +90,7 @@ func renderGo(s schema) string {
 		renderGoMessage(&b, m)
 	}
 
-	b.WriteString("// Encode marshals one lifecycle message for a v2 request or response payload.\n")
+	fmt.Fprintf(&b, "// Encode marshals one lifecycle message for a v%d request or response payload.\n", s.version)
 	b.WriteString("func Encode(msg any) ([]byte, error) {\n")
 	b.WriteString("\tb, err := json.Marshal(msg)\n")
 	b.WriteString("\tif err != nil {\n\t\treturn nil, fmt.Errorf(\"lifeproto: encode: %w\", err)\n\t}\n")
@@ -195,14 +195,14 @@ enum LifecycleJSON {
 }
 
 /// A flat lifecycle message: the shared ` + "`{v, op}`" + ` header plus op-specific
-/// fields, carried as a v2 request or response payload.
+/// fields, carried as a v{{VERSION}} request or response payload.
 public protocol LifecycleMessage: Decodable, Sendable {
     /// The compact JSON payload encoding of this message.
     func encoded() -> Data
 }
 
 public extension LifecycleMessage {
-    /// Decodes a message from one v2 frame payload.
+    /// Decodes a message from one v{{VERSION}} frame payload.
     static func decode(from data: Data) throws -> Self {
         try JSONDecoder().decode(Self.self, from: data)
     }
@@ -252,7 +252,7 @@ func renderSwift(s schema) string {
 	}
 	b.WriteString("}\n\n")
 
-	b.WriteString(swiftStatic)
+	b.WriteString(strings.ReplaceAll(swiftStatic, "{{VERSION}}", fmt.Sprint(s.version)))
 
 	for _, m := range s.messages {
 		b.WriteString("\n")

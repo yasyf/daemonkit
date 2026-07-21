@@ -94,7 +94,7 @@ extension SocketTransportTests {
             let chunkSize = 64 * 1024
             let chunks = CountedChunks(count: chunkCount, size: chunkSize)
             let expectedTerminal = SocketTerminal(
-                payload: Data(#"{"etag":"catalog-v7"}"#.utf8),
+                payload: Data(#"{"etag":"catalog-v1"}"#.utf8),
                 error: "upstream detail",
                 rejected: true,
                 reason: "terminal metadata"

@@ -1,0 +1,4 @@
+{
+  "comment": "Shared Go and Swift exact-v1 frame golden, including the 4-byte body-length prefix.",
+  "hex": "00000038444b533100010301000000000000002a000000000000018bcfe5687b000600076d7574617465616363742d31387b2276616c7565223a317d"
+}

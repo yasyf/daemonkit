@@ -253,7 +253,7 @@ func TestRuntimeHandoffResponseSurvivesImmediateSessionClosure(t *testing.T) {
 
 func TestResourceOwnerSocketReleaseKeepsLifecycleAvailableWhileDraining(t *testing.T) {
 	const (
-		businessBuild  = "runtime.rpc.v4"
+		businessBuild  = "runtime.rpc.v1"
 		incumbentBuild = "v1.0.0"
 		successorBuild = "v1.1.0"
 	)

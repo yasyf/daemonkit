@@ -112,7 +112,7 @@ private final class SocketSessionLifecycle: @unchecked Sendable {
     }
 }
 
-/// A unix-domain persistent v4 session server.
+/// A unix-domain persistent v1 session server.
 public final class SocketServer: @unchecked Sendable {
     public struct Configuration: Sendable {
         public var maximumFrameBytes: Int

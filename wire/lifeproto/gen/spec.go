@@ -62,7 +62,7 @@ var (
 
 // lifeproto is the frozen lifecycle protocol schema.
 var lifeproto = schema{
-	version: 2,
+	version: 1,
 	ops: []op{
 		{constName: "OpHealth", value: "health"},
 		{constName: "OpShutdown", value: "shutdown"},

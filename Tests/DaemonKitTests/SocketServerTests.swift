@@ -70,13 +70,13 @@ private actor PullChunks {
 extension SocketTransportTests {
     @Suite(.timeLimit(.minutes(1)))
     struct SocketServerTests {
-        @Test func frameV4MatchesSharedGoGolden() throws {
+        @Test func frameV1MatchesSharedGoGolden() throws {
             let repository = URL(fileURLWithPath: #filePath)
                 .deletingLastPathComponent()
                 .deletingLastPathComponent()
                 .deletingLastPathComponent()
             let fixture = try JSONSerialization.jsonObject(
-                with: Data(contentsOf: repository.appendingPathComponent("wire/testdata/frame-v4.json"))
+                with: Data(contentsOf: repository.appendingPathComponent("wire/testdata/frame-v1.json"))
             ) as? [String: String]
             let hex = try #require(fixture?["hex"])
             var encoded = Data()
@@ -303,7 +303,7 @@ extension SocketTransportTests {
             ))
             var foreign = body
             foreign[4] = 0
-            foreign[5] = 1
+            foreign[5] = 2
             #expect(throws: SessionTransportError.self) { _ = try SessionFrameCodec.decode(foreign) }
             #expect(throws: SessionTransportError.self) { _ = try SessionFrameCodec.decode(Data("short".utf8)) }
         }

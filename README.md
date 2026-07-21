@@ -57,14 +57,14 @@ One row per package; the Status column is each surface's live state.
 
 | Surface | Owns | Status |
 |---|---|---|
-| `proc` | Detached spawn, single-entrant sockets, process caps, child reaping | Landed |
-| `service` | `Agent` LaunchAgent lifecycle with required typed restart policy, installed in bootout, bootstrap, enable, kickstart order, plus the `AppKeepAlive` agent (`open -g -W`) for signed holder apps | Landed |
+| `proc` | Detached spawn, single-entrant sockets, process caps, child reaping, exact epoch-1 durable process ledger | Landed |
+| `service` | `Agent` LaunchAgent lifecycle with required typed restart policy and exact epoch-1 controller state, installed in bootout, bootstrap, enable, kickstart order, plus the `AppKeepAlive` agent (`open -g -W`) for signed holder apps | Landed |
 | `version` | Release/dev version taxonomy, newest-wins skew | Landed |
 | `paths` | The `~/<app>` state layout: daemon socket, HTTP handshake file, per-subject artifacts, start lock, sqlite database, daemon log, turn-snapshot scratch dirs | Landed |
 | `appgroup` | App Group container resolution via `NSFileManager` (the prompt-free TCC path), cgo-free | Landed |
 | `bundle` | Info.plist reads, stable `.app` path conventions | Landed |
-| `wire` | LF-JSON framing, bounded serve loop, peer credentials | Landed |
-| `wire/lifeproto` | The frozen lifecycle envelope (health, shutdown, hello, handoff) — Go and Swift bindings generated from one schema, pinned byte-identical by a shared golden fixture | Landed |
+| `wire` | Exact-v1 persistent session transport, bounded multiplexing and delivery, peer credentials | Landed |
+| `wire/lifeproto` | The exact-v1 frozen lifecycle envelope (health, shutdown, hello, handoff) — Go and Swift bindings generated from one schema, pinned byte-identical by a shared golden fixture | Landed |
 | `trust` | Codesign peer verification (audit-token designated requirements) | Landed |
 | `daemon` | Takeover ladder, skew watch, idle exit | Landed |
 | `drain` | Drain-on-upgrade: journals, fences, dead-peer adoption | Landed |

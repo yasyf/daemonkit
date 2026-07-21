@@ -50,9 +50,9 @@ func TestLifecyclePeerDoesNotMapProtocolFailureToNoPeer(t *testing.T) {
 			if _, err := wire.NewCodec(server).ReadFrame(); err != nil {
 				return
 			}
-			payload := []byte(`{"protocol":1,"build":"old"}`)
+			payload := []byte(`{"protocol":2,"build":"foreign"}`)
 			body := make([]byte, 32+len(payload))
-			copy(body[:4], []byte("DKS4"))
+			copy(body[:4], []byte("DKS1"))
 			binary.BigEndian.PutUint16(body[4:6], wire.ProtocolVersion)
 			body[6] = byte(wire.FrameHelloAck)
 			body[7] = byte(wire.FlagEnd)
