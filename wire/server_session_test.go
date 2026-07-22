@@ -6,12 +6,42 @@ import (
 	"errors"
 	"net"
 	"os"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/yasyf/daemonkit/proc"
 )
+
+type partialFrameWriteConn struct {
+	net.Conn
+	writes    atomic.Int32
+	entered   chan struct{}
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func (c *partialFrameWriteConn) Write(payload []byte) (int, error) {
+	switch c.writes.Add(1) {
+	case 1:
+		return c.Conn.Write(payload)
+	case 2:
+		return 1, nil
+	case 3:
+		close(c.entered)
+		<-c.closed
+		return 0, net.ErrClosed
+	default:
+		return c.Conn.Write(payload)
+	}
+}
+
+func (c *partialFrameWriteConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return c.Conn.Close()
+}
 
 func TestServeSessionRoundTripGoAwayAndJoin(t *testing.T) {
 	server := &Server{Build: "session-test"}
@@ -45,6 +75,46 @@ func TestServeSessionRoundTripGoAwayAndJoin(t *testing.T) {
 		t.Fatalf("client Close: %v", err)
 	}
 	awaitSessionServer(t, done)
+}
+
+func TestServeSessionGoAwayRejectsPartialFrameAcknowledgement(t *testing.T) {
+	var active atomic.Int32
+	server := &Server{Build: "session-test"}
+	server.RegisterConcurrent("large", func(context.Context, Request) (any, error) {
+		return strings.Repeat("x", 1<<20), nil
+	})
+	clientConn, rawServerConn := net.Pipe()
+	serverConn := &partialFrameWriteConn{
+		Conn: rawServerConn, entered: make(chan struct{}), closed: make(chan struct{}),
+	}
+	identity := currentSessionIdentity(t)
+	admit := func() (func(), error) {
+		active.Add(1)
+		return func() { active.Add(-1) }, nil
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- server.ServeSession(
+			context.Background(), serverConn, identity,
+			func() error { return nil }, admit, allowSession,
+		)
+	}()
+	client := newExistingSessionClient(t, clientConn)
+	if _, err := client.Open(context.Background(), "large", "", nil, true); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	select {
+	case <-serverConn.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server writer did not enter partial response frame")
+	}
+	if err := client.Close(); err == nil {
+		t.Fatal("Close acknowledged after a partial server frame made the stream unusable")
+	}
+	awaitSessionServer(t, done)
+	if got := active.Load(); got != 0 {
+		t.Fatalf("active admissions = %d, want 0", got)
+	}
 }
 
 func TestServeSessionPropagatesCancellationAndJoinsHandlers(t *testing.T) {

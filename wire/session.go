@@ -14,6 +14,12 @@ import (
 
 var errPeerGoAway = errors.New("wire: peer requested session close")
 
+const (
+	writerIdle uint32 = iota
+	writerActive
+	writerDraining
+)
+
 // AcceptedSession is a server-authenticated persistent client session.
 type AcceptedSession struct{ s *session }
 
@@ -70,6 +76,7 @@ type session struct {
 	writerDone     chan struct{}
 	disconnected   chan struct{}
 	done           chan struct{}
+	writerErr      error
 
 	mu        sync.Mutex
 	active    map[uint64]*requestState
@@ -81,6 +88,7 @@ type session struct {
 	closeOnce      sync.Once
 	disconnectOnce sync.Once
 	peerGoAway     atomic.Bool
+	writerState    atomic.Uint32
 }
 
 type sessionOutbound struct {
@@ -130,12 +138,19 @@ func (s *session) run(ctx context.Context, releaseCapacity func()) error {
 	err := s.readLoop(ctx)
 	if errors.Is(err, errPeerGoAway) {
 		s.peerGoAway.Store(true)
+		if !s.writerState.CompareAndSwap(writerIdle, writerDraining) {
+			_ = s.conn.Close()
+		}
 		s.stop()
 		s.closeRequestInputs()
 		s.requestWG.Wait()
 		close(s.requestsDone)
 		s.writerWG.Wait()
 		releaseCapacity()
+		if s.writerErr != nil {
+			_ = s.conn.Close()
+			return s.writerErr
+		}
 		if err := s.codec.WriteFrame(Frame{Kind: FrameGoAway, Flags: FlagEnd}); err != nil {
 			_ = s.conn.Close()
 			return err
@@ -215,11 +230,24 @@ func (s *session) writeLoop() {
 			if outgoing.beforeWrite != nil {
 				outgoing.beforeWrite()
 			}
+			if !s.writerState.CompareAndSwap(writerIdle, writerActive) {
+				err := s.ctx.Err()
+				if err == nil {
+					err = context.Canceled
+				}
+				if outgoing.done != nil {
+					outgoing.done <- err
+				}
+				terminalErr = err
+				continue
+			}
 			err := s.codec.WriteFrame(outgoing.frame)
+			s.writerState.Store(writerIdle)
 			if outgoing.done != nil {
 				outgoing.done <- err
 			}
 			if err != nil {
+				s.writerErr = err
 				s.close()
 				terminalErr = err
 			}
