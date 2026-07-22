@@ -69,7 +69,7 @@ public extension SocketResponse {
                 return nil
             },
             terminal: { try await call.response() },
-            cancel: { call.cancel() }
+            cancel: { Task { await call.cancel() } }
         ))
     }
 }

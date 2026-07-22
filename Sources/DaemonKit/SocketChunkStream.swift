@@ -6,12 +6,12 @@ public struct SocketChunkStream: AsyncSequence, Sendable {
 
     private let channel: SocketBoundedChannel<SocketRequestChunk>
     private let cancellationOperation: @Sendable () -> Void
-    private let consumptionOperation: @Sendable (SocketRequestChunk) throws -> Void
+    private let consumptionOperation: @Sendable (SocketRequestChunk) async throws -> Void
 
     init(
         channel: SocketBoundedChannel<SocketRequestChunk>,
         cancellationOperation: @escaping @Sendable () -> Void,
-        consumptionOperation: @escaping @Sendable (SocketRequestChunk) throws -> Void = { _ in }
+        consumptionOperation: @escaping @Sendable (SocketRequestChunk) async throws -> Void = { _ in }
     ) {
         self.channel = channel
         self.cancellationOperation = cancellationOperation
@@ -33,19 +33,21 @@ public struct SocketChunkStream: AsyncSequence, Sendable {
     /// Pulls the next request chunk, backpressuring the session reader until it is consumed.
     public func nextChunk() async throws -> SocketRequestChunk? {
         let chunk = try await channel.next(onCancel: cancellationOperation)
-        try chunk.map(consumptionOperation)
+        if let chunk {
+            try await consumptionOperation(chunk)
+        }
         return chunk
     }
 
     public struct Iterator: AsyncIteratorProtocol {
         private let channel: SocketBoundedChannel<SocketRequestChunk>
         private let cancellationOperation: @Sendable () -> Void
-        private let consumptionOperation: @Sendable (SocketRequestChunk) throws -> Void
+        private let consumptionOperation: @Sendable (SocketRequestChunk) async throws -> Void
 
         fileprivate init(
             channel: SocketBoundedChannel<SocketRequestChunk>,
             cancellationOperation: @escaping @Sendable () -> Void,
-            consumptionOperation: @escaping @Sendable (SocketRequestChunk) throws -> Void
+            consumptionOperation: @escaping @Sendable (SocketRequestChunk) async throws -> Void
         ) {
             self.channel = channel
             self.cancellationOperation = cancellationOperation
@@ -54,7 +56,9 @@ public struct SocketChunkStream: AsyncSequence, Sendable {
 
         public mutating func next() async throws -> SocketRequestChunk? {
             let chunk = try await channel.next(onCancel: cancellationOperation)
-            try chunk.map(consumptionOperation)
+            if let chunk {
+                try await consumptionOperation(chunk)
+            }
             return chunk
         }
     }
@@ -66,12 +70,12 @@ public struct SocketEventStream: AsyncSequence, Sendable {
 
     private let channel: SocketBoundedChannel<SocketEvent>
     private let cancellationOperation: @Sendable () -> Void
-    private let consumptionOperation: @Sendable (SocketEvent) throws -> Void
+    private let consumptionOperation: @Sendable (SocketEvent) async throws -> Void
 
     init(
         channel: SocketBoundedChannel<SocketEvent>,
         cancellationOperation: @escaping @Sendable () -> Void,
-        consumptionOperation: @escaping @Sendable (SocketEvent) throws -> Void = { _ in }
+        consumptionOperation: @escaping @Sendable (SocketEvent) async throws -> Void = { _ in }
     ) {
         self.channel = channel
         self.cancellationOperation = cancellationOperation
@@ -89,7 +93,9 @@ public struct SocketEventStream: AsyncSequence, Sendable {
     /// Pulls the next pushed event, backpressuring the session reader until it is consumed.
     public func nextEvent() async throws -> SocketEvent? {
         let event = try await channel.next(onCancel: cancellationOperation)
-        try event.map(consumptionOperation)
+        if let event {
+            try await consumptionOperation(event)
+        }
         return event
     }
 
@@ -100,12 +106,12 @@ public struct SocketEventStream: AsyncSequence, Sendable {
     public struct Iterator: AsyncIteratorProtocol {
         private let channel: SocketBoundedChannel<SocketEvent>
         private let cancellationOperation: @Sendable () -> Void
-        private let consumptionOperation: @Sendable (SocketEvent) throws -> Void
+        private let consumptionOperation: @Sendable (SocketEvent) async throws -> Void
 
         fileprivate init(
             channel: SocketBoundedChannel<SocketEvent>,
             cancellationOperation: @escaping @Sendable () -> Void,
-            consumptionOperation: @escaping @Sendable (SocketEvent) throws -> Void
+            consumptionOperation: @escaping @Sendable (SocketEvent) async throws -> Void
         ) {
             self.channel = channel
             self.cancellationOperation = cancellationOperation
@@ -114,7 +120,9 @@ public struct SocketEventStream: AsyncSequence, Sendable {
 
         public mutating func next() async throws -> SocketEvent? {
             let event = try await channel.next(onCancel: cancellationOperation)
-            try event.map(consumptionOperation)
+            if let event {
+                try await consumptionOperation(event)
+            }
             return event
         }
     }

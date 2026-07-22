@@ -184,7 +184,7 @@ extension SocketTransportTests {
             }
         }
 
-        @Test func clientRejectsServerBeforeWritingProtocolBytes() throws {
+        @Test func clientRejectsServerBeforeWritingProtocolBytes() async throws {
             let directory = try shortSocketDir()
             defer { try? FileManager.default.removeItem(at: directory) }
             let path = directory.appendingPathComponent("s.sock").path
@@ -195,37 +195,28 @@ extension SocketTransportTests {
             try #require(withAddress(&address) { Darwin.bind(listener, $0, $1) } == 0)
             try #require(listen(listener, 1) == 0)
 
-            let probe = SocketReadProbe()
-            let settled = DispatchSemaphore(value: 0)
-            DispatchQueue.global().async {
+            let settlement = Task.detached {
                 let peer = accept(listener, nil, nil)
                 guard peer >= 0 else {
-                    probe.record(-1)
-                    settled.signal()
-                    return
+                    return Int(-1)
                 }
-                defer {
-                    close(peer)
-                    settled.signal()
-                }
+                defer { close(peer) }
                 var poller = pollfd(fd: peer, events: Int16(POLLIN | POLLHUP), revents: 0)
                 guard poll(&poller, 1, 5000) == 1 else {
-                    probe.record(-2)
-                    return
+                    return Int(-2)
                 }
                 var byte: UInt8 = 0
-                probe.record(read(peer, &byte, 1))
+                return read(peer, &byte, 1)
             }
 
-            #expect(throws: PeerTrust.TrustError.self) {
-                _ = try SocketClient(
+            await #expect(throws: PeerTrust.TrustError.self) {
+                _ = try await SocketClient(
                     path: path,
                     build: "server-test",
                     trust: PeerTrust(requirement: fixtureRequirement())
                 )
             }
-            #expect(settled.wait(timeout: .now() + 5) == .success)
-            #expect(probe.value() == 0)
+            #expect(await settlement.value == 0)
         }
 
         @Test func requiredEntitlementsMatchClosedTypedPredicates() throws {
@@ -270,36 +261,40 @@ extension SocketTransportTests {
         }
 
         @Test func socketServerRequiresAnExplicitTrustPolicy() async throws {
-            let directory = try shortSocketDir()
-            defer { try? FileManager.default.removeItem(at: directory) }
-            let path = directory.appendingPathComponent("s.sock").path
-            let server = SocketServer(path: path, build: "server-test", trust: .sameEffectiveUser) { request in
-                .terminal(SocketTerminal(payload: request.payload))
+            try await withAsyncCleanup { cleanup in
+                let directory = try shortSocketDir()
+                cleanup.add { try? FileManager.default.removeItem(at: directory) }
+                let path = directory.appendingPathComponent("s.sock").path
+                let server = SocketServer(path: path, build: "server-test", trust: .sameEffectiveUser) { request in
+                    .terminal(SocketTerminal(payload: request.payload))
+                }
+                try await server.start()
+                cleanup.add { await server.stop() }
+                let client = try await SocketClient(path: path, build: "server-test", trust: .sameEffectiveUser)
+                cleanup.add { await client.close() }
+                let result = try await client.call(operation: "echo", payload: Data(#""hi""#.utf8))
+                #expect(result.payload == Data(#""hi""#.utf8))
             }
-            try server.start()
-            defer { server.stop() }
-            let client = try SocketClient(path: path, build: "server-test", trust: .sameEffectiveUser)
-            defer { client.close() }
-            let result = try await client.call(operation: "echo", payload: Data(#""hi""#.utf8))
-            #expect(result.payload == Data(#""hi""#.utf8))
         }
 
-        @Test func serverClosesConnectionForARejectedSignedPeer() throws {
-            let directory = try shortSocketDir()
-            defer { try? FileManager.default.removeItem(at: directory) }
-            let path = directory.appendingPathComponent("s.sock").path
-            let server = try SocketServer(
-                path: path,
-                build: "server-test",
-                trust: PeerTrust(requirement: fixtureRequirement())
-            ) { _ in
-                Issue.record("handler must not run for a rejected peer")
-                return .terminal(SocketTerminal())
-            }
-            try server.start()
-            defer { server.stop() }
-            #expect(throws: (any Error).self) {
-                _ = try SocketClient(path: path, build: "server-test", trust: .sameEffectiveUser)
+        @Test func serverClosesConnectionForARejectedSignedPeer() async throws {
+            try await withAsyncCleanup { cleanup in
+                let directory = try shortSocketDir()
+                cleanup.add { try? FileManager.default.removeItem(at: directory) }
+                let path = directory.appendingPathComponent("s.sock").path
+                let server = try SocketServer(
+                    path: path,
+                    build: "server-test",
+                    trust: PeerTrust(requirement: fixtureRequirement())
+                ) { _ in
+                    Issue.record("handler must not run for a rejected peer")
+                    return .terminal(SocketTerminal())
+                }
+                try await server.start()
+                cleanup.add { await server.stop() }
+                await #expect(throws: (any Error).self) {
+                    _ = try await SocketClient(path: path, build: "server-test", trust: .sameEffectiveUser)
+                }
             }
         }
 

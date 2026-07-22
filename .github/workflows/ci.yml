@@ -101,3 +101,7 @@ jobs:
         run: swift build
       - name: Test
         run: swift test
+      - name: Strict cooperative executor transport
+        env:
+          LIBDISPATCH_COOPERATIVE_POOL_STRICT: "1"
+        run: swift test --filter strictExecutorRunsProductionClientAndServerTogether

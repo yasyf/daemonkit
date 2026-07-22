@@ -47,11 +47,12 @@ private final class ContinuationGate: @unchecked Sendable {
     }
 
     func release() {
-        lock.lock()
-        let continuation = continuation
-        self.continuation = nil
-        lock.unlock()
-        continuation?.resume()
+        let pending = lock.withLock {
+            let pending = self.continuation
+            self.continuation = nil
+            return pending
+        }
+        pending?.resume()
     }
 }
 
@@ -122,78 +123,82 @@ extension SocketTransportTests {
         }
 
         @Test func persistentSessionMultiplexesEventsAndStreams() async throws {
-            let directory = try shortSocketDir()
-            defer { try? FileManager.default.removeItem(at: directory) }
-            let path = directory.appendingPathComponent("s.sock").path
-            let server = SocketServer(path: path, build: "server-test", trust: .sameEffectiveUser) { request in
-                if request.operation == "stream" {
-                    try? await request.session.pushEvent(topic: "changed", payload: Data(request.tenant.utf8))
-                    let chunks = PullChunks([Data("a".utf8), Data("b".utf8)])
-                    return .stream(SocketResponseStream(
-                        nextChunk: { await chunks.next() },
-                        terminal: { SocketTerminal(payload: Data(#""done""#.utf8)) },
-                        cancel: {}
-                    ))
-                }
-                return .terminal(SocketTerminal(payload: request.payload))
-            }
-            try server.start()
-            defer { server.stop() }
-            let client = try SocketClient(path: path, build: "server-test", trust: .sameEffectiveUser)
-            defer { client.close() }
-            #expect(client.peerBuild == "server-test")
-
-            try await withThrowingTaskGroup(of: Void.self) { group in
-                for index in 0 ..< 20 {
-                    group.addTask {
-                        let payload = Data("\(index)".utf8)
-                        let result = try await client.call(operation: "echo", payload: payload)
-                        #expect(result.payload == payload)
-                        #expect(result.error == nil)
+            try await withAsyncCleanup { cleanup in
+                let directory = try shortSocketDir()
+                cleanup.add { try? FileManager.default.removeItem(at: directory) }
+                let path = directory.appendingPathComponent("s.sock").path
+                let server = SocketServer(path: path, build: "server-test", trust: .sameEffectiveUser) { request in
+                    if request.operation == "stream" {
+                        try? await request.session.pushEvent(topic: "changed", payload: Data(request.tenant.utf8))
+                        let chunks = PullChunks([Data("a".utf8), Data("b".utf8)])
+                        return .stream(SocketResponseStream(
+                            nextChunk: { await chunks.next() },
+                            terminal: { SocketTerminal(payload: Data(#""done""#.utf8)) },
+                            cancel: {}
+                        ))
                     }
+                    return .terminal(SocketTerminal(payload: request.payload))
                 }
-                try await group.waitForAll()
-            }
+                try await server.start()
+                cleanup.add { await server.stop() }
+                let client = try await SocketClient(path: path, build: "server-test", trust: .sameEffectiveUser)
+                cleanup.add { await client.close() }
+                #expect(client.peerBuild == "server-test")
 
-            let call = try client.open(operation: "stream", tenant: "acct-18")
-            var streamPayloads: [Data] = []
-            for try await chunk in call.chunks where !chunk.end {
-                streamPayloads.append(chunk.payload)
-            }
-            let result = try await call.response()
-            #expect(streamPayloads == [Data("a".utf8), Data("b".utf8)])
-            #expect(result.payload == Data(#""done""#.utf8))
-            for try await event in client.events {
-                #expect(event.topic == "changed")
-                #expect(event.payload == Data("acct-18".utf8))
-                break
+                try await withThrowingTaskGroup(of: Void.self) { group in
+                    for index in 0 ..< 20 {
+                        group.addTask {
+                            let payload = Data("\(index)".utf8)
+                            let result = try await client.call(operation: "echo", payload: payload)
+                            #expect(result.payload == payload)
+                            #expect(result.error == nil)
+                        }
+                    }
+                    try await group.waitForAll()
+                }
+
+                let call = try await client.open(operation: "stream", tenant: "acct-18")
+                var streamPayloads: [Data] = []
+                for try await chunk in call.chunks where !chunk.end {
+                    streamPayloads.append(chunk.payload)
+                }
+                let result = try await call.response()
+                #expect(streamPayloads == [Data("a".utf8), Data("b".utf8)])
+                #expect(result.payload == Data(#""done""#.utf8))
+                for try await event in client.events {
+                    #expect(event.topic == "changed")
+                    #expect(event.payload == Data("acct-18".utf8))
+                    break
+                }
             }
         }
 
         @Test func persistentSessionSurvivesPastHandshakeTimeout() async throws {
-            let directory = try shortSocketDir()
-            defer { try? FileManager.default.removeItem(at: directory) }
-            let path = directory.appendingPathComponent("s.sock").path
-            let server = SocketServer(
-                path: path,
-                build: "server-test",
-                configuration: .init(handshakeTimeout: 0.1),
-                trust: .sameEffectiveUser
-            ) { _ in
-                .terminal(SocketTerminal(payload: Data(#""pong""#.utf8)))
+            try await withAsyncCleanup { cleanup in
+                let directory = try shortSocketDir()
+                cleanup.add { try? FileManager.default.removeItem(at: directory) }
+                let path = directory.appendingPathComponent("s.sock").path
+                let server = SocketServer(
+                    path: path,
+                    build: "server-test",
+                    configuration: .init(handshakeTimeout: 0.1),
+                    trust: .sameEffectiveUser
+                ) { _ in
+                    .terminal(SocketTerminal(payload: Data(#""pong""#.utf8)))
+                }
+                try await server.start()
+                cleanup.add { await server.stop() }
+                let client = try await SocketClient(
+                    path: path,
+                    build: "server-test",
+                    configuration: .init(handshakeTimeout: 0.1),
+                    trust: .sameEffectiveUser
+                )
+                cleanup.add { await client.close() }
+                try await Task.sleep(for: .milliseconds(300))
+                let result = try await client.call(operation: "ping")
+                #expect(result.payload == Data(#""pong""#.utf8))
             }
-            try server.start()
-            defer { server.stop() }
-            let client = try SocketClient(
-                path: path,
-                build: "server-test",
-                configuration: .init(handshakeTimeout: 0.1),
-                trust: .sameEffectiveUser
-            )
-            defer { client.close() }
-            try await Task.sleep(for: .milliseconds(300))
-            let result = try await client.call(operation: "ping")
-            #expect(result.payload == Data(#""pong""#.utf8))
         }
 
         @Test func rejectsStructurallyInvalidKindFields() throws {
@@ -231,95 +236,101 @@ extension SocketTransportTests {
         }
 
         @Test func canceledCallMustSettleWithinBound() async throws {
-            let directory = try shortSocketDir()
-            defer { try? FileManager.default.removeItem(at: directory) }
-            let path = directory.appendingPathComponent("s.sock").path
-            let gate = ContinuationGate()
-            let server = SocketServer(path: path, build: "server-test", trust: .sameEffectiveUser) { _ in
-                await gate.wait()
-                return .terminal(SocketTerminal(payload: Data("null".utf8)))
-            }
-            try server.start()
-            defer {
+            try await withAsyncCleanup { cleanup in
+                let directory = try shortSocketDir()
+                cleanup.add { try? FileManager.default.removeItem(at: directory) }
+                let path = directory.appendingPathComponent("s.sock").path
+                let gate = ContinuationGate()
+                let server = SocketServer(path: path, build: "server-test", trust: .sameEffectiveUser) { _ in
+                    await gate.wait()
+                    return .terminal(SocketTerminal(payload: Data("null".utf8)))
+                }
+                try await server.start()
+                let client = try await SocketClient(
+                    path: path,
+                    build: "server-test",
+                    configuration: .init(cancellationSettlementTimeout: 0.05),
+                    trust: .sameEffectiveUser
+                )
+                cleanup.add { await client.close() }
+                let call = try await client.open(operation: "wait")
+                await call.cancel()
+                await #expect(throws: SessionTransportError.cancellationDidNotSettle) {
+                    try await call.response()
+                }
+                await #expect(throws: SessionTransportError.self) {
+                    try await call.sendChunk(Data("late".utf8))
+                }
                 gate.release()
-                server.stop()
+                await client.close()
+                await server.stop()
             }
-            let client = try SocketClient(
-                path: path,
-                build: "server-test",
-                configuration: .init(cancellationSettlementTimeout: 0.05),
-                trust: .sameEffectiveUser
-            )
-            defer { client.close() }
-            let call = try client.open(operation: "wait")
-            call.cancel()
-            await #expect(throws: SessionTransportError.cancellationDidNotSettle) {
-                try await call.response()
-            }
-            await #expect(throws: SessionTransportError.self) {
-                try await call.sendChunk(Data("late".utf8))
-            }
-            gate.release()
         }
 
         @Test func requestInputStreamIsOrdered() async throws {
-            let directory = try shortSocketDir()
-            defer { try? FileManager.default.removeItem(at: directory) }
-            let path = directory.appendingPathComponent("s.sock").path
-            let server = SocketServer(path: path, build: "server-test", trust: .sameEffectiveUser) { request in
-                var values: [String] = []
-                do {
-                    for try await chunk in request.chunks where !chunk.end {
-                        values.append(String(data: chunk.payload, encoding: .utf8) ?? "")
+            try await withAsyncCleanup { cleanup in
+                let directory = try shortSocketDir()
+                cleanup.add { try? FileManager.default.removeItem(at: directory) }
+                let path = directory.appendingPathComponent("s.sock").path
+                let server = SocketServer(path: path, build: "server-test", trust: .sameEffectiveUser) { request in
+                    var values: [String] = []
+                    do {
+                        for try await chunk in request.chunks where !chunk.end {
+                            values.append(String(data: chunk.payload, encoding: .utf8) ?? "")
+                        }
+                    } catch {
+                        return .terminal(SocketTerminal(error: String(describing: error)))
                     }
-                } catch {
-                    return .terminal(SocketTerminal(error: String(describing: error)))
+                    return .terminal(SocketTerminal(payload: try? JSONEncoder().encode(values)))
                 }
-                return .terminal(SocketTerminal(payload: try? JSONEncoder().encode(values)))
+                try await server.start()
+                cleanup.add { await server.stop() }
+                let client = try await SocketClient(path: path, build: "server-test", trust: .sameEffectiveUser)
+                cleanup.add { await client.close() }
+                let call = try await client.open(operation: "collect", endInput: false)
+                try await call.sendChunk(Data("one".utf8))
+                try await call.sendChunk(Data("two".utf8))
+                try await call.closeSend()
+                let result = try await call.response()
+                let values = try JSONDecoder().decode([String].self, from: #require(result.payload))
+                #expect(values == ["one", "two"])
             }
-            try server.start()
-            defer { server.stop() }
-            let client = try SocketClient(path: path, build: "server-test", trust: .sameEffectiveUser)
-            defer { client.close() }
-            let call = try client.open(operation: "collect", endInput: false)
-            try await call.sendChunk(Data("one".utf8))
-            try await call.sendChunk(Data("two".utf8))
-            try await call.closeSend()
-            let result = try await call.response()
-            let values = try JSONDecoder().decode([String].self, from: #require(result.payload))
-            #expect(values == ["one", "two"])
         }
 
         @Test func mismatchedBuildRejectsOrdinaryMutation() async throws {
-            let directory = try shortSocketDir()
-            defer { try? FileManager.default.removeItem(at: directory) }
-            let path = directory.appendingPathComponent("s.sock").path
-            let server = SocketServer(path: path, build: "new-build", trust: .sameEffectiveUser) { _ in
-                Issue.record("mismatched-build mutation handler must not run")
-                return .terminal(SocketTerminal(payload: Data("true".utf8)))
+            try await withAsyncCleanup { cleanup in
+                let directory = try shortSocketDir()
+                cleanup.add { try? FileManager.default.removeItem(at: directory) }
+                let path = directory.appendingPathComponent("s.sock").path
+                let server = SocketServer(path: path, build: "new-build", trust: .sameEffectiveUser) { _ in
+                    Issue.record("mismatched-build mutation handler must not run")
+                    return .terminal(SocketTerminal(payload: Data("true".utf8)))
+                }
+                try await server.start()
+                cleanup.add { await server.stop() }
+                let client = try await SocketClient(path: path, build: "old-build", trust: .sameEffectiveUser)
+                cleanup.add { await client.close() }
+                let result = try await client.call(operation: "mutate")
+                #expect(result.rejected)
+                #expect(result.reason == "wire: client build does not match server build")
             }
-            try server.start()
-            defer { server.stop() }
-            let client = try SocketClient(path: path, build: "old-build", trust: .sameEffectiveUser)
-            defer { client.close() }
-            let result = try await client.call(operation: "mutate")
-            #expect(result.rejected)
-            #expect(result.reason == "wire: client build does not match server build")
         }
 
-        @Test func rejectsLegacyLFClientAndOversizedFrame() throws {
-            let directory = try shortSocketDir()
-            defer { try? FileManager.default.removeItem(at: directory) }
-            let path = directory.appendingPathComponent("s.sock").path
-            let server = SocketServer(
-                path: path,
-                build: "server-test",
-                configuration: .init(maximumFrameBytes: 64),
-                trust: .sameEffectiveUser
-            ) { _ in .terminal(SocketTerminal(payload: Data("null".utf8))) }
-            try server.start()
-            defer { server.stop() }
-            #expect(legacyLineIsRejected(at: path))
+        @Test func rejectsLegacyLFClientAndOversizedFrame() async throws {
+            try await withAsyncCleanup { cleanup in
+                let directory = try shortSocketDir()
+                cleanup.add { try? FileManager.default.removeItem(at: directory) }
+                let path = directory.appendingPathComponent("s.sock").path
+                let server = SocketServer(
+                    path: path,
+                    build: "server-test",
+                    configuration: .init(maximumFrameBytes: 64),
+                    trust: .sameEffectiveUser
+                ) { _ in .terminal(SocketTerminal(payload: Data("null".utf8))) }
+                try await server.start()
+                cleanup.add { await server.stop() }
+                #expect(legacyLineIsRejected(at: path))
+            }
         }
 
         @Test func codecRejectsPartialForeignAndOversizedFrames() throws {
@@ -335,42 +346,44 @@ extension SocketTransportTests {
             #expect(throws: SessionTransportError.self) { _ = try SessionFrameCodec.decode(Data("short".utf8)) }
         }
 
-        @Test func chmodsReclaimsAndRefusesLivePeer() throws {
-            let directory = try shortSocketDir()
-            defer { try? FileManager.default.removeItem(at: directory) }
-            let path = directory.appendingPathComponent("s.sock").path
-            leaveStaleSocket(at: path)
-            let server = SocketServer(path: path, build: "server-test", trust: .sameEffectiveUser) { _ in
-                .terminal(SocketTerminal())
-            }
-            try server.start()
-            defer { server.stop() }
-            var status = stat()
-            #expect(stat(path, &status) == 0)
-            #expect((status.st_mode & 0o777) == 0o600)
+        @Test func chmodsReclaimsAndRefusesLivePeer() async throws {
+            try await withAsyncCleanup { cleanup in
+                let directory = try shortSocketDir()
+                cleanup.add { try? FileManager.default.removeItem(at: directory) }
+                let path = directory.appendingPathComponent("s.sock").path
+                leaveStaleSocket(at: path)
+                let server = SocketServer(path: path, build: "server-test", trust: .sameEffectiveUser) { _ in
+                    .terminal(SocketTerminal())
+                }
+                try await server.start()
+                cleanup.add { await server.stop() }
+                var status = stat()
+                #expect(stat(path, &status) == 0)
+                #expect((status.st_mode & 0o777) == 0o600)
 
-            let intruder = SocketServer(path: path, build: "intruder", trust: .sameEffectiveUser) { _ in
-                .terminal(SocketTerminal())
+                let intruder = SocketServer(path: path, build: "intruder", trust: .sameEffectiveUser) { _ in
+                    .terminal(SocketTerminal())
+                }
+                await #expect(throws: SocketServerError.self) { try await intruder.start() }
             }
-            #expect(throws: SocketServerError.self) { try intruder.start() }
         }
 
-        @Test func cleanShutdownUnlinksAndRejectsOverlongPath() throws {
+        @Test func cleanShutdownUnlinksAndRejectsOverlongPath() async throws {
             let directory = try shortSocketDir()
             defer { try? FileManager.default.removeItem(at: directory) }
             let path = directory.appendingPathComponent("s.sock").path
             let server = SocketServer(path: path, build: "server-test", trust: .sameEffectiveUser) { _ in
                 .terminal(SocketTerminal())
             }
-            try server.start()
-            server.stop()
+            try await server.start()
+            await server.stop()
             #expect(!FileManager.default.fileExists(atPath: path))
 
             let longPath = "/tmp/" + String(repeating: "a", count: 200) + ".sock"
             let invalid = SocketServer(path: longPath, build: "server-test", trust: .sameEffectiveUser) { _ in
                 .terminal(SocketTerminal())
             }
-            #expect(throws: SocketServerError.self) { try invalid.start() }
+            await #expect(throws: SocketServerError.self) { try await invalid.start() }
         }
     }
 }
