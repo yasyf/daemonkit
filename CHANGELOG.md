@@ -6,6 +6,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-07-21
+
+### Fixed
+
+- `wire.AcceptedSession.Disconnected` now publishes only after transport intake
+  ends and the session is canceled, across graceful GoAway, server stop, write
+  failure, and context cancellation. Existing duplex sessions close on context
+  cancellation, eliminating the handshake-to-registration shutdown gap.
+
 ## [0.3.3] - 2026-07-21
 
 ### Added
@@ -77,7 +86,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/yasyf/daemonkit/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/yasyf/daemonkit/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/yasyf/daemonkit/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/yasyf/daemonkit/compare/v0.3.0...v0.3.1

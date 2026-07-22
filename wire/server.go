@@ -443,6 +443,8 @@ func (s *Server) serveConn(
 	releaseCapacity func(),
 ) error {
 	defer conn.Close()
+	stopContext := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopContext()
 	codec := NewCodec(conn)
 	codec.MaxFrame = s.maxFrame()
 	if err := codec.SetDeadline(earlierDeadline(ctx, s.handshakeTimeout())); err != nil {

@@ -605,6 +605,10 @@ func TestAcceptedSessionDoneOutlivesUnaryAdmissionAndIsSessionScoped(t *testing.
 	if got := first.Done(); got != firstDone {
 		t.Fatal("Done returned a different channel for one session")
 	}
+	firstDisconnected := first.Disconnected()
+	if got := first.Disconnected(); got != firstDisconnected {
+		t.Fatal("Disconnected returned a different channel for one session")
+	}
 	settleCtx, settleCancel := context.WithTimeout(context.Background(), time.Second)
 	defer settleCancel()
 	if err := intake.Settle(settleCtx); err != nil {
@@ -620,6 +624,11 @@ func TestAcceptedSessionDoneOutlivesUnaryAdmissionAndIsSessionScoped(t *testing.
 
 	if err := firstClient.Close(); err != nil {
 		t.Fatalf("close first client: %v", err)
+	}
+	select {
+	case <-firstDisconnected:
+	case <-time.After(time.Second):
+		t.Fatal("first Disconnected did not close after graceful client close")
 	}
 	select {
 	case <-firstDone:
@@ -655,6 +664,11 @@ func TestAcceptedSessionDoneClosesOnServerShutdown(t *testing.T) {
 	}
 	session := <-sessions
 	running.stop(t)
+	select {
+	case <-session.Disconnected():
+	case <-time.After(time.Second):
+		t.Fatal("Disconnected did not close on server shutdown")
+	}
 	select {
 	case <-session.Done():
 	case <-time.After(time.Second):
@@ -705,6 +719,91 @@ func TestAcceptedSessionDisconnectedPrecedesBlockedRequestSettlement(t *testing.
 	case <-session.Done():
 	case <-time.After(time.Second):
 		t.Fatal("Done did not close after request settlement")
+	}
+}
+
+func TestAcceptedSessionDisconnectedPrecedesBlockedGracefulClose(t *testing.T) {
+	sessions := make(chan *wire.AcceptedSession, 1)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	server := &wire.Server{Build: "server-test"}
+	server.RegisterControl("block", func(ctx context.Context, request wire.Request) (any, error) {
+		sessions <- request.Session
+		close(entered)
+		<-release
+		return nil, ctx.Err()
+	})
+	running := startSessionServer(t, server, func() (func(), error) { return func() {}, nil })
+	client := newClient(t, running, nil)
+	if _, err := client.Open(context.Background(), "block", "", nil, true); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	session := <-sessions
+	<-entered
+	closed := make(chan error, 1)
+	go func() { closed <- client.Close() }()
+	select {
+	case <-session.Disconnected():
+	case <-time.After(time.Second):
+		t.Fatal("Disconnected waited for blocked graceful settlement")
+	}
+	select {
+	case <-session.Done():
+		t.Fatal("Done closed before blocked graceful settlement")
+	case err := <-closed:
+		t.Fatalf("client Close returned before blocked graceful settlement: %v", err)
+	default:
+	}
+	releaseOnce.Do(func() { close(release) })
+	if err := <-closed; err != nil {
+		t.Fatalf("client Close: %v", err)
+	}
+	select {
+	case <-session.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Done did not close after graceful settlement")
+	}
+}
+
+func TestAcceptedSessionDisconnectedPrecedesBlockedServerStop(t *testing.T) {
+	sessions := make(chan *wire.AcceptedSession, 1)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	server := &wire.Server{Build: "server-test"}
+	server.RegisterControl("block", func(ctx context.Context, request wire.Request) (any, error) {
+		sessions <- request.Session
+		close(entered)
+		<-release
+		return nil, ctx.Err()
+	})
+	running := startSessionServer(t, server, func() (func(), error) { return func() {}, nil })
+	client := newClient(t, running, nil)
+	if _, err := client.Open(context.Background(), "block", "", nil, true); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	session := <-sessions
+	<-entered
+	running.cancel()
+	select {
+	case <-session.Disconnected():
+	case <-time.After(time.Second):
+		t.Fatal("Disconnected waited for blocked server-stop settlement")
+	}
+	select {
+	case <-session.Done():
+		t.Fatal("Done closed before blocked server-stop settlement")
+	default:
+	}
+	releaseOnce.Do(func() { close(release) })
+	running.stop(t)
+	select {
+	case <-session.Done():
+	default:
+		t.Fatal("Done remained open after server-stop settlement")
 	}
 }
 

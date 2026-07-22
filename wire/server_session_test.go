@@ -91,6 +91,28 @@ func TestServeSessionPropagatesCancellationAndJoinsHandlers(t *testing.T) {
 	awaitSessionServer(t, done)
 }
 
+func TestServeSessionContextCancellationClosesIdleTransport(t *testing.T) {
+	server := &Server{Build: "session-test"}
+	clientConn, serverConn := net.Pipe()
+	identity := currentSessionIdentity(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	ready := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- server.ServeSession(
+			ctx, serverConn, identity,
+			func() error { close(ready); return nil }, allowSession, allowSession,
+		)
+	}()
+	<-ready
+	client := newExistingSessionClient(t, clientConn)
+	cancel()
+	awaitSessionServer(t, done)
+	if err := client.Close(); err == nil {
+		t.Fatal("client Close succeeded after server context canceled its transport")
+	}
+}
+
 func TestServeSessionEOFAndOpaqueIdentityFailClosed(t *testing.T) {
 	t.Run("EOF", func(t *testing.T) {
 		clientConn, serverConn := net.Pipe()

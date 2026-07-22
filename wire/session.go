@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -79,6 +80,7 @@ type session struct {
 	writerWG       sync.WaitGroup
 	closeOnce      sync.Once
 	disconnectOnce sync.Once
+	peerGoAway     atomic.Bool
 }
 
 type sessionOutbound struct {
@@ -126,8 +128,8 @@ func (s *session) run(ctx context.Context, releaseCapacity func()) error {
 	s.writerWG.Add(1)
 	go s.writeLoop()
 	err := s.readLoop(ctx)
-	s.disconnect()
 	if errors.Is(err, errPeerGoAway) {
+		s.peerGoAway.Store(true)
 		s.stop()
 		s.closeRequestInputs()
 		s.requestWG.Wait()
@@ -158,6 +160,12 @@ func (s *session) close() {
 	_ = s.conn.Close()
 }
 
+func (s *session) closeOnRequestError() {
+	if !s.peerGoAway.Load() {
+		s.close()
+	}
+}
+
 func (s *session) stop() {
 	s.closeOnce.Do(func() {
 		s.cancel()
@@ -171,6 +179,7 @@ func (s *session) stop() {
 		for _, state := range states {
 			state.close()
 		}
+		s.disconnect()
 	})
 }
 
@@ -343,20 +352,20 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 		}
 		if !authorized {
 			if err := s.sendRejected(sessionCtx, frame.ID, ErrProtectedSessionRequired.Error()); err != nil {
-				s.close()
+				s.closeOnRequestError()
 			}
 			return
 		}
 	case routeBusiness:
 		if s.build != s.server.Build {
 			if err := s.sendRejected(sessionCtx, frame.ID, ErrBuildMismatch.Error()); err != nil {
-				s.close()
+				s.closeOnRequestError()
 			}
 			return
 		}
 		if s.server.isDraining() {
 			if err := s.sendRejected(sessionCtx, frame.ID, ErrDraining.Error()); err != nil {
-				s.close()
+				s.closeOnRequestError()
 			}
 			return
 		}
@@ -370,13 +379,13 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 	done, err := admit()
 	if err != nil {
 		if err := s.sendRejected(sessionCtx, frame.ID, err.Error()); err != nil {
-			s.close()
+			s.closeOnRequestError()
 		}
 		return
 	}
 	if done == nil {
 		if err := s.sendError(sessionCtx, frame.ID, errors.New("wire: admission returned nil completion")); err != nil {
-			s.close()
+			s.closeOnRequestError()
 		}
 		return
 	}
@@ -403,16 +412,16 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 	}
 	if errors.Is(err, ErrQueueFull) {
 		if err := s.sendAdmittedRejected(sessionCtx, frame.ID, state, err.Error()); err != nil {
-			s.close()
+			s.closeOnRequestError()
 			return
 		}
 		if err := s.waitTerminalAck(sessionCtx, state); err != nil {
-			s.close()
+			s.closeOnRequestError()
 		}
 		return
 	}
 	if err := s.sendValue(requestCtx, sessionCtx, frame.ID, state, value, err); err != nil {
-		s.close()
+		s.closeOnRequestError()
 	}
 }
 
@@ -617,7 +626,7 @@ func (s *session) deliverRequestChunks(id uint64, state *requestState) {
 			select {
 			case state.chunks <- chunk:
 				if err := s.enqueue(s.ctx, Frame{Kind: FrameWindow, ID: id, Sequence: 1}); err != nil {
-					s.close()
+					s.closeOnRequestError()
 					return
 				}
 			case <-state.deliveryDone:
