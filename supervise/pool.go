@@ -26,9 +26,9 @@ const workerWrapper = `
 trap ':' TERM
 printf r >&3
 exec 3>&-
-while ! IFS= read -r _ <&4; do
-    :
-done
+if ! IFS= read -r _ <&4; then
+    exit 125
+fi
 exec 4<&-
 trap - TERM
 exec "$@" <&5
@@ -112,8 +112,9 @@ type Pool struct {
 	nextID   uint64
 	workers  map[uint64]context.CancelFunc
 
-	grace  time.Duration
-	signal func(int, syscall.Signal) error
+	grace                time.Duration
+	untrackedKillTimeout time.Duration
+	signal               func(int, syscall.Signal) error
 }
 
 // NewPool builds a worker pool. limit and registry are required.
@@ -125,12 +126,13 @@ func NewPool(limit int, registry WorkerRegistry) (*Pool, error) {
 		return nil, errors.New("supervise: worker registry is required")
 	}
 	return &Pool{
-		limit:    limit,
-		registry: registry,
-		changed:  make(chan struct{}),
-		workers:  make(map[uint64]context.CancelFunc),
-		grace:    TerminationGrace,
-		signal:   syscall.Kill,
+		limit:                limit,
+		registry:             registry,
+		changed:              make(chan struct{}),
+		workers:              make(map[uint64]context.CancelFunc),
+		grace:                TerminationGrace,
+		untrackedKillTimeout: TerminationGrace,
+		signal:               syscall.Kill,
 	}, nil
 }
 
@@ -227,13 +229,19 @@ func (p *Pool) Run(ctx context.Context, task Task) (runErr error) {
 	if task.Path == "" {
 		return errors.New("supervise: worker path is required")
 	}
-	workerCtx, workerID, cancel, err := p.acquire(ctx, ctx)
+	workerCtx, workerID, cancel, err := p.acquire(ctx, context.WithoutCancel(ctx))
 	if err != nil {
 		return err
 	}
+	runCtx, cancelRun := context.WithCancel(ctx)
+	stopRun := context.AfterFunc(workerCtx, cancelRun)
+	defer func() {
+		stopRun()
+		cancelRun()
+	}()
 	defer p.release(workerID)
 	defer cancel()
-	if err := workerCtx.Err(); err != nil {
+	if err := runCtx.Err(); err != nil {
 		return fmt.Errorf("supervise: worker canceled before start: %w", err)
 	}
 
@@ -282,7 +290,7 @@ func (p *Pool) Run(ctx context.Context, task Task) (runErr error) {
 	_ = readyW.Close()
 	_ = gateR.Close()
 	_ = ownerR.Close()
-	if err := awaitWrapperReady(workerCtx, readyR); err != nil {
+	if err := awaitWrapperReady(runCtx, readyR); err != nil {
 		_ = gateW.Close()
 		_ = ownerW.Close()
 		killErr := p.killUntrackedGroup(cmd.Process.Pid)
@@ -310,12 +318,12 @@ func (p *Pool) Run(ctx context.Context, task Task) (runErr error) {
 		!rec.ProcessGroup || rec.SessionID != rec.PID {
 		_ = gateW.Close()
 		_ = ownerW.Close()
+		killErr := p.killUntrackedGroup(cmd.Process.Pid)
+		waitErr := cmd.Wait()
 		untrackErr := p.registry.Untrack(context.WithoutCancel(workerCtx), rec)
 		if untrackErr != nil {
 			untrackErr = fmt.Errorf("supervise: untrack invalid worker process record: %w", untrackErr)
 		}
-		killErr := p.killUntrackedGroup(cmd.Process.Pid)
-		waitErr := cmd.Wait()
 		return errors.Join(
 			errors.New("supervise: registry returned an invalid worker process record"),
 			recordErr,
@@ -327,35 +335,35 @@ func (p *Pool) Run(ctx context.Context, task Task) (runErr error) {
 
 	waited := make(chan error, 1)
 	go func() { waited <- cmd.Wait() }()
-	if err := workerCtx.Err(); err != nil {
-		stop := p.stop(rec, waited)
+	if err := runCtx.Err(); err != nil {
 		_ = gateW.Close()
 		_ = ownerW.Close()
-		return p.finish(workerCtx, rec, errors.Join(
+		stop := p.stop(rec, waited)
+		return p.settleTracked(workerCtx, rec, errors.Join(
 			fmt.Errorf("supervise: worker canceled before dispatch: %w", err),
 			stop.err,
 			unexpectedWaitError(stop.waitErr),
-		), stop.settled)
+		), "settle canceled worker")
 	}
 	if err := writeTrackedOwner(ownerW, rec); err != nil {
-		stop := p.stop(rec, waited)
 		_ = gateW.Close()
-		return p.finish(workerCtx, rec, errors.Join(
+		stop := p.stop(rec, waited)
+		return p.settleTracked(workerCtx, rec, errors.Join(
 			fmt.Errorf("supervise: deliver worker owner: %w", err),
 			stop.err,
 			unexpectedWaitError(stop.waitErr),
-		), stop.settled)
+		), "settle worker after owner delivery failure")
 	}
 	if err := writePayload(gateW, []byte("start\n")); err != nil {
 		stop := p.stop(rec, waited)
-		return p.finish(workerCtx, rec, errors.Join(
+		return p.settleTracked(workerCtx, rec, errors.Join(
 			fmt.Errorf("supervise: release worker dispatch gate: %w", err),
 			stop.err,
 			unexpectedWaitError(stop.waitErr),
-		), stop.settled)
+		), "settle worker after dispatch failure")
 	}
 
-	return p.await(workerCtx, rec, waited)
+	return p.await(runCtx, rec, waited)
 }
 
 func (p *Pool) acquire(
@@ -416,37 +424,20 @@ func (p *Pool) await(
 ) error {
 	select {
 	case waitErr := <-waited:
-		settleErr := p.registry.TerminateWithin(context.WithoutCancel(ctx), rec, p.grace)
-		if settleErr != nil {
-			settleErr = fmt.Errorf("supervise: settle completed worker: %w", settleErr)
-		}
-		return errors.Join(workerWaitError(waitErr), settleErr)
+		return p.settleTracked(ctx, rec, workerWaitError(waitErr), "settle completed worker")
 	case <-ctx.Done():
 		stop := p.stop(rec, waited)
-		if stop.settled {
-			return p.finish(ctx, rec, errors.Join(
-				fmt.Errorf("supervise: worker canceled: %w", ctx.Err()),
-				stop.err,
-				unexpectedWaitError(stop.waitErr),
-			), true)
-		}
-		settleErr := p.registry.TerminateWithin(context.WithoutCancel(ctx), rec, p.grace)
-		if settleErr == nil {
-			return fmt.Errorf("supervise: worker canceled: %w", ctx.Err())
-		}
-		return errors.Join(
+		return p.settleTracked(ctx, rec, errors.Join(
 			fmt.Errorf("supervise: worker canceled: %w", ctx.Err()),
 			stop.err,
-			fmt.Errorf("supervise: settle leaderless worker session: %w", settleErr),
-			ErrUnsettledGroup,
-		)
+			unexpectedWaitError(stop.waitErr),
+		), "settle canceled worker")
 	}
 }
 
 type stopResult struct {
 	waitErr error
 	err     error
-	settled bool
 }
 
 func (p *Pool) stop(rec proc.Record, waited <-chan error) stopResult {
@@ -465,10 +456,7 @@ func (p *Pool) stopAfterTerm(rec proc.Record, waited <-chan error, afterTerm fun
 	defer timer.Stop()
 	select {
 	case waitErr := <-waited:
-		return stopResult{waitErr: waitErr, err: errors.Join(
-			wrapSignalError("terminate worker group", termErr),
-			ErrUnsettledGroup,
-		)}
+		return stopResult{waitErr: waitErr, err: wrapSignalError("terminate worker group", termErr)}
 	case <-timer.C:
 	}
 
@@ -480,7 +468,7 @@ func (p *Pool) stopAfterTerm(rec proc.Record, waited <-chan error, afterTerm fun
 				settlementErr = fmt.Errorf("supervise: revalidate worker before SIGKILL: %w", err)
 			}
 			if retry := waitSettlementRetry(waited); retry.exited {
-				return stopResult{waitErr: retry.waitErr, err: errors.Join(settlementErr, ErrUnsettledGroup)}
+				return stopResult{waitErr: retry.waitErr, err: settlementErr}
 			}
 			continue
 		}
@@ -489,7 +477,7 @@ func (p *Pool) stopAfterTerm(rec proc.Record, waited <-chan error, afterTerm fun
 				settlementErr = errors.New("supervise: worker identity changed before SIGKILL")
 			}
 			if retry := waitSettlementRetry(waited); retry.exited {
-				return stopResult{waitErr: retry.waitErr, err: errors.Join(settlementErr, ErrUnsettledGroup)}
+				return stopResult{waitErr: retry.waitErr, err: settlementErr}
 			}
 			continue
 		}
@@ -499,7 +487,7 @@ func (p *Pool) stopAfterTerm(rec proc.Record, waited <-chan error, afterTerm fun
 				settlementErr = fmt.Errorf("supervise: revalidate worker process group: %w", err)
 			}
 			if retry := waitSettlementRetry(waited); retry.exited {
-				return stopResult{waitErr: retry.waitErr, err: errors.Join(settlementErr, ErrUnsettledGroup)}
+				return stopResult{waitErr: retry.waitErr, err: settlementErr}
 			}
 			continue
 		}
@@ -508,7 +496,7 @@ func (p *Pool) stopAfterTerm(rec proc.Record, waited <-chan error, afterTerm fun
 				settlementErr = fmt.Errorf("supervise: worker pid %d moved to process group %d", rec.PID, pgid)
 			}
 			if retry := waitSettlementRetry(waited); retry.exited {
-				return stopResult{waitErr: retry.waitErr, err: errors.Join(settlementErr, ErrUnsettledGroup)}
+				return stopResult{waitErr: retry.waitErr, err: settlementErr}
 			}
 			continue
 		}
@@ -528,7 +516,7 @@ func (p *Pool) stopAfterTerm(rec proc.Record, waited <-chan error, afterTerm fun
 		return stopResult{waitErr: <-waited, err: errors.Join(
 			wrapSignalError("terminate worker group", termErr),
 			settlementErr,
-		), settled: true}
+		)}
 	}
 }
 
@@ -548,12 +536,9 @@ func waitSettlementRetry(waited <-chan error) retryResult {
 	}
 }
 
-func (p *Pool) finish(ctx context.Context, rec proc.Record, runErr error, settled bool) error {
-	if !settled {
-		return errors.Join(runErr, ErrUnsettledGroup)
-	}
-	if err := p.registry.Untrack(context.WithoutCancel(ctx), rec); err != nil {
-		return errors.Join(runErr, fmt.Errorf("supervise: untrack worker: %w", err))
+func (p *Pool) settleTracked(ctx context.Context, rec proc.Record, runErr error, action string) error {
+	if err := p.registry.TerminateWithin(context.WithoutCancel(ctx), rec, p.grace); err != nil {
+		return errors.Join(runErr, fmt.Errorf("supervise: %s: %w", action, err), ErrUnsettledGroup)
 	}
 	return runErr
 }
@@ -580,6 +565,12 @@ func awaitWrapperReady(ctx context.Context, ready *os.File) error {
 }
 
 func (p *Pool) killUntrackedGroup(pid int) error {
+	timeout := p.untrackedKillTimeout
+	if timeout <= 0 {
+		timeout = TerminationGrace
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
 	var settlementErr error
 	for {
 		err := p.signal(-pid, syscall.SIGKILL)
@@ -590,7 +581,18 @@ func (p *Pool) killUntrackedGroup(pid int) error {
 			return settlementErr
 		}
 		settlementErr = errors.Join(settlementErr, wrapSignalError("kill untracked worker group", err))
-		time.Sleep(settlementRetry)
+		retry := time.NewTimer(settlementRetry)
+		select {
+		case <-retry.C:
+		case <-deadline.C:
+			if !retry.Stop() {
+				select {
+				case <-retry.C:
+				default:
+				}
+			}
+			return errors.Join(settlementErr, ErrUnsettledGroup)
+		}
 	}
 }
 

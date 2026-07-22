@@ -6,9 +6,28 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	bolt "go.etcd.io/bbolt"
 )
+
+type unpublishedDeadlineContext struct {
+	context.Context
+	deadline time.Time
+}
+
+func (c unpublishedDeadlineContext) Deadline() (time.Time, bool) { return c.deadline, true }
+func (unpublishedDeadlineContext) Done() <-chan struct{}         { return nil }
+func (unpublishedDeadlineContext) Err() error                    { return nil }
+
+func TestFileStoreExpiredDeadlineNeverReturnsNilSuccess(t *testing.T) {
+	store := &FileStore{Path: filepath.Join(t.TempDir(), "recovery.db")}
+	ctx := unpublishedDeadlineContext{Context: context.Background(), deadline: time.Now().Add(-time.Second)}
+	db, err := store.open(ctx)
+	if db != nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("open = %v, %v; want nil, deadline exceeded", db, err)
+	}
+}
 
 func TestFileStoreSchemaIsExactEpochOne(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "recovery.db")

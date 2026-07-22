@@ -67,9 +67,9 @@ var (
 const terminalWrapper = `
 printf r >&3
 exec 3>&-
-while ! IFS= read -r _ <&4; do
-    :
-done
+if ! IFS= read -r _ <&4; then
+    exit 125
+fi
 exec 4<&-
 exec "$@"
 `
@@ -294,6 +294,12 @@ func (p *Pool) StartTerminal(startup context.Context, spec TerminalSpec) (*Termi
 	if err != nil {
 		return nil, err
 	}
+	startupCtx, cancelStartup := context.WithCancel(startup)
+	stopStartup := context.AfterFunc(terminalCtx, cancelStartup)
+	defer func() {
+		stopStartup()
+		cancelStartup()
+	}()
 	cleanupSlot := true
 	defer func() {
 		if cleanupSlot {
@@ -330,14 +336,14 @@ func (p *Pool) StartTerminal(startup context.Context, spec TerminalSpec) (*Termi
 	}
 	_ = readyW.Close()
 	_ = gateR.Close()
-	if err := awaitWrapperReady(startup, readyR); err != nil {
+	if err := awaitWrapperReady(startupCtx, readyR); err != nil {
 		_ = gateW.Close()
 		_ = master.Close()
 		killErr := p.killUntrackedGroup(cmd.Process.Pid)
 		waitErr := cmd.Wait()
 		return nil, errors.Join(fmt.Errorf("supervise: await terminal readiness: %w", err), killErr, unexpectedWaitError(waitErr))
 	}
-	record, err := p.registry.TrackGroup(startup, cmd.Process.Pid, spec.RecoveryClass)
+	record, err := p.registry.TrackGroup(terminalCtx, cmd.Process.Pid, spec.RecoveryClass)
 	if err != nil {
 		_ = gateW.Close()
 		_ = master.Close()
@@ -348,10 +354,22 @@ func (p *Pool) StartTerminal(startup context.Context, spec TerminalSpec) (*Termi
 	if recordErr := record.Validate(); recordErr != nil || record.PID != cmd.Process.Pid || !record.ProcessGroup || record.SessionID != record.PID {
 		_ = gateW.Close()
 		_ = master.Close()
-		untrackErr := p.registry.Untrack(context.WithoutCancel(startup), record)
 		killErr := p.killUntrackedGroup(cmd.Process.Pid)
 		waitErr := cmd.Wait()
+		untrackErr := p.registry.Untrack(context.WithoutCancel(terminalCtx), record)
 		return nil, errors.Join(errors.New("supervise: registry returned an invalid terminal process record"), recordErr, untrackErr, killErr, unexpectedWaitError(waitErr))
+	}
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
+	if err := startupCtx.Err(); err != nil {
+		_ = gateW.Close()
+		_ = master.Close()
+		stop := p.stop(record, waited)
+		return nil, p.settleTracked(terminalCtx, record, errors.Join(
+			fmt.Errorf("supervise: terminal canceled after tracking: %w", err),
+			stop.err,
+			unexpectedWaitError(stop.waitErr),
+		), "settle canceled terminal")
 	}
 
 	t := &Terminal{
@@ -362,8 +380,6 @@ func (p *Pool) StartTerminal(startup context.Context, spec TerminalSpec) (*Termi
 		detachTimeout: detachTimeout,
 	}
 	t.write = func(data []byte) error { return writeTerminal(master, data) }
-	waited := make(chan error, 1)
-	go func() { waited <- cmd.Wait() }()
 	t.attachTimer = time.AfterFunc(attachTimeout, t.expireAttach)
 	go t.pumpInput()
 	go t.pumpOutput()

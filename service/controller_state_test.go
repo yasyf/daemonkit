@@ -14,6 +14,25 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
+type unpublishedControllerDeadlineContext struct {
+	context.Context
+	deadline time.Time
+}
+
+func (c unpublishedControllerDeadlineContext) Deadline() (time.Time, bool) { return c.deadline, true }
+func (unpublishedControllerDeadlineContext) Done() <-chan struct{}         { return nil }
+func (unpublishedControllerDeadlineContext) Err() error                    { return nil }
+
+func TestControllerStoreExpiredDeadlineNeverReturnsNilSuccess(t *testing.T) {
+	ctx := unpublishedControllerDeadlineContext{
+		Context: context.Background(), deadline: time.Now().Add(-time.Second),
+	}
+	store, err := openControllerStore(ctx, filepath.Join(t.TempDir(), "services.db"))
+	if store != nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("open = %v, %v; want nil, deadline exceeded", store, err)
+	}
+}
+
 func TestControllerStorePersistsExactDesiredAndAppliedState(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "services.db")
 	store, err := openControllerStore(context.Background(), path)

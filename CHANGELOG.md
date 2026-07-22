@@ -6,6 +6,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-07-22
+
+### Fixed
+
+- Process-store and launchd-controller opens return an exact deadline error
+  when a computed deadline is already expired, even before a custom context
+  publishes cancellation.
+- Disposable, managed-session, and terminal children cross a pool-owned durable
+  tracking barrier before caller cancellation can settle them; pool shutdown
+  remains able to interrupt tracking.
+- Managed processes settle every surviving member of their dedicated session
+  before completion or durable untracking, including when the leader exits
+  before a backgrounded descendant.
+- `supervise.ErrProcessExitedBeforeReadiness` identifies only an actual early
+  managed-child exit while retaining its typed exit status when available.
+- Untracked post-spawn cleanup is bounded and wrapper gate EOF exits directly,
+  preventing signal failures from trapping startup cleanup indefinitely.
+
 ## [0.4.1] - 2026-07-21
 
 ### Added
@@ -102,7 +120,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/yasyf/daemonkit/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/yasyf/daemonkit/compare/v0.3.4...v0.4.1
 [0.3.4]: https://github.com/yasyf/daemonkit/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/yasyf/daemonkit/compare/v0.3.2...v0.3.3

@@ -270,6 +270,71 @@ func TestRunTracksBeforeDispatchAndReaps(t *testing.T) {
 	}
 }
 
+func TestRunCallerCancellationWaitsForDurableTrackingThenSettles(t *testing.T) {
+	release := make(chan struct{})
+	registry := newFakeRegistry()
+	registry.trackStarted = make(chan int, 1)
+	registry.trackRelease = release
+	pool, err := NewPool(1, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- pool.Run(ctx, Task{RecoveryClass: proc.RecoveryTask, Path: "/usr/bin/true"})
+	}()
+	pid := <-registry.trackStarted
+	cancel()
+	waited := make(chan error, 1)
+	go func() { waited <- pool.Wait(context.Background()) }()
+	select {
+	case err := <-done:
+		t.Fatalf("Run returned before durable tracking completed: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	select {
+	case err := <-waited:
+		t.Fatalf("Wait returned before durable tracking completed: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want context.Canceled", err)
+	}
+	if err := <-waited; err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	assertPIDGone(t, pid)
+	if got := registry.recordCount(); got != 0 {
+		t.Fatalf("durable records = %d, want 0", got)
+	}
+}
+
+func TestRunPoolCancellationInterruptsDurableTracking(t *testing.T) {
+	release := make(chan struct{})
+	registry := newFakeRegistry()
+	registry.trackStarted = make(chan int, 1)
+	registry.trackRelease = release
+	pool, err := NewPool(1, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- pool.Run(context.Background(), Task{RecoveryClass: proc.RecoveryTask, Path: "/usr/bin/true"})
+	}()
+	pid := <-registry.trackStarted
+	pool.Cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want context.Canceled", err)
+	}
+	if err := pool.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	assertPIDGone(t, pid)
+}
+
 func TestRunRejectsRecordWithoutBootBeforeDispatch(t *testing.T) {
 	registry := newFakeRegistry()
 	registry.recordBoot = ""

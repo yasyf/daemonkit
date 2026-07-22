@@ -18,9 +18,9 @@ const processWrapper = `
 trap ':' TERM
 printf r >&3
 exec 3>&-
-while ! IFS= read -r _ <&4; do
-    :
-done
+if ! IFS= read -r _ <&4; then
+    exit 125
+fi
 exec 4<&-
 exec "$@"
 `
@@ -30,6 +30,10 @@ const DefaultReadinessTimeout = 5 * time.Second
 
 // ErrProcessStopped means a managed process was intentionally terminated.
 var ErrProcessStopped = errors.New("managed process stopped")
+
+// ErrProcessExitedBeforeReadiness means the managed child exited before its
+// readiness callback established readiness.
+var ErrProcessExitedBeforeReadiness = errors.New("managed process exited before readiness")
 
 // ProcessSpec describes one durably tracked, long-lived child process.
 type ProcessSpec struct {
@@ -160,7 +164,7 @@ func (p *Pool) Start(startup context.Context, spec ProcessSpec) (*Process, error
 		)
 	}
 
-	record, err := p.registry.TrackGroup(startupCtx, cmd.Process.Pid, spec.RecoveryClass)
+	record, err := p.registry.TrackGroup(processCtx, cmd.Process.Pid, spec.RecoveryClass)
 	if err != nil {
 		_ = gateW.Close()
 		killErr := p.killUntrackedGroup(cmd.Process.Pid)
@@ -175,12 +179,12 @@ func (p *Pool) Start(startup context.Context, spec ProcessSpec) (*Process, error
 	if recordErr != nil || record.PID != cmd.Process.Pid ||
 		!record.ProcessGroup || record.SessionID != record.PID {
 		_ = gateW.Close()
-		untrackErr := p.registry.Untrack(context.WithoutCancel(startupCtx), record)
+		killErr := p.killUntrackedGroup(cmd.Process.Pid)
+		waitErr := cmd.Wait()
+		untrackErr := p.registry.Untrack(context.WithoutCancel(processCtx), record)
 		if untrackErr != nil {
 			untrackErr = fmt.Errorf("supervise: untrack invalid managed process record: %w", untrackErr)
 		}
-		killErr := p.killUntrackedGroup(cmd.Process.Pid)
-		waitErr := cmd.Wait()
 		return nil, errors.Join(
 			errors.New("supervise: registry returned an invalid managed process record"),
 			recordErr,
@@ -189,23 +193,6 @@ func (p *Pool) Start(startup context.Context, spec ProcessSpec) (*Process, error
 			unexpectedWaitError(waitErr),
 		)
 	}
-	if spec.Recorded != nil {
-		if err := spec.Recorded(startupCtx, record); err != nil {
-			_ = gateW.Close()
-			untrackErr := p.registry.Untrack(context.WithoutCancel(startupCtx), record)
-			if untrackErr != nil {
-				untrackErr = fmt.Errorf("supervise: untrack rejected managed process record: %w", untrackErr)
-			}
-			killErr := p.killUntrackedGroup(cmd.Process.Pid)
-			waitErr := cmd.Wait()
-			return nil, errors.Join(
-				fmt.Errorf("supervise: accept managed process record: %w", err),
-				untrackErr,
-				killErr,
-				unexpectedWaitError(waitErr),
-			)
-		}
-	}
 	waited := make(chan error, 1)
 	go func() { waited <- cmd.Wait() }()
 	process := &Process{
@@ -213,6 +200,24 @@ func (p *Pool) Start(startup context.Context, spec ProcessSpec) (*Process, error
 	}
 	go process.run(processCtx, waited)
 	cleanupSlot = false
+	if err := startupCtx.Err(); err != nil {
+		_ = gateW.Close()
+		stopErr := process.Stop(context.WithoutCancel(startup))
+		return nil, errors.Join(
+			fmt.Errorf("supervise: managed process canceled after tracking: %w", err),
+			stopErr,
+		)
+	}
+	if spec.Recorded != nil {
+		if err := spec.Recorded(startupCtx, record); err != nil {
+			_ = gateW.Close()
+			stopErr := process.Stop(context.WithoutCancel(startup))
+			return nil, errors.Join(
+				fmt.Errorf("supervise: accept managed process record: %w", err),
+				stopErr,
+			)
+		}
+	}
 
 	if err := writePayload(gateW, []byte("start\n")); err != nil {
 		stopErr := process.Stop(context.WithoutCancel(startup))
@@ -279,19 +284,40 @@ func (p *Process) awaitReady(ctx context.Context, spec ProcessSpec) error {
 	select {
 	case err := <-ready:
 		if err != nil {
+			if exited, exitErr := p.earlyReadinessExit(); exited {
+				return exitErr
+			}
 			return fmt.Errorf("supervise: managed process readiness: %w", err)
 		}
-		select {
-		case <-p.done:
-			return errors.New("supervise: managed process exited during readiness")
-		default:
-			return nil
-		}
+		return nil
 	case <-p.done:
-		return errors.New("supervise: managed process exited before readiness")
+		if exited, exitErr := p.earlyReadinessExit(); exited {
+			return exitErr
+		}
+		if err := readyCtx.Err(); err != nil {
+			return fmt.Errorf("supervise: managed process readiness: %w", err)
+		}
+		return errors.New("supervise: managed process stopped during readiness")
 	case <-readyCtx.Done():
+		if exited, exitErr := p.earlyReadinessExit(); exited {
+			return exitErr
+		}
 		return fmt.Errorf("supervise: managed process readiness: %w", readyCtx.Err())
 	}
+}
+
+func (p *Process) earlyReadinessExit() (bool, error) {
+	select {
+	case <-p.done:
+		p.mu.Lock()
+		exitErr := p.result
+		p.mu.Unlock()
+		if !errors.Is(exitErr, ErrProcessStopped) {
+			return true, errors.Join(ErrProcessExitedBeforeReadiness, exitErr)
+		}
+	default:
+	}
+	return false, nil
 }
 
 func (p *Process) run(ctx context.Context, waited <-chan error) {
@@ -300,11 +326,24 @@ func (p *Process) run(ctx context.Context, waited <-chan error) {
 	defer p.cancel()
 	select {
 	case waitErr := <-waited:
-		result := p.pool.finish(context.WithoutCancel(ctx), p.record, wrapWaitError(waitErr), true)
-		p.complete(result, nil)
+		settleErr := p.pool.registry.TerminateWithin(context.WithoutCancel(ctx), p.record, p.pool.grace)
+		if settleErr != nil {
+			settleErr = errors.Join(
+				fmt.Errorf("supervise: settle completed managed process: %w", settleErr),
+				ErrUnsettledGroup,
+			)
+		}
+		p.complete(errors.Join(workerWaitError(waitErr), settleErr), settleErr)
 	case <-ctx.Done():
 		stop := p.pool.stopManaged(p.record, waited)
-		result := p.pool.finish(context.WithoutCancel(ctx), p.record, stop.err, stop.settled)
+		settleErr := p.pool.registry.TerminateWithin(context.WithoutCancel(ctx), p.record, p.pool.grace)
+		if settleErr != nil {
+			settleErr = errors.Join(
+				fmt.Errorf("supervise: settle canceled managed process: %w", settleErr),
+				ErrUnsettledGroup,
+			)
+		}
+		result := errors.Join(stop.err, unexpectedWaitError(stop.waitErr), settleErr)
 		p.complete(errors.Join(ErrProcessStopped, result), result)
 	}
 }
@@ -322,12 +361,12 @@ func (p *Pool) stopManaged(record proc.Record, waited <-chan error) stopResult {
 		return stopResult{waitErr: <-waited, err: fmt.Errorf("supervise: revalidate managed process: %w", err)}
 	}
 	if !owned {
-		return stopResult{waitErr: <-waited, settled: true}
+		return stopResult{waitErr: <-waited}
 	}
 	groupID, err := syscall.Getpgid(record.PID)
 	if err != nil {
 		if errors.Is(err, syscall.ESRCH) {
-			return stopResult{waitErr: <-waited, settled: true}
+			return stopResult{waitErr: <-waited}
 		}
 		return stopResult{waitErr: <-waited, err: fmt.Errorf("supervise: revalidate managed process group: %w", err)}
 	}
@@ -344,7 +383,7 @@ func (p *Pool) stopManaged(record proc.Record, waited <-chan error) stopResult {
 	defer timer.Stop()
 	select {
 	case waitErr := <-waited:
-		return stopResult{waitErr: waitErr, err: wrapSignalError("terminate managed process group", termErr), settled: true}
+		return stopResult{waitErr: waitErr, err: wrapSignalError("terminate managed process group", termErr)}
 	case <-timer.C:
 	}
 	owned, err = p.registry.Owns(record)
@@ -352,12 +391,12 @@ func (p *Pool) stopManaged(record proc.Record, waited <-chan error) stopResult {
 		return stopResult{waitErr: <-waited, err: fmt.Errorf("supervise: revalidate managed process before SIGKILL: %w", err)}
 	}
 	if !owned {
-		return stopResult{waitErr: <-waited, err: wrapSignalError("terminate managed process group", termErr), settled: true}
+		return stopResult{waitErr: <-waited, err: wrapSignalError("terminate managed process group", termErr)}
 	}
 	groupID, err = syscall.Getpgid(record.PID)
 	if err != nil {
 		if errors.Is(err, syscall.ESRCH) {
-			return stopResult{waitErr: <-waited, err: wrapSignalError("terminate managed process group", termErr), settled: true}
+			return stopResult{waitErr: <-waited, err: wrapSignalError("terminate managed process group", termErr)}
 		}
 		return stopResult{waitErr: <-waited, err: fmt.Errorf("supervise: revalidate managed process group before SIGKILL: %w", err)}
 	}
@@ -376,6 +415,5 @@ func (p *Pool) stopManaged(record proc.Record, waited <-chan error) stopResult {
 			wrapSignalError("terminate managed process group", termErr),
 			wrapSignalError("kill managed process group", killErr),
 		),
-		settled: killErr == nil,
 	}
 }

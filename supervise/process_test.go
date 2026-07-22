@@ -3,6 +3,7 @@ package supervise
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -113,6 +114,54 @@ func TestManagedProcessCannotExecOrBecomeReadyBeforeDurableRecord(t *testing.T) 
 	assertPIDGone(t, pid)
 }
 
+func TestManagedProcessCallerCancellationWaitsForDurableTrackingThenSettles(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "started")
+	release := make(chan struct{})
+	registry := newFakeRegistry()
+	registry.trackStarted = make(chan int, 1)
+	registry.trackRelease = release
+	pool, err := NewPool(1, registry)
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, startErr := pool.Start(ctx, managedProcessSpec(t, marker))
+		done <- startErr
+	}()
+	pid := <-registry.trackStarted
+	cancel()
+	waited := make(chan error, 1)
+	go func() { waited <- pool.Wait(context.Background()) }()
+	select {
+	case err := <-done:
+		t.Fatalf("Start returned before durable tracking completed: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	select {
+	case err := <-waited:
+		t.Fatalf("Wait returned before durable tracking completed: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("child executed before canceled tracking settled: %v", err)
+	}
+	close(release)
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start error = %v, want context.Canceled", err)
+	} else if errors.Is(err, ErrProcessExitedBeforeReadiness) {
+		t.Fatalf("tracking cancellation matched early-exit sentinel: %v", err)
+	}
+	if err := <-waited; err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	assertPIDGone(t, pid)
+	if got := registry.recordCount(); got != 0 {
+		t.Fatalf("durable records = %d, want 0", got)
+	}
+}
+
 func TestManagedProcessRecordedRefusalPreventsExecAndRemovesRecord(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "started")
 	registry := newFakeRegistry()
@@ -127,6 +176,9 @@ func TestManagedProcessRecordedRefusalPreventsExecAndRemovesRecord(t *testing.T)
 	_, err = pool.Start(context.Background(), spec)
 	if !errors.Is(err, refused) {
 		t.Fatalf("Start error = %v, want %v", err, refused)
+	}
+	if errors.Is(err, ErrProcessExitedBeforeReadiness) {
+		t.Fatalf("record refusal matched early-exit sentinel: %v", err)
 	}
 	pid := <-registry.trackStarted
 	assertPIDGone(t, pid)
@@ -151,6 +203,9 @@ func TestManagedProcessRejectsRecordWithoutBootBeforeExec(t *testing.T) {
 	if !errors.Is(err, proc.ErrInvalidRecord) {
 		t.Fatalf("Start error = %v, want ErrInvalidRecord", err)
 	}
+	if errors.Is(err, ErrProcessExitedBeforeReadiness) {
+		t.Fatalf("record validation matched early-exit sentinel: %v", err)
+	}
 	pid := <-registry.trackStarted
 	assertPIDGone(t, pid)
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
@@ -158,6 +213,35 @@ func TestManagedProcessRejectsRecordWithoutBootBeforeExec(t *testing.T) {
 	}
 	if got := registry.recordCount(); got != 0 {
 		t.Fatalf("durable records = %d, want invalid record removed", got)
+	}
+}
+
+func TestManagedProcessTrackFailureHasBoundedUntrackedCleanup(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "started")
+	registry := newFakeRegistry()
+	registry.trackStarted = make(chan int, 1)
+	registry.trackErr = errors.New("injected track failure")
+	pool, err := NewPool(1, registry)
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	pool.untrackedKillTimeout = 40 * time.Millisecond
+	pool.signal = func(int, syscall.Signal) error { return syscall.EPERM }
+	started := time.Now()
+	_, err = pool.Start(context.Background(), managedProcessSpec(t, marker))
+	if !errors.Is(err, registry.trackErr) || !errors.Is(err, syscall.EPERM) || !errors.Is(err, ErrUnsettledGroup) {
+		t.Fatalf("Start error = %v, want track, EPERM, and unsettled errors", err)
+	}
+	if errors.Is(err, ErrProcessExitedBeforeReadiness) {
+		t.Fatalf("tracking failure matched early-exit sentinel: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("untracked cleanup took %s, want bounded completion", elapsed)
+	}
+	pid := <-registry.trackStarted
+	assertPIDGone(t, pid)
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("child executed after tracking failure: %v", err)
 	}
 }
 
@@ -179,10 +263,110 @@ func TestManagedProcessReadinessTimeoutKillsReapsAndUntracks(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Start error = %v, want readiness deadline", err)
 	}
+	if errors.Is(err, ErrProcessExitedBeforeReadiness) {
+		t.Fatalf("readiness timeout matched early-exit sentinel: %v", err)
+	}
 	pid := <-registry.trackStarted
 	assertPIDGone(t, pid)
 	if got := registry.recordCount(); got != 0 {
 		t.Fatalf("durable records = %d, want 0", got)
+	}
+}
+
+func TestManagedProcessExitedBeforeReadinessClassification(t *testing.T) {
+	for _, exitCode := range []int{0, 23} {
+		t.Run(strconv.Itoa(exitCode), func(t *testing.T) {
+			registry := newFakeRegistry()
+			pool, err := NewPool(1, registry)
+			if err != nil {
+				t.Fatalf("NewPool: %v", err)
+			}
+			_, err = pool.Start(context.Background(), ProcessSpec{
+				RecoveryClass: proc.RecoveryTask,
+				Path:          "/bin/sh",
+				Args:          []string{"-c", fmt.Sprintf("exit %d", exitCode)},
+				Ready: func(ctx context.Context, _ proc.Record) error {
+					<-ctx.Done()
+					return ctx.Err()
+				},
+			})
+			if !errors.Is(err, ErrProcessExitedBeforeReadiness) {
+				t.Fatalf("Start error = %v, want ErrProcessExitedBeforeReadiness", err)
+			}
+			var exitErr *ExitError
+			if exitCode == 0 && errors.As(err, &exitErr) {
+				t.Fatalf("zero exit exposed typed failure: %v", err)
+			}
+			if exitCode != 0 && (!errors.As(err, &exitErr) || exitErr.ExitCode() != exitCode) {
+				t.Fatalf("Start error = %v, want typed exit %d", err, exitCode)
+			}
+			if got := registry.recordCount(); got != 0 {
+				t.Fatalf("durable records = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestManagedProcessSuccessfulReadinessLeavesExitForWait(t *testing.T) {
+	release := filepath.Join(t.TempDir(), "ready")
+	registry := newFakeRegistry()
+	pool, err := NewPool(1, registry)
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	process, err := pool.Start(context.Background(), ProcessSpec{
+		RecoveryClass: proc.RecoveryTask,
+		Path:          "/bin/sh",
+		Args:          []string{"-c", `while [ ! -e "$1" ]; do sleep 0.01; done; sleep 0.1; exit 7`, "ready", release},
+		Ready: func(context.Context, proc.Record) error {
+			return os.WriteFile(release, nil, 0o600)
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := process.Wait(context.Background()); err == nil || errors.Is(err, ErrProcessExitedBeforeReadiness) {
+		t.Fatalf("Wait error = %v, want only post-readiness exit", err)
+	} else {
+		var exitErr *ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 7 {
+			t.Fatalf("Wait error = %v, want typed exit 7", err)
+		}
+	}
+}
+
+func TestManagedProcessExitedBeforeReadinessExcludesPreLaunchFailures(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*Pool)
+		spec  ProcessSpec
+		want  error
+	}{
+		{name: "missing path", spec: ProcessSpec{RecoveryClass: proc.RecoveryTask}},
+		{name: "start failure", spec: ProcessSpec{RecoveryClass: proc.RecoveryTask, Path: "/usr/bin/true", Dir: "/no/such/daemonkit-directory"}},
+		{name: "closed pool", setup: func(pool *Pool) { pool.Close() }, spec: ProcessSpec{RecoveryClass: proc.RecoveryTask, Path: "/usr/bin/true"}, want: ErrClosed},
+		{name: "canceled pool", setup: func(pool *Pool) { pool.Cancel() }, spec: ProcessSpec{RecoveryClass: proc.RecoveryTask, Path: "/usr/bin/true"}, want: ErrCanceled},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			pool, err := NewPool(1, newFakeRegistry())
+			if err != nil {
+				t.Fatalf("NewPool: %v", err)
+			}
+			if test.setup != nil {
+				test.setup(pool)
+			}
+			_, err = pool.Start(context.Background(), test.spec)
+			if err == nil {
+				t.Fatal("Start unexpectedly succeeded")
+			}
+			if test.want != nil && !errors.Is(err, test.want) {
+				t.Fatalf("Start error = %v, want %v", err, test.want)
+			}
+			if errors.Is(err, ErrProcessExitedBeforeReadiness) {
+				t.Fatalf("pre-launch failure matched early-exit sentinel: %v", err)
+			}
+		})
 	}
 }
 
@@ -205,6 +389,9 @@ func TestManagedProcessRejectsWrongReadyPeerAndCleansChild(t *testing.T) {
 	_, err = pool.Start(context.Background(), spec)
 	if err == nil || !strings.Contains(err.Error(), "ready peer does not match") {
 		t.Fatalf("Start error = %v, want wrong-peer rejection", err)
+	}
+	if errors.Is(err, ErrProcessExitedBeforeReadiness) {
+		t.Fatalf("readiness rejection matched early-exit sentinel: %v", err)
 	}
 	pid := <-registry.trackStarted
 	assertPIDGone(t, pid)
@@ -321,6 +508,8 @@ func TestManagedProcessStartupCancellationBeforeReadinessStopsAndReaps(t *testin
 	cancel()
 	if err := <-started; !errors.Is(err, context.Canceled) {
 		t.Fatalf("Start = %v, want context.Canceled", err)
+	} else if errors.Is(err, ErrProcessExitedBeforeReadiness) {
+		t.Fatalf("caller cancellation matched early-exit sentinel: %v", err)
 	}
 	assertPIDGone(t, pid)
 	if got := registry.recordCount(); got != 0 {

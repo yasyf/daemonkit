@@ -76,7 +76,7 @@ func (s *FileStore) open(ctx context.Context) (*bolt.DB, error) {
 	if deadline, ok := ctx.Deadline(); ok {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return nil, ctx.Err()
+			return nil, context.DeadlineExceeded
 		}
 		if remaining < timeout {
 			timeout = remaining

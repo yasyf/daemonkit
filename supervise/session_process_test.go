@@ -156,6 +156,36 @@ func TestManagedSessionExitClosesConnection(t *testing.T) {
 	}
 }
 
+func TestManagedSessionLeaderExitSettlesBackgroundedDescendant(t *testing.T) {
+	registry := newFakeRegistry()
+	pool, err := NewPool(1, registry)
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	pool.grace = 40 * time.Millisecond
+	marker := filepath.Join(t.TempDir(), "descendant.pid")
+	session, err := pool.StartSession(context.Background(), SessionProcessSpec{
+		RecoveryClass: proc.RecoveryTask,
+		Path:          "/bin/sh",
+		Args: []string{"-c", `
+/bin/sh -c 'trap "" TERM; echo $$ > "$1"; while :; do sleep 10; done' descendant "$1" &
+while [ ! -s "$1" ]; do sleep 0.01; done
+exit 0
+`, "session", marker},
+	})
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	descendantPID := readPIDFile(t, marker)
+	if err := session.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	assertPIDGone(t, descendantPID)
+	if got := registry.recordCount(); got != 0 {
+		t.Fatalf("durable records = %d, want 0", got)
+	}
+}
+
 func TestManagedSessionWriteDeadlineUnblocksBackpressure(t *testing.T) {
 	registry := newFakeRegistry()
 	pool, err := NewPool(1, registry)

@@ -46,6 +46,9 @@ type boltControllerStore struct {
 }
 
 func openControllerStore(ctx context.Context, path string) (*boltControllerStore, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := exactControllerPath(path); err != nil {
 		return nil, err
 	}
@@ -56,7 +59,7 @@ func openControllerStore(ctx context.Context, path string) (*boltControllerStore
 	if deadline, ok := ctx.Deadline(); ok {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return nil, ctx.Err()
+			return nil, context.DeadlineExceeded
 		}
 		timeout = min(timeout, remaining)
 	}
