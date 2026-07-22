@@ -155,11 +155,24 @@ public final class SocketClient: @unchecked Sendable {
             throw error
         }
         descriptor = connectedDescriptor
-        codec = SessionFrameCodec(descriptor: descriptor, maximumFrameBytes: configuration.maximumFrameBytes)
-        eventChannel = SocketBoundedChannel(capacity: configuration.eventQueueDepth)
-        Self.configure(descriptor, receive: configuration.handshakeTimeout, send: configuration.writeTimeout)
         do {
-            let identity = try Self.handshake(codec: codec, build: build)
+            try Self.configureNonblocking(descriptor)
+        } catch {
+            Darwin.close(descriptor)
+            throw error
+        }
+        codec = SessionFrameCodec(
+            descriptor: descriptor,
+            maximumFrameBytes: configuration.maximumFrameBytes,
+            writeTimeout: configuration.writeTimeout
+        )
+        eventChannel = SocketBoundedChannel(capacity: configuration.eventQueueDepth)
+        do {
+            let identity = try Self.handshake(
+                codec: codec,
+                build: build,
+                timeout: configuration.handshakeTimeout
+            )
             peerBuild = identity.build
             guard let session = identity.session, session.count == 16 else {
                 throw SessionTransportError.handshake("invalid session generation")
@@ -169,7 +182,6 @@ public final class SocketClient: @unchecked Sendable {
             Darwin.close(descriptor)
             throw error
         }
-        Self.configure(descriptor, receive: 0, send: configuration.writeTimeout)
         try codec.write(SessionFrame(
             kind: .window,
             sequence: UInt32(configuration.eventQueueDepth)
@@ -384,13 +396,17 @@ public final class SocketClient: @unchecked Sendable {
         Task { await eventChannel.finish(throwing: error) }
     }
 
-    private static func handshake(codec: SessionFrameCodec, build: String) throws -> SessionBuildIdentity {
+    private static func handshake(
+        codec: SessionFrameCodec,
+        build: String,
+        timeout: TimeInterval
+    ) throws -> SessionBuildIdentity {
         let payload = try JSONEncoder().encode(SessionBuildIdentity(
             protocolVersion: daemonKitSessionProtocolVersion,
             build: build
         ))
         try codec.write(SessionFrame(kind: .hello, flags: .end, payload: payload))
-        let response = try codec.read()
+        let response = try codec.read(timeout: timeout)
         guard response.kind == .helloAck, response.flags == .end, response.id == 0,
               response.sequence == 0, response.operation.isEmpty, response.tenant.isEmpty
         else {
@@ -464,17 +480,14 @@ private extension SocketClient {
         return address
     }
 
-    private static func configure(_ descriptor: Int32, receive: TimeInterval, send: TimeInterval) {
-        var receiveTimeout = timeval(
-            tv_sec: Int(receive),
-            tv_usec: Int32((receive - Double(Int(receive))) * 1_000_000)
-        )
-        var sendTimeout = timeval(
-            tv_sec: Int(send),
-            tv_usec: Int32((send - Double(Int(send))) * 1_000_000)
-        )
-        setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &receiveTimeout, socklen_t(MemoryLayout<timeval>.size))
-        setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &sendTimeout, socklen_t(MemoryLayout<timeval>.size))
+    private static func configureNonblocking(_ descriptor: Int32) throws {
+        let flags = fcntl(descriptor, F_GETFL)
+        guard flags >= 0 else {
+            throw SessionTransportError.systemCall(operation: "fcntl", errno: errno)
+        }
+        guard fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else {
+            throw SessionTransportError.systemCall(operation: "fcntl", errno: errno)
+        }
     }
 }
 

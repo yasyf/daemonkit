@@ -126,15 +126,22 @@ final class SessionFrameCodec: @unchecked Sendable {
 
     private let descriptor: Int32
     private let maximumFrameBytes: Int
+    private let writeTimeout: TimeInterval
     private let writeLock = NSLock()
 
-    init(descriptor: Int32, maximumFrameBytes: Int = defaultMaximumFrameBytes) {
+    init(
+        descriptor: Int32,
+        maximumFrameBytes: Int = defaultMaximumFrameBytes,
+        writeTimeout: TimeInterval = 0
+    ) {
         self.descriptor = descriptor
         self.maximumFrameBytes = maximumFrameBytes
+        self.writeTimeout = writeTimeout
     }
 
-    func read() throws -> SessionFrame {
-        let prefix = try readExactly(4)
+    func read(timeout: TimeInterval = 0) throws -> SessionFrame {
+        let deadline = Self.deadline(after: timeout)
+        let prefix = try readExactly(4, deadline: deadline)
         let length = Int(prefix.uint32(at: 0))
         guard length <= maximumFrameBytes else {
             throw SessionTransportError.frameTooLarge(actual: length, maximum: maximumFrameBytes)
@@ -142,7 +149,7 @@ final class SessionFrameCodec: @unchecked Sendable {
         guard length >= Self.headerBytes else {
             throw SessionTransportError.invalidFrame("body length \(length)")
         }
-        return try Self.decode(readExactly(length))
+        return try Self.decode(readExactly(length, deadline: deadline))
     }
 
     func write(_ frame: SessionFrame) throws {
@@ -155,7 +162,7 @@ final class SessionFrameCodec: @unchecked Sendable {
         packet.append(body)
         writeLock.lock()
         defer { writeLock.unlock() }
-        try writeAll(packet)
+        try writeAll(packet, deadline: Self.deadline(after: writeTimeout))
     }
 
     static func encode(_ frame: SessionFrame) throws -> Data {
@@ -276,7 +283,7 @@ final class SessionFrameCodec: @unchecked Sendable {
         }
     }
 
-    private func readExactly(_ count: Int) throws -> Data {
+    private func readExactly(_ count: Int, deadline: UInt64?) throws -> Data {
         var data = Data(count: count)
         var offset = 0
         while offset < count {
@@ -293,6 +300,10 @@ final class SessionFrameCodec: @unchecked Sendable {
                 if errno == EINTR {
                     continue
                 }
+                if errno == EAGAIN || errno == EWOULDBLOCK {
+                    try waitUntilReady(events: Int16(POLLIN), operation: "read", deadline: deadline)
+                    continue
+                }
                 throw SessionTransportError.systemCall(operation: "read", errno: errno)
             }
             offset += readCount
@@ -300,7 +311,7 @@ final class SessionFrameCodec: @unchecked Sendable {
         return data
     }
 
-    private func writeAll(_ data: Data) throws {
+    private func writeAll(_ data: Data, deadline: UInt64?) throws {
         var offset = 0
         while offset < data.count {
             let written = data.withUnsafeBytes { buffer in
@@ -315,6 +326,10 @@ final class SessionFrameCodec: @unchecked Sendable {
                 if errno == EINTR {
                     continue
                 }
+                if errno == EAGAIN || errno == EWOULDBLOCK {
+                    try waitUntilReady(events: Int16(POLLOUT), operation: "send", deadline: deadline)
+                    continue
+                }
                 throw SessionTransportError.systemCall(operation: "send", errno: errno)
             }
             if written == 0 {
@@ -322,6 +337,42 @@ final class SessionFrameCodec: @unchecked Sendable {
             }
             offset += written
         }
+    }
+
+    private func waitUntilReady(events: Int16, operation: String, deadline: UInt64?) throws {
+        while true {
+            var descriptor = pollfd(fd: descriptor, events: events, revents: 0)
+            let ready = poll(&descriptor, 1, Self.pollTimeout(deadline: deadline))
+            if ready > 0 {
+                return
+            }
+            if ready == 0 {
+                throw SessionTransportError.systemCall(operation: operation, errno: EAGAIN)
+            }
+            if errno == EINTR {
+                continue
+            }
+            throw SessionTransportError.systemCall(operation: "poll", errno: errno)
+        }
+    }
+
+    private static func deadline(after timeout: TimeInterval) -> UInt64? {
+        guard timeout > 0 else { return nil }
+        let nanoseconds = timeout * 1_000_000_000
+        guard nanoseconds < Double(UInt64.max) else { return UInt64.max }
+        let now = DispatchTime.now().uptimeNanoseconds
+        let duration = UInt64(nanoseconds.rounded(.up))
+        let (deadline, overflow) = now.addingReportingOverflow(duration)
+        return overflow ? UInt64.max : deadline
+    }
+
+    private static func pollTimeout(deadline: UInt64?) -> Int32 {
+        guard let deadline else { return -1 }
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard deadline > now else { return 0 }
+        let remaining = deadline - now
+        let milliseconds = remaining / 1_000_000 + (remaining % 1_000_000 == 0 ? 0 : 1)
+        return Int32(min(milliseconds, UInt64(Int32.max)))
     }
 }
 

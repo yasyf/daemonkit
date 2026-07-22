@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before a backgrounded descendant.
 - `supervise.ErrProcessExitedBeforeReadiness` identifies only an actual early
   managed-child exit while retaining its typed exit status when available.
+- Swift client/server sessions use nonblocking descriptors with poll-backed
+  whole-frame deadlines, so strict cooperative executors wait for readiness
+  without spinning or surfacing transient `EAGAIN`.
 - Untracked post-spawn cleanup is bounded and wrapper gate EOF exits directly,
   preventing signal failures from trapping startup cleanup indefinitely.
 

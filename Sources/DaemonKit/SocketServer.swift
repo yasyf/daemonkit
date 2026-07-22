@@ -203,6 +203,16 @@ public final class SocketServer: @unchecked Sendable {
                 close(pipeDescriptors[1])
                 throw SocketServerError.socketFailed(errno: code)
             }
+            let pipeFlags = fcntl(pipeDescriptors[1], F_GETFL)
+            guard pipeFlags >= 0,
+                  fcntl(pipeDescriptors[1], F_SETFL, pipeFlags | O_NONBLOCK) == 0
+            else {
+                let code = errno
+                close(listener)
+                close(pipeDescriptors[0])
+                close(pipeDescriptors[1])
+                throw SocketServerError.socketFailed(errno: code)
+            }
             lock.lock()
             listenerDescriptor = listener
             shutdownReadDescriptor = pipeDescriptors[0]
@@ -228,7 +238,13 @@ public final class SocketServer: @unchecked Sendable {
         let writeDescriptor = shutdownWriteDescriptor
         lock.unlock()
         var byte: UInt8 = 1
-        while Darwin.write(writeDescriptor, &byte, 1) < 0, errno == EINTR {}
+        while Darwin.write(writeDescriptor, &byte, 1) < 0 {
+            if errno == EINTR {
+                continue
+            }
+            // A full nonblocking pipe already has a pending shutdown signal.
+            break
+        }
         acceptQueue.sync {}
         lock.lock()
         let active = Array(sessions.values)
@@ -330,8 +346,8 @@ public final class SocketServer: @unchecked Sendable {
             removeConnection(descriptor)
             close(descriptor)
         }
-        configure(descriptor)
         do {
+            try configure(descriptor)
             try trust.check(descriptor: descriptor)
             var user = uid_t()
             var group = gid_t()
@@ -373,19 +389,16 @@ public final class SocketServer: @unchecked Sendable {
         lock.unlock()
     }
 
-    private func configure(_ descriptor: Int32) {
+    private func configure(_ descriptor: Int32) throws {
         var enable: Int32 = 1
         setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &enable, socklen_t(MemoryLayout<Int32>.size))
-        setTimeout(descriptor, option: SO_RCVTIMEO, seconds: configuration.handshakeTimeout)
-        setTimeout(descriptor, option: SO_SNDTIMEO, seconds: configuration.writeTimeout)
-    }
-
-    private func setTimeout(_ descriptor: Int32, option: Int32, seconds: TimeInterval) {
-        var timeout = timeval(
-            tv_sec: Int(seconds),
-            tv_usec: Int32((seconds - Double(Int(seconds))) * 1_000_000)
-        )
-        setsockopt(descriptor, SOL_SOCKET, option, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        let flags = fcntl(descriptor, F_GETFL)
+        guard flags >= 0 else {
+            throw SessionTransportError.systemCall(operation: "fcntl", errno: errno)
+        }
+        guard fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else {
+            throw SessionTransportError.systemCall(operation: "fcntl", errno: errno)
+        }
     }
 
     private static func makeAddress(path: String) throws -> sockaddr_un {
@@ -607,7 +620,11 @@ private final class ServerSession: @unchecked Sendable {
         self.handler = handler
         var uuid = UUID().uuid
         generation = withUnsafeBytes(of: &uuid) { Data($0) }
-        codec = SessionFrameCodec(descriptor: descriptor, maximumFrameBytes: configuration.maximumFrameBytes)
+        codec = SessionFrameCodec(
+            descriptor: descriptor,
+            maximumFrameBytes: configuration.maximumFrameBytes,
+            writeTimeout: configuration.writeTimeout
+        )
         readQueue = DispatchQueue(label: "com.yasyf.daemonkit.SocketServer.read.\(descriptor)")
     }
 
@@ -618,7 +635,6 @@ private final class ServerSession: @unchecked Sendable {
     func run() async throws {
         do {
             let clientBuild = try await handshake()
-            disableReadTimeout()
             while true {
                 let frame = try await read()
                 switch frame.kind {
@@ -678,7 +694,7 @@ private final class ServerSession: @unchecked Sendable {
     }
 
     private func handshake() async throws -> String {
-        let frame = try await read()
+        let frame = try await read(timeout: configuration.handshakeTimeout)
         guard frame.kind == .hello, frame.flags == .end, frame.id == 0,
               frame.sequence == 0, frame.operation.isEmpty, frame.tenant.isEmpty
         else {
@@ -703,17 +719,12 @@ private final class ServerSession: @unchecked Sendable {
         return identity.build
     }
 
-    private func read() async throws -> SessionFrame {
+    private func read(timeout: TimeInterval = 0) async throws -> SessionFrame {
         try await withCheckedThrowingContinuation { continuation in
             readQueue.async { [codec] in
-                continuation.resume(with: Result { try codec.read() })
+                continuation.resume(with: Result { try codec.read(timeout: timeout) })
             }
         }
-    }
-
-    private func disableReadTimeout() {
-        var noTimeout = timeval()
-        setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &noTimeout, socklen_t(MemoryLayout<timeval>.size))
     }
 
     private enum Admission {
