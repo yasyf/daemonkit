@@ -34,6 +34,10 @@ func (s *AcceptedSession) Protected() bool { return s.s.protected }
 // removed from the server.
 func (s *AcceptedSession) Done() <-chan struct{} { return s.s.done }
 
+// Disconnected closes when transport intake ends, before admitted requests
+// necessarily settle. It is stable for the lifetime of this session.
+func (s *AcceptedSession) Disconnected() <-chan struct{} { return s.s.disconnected }
+
 // PushEvent enqueues a server-pushed event with bounded backpressure.
 func (s *AcceptedSession) PushEvent(ctx context.Context, event Event) error {
 	if event.Topic == "" {
@@ -63,6 +67,7 @@ type session struct {
 	eventCredits   *creditWindow
 	requestsDone   chan struct{}
 	writerDone     chan struct{}
+	disconnected   chan struct{}
 	done           chan struct{}
 
 	mu        sync.Mutex
@@ -70,9 +75,10 @@ type session struct {
 	seen      map[uint64]struct{}
 	watermark uint64
 
-	requestWG sync.WaitGroup
-	writerWG  sync.WaitGroup
-	closeOnce sync.Once
+	requestWG      sync.WaitGroup
+	writerWG       sync.WaitGroup
+	closeOnce      sync.Once
+	disconnectOnce sync.Once
 }
 
 type sessionOutbound struct {
@@ -120,6 +126,7 @@ func (s *session) run(ctx context.Context, releaseCapacity func()) error {
 	s.writerWG.Add(1)
 	go s.writeLoop()
 	err := s.readLoop(ctx)
+	s.disconnect()
 	if errors.Is(err, errPeerGoAway) {
 		s.stop()
 		s.closeRequestInputs()
@@ -140,6 +147,10 @@ func (s *session) run(ctx context.Context, releaseCapacity func()) error {
 	close(s.requestsDone)
 	s.writerWG.Wait()
 	return err
+}
+
+func (s *session) disconnect() {
+	s.disconnectOnce.Do(func() { close(s.disconnected) })
 }
 
 func (s *session) close() {

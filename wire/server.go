@@ -475,6 +475,7 @@ func (s *Server) serveConn(
 		eventCredits:   newCreditWindow(),
 		requestsDone:   make(chan struct{}),
 		writerDone:     make(chan struct{}),
+		disconnected:   make(chan struct{}),
 		done:           make(chan struct{}),
 		active:         make(map[uint64]*requestState),
 		seen:           make(map[uint64]struct{}),

@@ -662,6 +662,52 @@ func TestAcceptedSessionDoneClosesOnServerShutdown(t *testing.T) {
 	}
 }
 
+func TestAcceptedSessionDisconnectedPrecedesBlockedRequestSettlement(t *testing.T) {
+	sessions := make(chan *wire.AcceptedSession, 1)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	server := &wire.Server{Build: "server-test"}
+	server.RegisterControl("block", func(ctx context.Context, request wire.Request) (any, error) {
+		sessions <- request.Session
+		close(entered)
+		<-release
+		return nil, ctx.Err()
+	})
+	running := startSessionServer(t, server, func() (func(), error) { return func() {}, nil })
+	client := newClient(t, running, nil)
+	call, err := client.Open(context.Background(), "block", "", nil, true)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	session := <-sessions
+	<-entered
+	if err := client.Abort(errors.New("dispose blocked worker")); err != nil {
+		t.Fatalf("Abort: %v", err)
+	}
+	select {
+	case <-session.Disconnected():
+	case <-time.After(time.Second):
+		t.Fatal("Disconnected waited for blocked request settlement")
+	}
+	select {
+	case <-session.Done():
+		t.Fatal("Done closed before blocked request settlement")
+	default:
+	}
+
+	releaseOnce.Do(func() { close(release) })
+	if _, err := call.Response(context.Background()); !errors.Is(err, wire.ErrClientAbort) {
+		t.Fatalf("Response after abort = %v, want ErrClientAbort", err)
+	}
+	select {
+	case <-session.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Done did not close after request settlement")
+	}
+}
+
 func TestClientAbortIsTypedAndWaitsForAcceptedSessionSettlement(t *testing.T) {
 	const attempts = 32
 	sessions := make(chan *wire.AcceptedSession, 1)
