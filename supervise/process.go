@@ -46,6 +46,7 @@ type ProcessSpec struct {
 	// Stdout and Stderr receive child output. Nil discards the corresponding stream.
 	Stdout io.Writer
 	Stderr io.Writer
+	stdin  io.Reader
 	// Ready runs only after the process-group identity is durable and execution
 	// has been released. A nil callback makes durable launch the readiness point.
 	Ready func(context.Context, proc.Record) error
@@ -248,6 +249,7 @@ func managedCommand(spec ProcessSpec) (*exec.Cmd, *os.File, *os.File, *os.File, 
 	cmd := exec.Command("/bin/sh", wrapperArgs...)
 	cmd.Dir = spec.Dir
 	cmd.Env = spec.Env
+	cmd.Stdin = spec.stdin
 	cmd.Stdout = spec.Stdout
 	cmd.Stderr = spec.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
