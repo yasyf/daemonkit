@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-22
+
+### Added
+
+- `service.Agent` gains `WatchPaths []string` (start the job when a listed path
+  changes) and `StartCalendarInterval []CalendarInterval` (calendar-scheduled
+  launch; launchd ORs the set), each rendered into the plist with the same
+  exact-absolute-path and range validation as the existing keys. A
+  `service.Daily(hour, minute)` helper covers the common once-a-day case.
+
 ## [0.4.2] - 2026-07-22
 
 ### Fixed
