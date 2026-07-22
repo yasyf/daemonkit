@@ -304,13 +304,18 @@ final class SessionFrameCodec: @unchecked Sendable {
         var offset = 0
         while offset < data.count {
             let written = data.withUnsafeBytes { buffer in
-                Darwin.write(descriptor, buffer.baseAddress?.advanced(by: offset), data.count - offset)
+                Darwin.send(
+                    descriptor,
+                    buffer.baseAddress?.advanced(by: offset),
+                    data.count - offset,
+                    MSG_NOSIGNAL
+                )
             }
             if written < 0 {
                 if errno == EINTR {
                     continue
                 }
-                throw SessionTransportError.systemCall(operation: "write", errno: errno)
+                throw SessionTransportError.systemCall(operation: "send", errno: errno)
             }
             if written == 0 {
                 throw SessionTransportError.truncatedFrame

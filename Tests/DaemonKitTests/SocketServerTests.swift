@@ -96,6 +96,31 @@ extension SocketTransportTests {
             #expect(encoded.map { String(format: "%02x", $0) }.joined() == hex)
         }
 
+        @Test func concurrentClosedPeerWritesReturnEPIPEWithoutSIGPIPE() async throws {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for _ in 0 ..< 32 {
+                    group.addTask {
+                        var descriptors: [Int32] = [-1, -1]
+                        try #require(socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0)
+                        close(descriptors[1])
+                        defer { close(descriptors[0]) }
+
+                        let codec = SessionFrameCodec(
+                            descriptor: descriptors[0],
+                            maximumFrameBytes: daemonKitDefaultMaximumFrameBytes
+                        )
+                        do {
+                            try codec.write(SessionFrame(kind: .goAway, flags: .end))
+                            Issue.record("expected the closed peer write to fail")
+                        } catch let error as SessionTransportError {
+                            #expect(error == .systemCall(operation: "send", errno: EPIPE))
+                        }
+                    }
+                }
+                try await group.waitForAll()
+            }
+        }
+
         @Test func persistentSessionMultiplexesEventsAndStreams() async throws {
             let directory = try shortSocketDir()
             defer { try? FileManager.default.removeItem(at: directory) }

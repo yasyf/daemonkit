@@ -196,6 +196,13 @@ public final class SocketServer: @unchecked Sendable {
                 close(listener)
                 throw SocketServerError.socketFailed(errno: code)
             }
+            guard fcntl(pipeDescriptors[1], F_SETNOSIGPIPE, 1) == 0 else {
+                let code = errno
+                close(listener)
+                close(pipeDescriptors[0])
+                close(pipeDescriptors[1])
+                throw SocketServerError.socketFailed(errno: code)
+            }
             lock.lock()
             listenerDescriptor = listener
             shutdownReadDescriptor = pipeDescriptors[0]
