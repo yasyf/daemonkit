@@ -6,6 +6,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-21
+
+### Added
+
+- `supervise.Pool.StartSession` owns durable duplex child processes with exact
+  readiness, bounded framed I/O, cancellation, process-group termination, and
+  synchronous reaping.
+
+### Fixed
+
+- `supervise.SessionProcess.Wait` closes the child connection before returning
+  the process result, so no caller can observe an exited session with a live
+  transport.
+- Swift session and shutdown-pipe writes suppress `SIGPIPE`, including during
+  concurrent peer teardown.
+
 ## [0.3.4] - 2026-07-21
 
 ### Fixed
@@ -86,7 +102,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.3.4...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/yasyf/daemonkit/compare/v0.3.4...v0.4.1
 [0.3.4]: https://github.com/yasyf/daemonkit/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/yasyf/daemonkit/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/yasyf/daemonkit/compare/v0.3.1...v0.3.2
