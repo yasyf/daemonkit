@@ -356,7 +356,7 @@ final class SessionFrameCodec: @unchecked Sendable {
         }
     }
 
-    private static func deadline(after timeout: TimeInterval) -> UInt64? {
+    static func deadline(after timeout: TimeInterval) -> UInt64? {
         guard timeout > 0 else { return nil }
         let nanoseconds = timeout * 1_000_000_000
         guard nanoseconds < Double(UInt64.max) else { return UInt64.max }
@@ -366,13 +366,20 @@ final class SessionFrameCodec: @unchecked Sendable {
         return overflow ? UInt64.max : deadline
     }
 
-    private static func pollTimeout(deadline: UInt64?) -> Int32 {
+    static func pollTimeout(deadline: UInt64?, maximum: Int32 = .max) -> Int32 {
         guard let deadline else { return -1 }
         let now = DispatchTime.now().uptimeNanoseconds
         guard deadline > now else { return 0 }
         let remaining = deadline - now
         let milliseconds = remaining / 1_000_000 + (remaining % 1_000_000 == 0 ? 0 : 1)
-        return Int32(min(milliseconds, UInt64(Int32.max)))
+        return Int32(min(milliseconds, UInt64(maximum)))
+    }
+
+    static func durationNanoseconds(_ timeout: TimeInterval) -> UInt64 {
+        guard timeout > 0 else { return 0 }
+        let nanoseconds = timeout * 1_000_000_000
+        guard nanoseconds.isFinite, nanoseconds < Double(UInt64.max) else { return .max }
+        return UInt64(nanoseconds.rounded(.up))
     }
 }
 

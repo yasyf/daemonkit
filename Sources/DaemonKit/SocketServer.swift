@@ -2,115 +2,7 @@ import Darwin
 import Foundation
 import os
 
-private let socketServerLog = Logger(subsystem: DaemonKit.loggingSubsystem, category: "SocketServer")
-
-/// Errors thrown while binding or running a ``SocketServer``.
-public enum SocketServerError: Error, Sendable {
-    case pathTooLong(path: String, limit: Int)
-    case addressInUse(path: String)
-    case socketFailed(errno: Int32)
-    case bindFailed(path: String, errno: Int32)
-    case listenFailed(errno: Int32)
-    case alreadyRunning
-    case emptyBuild
-}
-
-/// The immutable OS identity captured from an accepted socket.
-public struct SocketPeer: Sendable {
-    public let effectiveUserID: uid_t
-    public let effectiveGroupID: gid_t
-}
-
-/// One ordered request-stream chunk.
-public struct SocketRequestChunk: Sendable {
-    public let sequence: UInt32
-    public let payload: Data
-    public let end: Bool
-}
-
-/// A request admitted on a persistent session.
-public struct SocketRequest: Sendable {
-    public let id: UInt64
-    public let operation: String
-    public let tenant: String
-    public let payload: Data
-    public let chunks: SocketChunkStream
-    public let peer: SocketPeer
-    public let peerBuild: String
-    public let session: SocketSession
-}
-
-/// A trusted persistent server session exposed to request handlers.
-public final class SocketSession: @unchecked Sendable {
-    fileprivate weak var implementation: ServerSession?
-    private let lifecycle: SocketSessionLifecycle
-
-    fileprivate init(implementation: ServerSession, lifecycle: SocketSessionLifecycle) {
-        self.implementation = implementation
-        self.lifecycle = lifecycle
-    }
-
-    /// Whether the authenticated peer connection remains live.
-    public var isConnected: Bool {
-        lifecycle.isConnected
-    }
-
-    /// Suspends until the authenticated peer connection closes.
-    public func waitUntilClosed() async {
-        await lifecycle.waitUntilClosed()
-    }
-
-    /// Pushes one event to the peer on the session's serialized writer.
-    public func pushEvent(topic: String, payload: Data = Data()) async throws {
-        guard !topic.isEmpty else {
-            throw SessionTransportError.invalidFrame("empty event topic")
-        }
-        guard let implementation else {
-            throw SessionTransportError.disconnected
-        }
-        try await implementation.pushEvent(topic: topic, payload: payload)
-    }
-}
-
-private final class SocketSessionLifecycle: @unchecked Sendable {
-    private let lock = NSLock()
-    private var connected = true
-    private var waiters: [CheckedContinuation<Void, Never>] = []
-
-    var isConnected: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return connected
-    }
-
-    func waitUntilClosed() async {
-        await withCheckedContinuation { continuation in
-            lock.lock()
-            guard connected else {
-                lock.unlock()
-                continuation.resume()
-                return
-            }
-            waiters.append(continuation)
-            lock.unlock()
-        }
-    }
-
-    func close() {
-        lock.lock()
-        guard connected else {
-            lock.unlock()
-            return
-        }
-        connected = false
-        let pending = waiters
-        waiters.removeAll()
-        lock.unlock()
-        for waiter in pending {
-            waiter.resume()
-        }
-    }
-}
+let socketServerLog = Logger(subsystem: DaemonKit.loggingSubsystem, category: "SocketServer")
 
 /// A unix-domain persistent v1 session server.
 public final class SocketServer: @unchecked Sendable {
@@ -119,6 +11,7 @@ public final class SocketServer: @unchecked Sendable {
         public var maximumActiveRequests: Int
         public var maximumSessions: Int
         public var streamQueueDepth: Int
+        public var maximumPendingWrites: Int
         public var handshakeTimeout: TimeInterval
         public var writeTimeout: TimeInterval
 
@@ -127,6 +20,7 @@ public final class SocketServer: @unchecked Sendable {
             maximumActiveRequests: Int = 64,
             maximumSessions: Int = 64,
             streamQueueDepth: Int = 16,
+            maximumPendingWrites: Int = 64,
             handshakeTimeout: TimeInterval = 10,
             writeTimeout: TimeInterval = 10
         ) {
@@ -134,6 +28,7 @@ public final class SocketServer: @unchecked Sendable {
             self.maximumActiveRequests = maximumActiveRequests
             self.maximumSessions = maximumSessions
             self.streamQueueDepth = streamQueueDepth
+            self.maximumPendingWrites = maximumPendingWrites
             self.handshakeTimeout = handshakeTimeout
             self.writeTimeout = writeTimeout
         }
@@ -141,8 +36,89 @@ public final class SocketServer: @unchecked Sendable {
 
     private enum State {
         case idle
+        case starting
         case serving
+        case stopping
         case stopped
+    }
+
+    private enum SocketPathProbe {
+        case live
+        case stale
+        case uncertain
+    }
+
+    private struct ListenerResources: Sendable {
+        let listener: Int32
+        let shutdownRead: Int32
+        let shutdownWrite: Int32
+    }
+
+    private final class ListenerResourcesOwner: @unchecked Sendable {
+        private let path: String
+        private let lock = NSLock()
+        private var resources: ListenerResources?
+        private var canceled = false
+
+        init(path: String) {
+            self.path = path
+        }
+
+        func install(_ resources: ListenerResources) throws {
+            let accepted = lock.withLock {
+                guard !canceled else { return false }
+                self.resources = resources
+                return true
+            }
+            guard accepted else {
+                Self.close(resources, path: path)
+                throw CancellationError()
+            }
+        }
+
+        func commit(_ operation: (ListenerResources) -> Bool) throws {
+            try lock.withLock {
+                guard !canceled, let resources else { throw CancellationError() }
+                guard operation(resources) else { throw CancellationError() }
+                self.resources = nil
+            }
+        }
+
+        func cancel() {
+            let resources = lock.withLock {
+                canceled = true
+                let resources = self.resources
+                self.resources = nil
+                return resources
+            }
+            if let resources {
+                Self.close(resources, path: path)
+            }
+        }
+
+        func close() {
+            let resources = lock.withLock {
+                let resources = self.resources
+                self.resources = nil
+                return resources
+            }
+            if let resources {
+                Self.close(resources, path: path)
+            }
+        }
+
+        private static func close(_ resources: ListenerResources, path: String) {
+            unlink(path)
+            if resources.listener >= 0 {
+                Darwin.close(resources.listener)
+            }
+            if resources.shutdownRead >= 0 {
+                Darwin.close(resources.shutdownRead)
+            }
+            if resources.shutdownWrite >= 0 {
+                Darwin.close(resources.shutdownWrite)
+            }
+        }
     }
 
     private let path: String
@@ -150,16 +126,22 @@ public final class SocketServer: @unchecked Sendable {
     private let configuration: Configuration
     private let trust: PeerTrust
     private let handler: @Sendable (SocketRequest) async -> SocketResponse
-    // Serial: stop() joins the single long-lived accept loop via acceptQueue.sync.
     private let acceptQueue = DispatchQueue(label: "com.yasyf.daemonkit.SocketServer.accept")
+    private let controlQueue = DispatchQueue(label: "com.yasyf.daemonkit.SocketServer.control")
     private let sessionGroup = DispatchGroup()
     private let lock = NSLock()
+    private let startLatch = AsyncLatch()
+    private let stopLatch = AsyncLatch()
     private var state = State.idle
     private var listenerDescriptor: Int32 = -1
     private var shutdownReadDescriptor: Int32 = -1
     private var shutdownWriteDescriptor: Int32 = -1
     private var sessions: [Int32: ServerSession] = [:]
     private var connections: Set<Int32> = []
+    var stopDrainHook: (@Sendable () async -> Void)?
+    var startCommitHook: (@Sendable () async -> Void)?
+    var stopFinishHook: (@Sendable () async -> Void)?
+    var stopWaitHook: (@Sendable () async -> Void)?
 
     public init(
         path: String,
@@ -174,69 +156,103 @@ public final class SocketServer: @unchecked Sendable {
         self.trust = trust
         self.handler = handler
     }
+}
 
+extension SocketServer {
     /// Reclaims a stale socket, binds with mode 0600, and starts accepting sessions.
-    public func start() throws {
+    public func start() async throws {
         guard !build.isEmpty else { throw SocketServerError.emptyBuild }
-        guard (1 ... Int(UInt32.max)).contains(configuration.streamQueueDepth) else {
+        guard configuration.maximumFrameBytes > 0,
+              configuration.maximumActiveRequests > 0,
+              configuration.maximumSessions > 0,
+              (1 ... Int(UInt32.max)).contains(configuration.streamQueueDepth)
+        else {
             throw SessionTransportError.invalidFrame("stream queue exceeds protocol window")
         }
-        lock.lock()
-        guard state == .idle else {
-            lock.unlock()
-            throw SocketServerError.alreadyRunning
+        guard configuration.maximumPendingWrites > 0 else {
+            throw SessionTransportError.invalidFrame("write queue capacity")
         }
-        state = .serving
-        lock.unlock()
+        guard configuration.handshakeTimeout.isFinite, configuration.handshakeTimeout > 0,
+              configuration.writeTimeout.isFinite, configuration.writeTimeout > 0
+        else { throw SessionTransportError.invalidFrame("timeout") }
+        let mayStart = lock.withLock {
+            guard case .idle = state else { return false }
+            state = .starting
+            return true
+        }
+        guard mayStart else { throw SocketServerError.alreadyRunning }
+        let owner = ListenerResourcesOwner(path: path)
         do {
-            let listener = try bind()
-            var pipeDescriptors: [Int32] = [-1, -1]
-            guard pipe(&pipeDescriptors) == 0 else {
-                let code = errno
-                close(listener)
-                throw SocketServerError.socketFailed(errno: code)
+            try await withTaskCancellationHandler {
+                try await controlQueue.performIO {
+                    let resources = try self.makeListenerResources()
+                    try owner.install(resources)
+                }
+                await startCommitHook?()
+                try owner.commit { resources in
+                    self.lock.withLock {
+                        guard case .starting = self.state else { return false }
+                        self.listenerDescriptor = resources.listener
+                        self.shutdownReadDescriptor = resources.shutdownRead
+                        self.shutdownWriteDescriptor = resources.shutdownWrite
+                        self.acceptQueue.async { [weak self] in self?.acceptLoop() }
+                        self.state = .serving
+                        return true
+                    }
+                }
+            } onCancel: {
+                owner.cancel()
             }
-            guard fcntl(pipeDescriptors[1], F_SETNOSIGPIPE, 1) == 0 else {
-                let code = errno
-                close(listener)
-                close(pipeDescriptors[0])
-                close(pipeDescriptors[1])
-                throw SocketServerError.socketFailed(errno: code)
-            }
-            let pipeFlags = fcntl(pipeDescriptors[1], F_GETFL)
-            guard pipeFlags >= 0,
-                  fcntl(pipeDescriptors[1], F_SETFL, pipeFlags | O_NONBLOCK) == 0
-            else {
-                let code = errno
-                close(listener)
-                close(pipeDescriptors[0])
-                close(pipeDescriptors[1])
-                throw SocketServerError.socketFailed(errno: code)
-            }
-            lock.lock()
-            listenerDescriptor = listener
-            shutdownReadDescriptor = pipeDescriptors[0]
-            shutdownWriteDescriptor = pipeDescriptors[1]
-            lock.unlock()
+            startLatch.finish()
         } catch {
-            lock.lock()
-            state = .idle
-            lock.unlock()
+            owner.close()
+            lock.withLock { state = .stopped }
+            startLatch.finish()
+            stopLatch.finish()
             throw error
         }
-        acceptQueue.async { [weak self] in self?.acceptLoop() }
     }
 
     /// Stops intake, disconnects sessions, joins their request tasks, and unlinks the path.
-    public func stop() {
-        lock.lock()
-        guard state == .serving else {
-            lock.unlock()
-            return
+    public func stop() async {
+        enum Action {
+            case settle(Int32)
+            case waitForStart
+            case waitForStop
+            case finishIdle
         }
-        state = .stopped
-        let writeDescriptor = shutdownWriteDescriptor
-        lock.unlock()
+        let action = lock.withLock { () -> Action in
+            switch state {
+            case .idle:
+                state = .stopped
+                return .finishIdle
+            case .starting:
+                state = .stopping
+                return .waitForStart
+            case .serving:
+                state = .stopping
+                return .settle(shutdownWriteDescriptor)
+            case .stopping, .stopped:
+                return .waitForStop
+            }
+        }
+        switch action {
+        case .finishIdle:
+            startLatch.finish()
+            stopLatch.finish()
+            return
+        case .waitForStart:
+            await startLatch.wait()
+            await stopLatch.wait()
+            return
+        case .waitForStop:
+            await stopWaitHook?()
+            await stopLatch.wait()
+            return
+        case .settle:
+            break
+        }
+        guard case let .settle(writeDescriptor) = action else { return }
         var byte: UInt8 = 1
         while Darwin.write(writeDescriptor, &byte, 1) < 0 {
             if errno == EINTR {
@@ -245,33 +261,113 @@ public final class SocketServer: @unchecked Sendable {
             // A full nonblocking pipe already has a pending shutdown signal.
             break
         }
-        acceptQueue.sync {}
-        lock.lock()
-        let active = Array(sessions.values)
-        let descriptors = Array(connections)
-        lock.unlock()
+        await withCheckedContinuation { continuation in
+            acceptQueue.async {
+                continuation.resume()
+            }
+        }
+        await stopDrainHook?()
+        let (active, descriptors) = lock.withLock {
+            (Array(sessions.values), Array(connections))
+        }
         for session in active {
             session.close()
         }
         for descriptor in descriptors {
             shutdown(descriptor, SHUT_RDWR)
         }
-        sessionGroup.wait()
-        lock.lock()
-        close(shutdownReadDescriptor)
-        close(shutdownWriteDescriptor)
-        shutdownReadDescriptor = -1
-        shutdownWriteDescriptor = -1
-        lock.unlock()
-        unlink(path)
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global().async { [sessionGroup] in
+                sessionGroup.wait()
+                continuation.resume()
+            }
+        }
+        let resources = lock.withLock {
+            let resources = ListenerResources(
+                listener: listenerDescriptor,
+                shutdownRead: shutdownReadDescriptor,
+                shutdownWrite: shutdownWriteDescriptor
+            )
+            listenerDescriptor = -1
+            shutdownReadDescriptor = -1
+            shutdownWriteDescriptor = -1
+            state = .stopped
+            return resources
+        }
+        await closeResources(resources)
+        await stopFinishHook?()
+        stopLatch.finish()
+    }
+
+    private func makeListenerResources() throws -> ListenerResources {
+        let listener = try bind()
+        var pipeDescriptors: [Int32] = [-1, -1]
+        var complete = false
+        defer {
+            if !complete {
+                unlink(path)
+                Darwin.close(listener)
+                if pipeDescriptors[0] >= 0 {
+                    Darwin.close(pipeDescriptors[0])
+                }
+                if pipeDescriptors[1] >= 0 {
+                    Darwin.close(pipeDescriptors[1])
+                }
+            }
+        }
+        guard pipe(&pipeDescriptors) == 0 else {
+            let code = errno
+            throw SocketServerError.socketFailed(errno: code)
+        }
+        guard fcntl(pipeDescriptors[1], F_SETNOSIGPIPE, 1) == 0 else {
+            let code = errno
+            throw SocketServerError.socketFailed(errno: code)
+        }
+        let pipeFlags = fcntl(pipeDescriptors[1], F_GETFL)
+        guard pipeFlags >= 0,
+              fcntl(pipeDescriptors[1], F_SETFL, pipeFlags | O_NONBLOCK) == 0
+        else {
+            let code = errno
+            throw SocketServerError.socketFailed(errno: code)
+        }
+        complete = true
+        return ListenerResources(
+            listener: listener,
+            shutdownRead: pipeDescriptors[0],
+            shutdownWrite: pipeDescriptors[1]
+        )
+    }
+
+    private func closeResources(_ resources: ListenerResources) async {
+        await withCheckedContinuation { continuation in
+            controlQueue.async { [path] in
+                unlink(path)
+                if resources.listener >= 0 {
+                    Darwin.close(resources.listener)
+                }
+                if resources.shutdownRead >= 0 {
+                    Darwin.close(resources.shutdownRead)
+                }
+                if resources.shutdownWrite >= 0 {
+                    Darwin.close(resources.shutdownWrite)
+                }
+                continuation.resume()
+            }
+        }
     }
 
     private func bind() throws -> Int32 {
         if access(path, F_OK) == 0 {
-            if isSocketLive(at: path) {
+            var status = stat()
+            guard lstat(path, &status) == 0, status.st_mode & S_IFMT == S_IFSOCK else {
                 throw SocketServerError.addressInUse(path: path)
             }
-            unlink(path)
+            switch probeSocket(at: path) {
+            case .live, .uncertain:
+                throw SocketServerError.addressInUse(path: path)
+            case .stale:
+                unlink(path)
+            }
         }
         var address = try Self.makeAddress(path: path)
         let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -279,24 +375,61 @@ public final class SocketServer: @unchecked Sendable {
         let bound = withAddress(&address) { Darwin.bind(descriptor, $0, $1) }
         guard bound == 0 else {
             let code = errno
-            close(descriptor)
+            Darwin.close(descriptor)
             throw SocketServerError.bindFailed(path: path, errno: code)
         }
-        chmod(path, 0o600)
+        guard chmod(path, 0o600) == 0 else {
+            let code = errno
+            unlink(path)
+            Darwin.close(descriptor)
+            throw SocketServerError.chmodFailed(path: path, errno: code)
+        }
         guard listen(descriptor, 64) == 0 else {
             let code = errno
-            close(descriptor)
+            unlink(path)
+            Darwin.close(descriptor)
             throw SocketServerError.listenFailed(errno: code)
         }
         return descriptor
     }
 
-    private func isSocketLive(at path: String) -> Bool {
+    private func probeSocket(at path: String) -> SocketPathProbe {
         let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard descriptor >= 0 else { return false }
-        defer { close(descriptor) }
-        guard var address = try? Self.makeAddress(path: path) else { return false }
-        return withAddress(&address) { connect(descriptor, $0, $1) } == 0
+        guard descriptor >= 0 else { return .uncertain }
+        defer { Darwin.close(descriptor) }
+        guard var address = try? Self.makeAddress(path: path) else { return .uncertain }
+        let flags = fcntl(descriptor, F_GETFL)
+        guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else { return .uncertain }
+        let connected = withAddress(&address) { connect(descriptor, $0, $1) }
+        if connected == 0 {
+            return .live
+        }
+        if errno == ECONNREFUSED || errno == ENOENT {
+            return .stale
+        }
+        guard errno == EINPROGRESS else { return .uncertain }
+        let deadline = DispatchTime.now().uptimeNanoseconds + 250_000_000
+        while true {
+            var writable = pollfd(fd: descriptor, events: Int16(POLLOUT), revents: 0)
+            let timeout = SessionFrameCodec.pollTimeout(deadline: deadline, maximum: 250)
+            let ready = poll(&writable, 1, timeout)
+            if ready < 0, errno == EINTR {
+                continue
+            }
+            guard ready > 0 else { return .uncertain }
+            var socketError: Int32 = 0
+            var length = socklen_t(MemoryLayout<Int32>.size)
+            guard getsockopt(descriptor, SOL_SOCKET, SO_ERROR, &socketError, &length) == 0 else {
+                return .uncertain
+            }
+            if socketError == 0 {
+                return .live
+            }
+            if socketError == ECONNREFUSED || socketError == ENOENT {
+                return .stale
+            }
+            return .uncertain
+        }
     }
 
     private func acceptLoop() {
@@ -327,7 +460,7 @@ public final class SocketServer: @unchecked Sendable {
             lock.lock()
             if connections.count >= configuration.maximumSessions {
                 lock.unlock()
-                close(descriptor)
+                Darwin.close(descriptor)
                 continue
             }
             connections.insert(descriptor)
@@ -338,26 +471,29 @@ public final class SocketServer: @unchecked Sendable {
                 self.sessionGroup.leave()
             }
         }
-        close(listenerDescriptor)
     }
 
     private func serve(_ descriptor: Int32) async {
         defer {
             removeConnection(descriptor)
-            close(descriptor)
+            Darwin.close(descriptor)
         }
         do {
-            try configure(descriptor)
-            try trust.check(descriptor: descriptor)
-            var user = uid_t()
-            var group = gid_t()
-            guard getpeereid(descriptor, &user, &group) == 0 else {
-                throw SessionTransportError.systemCall(operation: "getpeereid", errno: errno)
+            let setupQueue = DispatchQueue(label: "com.yasyf.daemonkit.SocketServer.setup.\(descriptor)")
+            let peer = try await setupQueue.performIO { [trust] in
+                try self.configure(descriptor)
+                try trust.check(descriptor: descriptor)
+                var user = uid_t()
+                var group = gid_t()
+                guard getpeereid(descriptor, &user, &group) == 0 else {
+                    throw SessionTransportError.systemCall(operation: "getpeereid", errno: errno)
+                }
+                return SocketPeer(effectiveUserID: user, effectiveGroupID: group)
             }
             let session = ServerSession(
                 descriptor: descriptor,
                 build: build,
-                peer: SocketPeer(effectiveUserID: user, effectiveGroupID: group),
+                peer: peer,
                 configuration: configuration,
                 handler: handler
             )
@@ -365,7 +501,12 @@ public final class SocketServer: @unchecked Sendable {
             defer {
                 removeSession(descriptor)
             }
-            try await session.run()
+            do {
+                try await session.run()
+            } catch {
+                socketServerLog.debug("session ended: \(String(describing: error), privacy: .public)")
+            }
+            await session.drainIO()
         } catch {
             socketServerLog.debug("session ended: \(String(describing: error), privacy: .public)")
         }
@@ -427,169 +568,7 @@ public final class SocketServer: @unchecked Sendable {
     }
 }
 
-private actor ServerRequestState {
-    let channel: SocketBoundedChannel<SocketRequestChunk>
-    let responseWindow = SocketCreditWindow()
-    private var task: Task<Void, Never>?
-    private var requestSequence = SessionSequence()
-    private var ended = false
-    private var canceled = false
-    private var transportError: Error?
-    private var terminalSent = false
-    private var terminalAcknowledged = false
-    private var terminalAckWaiter: CheckedContinuation<Void, Error>?
-    private var terminalAckTimer: Task<Void, Never>?
-
-    init(capacity: Int) {
-        channel = SocketBoundedChannel(capacity: capacity)
-    }
-
-    func attach(_ task: Task<Void, Never>) {
-        self.task = task
-        if canceled {
-            task.cancel()
-        }
-    }
-
-    func finishInitialInput() async {
-        guard !ended else { return }
-        ended = true
-        await channel.finish()
-    }
-
-    func receive(_ frame: SessionFrame) async {
-        guard !canceled else { return }
-        guard !ended else {
-            let error = SessionTransportError.invalidFrame("request stream already ended")
-            transportError = error
-            canceled = true
-            task?.cancel()
-            await channel.finish(throwing: error)
-            await responseWindow.close()
-            return
-        }
-        let expected: UInt32
-        do {
-            expected = try requestSequence.take()
-        } catch {
-            transportError = error
-            canceled = true
-            task?.cancel()
-            await channel.finish(throwing: error)
-            await responseWindow.close()
-            return
-        }
-        guard frame.sequence == expected else {
-            let error = SessionTransportError.streamSequence(
-                id: frame.id,
-                got: frame.sequence,
-                want: expected
-            )
-            transportError = error
-            canceled = true
-            ended = true
-            task?.cancel()
-            await channel.finish(throwing: error)
-            return
-        }
-        let end = frame.flags.contains(.end)
-        if end {
-            ended = true
-        }
-        let accepted = await channel.offer(SocketRequestChunk(
-            sequence: frame.sequence,
-            payload: frame.payload,
-            end: end
-        ))
-        if !accepted {
-            let error = SessionTransportError.invalidFrame("request stream exceeded granted window")
-            transportError = error
-            canceled = true
-            task?.cancel()
-            await channel.finish(throwing: error)
-            await responseWindow.close()
-            return
-        }
-        if end, accepted {
-            await channel.finish()
-        }
-    }
-
-    func cancel() async {
-        guard !canceled else { return }
-        canceled = true
-        ended = true
-        task?.cancel()
-        await channel.discard()
-        await responseWindow.close()
-    }
-
-    private func close() async {
-        await cancel()
-        let waiter = terminalAckWaiter
-        terminalAckWaiter = nil
-        terminalAckTimer?.cancel()
-        terminalAckTimer = nil
-        waiter?.resume(throwing: SessionTransportError.disconnected)
-    }
-
-    func error() -> Error? {
-        transportError
-    }
-
-    func grantResponseCredits(_ count: UInt32) async {
-        await responseWindow.grant(count)
-    }
-
-    func acknowledgeTerminal() -> Bool {
-        guard terminalSent, !terminalAcknowledged else { return false }
-        terminalAcknowledged = true
-        let waiter = terminalAckWaiter
-        terminalAckWaiter = nil
-        terminalAckTimer?.cancel()
-        terminalAckTimer = nil
-        waiter?.resume()
-        return true
-    }
-
-    func writeTerminal(_ write: @Sendable () throws -> Void) throws {
-        terminalSent = true
-        try write()
-    }
-
-    func waitForTerminalAcknowledgement(timeout: TimeInterval) async throws {
-        if terminalAcknowledged {
-            return
-        }
-        try await withCheckedThrowingContinuation { continuation in
-            terminalAckWaiter = continuation
-            terminalAckTimer = Task {
-                let nanoseconds = UInt64(max(0, timeout) * 1_000_000_000)
-                do {
-                    try await Task.sleep(nanoseconds: nanoseconds)
-                } catch {
-                    return
-                }
-                self.expireTerminalAcknowledgement()
-            }
-        }
-    }
-
-    private func expireTerminalAcknowledgement() {
-        guard !terminalAcknowledged else { return }
-        let waiter = terminalAckWaiter
-        terminalAckWaiter = nil
-        terminalAckTimer = nil
-        waiter?.resume(throwing: SessionTransportError.disconnected)
-    }
-
-    func settle() async {
-        await close()
-        await task?.value
-    }
-}
-
-private final class ServerSession: @unchecked Sendable {
+final class ServerSession: @unchecked Sendable {
     let descriptor: Int32
     private let serverBuild: String
     private let peer: SocketPeer
@@ -597,6 +576,7 @@ private final class ServerSession: @unchecked Sendable {
     private let handler: @Sendable (SocketRequest) async -> SocketResponse
     private let codec: SessionFrameCodec
     private let readQueue: DispatchQueue
+    private let writer: SessionWriter
     private let eventWindow = SocketCreditWindow()
     private let lifecycle = SocketSessionLifecycle()
     private let generation: Data
@@ -624,6 +604,11 @@ private final class ServerSession: @unchecked Sendable {
             descriptor: descriptor,
             maximumFrameBytes: configuration.maximumFrameBytes,
             writeTimeout: configuration.writeTimeout
+        )
+        writer = SessionWriter(
+            codec: codec,
+            maximumPendingWrites: configuration.maximumPendingWrites,
+            label: "com.yasyf.daemonkit.SocketServer.write.\(descriptor)"
         )
         readQueue = DispatchQueue(label: "com.yasyf.daemonkit.SocketServer.read.\(descriptor)")
     }
@@ -665,19 +650,25 @@ private final class ServerSession: @unchecked Sendable {
         }
     }
 
-    func write(_ frame: SessionFrame) throws {
-        lock.lock()
-        let isClosed = closed
-        lock.unlock()
+    func write(_ frame: SessionFrame) async throws {
+        let isClosed = lock.withLock { closed }
         if isClosed {
             throw SessionTransportError.disconnected
         }
-        try codec.write(frame)
+        try await writer.write(frame)
+    }
+
+    func writeSettlement(_ frame: SessionFrame) async throws {
+        let isClosed = lock.withLock { closed }
+        if isClosed {
+            throw SessionTransportError.disconnected
+        }
+        try await writer.writeSettlement(frame)
     }
 
     func pushEvent(topic: String, payload: Data) async throws {
         guard await eventWindow.acquire() else { throw CancellationError() }
-        try write(SessionFrame(kind: .event, flags: .end, operation: topic, payload: payload))
+        try await write(SessionFrame(kind: .event, flags: .end, operation: topic, payload: payload))
     }
 
     func close() {
@@ -689,8 +680,21 @@ private final class ServerSession: @unchecked Sendable {
         closed = true
         lock.unlock()
         lifecycle.close()
+        writer.abort()
         Task { await eventWindow.close() }
         shutdown(descriptor, SHUT_RDWR)
+    }
+
+    func drainIO() async {
+        writer.abort()
+        shutdown(descriptor, SHUT_RDWR)
+        await withCheckedContinuation { continuation in
+            writer.afterDrained { [readQueue] in
+                readQueue.async {
+                    continuation.resume()
+                }
+            }
+        }
     }
 
     private func handshake() async throws -> String {
@@ -715,15 +719,13 @@ private final class ServerSession: @unchecked Sendable {
             build: serverBuild,
             session: generation
         ))
-        try codec.write(SessionFrame(kind: .helloAck, flags: .end, payload: payload))
+        try await write(SessionFrame(kind: .helloAck, flags: .end, payload: payload))
         return identity.build
     }
 
     private func read(timeout: TimeInterval = 0) async throws -> SessionFrame {
-        try await withCheckedThrowingContinuation { continuation in
-            readQueue.async { [codec] in
-                continuation.resume(with: Result { try codec.read(timeout: timeout) })
-            }
+        try await readQueue.performIO {
+            try self.codec.read(timeout: timeout)
         }
     }
 
@@ -739,7 +741,7 @@ private final class ServerSession: @unchecked Sendable {
         let admission = try admit(frame, clientBuild: clientBuild)
         guard case let .accepted(state) = admission else {
             guard case let .rejected(reason) = admission else { return }
-            try sendRejected(id: frame.id, reason: reason)
+            try await sendRejected(id: frame.id, reason: reason)
             return
         }
         if frame.flags.contains(.end) {
@@ -750,9 +752,9 @@ private final class ServerSession: @unchecked Sendable {
             Task { await state.cancel() }
         } consumptionOperation: { [weak self] _ in
             guard let self else { throw SessionTransportError.disconnected }
-            try write(SessionFrame(kind: .window, id: frame.id, sequence: 1))
+            try await write(SessionFrame(kind: .window, id: frame.id, sequence: 1))
         }
-        try write(SessionFrame(
+        try await write(SessionFrame(
             kind: .window,
             id: frame.id,
             sequence: UInt32(configuration.streamQueueDepth)
@@ -783,20 +785,24 @@ private final class ServerSession: @unchecked Sendable {
             } catch {
                 socketServerLog.debug("response failed: \(String(describing: error), privacy: .public)")
             }
+            await state.finish()
             remove(frame.id)
         }
         await state.attach(task)
         if frame.deadlineUnixMilliseconds > 0 {
-            let interval = max(0, frame.deadlineUnixMilliseconds - Int64(Date().timeIntervalSince1970 * 1000))
-            Task {
+            let interval = SessionTime.remainingMilliseconds(until: frame.deadlineUnixMilliseconds)
+            let timer = Task {
                 try? await Task.sleep(for: .milliseconds(interval))
                 if !Task.isCancelled {
                     task.cancel()
                 }
             }
+            await state.attachDeadline(timer)
         }
     }
+}
 
+private extension ServerSession {
     private func admit(_ frame: SessionFrame, clientBuild: String) throws -> Admission {
         lock.lock()
         defer { lock.unlock() }
@@ -871,7 +877,7 @@ private final class ServerSession: @unchecked Sendable {
                     guard await state.responseWindow.acquire() else { throw CancellationError() }
                     guard let payload = try await stream.nextChunk() else { break }
                     let current = try sequence.take()
-                    try write(SessionFrame(kind: .stream, id: id, sequence: current, payload: payload))
+                    try await write(SessionFrame(kind: .stream, id: id, sequence: current, payload: payload))
                 }
                 let terminal = try await settlement.value().get()
                 try Task.checkCancellation()
@@ -899,12 +905,12 @@ private final class ServerSession: @unchecked Sendable {
     private func sendTerminal(_ terminal: SocketTerminal, id: UInt64, state: ServerRequestState) async throws {
         let envelope = try responseEnvelope(terminal, acknowledge: true)
         try await state.writeTerminal { [self] in
-            try write(SessionFrame(kind: .response, flags: .end, id: id, payload: envelope))
+            try await writeSettlement(SessionFrame(kind: .response, flags: .end, id: id, payload: envelope))
         }
     }
 
-    private func sendError(id: UInt64, _ error: Error) throws {
-        try write(SessionFrame(
+    private func sendError(id: UInt64, _ error: Error) async throws {
+        try await write(SessionFrame(
             kind: .response,
             flags: .end,
             id: id,
@@ -912,8 +918,8 @@ private final class ServerSession: @unchecked Sendable {
         ))
     }
 
-    private func sendRejected(id: UInt64, reason: String) throws {
-        try write(SessionFrame(
+    private func sendRejected(id: UInt64, reason: String) async throws {
+        try await write(SessionFrame(
             kind: .response,
             flags: .end,
             id: id,

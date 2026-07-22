@@ -52,7 +52,7 @@ private actor CancelableChunks {
         throw CancellationError()
     }
 
-    func cancel() {
+    func cancel() async {
         guard !canceled else { return }
         canceled = true
         let waiters = cancellationWaiters
@@ -86,168 +86,176 @@ extension SocketTransportTests {
     @Suite(.timeLimit(.minutes(1)))
     struct SocketRelayTests {
         @Test func multiMegabyteRelayUsesBoundedPullsAndPreservesTerminal() async throws {
-            let directory = try relaySocketDirectory()
-            defer { try? FileManager.default.removeItem(at: directory) }
-            let upstreamPath = directory.appendingPathComponent("up.sock").path
-            let relayPath = directory.appendingPathComponent("relay.sock").path
-            let chunkCount = 128
-            let chunkSize = 64 * 1024
-            let chunks = CountedChunks(count: chunkCount, size: chunkSize)
-            let expectedTerminal = SocketTerminal(
-                payload: Data(#"{"etag":"catalog-v1"}"#.utf8),
-                error: "upstream detail",
-                rejected: true,
-                reason: "terminal metadata"
-            )
-            let upstream = SocketServer(path: upstreamPath, build: "relay-test", trust: .sameEffectiveUser) { _ in
-                .stream(SocketResponseStream(
-                    nextChunk: { await chunks.next() },
-                    terminal: { expectedTerminal },
-                    cancel: {}
-                ))
-            }
-            try upstream.start()
-            defer { upstream.stop() }
-            let upstreamClient = try SocketClient(
-                path: upstreamPath,
-                build: "relay-test",
-                configuration: .init(streamQueueDepth: 2),
-                trust: .sameEffectiveUser
-            )
-            defer { upstreamClient.close() }
-            let relay = try makeRelay(path: relayPath, upstream: upstreamClient)
-            defer { relay.stop() }
-            let client = try SocketClient(
-                path: relayPath,
-                build: "relay-test",
-                configuration: .init(streamQueueDepth: 2),
-                trust: .sameEffectiveUser
-            )
-            defer { client.close() }
+            try await withAsyncCleanup { cleanup in
+                let directory = try relaySocketDirectory()
+                cleanup.add { try? FileManager.default.removeItem(at: directory) }
+                let upstreamPath = directory.appendingPathComponent("up.sock").path
+                let relayPath = directory.appendingPathComponent("relay.sock").path
+                let chunkCount = 128
+                let chunkSize = 64 * 1024
+                let chunks = CountedChunks(count: chunkCount, size: chunkSize)
+                let expectedTerminal = SocketTerminal(
+                    payload: Data(#"{"etag":"catalog-v1"}"#.utf8),
+                    error: "upstream detail",
+                    rejected: true,
+                    reason: "terminal metadata"
+                )
+                let upstream = SocketServer(path: upstreamPath, build: "relay-test", trust: .sameEffectiveUser) { _ in
+                    .stream(SocketResponseStream(
+                        nextChunk: { await chunks.next() },
+                        terminal: { expectedTerminal },
+                        cancel: {}
+                    ))
+                }
+                try await upstream.start()
+                cleanup.add { await upstream.stop() }
+                let upstreamClient = try await SocketClient(
+                    path: upstreamPath,
+                    build: "relay-test",
+                    configuration: .init(streamQueueDepth: 2),
+                    trust: .sameEffectiveUser
+                )
+                cleanup.add { await upstreamClient.close() }
+                let relay = try await makeRelay(path: relayPath, upstream: upstreamClient)
+                cleanup.add { await relay.stop() }
+                let client = try await SocketClient(
+                    path: relayPath,
+                    build: "relay-test",
+                    configuration: .init(streamQueueDepth: 2),
+                    trust: .sameEffectiveUser
+                )
+                cleanup.add { await client.close() }
 
-            let call = try client.open(operation: "catalog.open_at", tenant: "acct-18")
-            let received = try await consume(call, chunkSize: chunkSize)
-            let terminal = try await call.response()
-            let snapshot = await chunks.snapshot()
-            #expect(received.chunks == chunkCount)
-            #expect(received.bytes == chunkCount * chunkSize)
-            #expect(await call.chunks.maximumBufferedChunkCount() <= 2)
-            #expect(snapshot.produced == chunkCount)
-            #expect(snapshot.maximumActivePulls == 1)
-            #expect(terminal.payload == expectedTerminal.payload)
-            #expect(terminal.error == expectedTerminal.error)
-            #expect(terminal.rejected == expectedTerminal.rejected)
-            #expect(terminal.reason == expectedTerminal.reason)
+                let call = try await client.open(operation: "catalog.open_at", tenant: "acct-18")
+                let received = try await consume(call, chunkSize: chunkSize)
+                let terminal = try await call.response()
+                let snapshot = await chunks.snapshot()
+                #expect(received.chunks == chunkCount)
+                #expect(received.bytes == chunkCount * chunkSize)
+                #expect(await call.chunks.maximumBufferedChunkCount() <= 2)
+                #expect(snapshot.produced == chunkCount)
+                #expect(snapshot.maximumActivePulls == 1)
+                #expect(terminal.payload == expectedTerminal.payload)
+                #expect(terminal.error == expectedTerminal.error)
+                #expect(terminal.rejected == expectedTerminal.rejected)
+                #expect(terminal.reason == expectedTerminal.reason)
+            }
         }
 
         @Test func canceledRelayCancelsUpstreamAndAwaitsSettlement() async throws {
-            let directory = try relaySocketDirectory()
-            defer { try? FileManager.default.removeItem(at: directory) }
-            let upstreamPath = directory.appendingPathComponent("up.sock").path
-            let relayPath = directory.appendingPathComponent("relay.sock").path
-            let chunks = CancelableChunks()
-            let upstream = SocketServer(path: upstreamPath, build: "relay-test", trust: .sameEffectiveUser) { _ in
-                .stream(SocketResponseStream(
-                    nextChunk: { try await chunks.next() },
-                    terminal: { await chunks.terminal() },
-                    cancel: { Task { await chunks.cancel() } }
-                ))
-            }
-            try upstream.start()
-            defer { upstream.stop() }
-            let upstreamClient = try SocketClient(path: upstreamPath, build: "relay-test", trust: .sameEffectiveUser)
-            defer { upstreamClient.close() }
-            let relay = try makeRelay(path: relayPath, upstream: upstreamClient)
-            defer { relay.stop() }
-            let client = try SocketClient(path: relayPath, build: "relay-test", trust: .sameEffectiveUser)
-            defer { client.close() }
+            try await withAsyncCleanup { cleanup in
+                let directory = try relaySocketDirectory()
+                cleanup.add { try? FileManager.default.removeItem(at: directory) }
+                let upstreamPath = directory.appendingPathComponent("up.sock").path
+                let relayPath = directory.appendingPathComponent("relay.sock").path
+                let chunks = CancelableChunks()
+                let upstream = SocketServer(path: upstreamPath, build: "relay-test", trust: .sameEffectiveUser) { _ in
+                    .stream(SocketResponseStream(
+                        nextChunk: { try await chunks.next() },
+                        terminal: { await chunks.terminal() },
+                        cancel: { Task { await chunks.cancel() } }
+                    ))
+                }
+                try await upstream.start()
+                cleanup.add { await upstream.stop() }
+                let upstreamClient = try await SocketClient(path: upstreamPath, build: "relay-test", trust: .sameEffectiveUser)
+                cleanup.add { await upstreamClient.close() }
+                let relay = try await makeRelay(path: relayPath, upstream: upstreamClient)
+                cleanup.add { await relay.stop() }
+                let client = try await SocketClient(path: relayPath, build: "relay-test", trust: .sameEffectiveUser)
+                cleanup.add { await client.close() }
 
-            let call = try client.open(operation: "catalog.open_at")
-            var iterator = call.chunks.makeAsyncIterator()
-            let first = try await iterator.next()
-            #expect(first?.payload == Data("first".utf8))
-            let waiting = Task {
+                let call = try await client.open(operation: "catalog.open_at")
                 var iterator = call.chunks.makeAsyncIterator()
-                return try await iterator.next()
+                let first = try await iterator.next()
+                #expect(first?.payload == Data("first".utf8))
+                let waiting = Task {
+                    var iterator = call.chunks.makeAsyncIterator()
+                    return try await iterator.next()
+                }
+                await Task.yield()
+                waiting.cancel()
+                await #expect(throws: CancellationError.self) {
+                    try await waiting.value
+                }
+                let terminal = try await call.response()
+                #expect(terminal.error == "wire: request canceled")
+                #expect(await chunks.settled())
             }
-            await Task.yield()
-            waiting.cancel()
-            await #expect(throws: CancellationError.self) {
-                try await waiting.value
-            }
-            let terminal = try await call.response()
-            #expect(terminal.error == "wire: request canceled")
-            #expect(await chunks.settled())
         }
 
         @Test func unreadStreamDoesNotBlockUnrelatedResponse() async throws {
-            let directory = try relaySocketDirectory()
-            defer { try? FileManager.default.removeItem(at: directory) }
-            let path = directory.appendingPathComponent("server.sock").path
-            let unread = CountedChunks(count: 128, size: 64 * 1024)
-            let server = SocketServer(path: path, build: "relay-test", trust: .sameEffectiveUser) { request in
-                if request.operation == "unread" {
-                    return .stream(SocketResponseStream(
-                        nextChunk: { await unread.next() },
+            try await withAsyncCleanup { cleanup in
+                let directory = try relaySocketDirectory()
+                cleanup.add { try? FileManager.default.removeItem(at: directory) }
+                let path = directory.appendingPathComponent("server.sock").path
+                let unread = CountedChunks(count: 128, size: 64 * 1024)
+                let server = SocketServer(path: path, build: "relay-test", trust: .sameEffectiveUser) { request in
+                    if request.operation == "unread" {
+                        return .stream(SocketResponseStream(
+                            nextChunk: { await unread.next() },
+                            terminal: { SocketTerminal(payload: Data("true".utf8)) },
+                            cancel: {}
+                        ))
+                    }
+                    return .terminal(SocketTerminal(payload: request.payload))
+                }
+                try await server.start()
+                cleanup.add { await server.stop() }
+                let client = try await SocketClient(
+                    path: path,
+                    build: "relay-test",
+                    configuration: .init(streamQueueDepth: 1),
+                    trust: .sameEffectiveUser
+                )
+                cleanup.add { await client.close() }
+
+                let blocked = try await client.open(operation: "unread")
+                try await Task.sleep(for: .milliseconds(20))
+                let echo = try await client.call(operation: "echo", payload: Data(#"{"ok":true}"#.utf8))
+                #expect(echo.payload == Data(#"{"ok":true}"#.utf8))
+                await blocked.cancel()
+                let terminal = try await blocked.response()
+                #expect(terminal.error == "wire: request canceled")
+            }
+        }
+
+        @Test func emptyStreamSettlesWithSingleCredit() async throws {
+            try await withAsyncCleanup { cleanup in
+                let directory = try relaySocketDirectory()
+                cleanup.add { try? FileManager.default.removeItem(at: directory) }
+                let path = directory.appendingPathComponent("server.sock").path
+                let server = SocketServer(path: path, build: "relay-test", trust: .sameEffectiveUser) { _ in
+                    .stream(SocketResponseStream(
+                        nextChunk: { nil },
                         terminal: { SocketTerminal(payload: Data("true".utf8)) },
                         cancel: {}
                     ))
                 }
-                return .terminal(SocketTerminal(payload: request.payload))
+                try await server.start()
+                cleanup.add { await server.stop() }
+                let client = try await SocketClient(
+                    path: path,
+                    build: "relay-test",
+                    configuration: .init(streamQueueDepth: 1),
+                    trust: .sameEffectiveUser
+                )
+                cleanup.add { await client.close() }
+                let call = try await client.open(operation: "empty")
+                var chunks = 0
+                for try await _ in call.chunks {
+                    chunks += 1
+                }
+                let terminal = try await call.response()
+                #expect(chunks == 0)
+                #expect(terminal.payload == Data("true".utf8))
             }
-            try server.start()
-            defer { server.stop() }
-            let client = try SocketClient(
-                path: path,
-                build: "relay-test",
-                configuration: .init(streamQueueDepth: 1),
-                trust: .sameEffectiveUser
-            )
-            defer { client.close() }
-
-            let blocked = try client.open(operation: "unread")
-            try await Task.sleep(for: .milliseconds(20))
-            let echo = try await client.call(operation: "echo", payload: Data(#"{"ok":true}"#.utf8))
-            #expect(echo.payload == Data(#"{"ok":true}"#.utf8))
-            blocked.cancel()
-            let terminal = try await blocked.response()
-            #expect(terminal.error == "wire: request canceled")
         }
 
-        @Test func emptyStreamSettlesWithSingleCredit() async throws {
-            let directory = try relaySocketDirectory()
-            defer { try? FileManager.default.removeItem(at: directory) }
-            let path = directory.appendingPathComponent("server.sock").path
-            let server = SocketServer(path: path, build: "relay-test", trust: .sameEffectiveUser) { _ in
-                .stream(SocketResponseStream(
-                    nextChunk: { nil },
-                    terminal: { SocketTerminal(payload: Data("true".utf8)) },
-                    cancel: {}
-                ))
-            }
-            try server.start()
-            defer { server.stop() }
-            let client = try SocketClient(
-                path: path,
-                build: "relay-test",
-                configuration: .init(streamQueueDepth: 1),
-                trust: .sameEffectiveUser
-            )
-            defer { client.close() }
-            let call = try client.open(operation: "empty")
-            var chunks = 0
-            for try await _ in call.chunks {
-                chunks += 1
-            }
-            let terminal = try await call.response()
-            #expect(chunks == 0)
-            #expect(terminal.payload == Data("true".utf8))
-        }
-
-        private func makeRelay(path: String, upstream: SocketClient) throws -> SocketServer {
+        private func makeRelay(path: String, upstream: SocketClient) async throws -> SocketServer {
             let relay = SocketServer(path: path, build: "relay-test", trust: .sameEffectiveUser) { request in
                 do {
-                    return try .relaying(upstream.open(
+                    return try await .relaying(upstream.open(
                         operation: request.operation,
                         tenant: request.tenant,
                         payload: request.payload
@@ -256,7 +264,7 @@ extension SocketTransportTests {
                     return .terminal(SocketTerminal(error: String(describing: error)))
                 }
             }
-            try relay.start()
+            try await relay.start()
             return relay
         }
 
