@@ -30,6 +30,15 @@ const plistTemplateText = `<?xml version="1.0" encoding="UTF-8"?>
 {{.Restart}}
 {{if .StartInterval}}    <key>StartInterval</key>
     <integer>{{.StartInterval}}</integer>
+{{end}}{{if .WatchPaths}}    <key>WatchPaths</key>
+    <array>
+{{range .WatchPaths}}        <string>{{.}}</string>
+{{end}}    </array>
+{{end}}{{if .StartCalendarInterval}}    <key>StartCalendarInterval</key>
+    <array>
+{{range .StartCalendarInterval}}        <dict>
+{{.}}        </dict>
+{{end}}    </array>
 {{end}}
     <key>ThrottleInterval</key>
     <integer>10</integer>
@@ -75,6 +84,8 @@ type plistData struct {
 	Env                         []plistKV
 	Restart                     string
 	StartInterval               int64
+	WatchPaths                  []string
+	StartCalendarInterval       []string
 	ProcessType                 string
 	LimitLoadToSessionType      string
 	AssociatedBundleIdentifiers []string
@@ -105,6 +116,12 @@ type Agent struct {
 	// StartInterval schedules the job at a whole-second interval. Zero omits
 	// the launchd key.
 	StartInterval time.Duration
+	// WatchPaths starts the job whenever any listed path is modified. Entries
+	// must be exact absolute paths. Empty omits the launchd key.
+	WatchPaths []string
+	// StartCalendarInterval schedules the job at each calendar match (launchd
+	// treats the set as a logical OR). Empty omits the launchd key.
+	StartCalendarInterval []CalendarInterval
 	// ProcessType declares launchd's resource policy. The zero value omits the
 	// launchd key.
 	ProcessType ProcessType
@@ -154,6 +171,14 @@ func (a Agent) Plist() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	watchPaths, err := canonicalWatchPaths(a.WatchPaths)
+	if err != nil {
+		return nil, err
+	}
+	calendar, err := renderCalendarIntervals(a.StartCalendarInterval)
+	if err != nil {
+		return nil, err
+	}
 	bin, err := a.programPath()
 	if err != nil {
 		return nil, err
@@ -178,6 +203,8 @@ func (a Agent) Plist() ([]byte, error) {
 		Env:                         env,
 		Restart:                     restart,
 		StartInterval:               startInterval,
+		WatchPaths:                  watchPaths,
+		StartCalendarInterval:       calendar,
 		ProcessType:                 processType,
 		LimitLoadToSessionType:      sessionType,
 		AssociatedBundleIdentifiers: associated,
