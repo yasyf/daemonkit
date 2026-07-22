@@ -24,7 +24,7 @@ func TestManagedSessionTracksBeforeReadinessAndRoundTrips(t *testing.T) {
 		RecoveryClass: proc.RecoveryTask,
 		Path:          "/bin/sh",
 		Args:          []string{"-c", `while IFS= read -r line; do printf 'reply:%s\n' "$line"; done`},
-		Ready: func(ctx context.Context, record proc.Record, conn net.Conn) error {
+		Ready: func(_ context.Context, record proc.Record, conn net.Conn) error {
 			if registry.recordCount() != 1 {
 				return errors.New("readiness ran before durable tracking")
 			}
@@ -146,9 +146,6 @@ func TestManagedSessionExitClosesConnection(t *testing.T) {
 	}
 	if err := session.Wait(context.Background()); err != nil {
 		t.Fatalf("Wait: %v", err)
-	}
-	if err := session.Conn().SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-		t.Fatalf("SetReadDeadline: %v", err)
 	}
 	buffer := make([]byte, 1)
 	if _, err := session.Conn().Read(buffer); err == nil {

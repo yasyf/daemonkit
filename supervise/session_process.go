@@ -90,8 +90,14 @@ func (s *SessionProcess) Conn() net.Conn { return s.conn }
 // Record returns the child's immutable process identity.
 func (s *SessionProcess) Record() proc.Record { return s.process.Record() }
 
-// Wait waits for the child to exit or ctx to expire.
-func (s *SessionProcess) Wait(ctx context.Context) error { return s.process.Wait(ctx) }
+// Wait waits for the child to exit and closes its session before returning, or
+// returns when ctx expires while the background exit close remains armed.
+func (s *SessionProcess) Wait(ctx context.Context) error {
+	if err := s.process.Wait(ctx); err != nil {
+		return err
+	}
+	return s.conn.Close()
+}
 
 // Stop closes the session, terminates the process group, reaps it, and removes
 // its durable identity before returning.
