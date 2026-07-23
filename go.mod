@@ -2,6 +2,8 @@ module github.com/yasyf/daemonkit
 
 go 1.26.3
 
+toolchain go1.26.4
+
 require github.com/ebitengine/purego v0.10.1
 
 require (
