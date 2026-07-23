@@ -213,6 +213,17 @@ func publicReplacementCommit(commit *replacementCommit) *ReplacementCommit {
 	}
 }
 
+func replacementCommitMatches(
+	commit *replacementCommit,
+	operationID string,
+	binding ReplacementBinding,
+	prior Plan,
+	next Plan,
+) bool {
+	return commit != nil && commit.OperationID == operationID && commit.Binding == binding &&
+		plansEqual(commit.Prior, prior) && plansEqual(commit.Next, next)
+}
+
 func copyReplacement(replacement *replacementState) *replacementState {
 	if replacement == nil {
 		return nil
@@ -322,6 +333,21 @@ func (c *Controller) ReplacementCompletion(ctx context.Context) (*ReplacementCom
 	return publicReplacementCommit(c.state.ReplacementCommit), nil
 }
 
+// ReplacementAcknowledgement returns the latest exact acknowledged replacement.
+func (c *Controller) ReplacementAcknowledgement(ctx context.Context) (*ReplacementCommit, error) {
+	c.opMu.Lock()
+	defer c.opMu.Unlock()
+	opCtx, finish, err := c.admit(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
+	if err := opCtx.Err(); err != nil {
+		return nil, err
+	}
+	return publicReplacementCommit(c.state.ReplacementAck), nil
+}
+
 // Quiesce durably fences the expected plan, suppresses RestartAlways, and unloads it.
 func (c *Controller) Quiesce(
 	ctx context.Context,
@@ -348,6 +374,9 @@ func (c *Controller) Quiesce(
 	if c.state.ReplacementCommit != nil {
 		return QuiesceReceipt{}, ErrReplacementCommitPending
 	}
+	if acknowledged := c.state.ReplacementAck; acknowledged != nil && acknowledged.OperationID == operationID {
+		return QuiesceReceipt{}, ErrReplacementMismatch
+	}
 	if existing := c.state.Replacement; existing != nil {
 		if existing.OperationID != operationID || existing.Binding != binding || !plansEqual(existing.Prior, expected) ||
 			(existing.Phase != ReplacementUnloaded && existing.Phase != ReplacementQuiesced) {
@@ -372,7 +401,7 @@ func (c *Controller) Quiesce(
 		OperationID: operationID, Phase: ReplacementUnloaded, Epoch: 1,
 		Binding: binding, Prior: expected, Current: expected,
 	}
-	if err := c.transitionReplacement(opCtx, map[string]Agent{}, replacement, nil); err != nil {
+	if err := c.transitionReplacement(opCtx, map[string]Agent{}, replacement, nil, c.state.ReplacementAck); err != nil {
 		return QuiesceReceipt{}, err
 	}
 	if err := c.reconcile(opCtx, copyAgents(c.state.Applied), c.state.Desired); err != nil {
@@ -462,7 +491,7 @@ func (c *Controller) ProveQuiesced(ctx context.Context, receipt QuiesceReceipt, 
 	} else {
 		updated.Proofs = append(updated.Proofs, proof)
 	}
-	return c.transitionReplacement(opCtx, map[string]Agent{}, updated, nil)
+	return c.transitionReplacement(opCtx, map[string]Agent{}, updated, nil, c.state.ReplacementAck)
 }
 
 // ApplyReplacement starts next while retaining deployment ownership of the fence.
@@ -534,7 +563,7 @@ func (c *Controller) resumeReplacementLocked(ctx context.Context, replacement *r
 	updated := copyReplacement(replacement)
 	updated.Current = next
 	updated.Phase = ReplacementRunningOwned
-	if err := c.transitionReplacement(ctx, next.agents, updated, nil); err != nil {
+	if err := c.transitionReplacement(ctx, next.agents, updated, nil, c.state.ReplacementAck); err != nil {
 		return err
 	}
 	return c.reconcile(ctx, copyAgents(c.state.Applied), c.state.Desired)
@@ -567,7 +596,7 @@ func (c *Controller) Requiesce(
 		updated := copyReplacement(replacement)
 		updated.Phase = ReplacementUnloaded
 		updated.Epoch++
-		if err := c.transitionReplacement(opCtx, map[string]Agent{}, updated, nil); err != nil {
+		if err := c.transitionReplacement(opCtx, map[string]Agent{}, updated, nil, c.state.ReplacementAck); err != nil {
 			return QuiesceReceipt{}, err
 		}
 	} else if replacement.Phase != ReplacementUnloaded {
@@ -630,7 +659,7 @@ func (c *Controller) CommitReplacement(
 		OperationID: operationID, Binding: binding,
 		Prior: copyPlan(replacement.Prior), Next: copyPlan(expected),
 	}
-	if err := c.transitionReplacement(opCtx, expected.agents, nil, completion); err != nil {
+	if err := c.transitionReplacement(opCtx, expected.agents, nil, completion, c.state.ReplacementAck); err != nil {
 		return ReplacementCommit{}, err
 	}
 	return *publicReplacementCommit(c.state.ReplacementCommit), nil
@@ -663,9 +692,11 @@ func (c *Controller) AcknowledgeReplacementCommit(
 		return err
 	}
 	defer finish()
+	if replacementCommitMatches(c.state.ReplacementAck, operationID, binding, prior, next) {
+		return nil
+	}
 	commit := c.state.ReplacementCommit
-	if c.state.Replacement != nil || commit == nil || commit.OperationID != operationID ||
-		commit.Binding != binding || !plansEqual(commit.Prior, prior) || !plansEqual(commit.Next, next) {
+	if c.state.Replacement != nil || !replacementCommitMatches(commit, operationID, binding, prior, next) {
 		return ErrReplacementMismatch
 	}
 	if !reflect.DeepEqual(c.state.Desired, next.agents) || !reflect.DeepEqual(c.state.Applied, next.agents) {
@@ -674,7 +705,7 @@ func (c *Controller) AcknowledgeReplacementCommit(
 	if err := c.requireExactPlanLoaded(opCtx, next); err != nil {
 		return fmt.Errorf("%w: acknowledged plan is not exact and loaded: %w", ErrReplacementMismatch, err)
 	}
-	return c.transitionReplacement(opCtx, next.agents, nil, nil)
+	return c.transitionReplacement(opCtx, next.agents, nil, nil, copyReplacementCommit(commit))
 }
 
 func (c *Controller) transitionReplacement(
@@ -682,8 +713,9 @@ func (c *Controller) transitionReplacement(
 	desired map[string]Agent,
 	replacement *replacementState,
 	commit *replacementCommit,
+	acknowledged *replacementCommit,
 ) error {
-	state, err := c.store.SetReplacement(ctx, desired, replacement, commit)
+	state, err := c.store.SetReplacement(ctx, desired, replacement, commit, acknowledged)
 	if err != nil {
 		return err
 	}
@@ -733,9 +765,6 @@ func exactProgramPaths(paths []string) ([]string, error) {
 	canonical := append([]string(nil), paths...)
 	slices.Sort(canonical)
 	canonical = slices.Compact(canonical)
-	if len(canonical) != len(paths) {
-		return nil, errors.New("service: replacement program paths contain duplicates")
-	}
 	for _, path := range canonical {
 		if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 			return nil, fmt.Errorf("service: replacement program path %q is not exact and absolute", path)

@@ -85,6 +85,7 @@ func (s *controllerStoreStub) Load(context.Context) (controllerState, error) {
 		Desired: copyAgents(s.state.Desired), Applied: copyAgents(s.state.Applied),
 		Replacement:       copyReplacement(s.state.Replacement),
 		ReplacementCommit: copyReplacementCommit(s.state.ReplacementCommit),
+		ReplacementAck:    copyReplacementCommit(s.state.ReplacementAck),
 	}, nil
 }
 
@@ -98,6 +99,7 @@ func (s *controllerStoreStub) ReplaceDesired(
 		Applied:           copyAgents(s.state.Applied),
 		Replacement:       copyReplacement(s.state.Replacement),
 		ReplacementCommit: copyReplacementCommit(s.state.ReplacementCommit),
+		ReplacementAck:    copyReplacementCommit(s.state.ReplacementAck),
 	}
 	if s.replaceErr != nil {
 		return controllerState{}, s.replaceErr
@@ -111,6 +113,7 @@ func (s *controllerStoreStub) SetReplacement(
 	desired map[string]Agent,
 	replacement *replacementState,
 	commit *replacementCommit,
+	acknowledged *replacementCommit,
 ) (controllerState, error) {
 	s.record("set-replacement")
 	if s.replaceErr != nil {
@@ -119,10 +122,12 @@ func (s *controllerStoreStub) SetReplacement(
 	s.state.Desired = copyAgents(desired)
 	s.state.Replacement = copyReplacement(replacement)
 	s.state.ReplacementCommit = copyReplacementCommit(commit)
+	s.state.ReplacementAck = copyReplacementCommit(acknowledged)
 	return controllerState{
 		Desired: copyAgents(s.state.Desired), Applied: copyAgents(s.state.Applied),
 		Replacement:       copyReplacement(s.state.Replacement),
 		ReplacementCommit: copyReplacementCommit(s.state.ReplacementCommit),
+		ReplacementAck:    copyReplacementCommit(s.state.ReplacementAck),
 	}, nil
 }
 

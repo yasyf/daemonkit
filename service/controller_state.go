@@ -32,15 +32,18 @@ var (
 	controllerReplacementBucket    = []byte("replacement")
 	controllerReplacementKey       = []byte("fence")
 	controllerReplacementCommitKey = []byte("commit")
+	controllerReplacementAckKey    = []byte("acknowledged")
 	controllerIdentityKey          = []byte("identity")
 	controllerSchemaKey            = []byte("schema")
 	controllerFingerprintKey       = []byte("fingerprint")
 	controllerIdentity             = []byte("daemonkit.service.controller-store.v1")
-	controllerFingerprint          = []byte("6a4d31e28472f2d420c0c9a718aab16bac7ea57093c73f977b5062687a37213d")
+	controllerFingerprint          = []byte("41187f10b4271970a39b5f7beef1972e1c3b802e93eb46f219171fb0b12034cc")
 	replacementIdentity            = "daemonkit.service.replacement-fence.v1"
 	replacementFingerprint         = "d2ad7d3d5fb6b835099c6301c285791b1cd026f859387e0c7e9bdcac23b0285e"
 	replacementCommitIdentity      = "daemonkit.service.replacement-commit.v1"
 	replacementCommitFingerprint   = "709c4597c1d1ad13efb7a6682d39b6aa37304c49f7e5b56653536b72710ab7a9"
+	replacementAckIdentity         = "daemonkit.service.replacement-acknowledgement.v1"
+	replacementAckFingerprint      = "baacdf40ef2760ac95294c4662d5c54e555e36f40f9763602714dff9e67de1cf"
 )
 
 type controllerState struct {
@@ -48,12 +51,15 @@ type controllerState struct {
 	Applied           map[string]Agent
 	Replacement       *replacementState
 	ReplacementCommit *replacementCommit
+	ReplacementAck    *replacementCommit
 }
 
 type controllerStateStore interface {
 	Load(context.Context) (controllerState, error)
 	ReplaceDesired(context.Context, map[string]Agent) (controllerState, error)
-	SetReplacement(context.Context, map[string]Agent, *replacementState, *replacementCommit) (controllerState, error)
+	SetReplacement(
+		context.Context, map[string]Agent, *replacementState, *replacementCommit, *replacementCommit,
+	) (controllerState, error)
 	SetApplied(context.Context, string, *Agent) error
 	Close() error
 }
@@ -266,6 +272,7 @@ func (s *boltControllerStore) SetReplacement(
 	desired map[string]Agent,
 	replacement *replacementState,
 	commit *replacementCommit,
+	acknowledged *replacementCommit,
 ) (controllerState, error) {
 	if err := ctx.Err(); err != nil {
 		return controllerState{}, err
@@ -283,7 +290,16 @@ func (s *boltControllerStore) SetReplacement(
 	}
 	var commitPayload []byte
 	if commit != nil {
-		commitPayload, err = encodeReplacementCommit(commit)
+		commitPayload, err = encodeReplacementCommit(commit, replacementCommitIdentity, replacementCommitFingerprint)
+		if err != nil {
+			return controllerState{}, err
+		}
+	}
+	var acknowledgedPayload []byte
+	if acknowledged != nil {
+		acknowledgedPayload, err = encodeReplacementCommit(
+			acknowledged, replacementAckIdentity, replacementAckFingerprint,
+		)
 		if err != nil {
 			return controllerState{}, err
 		}
@@ -307,6 +323,13 @@ func (s *boltControllerStore) SetReplacement(
 			}
 		} else if err := bucket.Put(controllerReplacementCommitKey, commitPayload); err != nil {
 			return fmt.Errorf("service: persist replacement commit: %w", err)
+		}
+		if acknowledged == nil {
+			if err := bucket.Delete(controllerReplacementAckKey); err != nil {
+				return fmt.Errorf("service: clear replacement acknowledgement: %w", err)
+			}
+		} else if err := bucket.Put(controllerReplacementAckKey, acknowledgedPayload); err != nil {
+			return fmt.Errorf("service: persist replacement acknowledgement: %w", err)
 		}
 		var err error
 		state, err = loadControllerStateTx(tx)
@@ -392,12 +415,13 @@ func loadControllerStateTx(tx *bolt.Tx) (controllerState, error) {
 	if err != nil {
 		return controllerState{}, fmt.Errorf("service: load applied agents: %w", err)
 	}
-	replacement, commit, err := loadReplacementState(tx.Bucket(controllerReplacementBucket))
+	replacement, commit, acknowledged, err := loadReplacementState(tx.Bucket(controllerReplacementBucket))
 	if err != nil {
 		return controllerState{}, err
 	}
 	state := controllerState{
-		Desired: desired, Applied: applied, Replacement: replacement, ReplacementCommit: commit,
+		Desired: desired, Applied: applied, Replacement: replacement,
+		ReplacementCommit: commit, ReplacementAck: acknowledged,
 	}
 	if err := validateReplacementState(state); err != nil {
 		return controllerState{}, err
@@ -496,12 +520,12 @@ func encodeReplacementState(replacement *replacementState) ([]byte, error) {
 	return payload, nil
 }
 
-func encodeReplacementCommit(commit *replacementCommit) ([]byte, error) {
+func encodeReplacementCommit(commit *replacementCommit, identity, fingerprint string) ([]byte, error) {
 	if err := validateReplacementCommit(commit); err != nil {
 		return nil, err
 	}
 	wire := replacementCommitWire{
-		Identity: replacementCommitIdentity, Schema: 1, Fingerprint: replacementCommitFingerprint,
+		Identity: identity, Schema: 1, Fingerprint: fingerprint,
 		OperationID: commit.OperationID, Binding: commit.Binding.String(),
 		PriorDigest: commit.Prior.digest.String(), NextDigest: commit.Next.digest.String(),
 		Prior: make(map[string]json.RawMessage, len(commit.Prior.agents)),
@@ -528,37 +552,50 @@ func encodeReplacementCommit(commit *replacementCommit) ([]byte, error) {
 	return payload, nil
 }
 
-func loadReplacementState(bucket *bolt.Bucket) (*replacementState, *replacementCommit, error) {
-	var payload, commitPayload []byte
+func loadReplacementState(bucket *bolt.Bucket) (*replacementState, *replacementCommit, *replacementCommit, error) {
+	var payload, commitPayload, acknowledgedPayload []byte
 	if err := bucket.ForEach(func(key, value []byte) error {
 		switch {
 		case bytes.Equal(key, controllerReplacementKey):
 			payload = append([]byte(nil), value...)
 		case bytes.Equal(key, controllerReplacementCommitKey):
 			commitPayload = append([]byte(nil), value...)
+		case bytes.Equal(key, controllerReplacementAckKey):
+			acknowledgedPayload = append([]byte(nil), value...)
 		default:
 			return fmt.Errorf("service: unknown replacement state key %q", key)
 		}
 		return nil
 	}); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	var replacement *replacementState
 	var err error
 	if payload != nil {
 		replacement, err = decodeReplacementState(payload)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 	}
 	var commit *replacementCommit
 	if commitPayload != nil {
-		commit, err = decodeReplacementCommit(commitPayload)
+		commit, err = decodeReplacementCommit(
+			commitPayload, replacementCommitIdentity, replacementCommitFingerprint,
+		)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 	}
-	return replacement, commit, nil
+	var acknowledged *replacementCommit
+	if acknowledgedPayload != nil {
+		acknowledged, err = decodeReplacementCommit(
+			acknowledgedPayload, replacementAckIdentity, replacementAckFingerprint,
+		)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	return replacement, commit, acknowledged, nil
 }
 
 func decodeReplacementState(payload []byte) (*replacementState, error) {
@@ -630,7 +667,7 @@ func decodeReplacementState(payload []byte) (*replacementState, error) {
 	return replacement, nil
 }
 
-func decodeReplacementCommit(payload []byte) (*replacementCommit, error) {
+func decodeReplacementCommit(payload []byte, identity, fingerprint string) (*replacementCommit, error) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(payload, &fields); err != nil {
 		return nil, fmt.Errorf("service: decode replacement commit: %w", err)
@@ -656,7 +693,7 @@ func decodeReplacementCommit(payload []byte) (*replacementCommit, error) {
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return nil, errors.New("service: replacement commit has trailing JSON")
 	}
-	if wire.Identity != replacementCommitIdentity || wire.Schema != 1 || wire.Fingerprint != replacementCommitFingerprint {
+	if wire.Identity != identity || wire.Schema != 1 || wire.Fingerprint != fingerprint {
 		return nil, errors.New("service: replacement commit identity, schema, or fingerprint mismatch")
 	}
 	binding, err := decodeExactDigest(wire.Binding)
@@ -717,6 +754,9 @@ func decodeExactDigest(value string) ([32]byte, error) {
 }
 
 func validateReplacementState(state controllerState) error {
+	if err := validateReplacementCommit(state.ReplacementAck); err != nil {
+		return fmt.Errorf("service: replacement acknowledgement: %w", err)
+	}
 	if state.Replacement != nil && state.ReplacementCommit != nil {
 		return errors.New("service: active replacement and committed replacement coexist")
 	}

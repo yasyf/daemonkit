@@ -351,7 +351,7 @@ func TestReplacementFenceSurvivesStoreReopen(t *testing.T) {
 		OperationID: "replace-reopen", Phase: ReplacementUnloaded, Epoch: 1,
 		Binding: replacementBinding("replace-reopen"), Prior: plan, Current: plan,
 	}
-	if _, err := store.SetReplacement(t.Context(), map[string]Agent{}, replacement, nil); err != nil {
+	if _, err := store.SetReplacement(t.Context(), map[string]Agent{}, replacement, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
@@ -487,13 +487,171 @@ func TestReplacementCommitSurvivesReopenAndBlocksUntilExactAcknowledgement(t *te
 	closeReplacementController(t, controller)
 
 	controller = openDurableReplacementController(t, config, launchd)
-	defer closeReplacementController(t, controller)
 	completion, err = controller.ReplacementCompletion(t.Context())
 	if err != nil || completion != nil {
 		t.Fatalf("completion after acknowledgement = %#v, %v", completion, err)
 	}
-	if err := controller.Converge(t.Context(), next.Agents()); err != nil {
+	acknowledgement, err := controller.ReplacementAcknowledgement(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acknowledgement == nil || acknowledgement.OperationID() != commit.OperationID() ||
+		acknowledgement.Binding() != commit.Binding() || !plansEqual(acknowledgement.Prior(), commit.Prior()) ||
+		!plansEqual(acknowledgement.Next(), commit.Next()) {
+		t.Fatalf("reopened acknowledgement = %#v", acknowledgement)
+	}
+	mutatedPrior := acknowledgement.Prior()
+	delete(mutatedPrior.agents, prior.Agents()[0].Label)
+	unchanged, err := controller.ReplacementAcknowledgement(t.Context())
+	if err != nil || unchanged == nil || !plansEqual(unchanged.Prior(), prior) {
+		t.Fatalf("acknowledgement exposed mutable state: %#v, %v", unchanged, err)
+	}
+	if err := controller.AcknowledgeReplacementCommit(
+		t.Context(), commit.OperationID(), commit.Binding(), commit.Prior(), commit.Next(),
+	); err != nil {
+		t.Fatalf("replayed exact acknowledgement = %v", err)
+	}
+	ackMismatches := []struct {
+		name      string
+		operation string
+		binding   ReplacementBinding
+		prior     Plan
+		next      Plan
+	}{
+		{name: "operation", operation: "commit-never-happened", binding: commit.Binding(), prior: commit.Prior(), next: commit.Next()},
+		{name: "binding", operation: commit.OperationID(), binding: replacementBinding("wrong-ack"), prior: commit.Prior(), next: commit.Next()},
+		{name: "prior", operation: commit.OperationID(), binding: commit.Binding(), prior: commit.Next(), next: commit.Next()},
+		{name: "next", operation: commit.OperationID(), binding: commit.Binding(), prior: commit.Prior(), next: commit.Prior()},
+	}
+	for _, test := range ackMismatches {
+		t.Run("ack mismatch "+test.name, func(t *testing.T) {
+			if err := controller.AcknowledgeReplacementCommit(
+				t.Context(), test.operation, test.binding, test.prior, test.next,
+			); !errors.Is(err, ErrReplacementMismatch) {
+				t.Fatalf("AcknowledgeReplacementCommit = %v, want ErrReplacementMismatch", err)
+			}
+		})
+	}
+	later := replacementPlan(t, controllerAgent(t, "com.example.commit-later"))
+	if err := controller.Converge(t.Context(), later.Agents()); err != nil {
 		t.Fatalf("Converge after acknowledgement = %v", err)
+	}
+	if err := controller.AcknowledgeReplacementCommit(
+		t.Context(), commit.OperationID(), commit.Binding(), commit.Prior(), commit.Next(),
+	); err != nil {
+		t.Fatalf("replayed acknowledgement after Converge = %v", err)
+	}
+	closeReplacementController(t, controller)
+
+	controller = openDurableReplacementController(t, config, launchd)
+	defer closeReplacementController(t, controller)
+	if err := controller.AcknowledgeReplacementCommit(
+		t.Context(), commit.OperationID(), commit.Binding(), commit.Prior(), commit.Next(),
+	); err != nil {
+		t.Fatalf("replayed acknowledgement after Converge and reopen = %v", err)
+	}
+	acknowledgement, err = controller.ReplacementAcknowledgement(t.Context())
+	if err != nil || acknowledgement == nil || acknowledgement.OperationID() != commit.OperationID() {
+		t.Fatalf("acknowledgement after Converge and reopen = %#v, %v", acknowledgement, err)
+	}
+	if _, err := controller.Quiesce(
+		t.Context(), commit.OperationID(), replacementBinding("reused-operation"), later,
+	); !errors.Is(err, ErrReplacementMismatch) {
+		t.Fatalf("Quiesce with acknowledged operation ID = %v, want ErrReplacementMismatch", err)
+	}
+
+	laterBinding := replacementBinding("later-operation")
+	laterReceipt, err := controller.Quiesce(t.Context(), "later-operation", laterBinding, later)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.AcknowledgeReplacementCommit(
+		t.Context(), commit.OperationID(), commit.Binding(), commit.Prior(), commit.Next(),
+	); err != nil {
+		t.Fatalf("replayed acknowledgement during later fence = %v", err)
+	}
+	status, err := controller.ReplacementStatus(t.Context())
+	if err != nil || status == nil || status.OperationID != laterReceipt.OperationID {
+		t.Fatalf("later fence after old acknowledgement replay = %#v, %v", status, err)
+	}
+	proveReplacement(t, controller, laterReceipt)
+	final := replacementPlan(t, controllerAgent(t, "com.example.commit-final"))
+	if err := controller.ApplyReplacement(t.Context(), laterReceipt.OperationID, laterBinding, final); err != nil {
+		t.Fatal(err)
+	}
+	laterCommit, err := controller.CommitReplacement(t.Context(), laterReceipt.OperationID, laterBinding, final)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.AcknowledgeReplacementCommit(
+		t.Context(), commit.OperationID(), commit.Binding(), commit.Prior(), commit.Next(),
+	); err != nil {
+		t.Fatalf("replayed acknowledgement during later pending commit = %v", err)
+	}
+	completion, err = controller.ReplacementCompletion(t.Context())
+	if err != nil || completion == nil || completion.OperationID() != laterCommit.OperationID() {
+		t.Fatalf("later completion after old acknowledgement replay = %#v, %v", completion, err)
+	}
+}
+
+func TestReplacementAcknowledgementRejectsNeverCommittedOperation(t *testing.T) {
+	agent := controllerAgent(t, "com.example.never-committed")
+	controller, _, _ := newReplacementController(t, agent)
+	plan := replacementPlan(t, agent)
+	if err := controller.AcknowledgeReplacementCommit(
+		t.Context(), "never-committed", replacementBinding("never-committed"), plan, plan,
+	); !errors.Is(err, ErrReplacementMismatch) {
+		t.Fatalf("AcknowledgeReplacementCommit = %v, want ErrReplacementMismatch", err)
+	}
+	acknowledgement, err := controller.ReplacementAcknowledgement(t.Context())
+	if err != nil || acknowledgement != nil {
+		t.Fatalf("acknowledgement = %#v, %v", acknowledgement, err)
+	}
+}
+
+func TestSharedExecutablePlanQuiescesAndReopensWithOneProofPath(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	directory := t.TempDir()
+	config := ControllerConfig{
+		StatePath:   filepath.Join(directory, "services.db"),
+		ProcessPath: filepath.Join(directory, "processes.db"), WorkerLimit: 1,
+	}
+	launchd := &replacementLaunchd{loaded: make(map[string]bool)}
+	first := controllerAgent(t, "com.example.shared-executable-first")
+	second := controllerAgent(t, "com.example.shared-executable-second")
+	if first.Program != second.Program {
+		t.Fatalf("programs differ: %q != %q", first.Program, second.Program)
+	}
+	plan := replacementPlan(t, first, second)
+	controller := openDurableReplacementController(t, config, launchd)
+	if err := controller.Converge(t.Context(), plan.Agents()); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := controller.Quiesce(
+		t.Context(), "shared-executable", replacementBinding("shared-executable"), plan,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := mustProgramPaths(t, plan)
+	if !slices.Equal(paths, []string{first.Program}) {
+		t.Fatalf("program paths = %q, want one %q", paths, first.Program)
+	}
+	proveReplacement(t, controller, receipt)
+	if err := controller.ProveQuiesced(t.Context(), receipt, []string{first.Program, second.Program}); err != nil {
+		t.Fatalf("replayed proof with duplicate role paths = %v", err)
+	}
+	closeReplacementController(t, controller)
+
+	controller = openDurableReplacementController(t, config, launchd)
+	defer closeReplacementController(t, controller)
+	status, err := controller.ReplacementStatus(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status == nil || status.Phase != ReplacementQuiesced || len(status.Proofs) != 1 ||
+		!slices.Equal(status.Proofs[0].ProgramPaths, paths) {
+		t.Fatalf("reopened shared-executable status = %#v", status)
 	}
 }
 
