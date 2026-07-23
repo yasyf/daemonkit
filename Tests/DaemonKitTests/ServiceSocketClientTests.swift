@@ -48,8 +48,9 @@ private actor ServiceTakeoverSequence {
             Issue.record("old generation received a replay")
             return .terminal(SocketTerminal(rejected: true, reason: "old generation replay"))
         }
+        let session = request.session
         Task {
-            try await Task.sleep(nanoseconds: 5_000_000)
+            await session.waitUntilClosed()
             await oldServer.stop()
             self.markOldStopped()
             do {
