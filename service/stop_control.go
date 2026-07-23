@@ -81,6 +81,11 @@ type stopChildResult struct {
 	Error  string          `json:"error,omitempty"`
 }
 
+func stopAuthorityRetainsFullWindow(record proc.Record, now time.Time, window time.Duration) bool {
+	expires := time.UnixMilli(record.ExpiresUnixMilli)
+	return record.StopAuthorityState == proc.StopAuthorityArmed && expires.After(now.Add(window))
+}
+
 // StopRuntime starts one exact hidden-role child, records its post-exec kernel
 // identity and complete authority before release, and returns only after the
 // child and target runtime have settled.
@@ -190,8 +195,7 @@ func (c *Controller) StopRuntime(
 	if err != nil {
 		return wire.StopResult{}, fmt.Errorf("service: record stop control: %w", err)
 	}
-	if record.StopAuthorityState != proc.StopAuthorityArmed ||
-		timing.now().Add(timing.authority).After(time.UnixMilli(record.ExpiresUnixMilli)) {
+	if !stopAuthorityRetainsFullWindow(record, timing.now(), timing.authority) {
 		revokeCtx, cancelRevoke := context.WithTimeout(context.WithoutCancel(opCtx), timing.identity)
 		revoked, revokeErr := c.stopReaper.RevokeStopControl(revokeCtx, record)
 		cancelRevoke()

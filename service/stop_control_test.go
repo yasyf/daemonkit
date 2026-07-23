@@ -112,6 +112,30 @@ func TestStopControlFrameRejectsUnknownAndTrailingFields(t *testing.T) {
 	}
 }
 
+func TestStopAuthorityFullWindowBoundaryIsStrict(t *testing.T) {
+	now := time.UnixMilli(1_900_000_000_000)
+	window := 5 * time.Second
+	for _, test := range []struct {
+		name    string
+		expires time.Time
+		want    bool
+	}{
+		{name: "before", expires: now.Add(window - time.Millisecond), want: false},
+		{name: "equal", expires: now.Add(window), want: false},
+		{name: "after", expires: now.Add(window + time.Millisecond), want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			record := proc.Record{
+				StopAuthorityState: proc.StopAuthorityArmed,
+				ExpiresUnixMilli:   test.expires.UnixMilli(),
+			}
+			if got := stopAuthorityRetainsFullWindow(record, now, window); got != test.want {
+				t.Fatalf("retains full window = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestStopControlHelperProcess(_ *testing.T) {
 	mode := os.Getenv(stopControlHelperMode)
 	if mode == "" {

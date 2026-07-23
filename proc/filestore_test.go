@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -376,6 +377,116 @@ func TestFileStoreStopControlConsumesExactlyOnceConcurrently(t *testing.T) {
 	}
 	if len(records) != 0 {
 		t.Fatalf("records after settled untrack = %+v", records)
+	}
+}
+
+func TestFileStoreConsumedStopControlCannotBeRetracked(t *testing.T) {
+	store := &FileStore{Path: filepath.Join(t.TempDir(), "recovery.db")}
+	reaper := &Reaper{Store: store, Generation: "controller-generation"}
+	identity, _ := stopControlStoreRecord(148, time.Time{})
+	record, err := reaper.TrackStopControl(
+		t.Context(), identity, "com.example.stop", "v2.0.0", 1,
+		"runtime-generation", "upgrade", time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := store.ConsumeStopControl(
+		t.Context(), identity, record.Role, record.TargetProcessGeneration, time.Now(),
+	); err != nil || !ok {
+		t.Fatalf("consume = %v, %v; want true, nil", ok, err)
+	}
+	if _, err := reaper.TrackStopControl(
+		t.Context(), identity, "com.example.stop", "v2.0.0", 1,
+		"runtime-generation", "upgrade", time.Minute,
+	); err == nil || !strings.Contains(err.Error(), "already consumed") {
+		t.Fatalf("retrack error = %v, want already consumed", err)
+	}
+}
+
+func TestFileStoreStopControlRevokeRejectsRecoveryOwnership(t *testing.T) {
+	for _, state := range []string{"claimed", "receipted"} {
+		t.Run(state, func(t *testing.T) {
+			store := &FileStore{Path: filepath.Join(t.TempDir(), "recovery.db")}
+			_, record := stopControlStoreRecord(149, time.Now().Add(time.Minute))
+			if err := store.Add(t.Context(), record); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.BeginReap(t.Context(), record, "successor-generation"); err != nil {
+				t.Fatal(err)
+			}
+			if state == "receipted" {
+				if _, err := store.CommitReap(
+					t.Context(), record, "successor-generation", ReapTerminated,
+				); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := store.revokeStopControl(t.Context(), record); err == nil ||
+				!strings.Contains(err.Error(), state[:len(state)-2]) {
+				t.Fatalf("revoke %s error = %v", state, err)
+			}
+			if state == "claimed" {
+				records, err := store.Load(t.Context())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(records) != 1 || records[0] != record {
+					t.Fatalf("claimed record changed = %+v", records)
+				}
+				if _, err := store.CommitReap(
+					t.Context(), record, "successor-generation", ReapTerminated,
+				); err != nil {
+					t.Fatalf("successor could not settle unchanged claim: %v", err)
+				}
+				records, err = store.Load(t.Context())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(records) != 0 {
+					t.Fatalf("records after successor settlement = %+v, want none", records)
+				}
+			}
+		})
+	}
+}
+
+func TestFileStoreStopControlValidatesStoredRecordBeforeConsume(t *testing.T) {
+	store := &FileStore{Path: filepath.Join(t.TempDir(), "recovery.db")}
+	identity, record := stopControlStoreRecord(150, time.Now().Add(time.Minute))
+	if err := store.Add(t.Context(), record); err != nil {
+		t.Fatal(err)
+	}
+	writeRecord := func(value Record) {
+		t.Helper()
+		db, err := store.open(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		encoded, err := encodeStored(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Update(func(tx *bolt.Tx) error {
+			return tx.Bucket(fileStoreRecordsBucket).Put([]byte(recordKey(record)), encoded)
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	malformed := record
+	malformed.StopAuthorityState = StopAuthorityState("unknown")
+	writeRecord(malformed)
+	if got, ok, err := store.ConsumeStopControl(
+		t.Context(), identity, record.Role, record.TargetProcessGeneration, time.Now(),
+	); !errors.Is(err, ErrInvalidRecord) || ok || got != (Record{}) {
+		t.Fatalf("malformed consume = %+v, %v, %v; want invalid record", got, ok, err)
+	}
+	writeRecord(record)
+	if got, ok, err := store.ConsumeStopControl(
+		t.Context(), identity, record.Role, record.TargetProcessGeneration, time.Now(),
+	); err != nil || !ok || got != record {
+		t.Fatalf("repaired consume = %+v, %v, %v; want record, true, nil", got, ok, err)
 	}
 }
 

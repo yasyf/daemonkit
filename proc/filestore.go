@@ -334,6 +334,9 @@ func (s *FileStore) addStopControlPending(ctx context.Context, rec Record) (Reco
 		if tx.Bucket(fileStoreReceiptIndexBucket).Get(key) != nil {
 			return errors.New("proc: process instance already has a retirement receipt")
 		}
+		if tx.Bucket(fileStoreStopConsumedBucket).Get(key) != nil {
+			return errors.New("proc: stop control authority was already consumed")
+		}
 		records := tx.Bucket(fileStoreRecordsBucket)
 		if value := records.Get(key); value != nil {
 			var existing Record
@@ -464,6 +467,12 @@ func (s *FileStore) revokeStopControl(ctx context.Context, armed Record) (Record
 	var durable Record
 	err = db.Update(func(tx *bolt.Tx) error {
 		key := []byte(recordKey(armed))
+		if tx.Bucket(fileStoreClaimsBucket).Get(key) != nil {
+			return errors.New("proc: armed stop control is claimed for reap")
+		}
+		if tx.Bucket(fileStoreReceiptIndexBucket).Get(key) != nil {
+			return errors.New("proc: armed stop control already has a retirement receipt")
+		}
 		if tx.Bucket(fileStoreStopConsumedBucket).Get(key) != nil {
 			return errors.New("proc: consumed stop control cannot be revoked")
 		}
@@ -618,6 +627,9 @@ func (s *FileStore) ConsumeStopControl(
 		}
 		var stored Record
 		if err := decodeStored(value, &stored); err != nil {
+			return err
+		}
+		if err := stored.Validate(); err != nil {
 			return err
 		}
 		if stored.RecoveryClass != RecoveryStopControl || stored.PID != identity.PID ||
