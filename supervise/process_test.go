@@ -328,6 +328,81 @@ func TestManagedProcessExitOutranksConcurrentReadinessCancellation(t *testing.T)
 	}
 }
 
+func TestManagedProcessObservableExitOutranksSuccessfulReadiness(t *testing.T) {
+	exitErr := &ExitError{Code: 23}
+	process := &Process{done: make(chan struct{})}
+	process.complete(exitErr, nil)
+	close(process.done)
+	if err := process.readinessResult(nil); !errors.Is(err, ErrProcessExitedBeforeReadiness) || !errors.Is(err, exitErr) {
+		t.Fatalf("readinessResult(nil) = %v, want observable process exit", err)
+	}
+}
+
+func TestManagedProcessCompletionPublishesBeforeCancelAndRelease(t *testing.T) {
+	registry := newFakeRegistry()
+	pool := &Pool{
+		registry: registry,
+		active:   1,
+		changed:  make(chan struct{}),
+		workers:  map[uint64]context.CancelFunc{1: func() {}},
+		grace:    time.Millisecond,
+	}
+	process := &Process{
+		record:   proc.Record{PID: 1 << 30},
+		pool:     pool,
+		workerID: 1,
+		done:     make(chan struct{}),
+	}
+	var doneBeforeCancel, activeBeforeCancel bool
+	process.cancel = func() {
+		select {
+		case <-process.done:
+			doneBeforeCancel = true
+		default:
+		}
+		pool.mu.Lock()
+		activeBeforeCancel = pool.active == 1
+		pool.mu.Unlock()
+	}
+	waited := make(chan error, 1)
+	waited <- nil
+	process.run(t.Context(), waited)
+	if !doneBeforeCancel || !activeBeforeCancel {
+		t.Fatalf("defer order: done-before-cancel=%v active-before-cancel=%v", doneBeforeCancel, activeBeforeCancel)
+	}
+	if pool.active != 0 {
+		t.Fatalf("pool active = %d, want released", pool.active)
+	}
+}
+
+func TestManagedProcessBufferedExitOutranksCanceledContext(t *testing.T) {
+	for range 100 {
+		registry := newFakeRegistry()
+		pool := &Pool{
+			registry: registry,
+			active:   1,
+			changed:  make(chan struct{}),
+			workers:  map[uint64]context.CancelFunc{1: func() {}},
+			grace:    time.Millisecond,
+		}
+		process := &Process{
+			record: proc.Record{PID: 1 << 30}, pool: pool, workerID: 1,
+			cancel: func() {}, done: make(chan struct{}),
+		}
+		waited := make(chan error, 1)
+		waited <- nil
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		process.run(ctx, waited)
+		process.mu.Lock()
+		result := process.result
+		process.mu.Unlock()
+		if errors.Is(result, ErrProcessStopped) {
+			t.Fatalf("buffered natural exit was classified as cancellation: %v", result)
+		}
+	}
+}
+
 func TestManagedProcessSuccessfulReadinessLeavesExitForWait(t *testing.T) {
 	release := filepath.Join(t.TempDir(), "ready")
 	registry := newFakeRegistry()

@@ -283,13 +283,7 @@ func (p *Process) awaitReady(ctx context.Context, spec ProcessSpec) error {
 	go func() { ready <- spec.Ready(readyCtx, p.record) }()
 	select {
 	case err := <-ready:
-		if err != nil {
-			if exited, exitErr := p.earlyReadinessExit(); exited {
-				return exitErr
-			}
-			return fmt.Errorf("supervise: managed process readiness: %w", err)
-		}
-		return nil
+		return p.readinessResult(err)
 	case <-p.done:
 		if exited, exitErr := p.earlyReadinessExit(); exited {
 			return exitErr
@@ -304,6 +298,16 @@ func (p *Process) awaitReady(ctx context.Context, spec ProcessSpec) error {
 		}
 		return fmt.Errorf("supervise: managed process readiness: %w", readyCtx.Err())
 	}
+}
+
+func (p *Process) readinessResult(err error) error {
+	if exited, exitErr := p.earlyReadinessExit(); exited {
+		return exitErr
+	}
+	if err != nil {
+		return fmt.Errorf("supervise: managed process readiness: %w", err)
+	}
+	return nil
 }
 
 func (p *Process) earlyReadinessExit() (bool, error) {
@@ -322,31 +326,37 @@ func (p *Process) earlyReadinessExit() (bool, error) {
 
 func (p *Process) run(ctx context.Context, waited <-chan error) {
 	// Publish completion before cancellation can wake a readiness callback.
+	defer p.pool.release(p.workerID)
 	defer p.cancel()
 	defer close(p.done)
-	defer p.pool.release(p.workerID)
+	var waitErr error
 	select {
-	case waitErr := <-waited:
-		settleErr := p.pool.registry.TerminateWithin(context.WithoutCancel(ctx), p.record, p.pool.grace)
-		if settleErr != nil {
-			settleErr = errors.Join(
-				fmt.Errorf("supervise: settle completed managed process: %w", settleErr),
-				ErrUnsettledGroup,
-			)
+	case waitErr = <-waited:
+	default:
+		select {
+		case waitErr = <-waited:
+		case <-ctx.Done():
+			stop := p.pool.stopManaged(p.record, waited)
+			settleErr := p.pool.registry.TerminateWithin(context.WithoutCancel(ctx), p.record, p.pool.grace)
+			if settleErr != nil {
+				settleErr = errors.Join(
+					fmt.Errorf("supervise: settle canceled managed process: %w", settleErr),
+					ErrUnsettledGroup,
+				)
+			}
+			result := errors.Join(stop.err, unexpectedWaitError(stop.waitErr), settleErr)
+			p.complete(errors.Join(ErrProcessStopped, result), result)
+			return
 		}
-		p.complete(errors.Join(workerWaitError(waitErr), settleErr), settleErr)
-	case <-ctx.Done():
-		stop := p.pool.stopManaged(p.record, waited)
-		settleErr := p.pool.registry.TerminateWithin(context.WithoutCancel(ctx), p.record, p.pool.grace)
-		if settleErr != nil {
-			settleErr = errors.Join(
-				fmt.Errorf("supervise: settle canceled managed process: %w", settleErr),
-				ErrUnsettledGroup,
-			)
-		}
-		result := errors.Join(stop.err, unexpectedWaitError(stop.waitErr), settleErr)
-		p.complete(errors.Join(ErrProcessStopped, result), result)
 	}
+	settleErr := p.pool.registry.TerminateWithin(context.WithoutCancel(ctx), p.record, p.pool.grace)
+	if settleErr != nil {
+		settleErr = errors.Join(
+			fmt.Errorf("supervise: settle completed managed process: %w", settleErr),
+			ErrUnsettledGroup,
+		)
+	}
+	p.complete(errors.Join(workerWaitError(waitErr), settleErr), settleErr)
 }
 
 func (p *Process) complete(result, stopResult error) {
