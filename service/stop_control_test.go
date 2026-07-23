@@ -135,7 +135,7 @@ func TestStopControlHelperProcess(_ *testing.T) {
 	}
 	if mode == "after-authority-expiry" || mode == "declined" {
 		if mode == "after-authority-expiry" {
-			time.Sleep(80 * time.Millisecond)
+			time.Sleep(2200 * time.Millisecond)
 		}
 		result := stopChildResult{Result: wire.StopResult{
 			ProcessGeneration: "runtime-generation",
@@ -212,7 +212,7 @@ func TestStopRuntimeSeparatesAuthorityExpiryFromOperationSettlement(t *testing.T
 	store := &proc.FileStore{Path: filepath.Join(t.TempDir(), "workers.db")}
 	controller := &Controller{
 		stopReaper: &proc.Reaper{Store: store, Generation: generation},
-		stopTiming: stopControlTiming{identity: 5 * time.Second, authority: 20 * time.Millisecond, operation: 5 * time.Second},
+		stopTiming: stopControlTiming{identity: 5 * time.Second, authority: 2 * time.Second, operation: 5 * time.Second},
 	}
 	result, err := controller.StopRuntime(t.Context(), StopControlSpec{
 		Executable: executable,
