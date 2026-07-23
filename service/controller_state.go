@@ -871,6 +871,9 @@ func encodeControllerAgent(agent Agent) ([]byte, error) {
 	if _, err := agent.Plist(); err != nil {
 		return nil, fmt.Errorf("service: validate stored agent %q: %w", agent.Label, err)
 	}
+	if err := validateProgramTree(agent); err != nil {
+		return nil, fmt.Errorf("service: validate stored agent %q: %w", agent.Label, err)
+	}
 	agent.AssociatedBundleIdentifiers, _ = canonicalAssociatedBundleIdentifiers(
 		agent.AssociatedBundleIdentifiers,
 	)
@@ -909,6 +912,9 @@ func decodeControllerAgent(payload []byte) (Agent, error) {
 		return Agent{}, errors.New("stored agent has trailing JSON")
 	}
 	if _, err := agent.Plist(); err != nil {
+		return Agent{}, fmt.Errorf("validate stored agent: %w", err)
+	}
+	if err := validateProgramTree(agent); err != nil {
 		return Agent{}, fmt.Errorf("validate stored agent: %w", err)
 	}
 	agent.Args = append([]string(nil), agent.Args...)

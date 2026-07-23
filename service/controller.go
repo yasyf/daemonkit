@@ -588,6 +588,9 @@ func desiredAgents(agents []Agent) (map[string]Agent, error) {
 		if _, err := agent.Plist(); err != nil {
 			return nil, fmt.Errorf("service: validate agent %q: %w", agent.Label, err)
 		}
+		if err := validateProgramTree(agent); err != nil {
+			return nil, fmt.Errorf("service: validate agent %q: %w", agent.Label, err)
+		}
 		if _, duplicate := desired[agent.Label]; duplicate {
 			return nil, fmt.Errorf("service: duplicate agent label %q", agent.Label)
 		}

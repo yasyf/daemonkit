@@ -150,6 +150,33 @@ func TestPlanIsCanonicalImmutableAndDigestSensitive(t *testing.T) {
 	}
 }
 
+func TestPlanRejectsNonExactProgramPaths(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "executable")
+	if err := os.WriteFile(target, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "executable-link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name    string
+		program string
+	}{
+		{name: "empty", program: ""},
+		{name: "relative", program: "usr/bin/true"},
+		{name: "symlink", program: link},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			agent := controllerAgent(t, "com.example.invalid-plan")
+			agent.Program = test.program
+			if _, err := NewPlan([]Agent{agent}); err == nil {
+				t.Fatal("NewPlan accepted unsafe program")
+			}
+		})
+	}
+}
+
 func TestReplacementFenceOwnsQuiesceApplyAndCommit(t *testing.T) {
 	priorAgent := controllerAgent(t, "com.example.prior")
 	controller, store, launchd := newReplacementController(t, priorAgent)

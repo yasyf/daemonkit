@@ -465,7 +465,7 @@ func TestControllerRejectsUnsafeProgramTreeBeforeEffects(t *testing.T) {
 			agent := controllerAgent(t, "com.example.unsafe")
 			agent.Program = test.program
 			var events []string
-			controller, _, _, _ := newTestController(t, controllerState{
+			controller, _, store, _ := newTestController(t, controllerState{
 				Desired: map[string]Agent{}, Applied: map[string]Agent{},
 			}, launchctlStub(func(args []string) (string, error) {
 				return "", fmt.Errorf("unexpected launchctl effect: %v", args)
@@ -474,8 +474,8 @@ func TestControllerRejectsUnsafeProgramTreeBeforeEffects(t *testing.T) {
 			if err := controller.Converge(context.Background(), []Agent{agent}); err == nil {
 				t.Fatal("Converge() accepted unsafe program")
 			}
-			if !reflect.DeepEqual(events, []string{"replace-desired"}) {
-				t.Fatalf("events = %v, want durable desired only", events)
+			if len(events) != 0 || len(store.state.Desired) != 0 {
+				t.Fatalf("unsafe program reached durable state: events=%v state=%#v", events, store.state)
 			}
 			path, err := agent.PlistPath()
 			if err != nil {
@@ -488,37 +488,23 @@ func TestControllerRejectsUnsafeProgramTreeBeforeEffects(t *testing.T) {
 	}
 }
 
-func TestControllerUsesCanonicalCurrentExecutableForEmptyProgram(t *testing.T) {
+func TestControllerRejectsEmptyProgramBeforePersistence(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	agent := controllerAgent(t, "com.example.canonical-self")
+	agent := controllerAgent(t, "com.example.empty-program")
 	agent.Program = ""
 	var events []string
-	controller, _, _, _ := newTestController(t, controllerState{
+	controller, _, store, _ := newTestController(t, controllerState{
 		Desired: map[string]Agent{}, Applied: map[string]Agent{},
 	}, launchctlStub(func(args []string) (string, error) {
-		if args[0] == "bootout" {
-			return "not loaded", launchctlExit(launchctlNotLoadedExit)
-		}
-		return "", nil
+		return "", fmt.Errorf("unexpected launchctl effect: %v", args)
 	}), &events)
-	if err := controller.Converge(context.Background(), []Agent{agent}); err != nil {
-		t.Fatal(err)
+	events = nil
+	if err := controller.Converge(context.Background(), []Agent{agent}); err == nil ||
+		!strings.Contains(err.Error(), "program path") {
+		t.Fatalf("Converge error = %v, want program path rejection", err)
 	}
-	canonical, err := CanonicalExecutable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	path, err := agent.PlistPath()
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := "<string>" + xmlEscape(canonical) + "</string>"
-	if !strings.Contains(string(body), want) {
-		t.Fatalf("controller plist does not use canonical executable %q\n%s", canonical, body)
+	if len(events) != 0 || len(store.state.Desired) != 0 {
+		t.Fatalf("empty program reached durable state: events=%v state=%#v", events, store.state)
 	}
 }
 
