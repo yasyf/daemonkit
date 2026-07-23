@@ -293,19 +293,22 @@ func (r *Reaper) TrackStopControl(
 	protocol int,
 	targetProcessGeneration string,
 	intent string,
-	expires time.Time,
+	authorityLifetime time.Duration,
 ) (Record, error) {
 	record := Record{
 		RecoveryClass: RecoveryStopControl,
 		PID:           identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
 		Comm: identity.Comm, Generation: r.Generation, Executable: identity.Executable,
 		AuditToken: identity.AuditToken, Role: role, RuntimeBuild: build, RuntimeProtocol: protocol,
-		TargetProcessGeneration: targetProcessGeneration, Intent: intent, ExpiresUnixMilli: expires.UnixMilli(),
+		TargetProcessGeneration: targetProcessGeneration, Intent: intent,
 	}
-	if err := record.Validate(); err != nil {
-		return Record{}, err
+	store, ok := r.Store.(interface {
+		addStopControl(context.Context, Record, time.Duration) (Record, error)
+	})
+	if !ok {
+		return Record{}, errors.New("proc: stop control requires the durable file store")
 	}
-	return r.trackIdentityRecord(ctx, record)
+	return store.addStopControl(ctx, record, authorityLifetime)
 }
 
 // StopControlStore atomically consumes one exact one-shot stop authority.

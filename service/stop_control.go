@@ -173,11 +173,10 @@ func (c *Controller) StopRuntime(
 	if identity.PID != cmd.Process.Pid || identity.Executable != roleTarget {
 		return wire.StopResult{}, errors.New("service: stop child reported another process identity")
 	}
-	expires := time.Now().Add(timing.authority)
-	authorityCtx, cancelAuthority := context.WithDeadline(opCtx, expires)
+	authorityCtx, cancelAuthority := context.WithTimeout(opCtx, timing.identity)
 	record, err := c.stopReaper.TrackStopControl(
 		authorityCtx, identity, spec.Role, spec.RuntimeBuild, spec.RuntimeProtocol,
-		spec.TargetProcessGeneration, string(spec.Intent), expires,
+		spec.TargetProcessGeneration, string(spec.Intent), timing.authority,
 	)
 	cancelAuthority()
 	if err != nil {

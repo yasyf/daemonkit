@@ -219,6 +219,53 @@ func stopControlStoreRecord(pid int, expires time.Time) (Identity, Record) {
 	}
 }
 
+func TestFileStoreStopControlLifetimeStartsAtDurableStamp(t *testing.T) {
+	stamp := time.UnixMilli(1_900_000_000_000)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	store := &FileStore{
+		Path: filepath.Join(t.TempDir(), "recovery.db"),
+		stopControlNow: func() time.Time {
+			close(entered)
+			<-release
+			return stamp
+		},
+	}
+	_, record := stopControlStoreRecord(147, time.Time{})
+	record.ExpiresUnixMilli = 0
+	type outcome struct {
+		record Record
+		err    error
+	}
+	result := make(chan outcome, 1)
+	go func() {
+		got, err := store.addStopControl(context.Background(), record, 5*time.Second)
+		result <- outcome{record: got, err: err}
+	}()
+	<-entered
+	select {
+	case got := <-result:
+		t.Fatalf("stop control persisted before injected store delay released: %+v", got)
+	default:
+	}
+	close(release)
+	got := <-result
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	if want := stamp.Add(5 * time.Second).UnixMilli(); got.record.ExpiresUnixMilli != want {
+		t.Fatalf("expiry = %d, want store stamp + lifetime = %d", got.record.ExpiresUnixMilli, want)
+	}
+	store.stopControlNow = func() time.Time { return stamp.Add(time.Hour) }
+	retry, err := store.addStopControl(t.Context(), record, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry != got.record {
+		t.Fatalf("exact retry extended authority: got %+v want %+v", retry, got.record)
+	}
+}
+
 func TestFileStoreStopControlConsumesExactlyOnceConcurrently(t *testing.T) {
 	store := &FileStore{Path: filepath.Join(t.TempDir(), "recovery.db")}
 	identity, record := stopControlStoreRecord(142, time.Now().Add(time.Minute))

@@ -48,6 +48,7 @@ type FileStore struct {
 	// MaxOutstanding bounds records plus unacknowledged receipts. Zero uses
 	// defaultMaxOutstanding.
 	MaxOutstanding uint64
+	stopControlNow func() time.Time
 }
 
 func (s *FileStore) maximumOutstanding() uint64 {
@@ -301,6 +302,75 @@ func (s *FileStore) Add(ctx context.Context, rec Record) error {
 		}
 		return records.Put(key, encoded)
 	})
+}
+
+func (s *FileStore) addStopControl(ctx context.Context, rec Record, lifetime time.Duration) (Record, error) {
+	if rec.RecoveryClass != RecoveryStopControl || rec.ExpiresUnixMilli != 0 || lifetime <= 0 {
+		return Record{}, errors.New("proc: stop control admission is invalid")
+	}
+	candidate := rec
+	candidate.ExpiresUnixMilli = 1
+	if err := candidate.Validate(); err != nil {
+		return Record{}, err
+	}
+	maximum := s.maximumOutstanding()
+	db, err := s.open(ctx)
+	if err != nil {
+		return Record{}, err
+	}
+	defer db.Close()
+	var durable Record
+	err = db.Update(func(tx *bolt.Tx) error {
+		key := []byte(recordKey(rec))
+		if tx.Bucket(fileStoreClaimsBucket).Get(key) != nil {
+			return errors.New("proc: process instance is claimed for reap")
+		}
+		if tx.Bucket(fileStoreReceiptIndexBucket).Get(key) != nil {
+			return errors.New("proc: process instance already has a retirement receipt")
+		}
+		records := tx.Bucket(fileStoreRecordsBucket)
+		if value := records.Get(key); value != nil {
+			var existing Record
+			if err := decodeStored(value, &existing); err != nil {
+				return err
+			}
+			unstamped := existing
+			unstamped.ExpiresUnixMilli = 0
+			if unstamped != rec {
+				return fmt.Errorf("%w: process instance record changed", ErrIdentityChanged)
+			}
+			durable = existing
+			return nil
+		}
+		outstanding := binary.BigEndian.Uint64(tx.Bucket(fileStoreMetaBucket).Get(fileStoreOutstandingKey))
+		if outstanding >= maximum {
+			return ErrReceiptBacklog
+		}
+		now := time.Now
+		if s.stopControlNow != nil {
+			now = s.stopControlNow
+		}
+		rec.ExpiresUnixMilli = now().Add(lifetime).UnixMilli()
+		if err := rec.Validate(); err != nil {
+			return err
+		}
+		encoded, err := encodeStored(rec)
+		if err != nil {
+			return err
+		}
+		if err := updateOutstanding(tx, 1); err != nil {
+			return err
+		}
+		if err := records.Put(key, encoded); err != nil {
+			return err
+		}
+		durable = rec
+		return nil
+	})
+	if err != nil {
+		return Record{}, err
+	}
+	return durable, nil
 }
 
 // Load returns every durable process record in stable instance-key order.
