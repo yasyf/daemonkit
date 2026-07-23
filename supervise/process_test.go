@@ -306,6 +306,28 @@ func TestManagedProcessExitedBeforeReadinessClassification(t *testing.T) {
 	}
 }
 
+func TestManagedProcessExitOutranksConcurrentReadinessCancellation(t *testing.T) {
+	for range 100 {
+		process := &Process{done: make(chan struct{})}
+		releaseReady := make(chan struct{})
+		exitErr := &ExitError{Code: 23}
+		go func() {
+			process.complete(exitErr, nil)
+			close(process.done)
+			close(releaseReady)
+		}()
+		err := process.awaitReady(t.Context(), ProcessSpec{
+			Ready: func(context.Context, proc.Record) error {
+				<-releaseReady
+				return context.Canceled
+			},
+		})
+		if !errors.Is(err, ErrProcessExitedBeforeReadiness) || !errors.Is(err, exitErr) {
+			t.Fatalf("awaitReady error = %v, want process exit ahead of cancellation", err)
+		}
+	}
+}
+
 func TestManagedProcessSuccessfulReadinessLeavesExitForWait(t *testing.T) {
 	release := filepath.Join(t.TempDir(), "ready")
 	registry := newFakeRegistry()

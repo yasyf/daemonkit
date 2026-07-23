@@ -321,9 +321,10 @@ func (p *Process) earlyReadinessExit() (bool, error) {
 }
 
 func (p *Process) run(ctx context.Context, waited <-chan error) {
+	// Publish completion before cancellation can wake a readiness callback.
+	defer p.cancel()
 	defer close(p.done)
 	defer p.pool.release(p.workerID)
-	defer p.cancel()
 	select {
 	case waitErr := <-waited:
 		settleErr := p.pool.registry.TerminateWithin(context.WithoutCancel(ctx), p.record, p.pool.grace)
