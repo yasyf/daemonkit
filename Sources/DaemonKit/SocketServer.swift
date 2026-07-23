@@ -936,6 +936,9 @@ private extension ServerSession {
         if response.rejected {
             members.append("\"rejected\":true")
         }
+        if let code = response.code {
+            try members.append("\"code\":\(jsonString(code.rawValue))")
+        }
         if let reason = response.reason {
             try members.append("\"reason\":\(jsonString(reason))")
         }

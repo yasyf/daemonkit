@@ -23,6 +23,8 @@ type ResponseCode string
 const (
 	// ResponseCodeRuntimeStarting identifies pre-ready non-dispatch.
 	ResponseCodeRuntimeStarting ResponseCode = "runtime_starting"
+	// ResponseCodeServerDraining identifies closed-intake non-dispatch.
+	ResponseCodeServerDraining ResponseCode = "server_draining"
 )
 
 // WireIdentity is exchanged during the mandatory exact-version handshake.
@@ -84,10 +86,14 @@ type RejectionError struct {
 func (e *RejectionError) Error() string { return e.Reason }
 
 func (e *RejectionError) Unwrap() error {
-	if e.Code == ResponseCodeRuntimeStarting {
+	switch e.Code {
+	case ResponseCodeRuntimeStarting:
 		return ErrNotReady
+	case ResponseCodeServerDraining:
+		return ErrDraining
+	default:
+		return nil
 	}
-	return nil
 }
 
 // StreamResponse asks the server to emit Chunks in order before its terminal response.

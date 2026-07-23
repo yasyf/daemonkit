@@ -408,7 +408,12 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 		}
 		defer releasePublication()
 		if entry.route == routeBusiness && s.server.isDraining() {
-			if err := s.sendRejected(sessionCtx, frame.ID, ErrDraining.Error()); err != nil {
+			if err := s.sendRejectedCode(
+				sessionCtx,
+				frame.ID,
+				ResponseCodeServerDraining,
+				ErrDraining.Error(),
+			); err != nil {
 				s.closeOnRequestError()
 			}
 			return

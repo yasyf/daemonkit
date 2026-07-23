@@ -1,22 +1,37 @@
 import Foundation
 import Synchronization
 
+/// A machine-readable terminal response status.
+public struct SocketResponseCode: RawRepresentable, Equatable, Hashable, Sendable {
+    public let rawValue: String
+
+    public init(rawValue: String) {
+        self.rawValue = rawValue
+    }
+
+    public static let runtimeStarting = SocketResponseCode(rawValue: "runtime_starting")
+    public static let serverDraining = SocketResponseCode(rawValue: "server_draining")
+}
+
 /// The terminal envelope emitted after any response stream ends.
 public struct SocketTerminal: Sendable {
     public let payload: Data?
     public let error: String?
     public let rejected: Bool
+    public let code: SocketResponseCode?
     public let reason: String?
 
     public init(
         payload: Data? = nil,
         error: String? = nil,
         rejected: Bool = false,
+        code: SocketResponseCode? = nil,
         reason: String? = nil
     ) {
         self.payload = payload
         self.error = error
         self.rejected = rejected
+        self.code = code
         self.reason = reason
     }
 }

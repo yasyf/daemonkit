@@ -551,6 +551,7 @@ private extension SocketClientCore {
             payload: payload,
             error: object["err"] as? String,
             rejected: object["rejected"] as? Bool ?? false,
+            code: (object["code"] as? String).map(SocketResponseCode.init(rawValue:)),
             reason: object["reason"] as? String
         )
         return DecodedResponse(terminal: terminal, acknowledge: object["ack"] as? Bool ?? false)

@@ -107,6 +107,12 @@ type ClientConfig struct {
 	CancelSettlementTimeout time.Duration
 }
 
+// UnaryClient is an exact-build unary request transport.
+type UnaryClient interface {
+	Call(context.Context, Op, string, []byte) (Result, error)
+	WireBuild() string
+}
+
 // Client is one persistent, concurrent v1 session.
 type Client struct {
 	conn      net.Conn
@@ -196,22 +202,14 @@ func NewClient(ctx context.Context, config ClientConfig) (*Client, error) {
 }
 
 func newClient(ctx context.Context, config ClientConfig) (*Client, error) {
-	if config.Dial == nil {
-		return nil, errors.New("wire: Dial is required")
-	}
-	if config.WireBuild == "" {
-		return nil, errors.New("wire: WireBuild is required")
-	}
-	streamCap := positiveOr(config.StreamQueue, defaultStreamQueue)
-	eventCap := positiveOr(config.EventQueue, defaultStreamQueue)
-	streamWindow, err := uint32Length("stream queue", streamCap)
+	parameters, err := validateClientConfig(config)
 	if err != nil {
-		return nil, errors.New("wire: stream queue exceeds protocol window")
+		return nil, err
 	}
-	eventWindow, err := uint32Length("event queue", eventCap)
-	if err != nil {
-		return nil, errors.New("wire: event queue exceeds protocol window")
-	}
+	streamCap := parameters.streamCap
+	eventCap := parameters.eventCap
+	streamWindow := parameters.streamWindow
+	eventWindow := parameters.eventWindow
 	conn, err := config.Dial(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("wire: dial: %w", err)
@@ -263,8 +261,40 @@ func newClient(ctx context.Context, config ClientConfig) (*Client, error) {
 	return c, nil
 }
 
+type clientParameters struct {
+	streamCap    int
+	eventCap     int
+	streamWindow uint32
+	eventWindow  uint32
+}
+
+func validateClientConfig(config ClientConfig) (clientParameters, error) {
+	if config.Dial == nil {
+		return clientParameters{}, errors.New("wire: Dial is required")
+	}
+	if config.WireBuild == "" {
+		return clientParameters{}, errors.New("wire: WireBuild is required")
+	}
+	streamCap := positiveOr(config.StreamQueue, defaultStreamQueue)
+	eventCap := positiveOr(config.EventQueue, defaultStreamQueue)
+	streamWindow, err := uint32Length("stream queue", streamCap)
+	if err != nil {
+		return clientParameters{}, errors.New("wire: stream queue exceeds protocol window")
+	}
+	eventWindow, err := uint32Length("event queue", eventCap)
+	if err != nil {
+		return clientParameters{}, errors.New("wire: event queue exceeds protocol window")
+	}
+	return clientParameters{
+		streamCap: streamCap, eventCap: eventCap, streamWindow: streamWindow, eventWindow: eventWindow,
+	}, nil
+}
+
 // PeerWireIdentity returns the server identity established by the handshake.
 func (c *Client) PeerWireIdentity() WireIdentity { return c.peer }
+
+// WireBuild returns the client schema identity presented by this session.
+func (c *Client) WireBuild() string { return c.wireBuild }
 
 // Events returns the bounded server-pushed event stream.
 func (c *Client) Events() <-chan Event { return c.eventOut }
@@ -299,8 +329,8 @@ func (c *Client) open(
 	endInput bool,
 	responseStream bool,
 ) (*ClientCall, error) {
-	if op == "" {
-		return nil, &OpenError{Outcome: PreSendFailure, Err: errors.New("wire: operation is required")}
+	if err := validateOperation(op); err != nil {
+		return nil, &OpenError{Outcome: PreSendFailure, Err: err}
 	}
 	if err := c.sessionErr(); err != nil {
 		return nil, &OpenError{Outcome: PreSendFailure, Err: err}
@@ -366,6 +396,13 @@ func (c *Client) open(
 		}
 	}()
 	return call, nil
+}
+
+func validateOperation(op Op) error {
+	if op == "" {
+		return errors.New("wire: operation is required")
+	}
+	return nil
 }
 
 // ID returns the session-unique request identifier.
