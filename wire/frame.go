@@ -84,13 +84,14 @@ type Frame struct {
 }
 
 // Codec reads and writes exact-v1 length-prefixed frames over one connection.
-// Reads are single-goroutine; writes are serialized and safe from any goroutine.
+// Reads and writes are independently serialized and safe from any goroutine.
 type Codec struct {
 	MaxFrame     int
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
 
 	conn    net.Conn
+	readMu  sync.Mutex
 	writeMu sync.Mutex
 }
 
@@ -116,11 +117,16 @@ func (c *Codec) ClearDeadline() error {
 }
 
 // ReadFrame reads one complete frame and rejects foreign versions before payload use.
-func (c *Codec) ReadFrame() (Frame, error) {
+func (c *Codec) ReadFrame() (frame Frame, err error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
 	if c.ReadTimeout > 0 {
 		if err := c.conn.SetReadDeadline(time.Now().Add(c.ReadTimeout)); err != nil {
 			return Frame{}, fmt.Errorf("wire: set read deadline: %w", err)
 		}
+		defer func() {
+			err = errors.Join(err, clearReadDeadline(c.conn))
+		}()
 	}
 	var prefix [4]byte
 	if _, err := io.ReadFull(c.conn, prefix[:]); err != nil {
@@ -158,7 +164,7 @@ func (c *Codec) WriteFrame(frame Frame) error {
 
 // writeFrame reports whether the complete length-framed packet reached the
 // connection writer. A partial packet cannot dispatch at the peer.
-func (c *Codec) writeFrame(frame Frame) (bool, error) {
+func (c *Codec) writeFrame(frame Frame) (complete bool, err error) {
 	body, err := encodeFrame(frame)
 	if err != nil {
 		return false, err
@@ -183,13 +189,30 @@ func (c *Codec) writeFrame(frame Frame) (bool, error) {
 		if err := c.conn.SetWriteDeadline(time.Now().Add(c.WriteTimeout)); err != nil {
 			return false, fmt.Errorf("wire: set write deadline: %w", err)
 		}
+		defer func() {
+			err = errors.Join(err, clearWriteDeadline(c.conn))
+		}()
 	}
 	written, err := writeFull(c.conn, packet)
-	complete := written == len(packet)
+	complete = written == len(packet)
 	if err != nil {
 		return complete, fmt.Errorf("wire: write frame: %w", err)
 	}
 	return true, nil
+}
+
+func clearReadDeadline(conn net.Conn) error {
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		return fmt.Errorf("wire: clear read deadline: %w", err)
+	}
+	return nil
+}
+
+func clearWriteDeadline(conn net.Conn) error {
+	if err := conn.SetWriteDeadline(time.Time{}); err != nil {
+		return fmt.Errorf("wire: clear write deadline: %w", err)
+	}
+	return nil
 }
 
 func encodeFrame(frame Frame) ([]byte, error) {

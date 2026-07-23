@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Per-frame read and write deadlines are cleared under their serialized I/O
+  ownership, so quiet duplex sessions survive beyond the frame timeout without
+  losing explicit cleanup failures or completed-write state.
 - Managed-process completion now publishes its exact exit result before
   readiness cancellation or worker-slot release, so an observable natural exit
   deterministically outranks concurrent readiness and shutdown signals.
