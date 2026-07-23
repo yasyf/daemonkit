@@ -218,6 +218,9 @@ func (c *Controller) Converge(ctx context.Context, agents []Agent) error {
 	if c.state.Replacement != nil {
 		return ErrQuiesced
 	}
+	if c.state.ReplacementCommit != nil {
+		return ErrReplacementCommitPending
+	}
 	desired, err := desiredAgents(agents)
 	if err != nil {
 		return err

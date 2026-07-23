@@ -83,7 +83,8 @@ func (s *controllerStoreStub) Load(context.Context) (controllerState, error) {
 	s.record("load")
 	return controllerState{
 		Desired: copyAgents(s.state.Desired), Applied: copyAgents(s.state.Applied),
-		Replacement: copyReplacement(s.state.Replacement),
+		Replacement:       copyReplacement(s.state.Replacement),
+		ReplacementCommit: copyReplacementCommit(s.state.ReplacementCommit),
 	}, nil
 }
 
@@ -93,9 +94,10 @@ func (s *controllerStoreStub) ReplaceDesired(
 ) (controllerState, error) {
 	s.record("replace-desired")
 	prior := controllerState{
-		Desired:     copyAgents(s.state.Desired),
-		Applied:     copyAgents(s.state.Applied),
-		Replacement: copyReplacement(s.state.Replacement),
+		Desired:           copyAgents(s.state.Desired),
+		Applied:           copyAgents(s.state.Applied),
+		Replacement:       copyReplacement(s.state.Replacement),
+		ReplacementCommit: copyReplacementCommit(s.state.ReplacementCommit),
 	}
 	if s.replaceErr != nil {
 		return controllerState{}, s.replaceErr
@@ -108,6 +110,7 @@ func (s *controllerStoreStub) SetReplacement(
 	_ context.Context,
 	desired map[string]Agent,
 	replacement *replacementState,
+	commit *replacementCommit,
 ) (controllerState, error) {
 	s.record("set-replacement")
 	if s.replaceErr != nil {
@@ -115,9 +118,11 @@ func (s *controllerStoreStub) SetReplacement(
 	}
 	s.state.Desired = copyAgents(desired)
 	s.state.Replacement = copyReplacement(replacement)
+	s.state.ReplacementCommit = copyReplacementCommit(commit)
 	return controllerState{
 		Desired: copyAgents(s.state.Desired), Applied: copyAgents(s.state.Applied),
-		Replacement: copyReplacement(s.state.Replacement),
+		Replacement:       copyReplacement(s.state.Replacement),
+		ReplacementCommit: copyReplacementCommit(s.state.ReplacementCommit),
 	}, nil
 }
 
