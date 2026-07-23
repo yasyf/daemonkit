@@ -621,6 +621,106 @@ func TestReplacementCommitSurvivesReopenAndBlocksUntilExactAcknowledgement(t *te
 	}
 }
 
+func TestReplacementHistorySurvivesRemovedPriorProgram(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	directory := t.TempDir()
+	realDirectory, err := filepath.EvalSymlinks(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	priorProgram := filepath.Join(realDirectory, "prior")
+	nextProgram := filepath.Join(realDirectory, "next")
+	for _, path := range []string{priorProgram, nextProgram} {
+		if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	config := ControllerConfig{
+		StatePath:   filepath.Join(realDirectory, "services.db"),
+		ProcessPath: filepath.Join(realDirectory, "processes.db"), WorkerLimit: 1,
+	}
+	launchd := &replacementLaunchd{loaded: make(map[string]bool)}
+	priorAgent := controllerAgent(t, "com.example.removed-prior")
+	priorAgent.Program = priorProgram
+	nextAgent := priorAgent
+	nextAgent.Program = nextProgram
+	prior := replacementPlan(t, priorAgent)
+	next := replacementPlan(t, nextAgent)
+	binding := replacementBinding("removed-prior")
+
+	controller := openDurableReplacementController(t, config, launchd)
+	if err := controller.Converge(t.Context(), prior.Agents()); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := controller.Quiesce(t.Context(), "removed-prior", binding, prior)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proveReplacement(t, controller, receipt)
+	if err := os.Remove(priorProgram); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(priorProgram); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("prior program stat = %v, want not exist", err)
+	}
+	closeReplacementController(t, controller)
+
+	controller = openDurableReplacementController(t, config, launchd)
+	status, err := controller.ReplacementStatus(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status == nil || status.Phase != ReplacementQuiesced ||
+		!plansEqual(status.Prior, prior) || !plansEqual(status.Current, prior) {
+		t.Fatalf("reopened quiesced status = %#v", status)
+	}
+	if err := controller.ApplyReplacement(t.Context(), "removed-prior", binding, next); err != nil {
+		t.Fatalf("ApplyReplacement after prior program removal: %v", err)
+	}
+	closeReplacementController(t, controller)
+
+	controller = openDurableReplacementController(t, config, launchd)
+	status, err = controller.ReplacementStatus(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status == nil || status.Phase != ReplacementRunningOwned ||
+		!plansEqual(status.Prior, prior) || !plansEqual(status.Current, next) {
+		t.Fatalf("reopened status = %#v", status)
+	}
+	commit, err := controller.CommitReplacement(t.Context(), "removed-prior", binding, next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeReplacementController(t, controller)
+
+	controller = openDurableReplacementController(t, config, launchd)
+	completion, err := controller.ReplacementCompletion(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completion == nil || !plansEqual(completion.Prior(), prior) || !plansEqual(completion.Next(), next) {
+		t.Fatalf("reopened completion = %#v", completion)
+	}
+	if err := controller.AcknowledgeReplacementCommit(
+		t.Context(), commit.OperationID(), commit.Binding(), commit.Prior(), commit.Next(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	closeReplacementController(t, controller)
+
+	controller = openDurableReplacementController(t, config, launchd)
+	acknowledgement, err := controller.ReplacementAcknowledgement(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acknowledgement == nil || !plansEqual(acknowledgement.Prior(), prior) ||
+		!plansEqual(acknowledgement.Next(), next) {
+		t.Fatalf("reopened acknowledgement = %#v", acknowledgement)
+	}
+	closeReplacementController(t, controller)
+}
+
 func TestReplacementAcknowledgementRejectsNeverCommittedOperation(t *testing.T) {
 	agent := controllerAgent(t, "com.example.never-committed")
 	controller, _, _ := newReplacementController(t, agent)
