@@ -1,10 +1,11 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
+	"math"
 	"net"
 	"os"
 	"os/signal"
@@ -13,54 +14,20 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/internal/runtimeauth"
+	peeridentity "github.com/yasyf/daemonkit/peer"
 	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/trust"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 // DefaultShutdownTimeout bounds graceful runtime shutdown when no timeout is configured.
 const DefaultShutdownTimeout = 30 * time.Second
 
-var errRuntimeExitSelf = errors.New("daemon: same-or-newer runtime already serving")
-
-// Admission tracks admitted frames through their terminal responses.
-type Admission interface {
-	Admit() (done func(), err error)
-	AdmitProtected() (done func(), err error)
-	Close()
-	Draining() bool
-	Settle(ctx context.Context) error
-}
-
-// SessionServer serves persistent sessions over a Runtime-owned listener.
-type SessionServer interface {
-	Serve(
-		ctx context.Context,
-		listener net.Listener,
-		ready func() error,
-		admit, admitProtected func() (func(), error),
-	) error
-	CloseIntake() error
-}
-
-// Workers owns every disposable worker admitted by a Runtime. Wait must not
-// return while an admitted worker or tracked process group remains alive; a
-// context error is reported only after identity-safe settlement.
-type Workers interface {
-	Close()
-	Cancel()
-	Wait(ctx context.Context) error
-}
-
-// Resources owns the consumer resources released last during shutdown.
-type Resources interface {
-	Close() error
-}
-
-// Activation separates bounded startup work from the runtime-owned resource
-// lifetime. Startup is canceled when Activate returns. Lifetime remains live
-// after successful activation until ordered shutdown reaches resource teardown.
+// Activation is one generation-bound consumer preparation authority.
 type Activation struct {
-	Startup  context.Context
-	Lifetime context.Context
+	runtime    *Runtime
+	generation uint64
+	ctx        context.Context
 }
 
 // RuntimeConfig defines one daemon process generation. Every ownership seam is
@@ -71,21 +38,8 @@ type RuntimeConfig struct {
 	RuntimeProtocol int
 
 	ListenerWait time.Duration
-	Admission    Admission
-	Server       SessionServer
-	Workers      Workers
-	State        io.Closer
-	Resources    Resources
-	// Activate constructs and publishes the generation's owned state only after
-	// listener acquisition has established exclusive ownership.
-	// It must use Startup only for bounded construction and readiness, and
-	// Lifetime for resources retained after a successful return.
-	Activate func(Activation) error
-
-	// Busy reports consumer work outside Admission and Workers.
-	Busy func() bool
-	// HealthState reports degraded or failed consumer health. nil is healthy.
-	HealthState func() State
+	Workers      *worker.Pool
+	Children     *proc.Manager
 
 	ShutdownTimeout time.Duration
 	Signals         <-chan os.Signal
@@ -93,31 +47,62 @@ type RuntimeConfig struct {
 
 // Runtime is the sole process coordinator for one daemon generation.
 type Runtime struct {
-	cfg               RuntimeConfig
-	processGeneration string
-	mu                sync.Mutex
-	started           bool
-	finished          bool
-	stopping          bool
-	runErr            error
-	done              chan struct{}
-	ready             chan struct{}
-	isReady           bool
-	stop              chan struct{}
-	stopOnce          sync.Once
+	cfg                  RuntimeConfig
+	processGeneration    string
+	mu                   sync.Mutex
+	started              bool
+	finished             bool
+	stopping             bool
+	runErr               error
+	done                 chan struct{}
+	lifecycle            *Lifecycle
+	stop                 chan struct{}
+	stopOnce             sync.Once
+	controllerGeneration uint64
+	publication          *publicationCore
+	activationCancel     context.CancelFunc
+	serveCancel          context.CancelFunc
+	serverLive           bool
+	serverTerminal       bool
+	startupFailure       error
+	workerClaim          *worker.RuntimeClaim
+	workerActivated      bool
+	childrenClaimed      bool
+	trustWorkers         *worker.RuntimeClaim
+	server               runtimeauth.SessionServer
+	retainedListener     net.Listener
+	retainedLock         *proc.FileLockHandle
+	childFences          map[childFenceKey]*childFenceState
+	trustPolicy          trust.TrustPolicy
+	trustExecutable      string
+	childFenceTimeout    time.Duration
+	childFenceVerifier   func(context.Context, peeridentity.Identity, trust.Requirement) error
 }
 
 func init() {
 	runtimeauth.Register(func(config any) (any, error) {
-		cfg, ok := config.(RuntimeConfig)
+		composition, ok := config.(runtimeauth.Composition)
+		if !ok || composition.Server == nil {
+			return nil, errors.New("daemon: invalid private runtime composition")
+		}
+		cfg, ok := composition.RuntimeConfig.(RuntimeConfig)
 		if !ok {
 			return nil, errors.New("daemon: invalid private runtime config")
 		}
-		return newRuntime(cfg)
+		policy, ok := composition.TrustPolicy.(trust.TrustPolicy)
+		if !ok {
+			return nil, errors.New("daemon: invalid private trust policy")
+		}
+		runtime, err := newRuntime(cfg, policy)
+		if err != nil {
+			return nil, err
+		}
+		runtime.server = composition.Server
+		return runtime, nil
 	})
 }
 
-func newRuntime(cfg RuntimeConfig) (*Runtime, error) {
+func newRuntime(cfg RuntimeConfig, policy trust.TrustPolicy) (*Runtime, error) {
 	if err := validateRuntimeConfig(cfg); err != nil {
 		return nil, err
 	}
@@ -125,12 +110,20 @@ func newRuntime(cfg RuntimeConfig) (*Runtime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("daemon: derive process generation: %w", err)
 	}
+	executable, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("daemon: trust verifier executable: %w", err)
+	}
 	return &Runtime{
-		cfg:               cfg,
-		processGeneration: generation,
-		done:              make(chan struct{}),
-		ready:             make(chan struct{}),
-		stop:              make(chan struct{}, 1),
+		cfg:                  cfg,
+		processGeneration:    generation,
+		done:                 make(chan struct{}),
+		lifecycle:            newLifecycle(),
+		stop:                 make(chan struct{}, 1),
+		controllerGeneration: 1,
+		childFences:          make(map[childFenceKey]*childFenceState),
+		trustPolicy:          policy,
+		trustExecutable:      executable,
 	}, nil
 }
 
@@ -142,18 +135,10 @@ func validateRuntimeConfig(cfg RuntimeConfig) error {
 		return errors.New("daemon: runtime build is required")
 	case cfg.RuntimeProtocol <= 0:
 		return errors.New("daemon: runtime protocol must be positive")
-	case cfg.Admission == nil:
-		return errors.New("daemon: runtime admission is required")
-	case cfg.Server == nil:
-		return errors.New("daemon: runtime session server is required")
 	case cfg.Workers == nil:
 		return errors.New("daemon: runtime workers are required")
-	case cfg.State == nil:
-		return errors.New("daemon: runtime state is required")
-	case cfg.Resources == nil:
-		return errors.New("daemon: runtime resources are required")
-	case cfg.Activate == nil:
-		return errors.New("daemon: runtime activation is required")
+	case cfg.Children == nil:
+		return errors.New("daemon: runtime child manager is required")
 	}
 	return nil
 }
@@ -163,18 +148,21 @@ func (r *Runtime) Health(ctx context.Context) (Health, error) {
 	if err := ctx.Err(); err != nil {
 		return Health{}, err
 	}
-	state := StateHealthy
-	if r.cfg.HealthState != nil {
-		state = r.cfg.HealthState()
-	}
-	busy := false
-	if r.cfg.Busy != nil {
-		busy = r.cfg.Busy()
-	}
 	r.mu.Lock()
-	stopping := r.stopping
-	draining := stopping || r.cfg.Admission.Draining()
-	ready := r.isReady && !stopping && !r.finished && !draining
+	r.lifecycle.mu.Lock()
+	progress := cloneLifecycleProgress(r.lifecycle.progress)
+	healthStatus := HealthStatus{
+		State: r.lifecycle.health.State, Detail: append([]byte{}, r.lifecycle.health.Detail...),
+	}
+	fatal := r.lifecycle.fatal
+	if fatal != nil {
+		healthStatus = HealthStatus{State: StateFailed, Detail: []byte(fatal.Error())}
+	}
+	busy := r.lifecycle.inflight > 0 || len(r.lifecycle.activities) > 0 ||
+		r.cfg.Workers.Active() > 0 || r.cfg.Children.Active() > 0
+	r.lifecycle.mu.Unlock()
+	ready := progress.State == LifecycleReady && fatal == nil
+	draining := progress.State == LifecycleDraining
 	generation := r.processGeneration
 	r.mu.Unlock()
 	return Health{
@@ -182,7 +170,8 @@ func (r *Runtime) Health(ctx context.Context) (Health, error) {
 		RuntimeProtocol:   r.cfg.RuntimeProtocol,
 		ProcessGeneration: generation,
 		PID:               os.Getpid(),
-		State:             state,
+		State:             healthStatus.State,
+		Detail:            healthStatus.Detail,
 		Draining:          draining,
 		Busy:              busy,
 		Ready:             ready,
@@ -208,48 +197,38 @@ func (r *Runtime) Close(ctx context.Context) error {
 		return err
 	}
 	r.mu.Unlock()
-	if err := r.requestStop(ctx); err != nil && !errors.Is(err, ErrRuntimeClosed) {
-		return err
+	stopErr := r.requestStop(ctx)
+	r.mu.Lock()
+	stopIssued := r.stopping
+	r.mu.Unlock()
+	if stopErr != nil && !stopIssued {
+		return stopErr
 	}
-	return r.Wait(ctx)
+	return errors.Join(stopErr, r.Wait(ctx))
 }
 
 // WaitReady waits for exact healthy serving readiness. Session servers publish
 // readiness once after every serving prerequisite is live; no polling occurs.
 func (r *Runtime) WaitReady(ctx context.Context) error {
+	sequence := uint64(0)
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		r.mu.Lock()
-		finished, stopping, runErr, ready := r.finished, r.stopping, r.runErr, r.isReady
-		r.mu.Unlock()
-		if finished {
-			return errors.Join(ErrRuntimeNotReady, runErr)
+		if fatal := r.lifecycle.fatalError(); fatal != nil {
+			return fatal
 		}
-		if stopping {
+		progress := r.lifecycle.Snapshot()
+		sequence = progress.Sequence
+		switch progress.State {
+		case LifecycleReady:
+			return nil
+		case LifecycleFailed, LifecycleDraining:
 			return ErrRuntimeNotReady
 		}
-		if ready {
-			health, err := r.Health(ctx)
-			if err != nil {
-				return err
-			}
-			if health.State != StateHealthy || health.Draining {
-				return fmt.Errorf(
-					"%w: state=%q draining=%t",
-					ErrRuntimeNotReady,
-					health.State,
-					health.Draining,
-				)
-			}
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-r.ready:
-		case <-r.done:
+		_, err := r.lifecycle.WaitChange(ctx, sequence)
+		if err != nil {
+			return err
 		}
 	}
 }
@@ -272,131 +251,283 @@ func (r *Runtime) Wait(ctx context.Context) error {
 	}
 }
 
-// Run acquires the single-entrant listener, serves sessions, and owns every
-// shutdown phase through final resource release. A Runtime is single-use.
-func (r *Runtime) Run(ctx context.Context) (err error) {
+// Begin acquires the single-entrant listener and starts authenticated sessions
+// in Starting. The caller owns consumer preparation through the returned
+// generation-bound Activation. The acquisition context has no authority after
+// Begin returns.
+//
+//nolint:contextcheck // Serving and settlement lifetimes are Runtime-owned after acquisition.
+func (r *Runtime) Begin(ctx context.Context) (activation Activation, err error) {
 	if !r.begin() {
-		return ErrRuntimeStarted
+		return Activation{}, ErrRuntimeStarted
 	}
-	defer func() { r.finish(err) }()
+	if claimErr := r.cfg.Children.ClaimRuntime(); claimErr != nil {
+		r.finish(claimErr)
+		return Activation{}, fmt.Errorf("daemon: claim runtime children: %w", claimErr)
+	}
+	r.mu.Lock()
+	r.childrenClaimed = true
+	r.mu.Unlock()
+	if recoverErr := r.cfg.Children.Recover(ctx); recoverErr != nil {
+		closeErr := r.closeUnstarted(ctx)
+		err = errors.Join(fmt.Errorf("daemon: recover runtime children: %w", recoverErr), closeErr)
+		r.finish(err)
+		return Activation{}, err
+	}
+	claim, claimErr := r.cfg.Workers.ClaimRuntime()
+	if claimErr != nil {
+		_ = r.cfg.Children.ReleaseRuntime()
+		r.mu.Lock()
+		r.childrenClaimed = false
+		r.mu.Unlock()
+		r.finish(claimErr)
+		return Activation{}, fmt.Errorf("daemon: claim runtime workers: %w", claimErr)
+	}
+	r.mu.Lock()
+	r.workerClaim = claim
+	r.trustWorkers = claim
+	r.mu.Unlock()
+	if recoverErr := claim.Recover(ctx); recoverErr != nil {
+		closeErr := r.closeUnstarted(ctx)
+		err = errors.Join(fmt.Errorf("daemon: recover runtime workers: %w", recoverErr), closeErr)
+		r.finish(err)
+		return Activation{}, err
+	}
+	r.mu.Lock()
+	publicationBound := r.publication != nil
+	r.mu.Unlock()
+	if !publicationBound {
+		err = errors.New("daemon: runtime publication slot is required")
+		closeErr := r.closeUnstarted(ctx)
+		err = errors.Join(err, closeErr)
+		r.finish(err)
+		return Activation{}, err
+	}
+	if r.lifecycle.Snapshot().State != LifecycleStarting {
+		err = errors.New("daemon: runtime controller is not starting")
+		closeErr := r.closeUnstarted(ctx)
+		err = errors.Join(err, closeErr)
+		r.finish(err)
+		return Activation{}, err
+	}
 
 	listener, lock, exitSelf, listenErr := r.listen(ctx)
 	if listenErr != nil || exitSelf {
 		closeErr := r.closeUnstarted(ctx)
+		err = errors.Join(listenErr, closeErr)
+		r.finish(err)
 		if exitSelf {
-			return closeErr
+			return Activation{}, closeErr
 		}
-		return errors.Join(listenErr, closeErr)
+		return Activation{}, err
 	}
+	if activateErr := claim.Activate(); activateErr != nil {
+		closeErr := r.closeAcquired(ctx, listener, lock)
+		err = errors.Join(fmt.Errorf("daemon: activate runtime workers: %w", activateErr), closeErr)
+		r.finish(err)
+		return Activation{}, err
+	}
+	r.mu.Lock()
+	r.workerActivated = true
+	r.mu.Unlock()
 
 	signalCh, stopSignals := r.signalChannel()
-	defer stopSignals()
-	cancelActivation, activated, activationCause, activateErr := r.activate(ctx, signalCh)
-	if !activated {
-		closeErr := r.closeAcquired(ctx, listener, lock)
-		return errors.Join(activationCause, activateErr, closeErr)
-	}
-
-	serveCtx, cancelServe := context.WithCancel(context.WithoutCancel(ctx))
-	defer cancelServe()
+	activationCtx, cancelActivation := context.WithCancel(context.WithoutCancel(ctx))
+	serveCtx, cancelServe := context.WithCancel(context.Background())
 	serveDone := make(chan error, 1)
+	serveStarted := make(chan error, 1)
+	var serverExitOnce sync.Once
+	var serverExitResult error
+	serverExit := func(serveErr error) error {
+		serverExitOnce.Do(func() { serverExitResult = r.markServerTerminal(serveErr) })
+		return serverExitResult
+	}
 	go func() {
-		serveDone <- r.cfg.Server.Serve(
+		serveErr := r.server.ServeRuntime(
 			serveCtx,
 			listener,
-			r.publishReady,
-			r.cfg.Admission.Admit,
-			r.cfg.Admission.AdmitProtected,
+			r.lifecycle,
+			r.trustWorkers,
+			func() (any, func(), error) { return r.admitReady() },
+			func() (any, func(), error) { return r.admitProtected() },
+			r.matchChildFence,
+			serverExit,
+			serveStarted,
 		)
+		serveDone <- serverExit(serveErr)
 	}()
+	abort := func(cause error, joined bool) error {
+		result := r.abortBegin(cause, listener, lock, cancelActivation, cancelServe, serveDone, joined)
+		stopSignals()
+		r.finish(result)
+		return result
+	}
 
-	var cause error
-	var servedEarly bool
-	var serveErr error
 	select {
-	case <-r.stop:
 	case <-ctx.Done():
-		cause = ctx.Err()
-	case <-signalCh:
-	case serveErr = <-serveDone:
-		servedEarly = true
-		if serveErr == nil {
-			cause = ErrSessionServerStopped
-		} else {
-			cause = fmt.Errorf("daemon: serve sessions: %w", serveErr)
-		}
-	}
-
-	shutdownErr := r.shutdown(
-		ctx, listener, lock, cancelActivation, cancelServe, serveDone, servedEarly,
-	)
-	return errors.Join(cause, shutdownErr)
-}
-
-func (r *Runtime) activate(
-	parent context.Context,
-	signalCh <-chan os.Signal,
-) (context.CancelFunc, bool, error, error) {
-	startup, cancelStartup := context.WithCancel(parent)
-	lifetime, cancelLifetime := context.WithCancel(context.WithoutCancel(parent))
-	done := make(chan error, 1)
-	go func() {
-		done <- runActivation(Activation{Startup: startup, Lifetime: lifetime}, r.cfg.Activate)
-	}()
-
-	select {
-	case err := <-done:
-		cancelStartup()
-		if err != nil {
-			cancelLifetime()
-			return nil, false, nil, fmt.Errorf("daemon: activate runtime: %w", err)
-		}
-		if err := parent.Err(); err != nil {
-			cancelLifetime()
-			return nil, false, err, nil
-		}
-		select {
-		case <-r.stop:
-			cancelLifetime()
-			return nil, false, nil, nil
-		default:
-		}
-		select {
-		case <-signalCh:
-			cancelLifetime()
-			return nil, false, nil, nil
-		default:
-		}
-		return cancelLifetime, true, nil, nil
+		return Activation{}, abort(ctx.Err(), false)
 	case <-r.stop:
-		cancelStartup()
-		cancelLifetime()
-		return nil, false, nil, interruptedActivationError(<-done)
-	case <-parent.Done():
-		cancelStartup()
-		cancelLifetime()
-		return nil, false, parent.Err(), interruptedActivationError(<-done)
+		return Activation{}, abort(r.startupStopCause(), false)
 	case <-signalCh:
-		cancelStartup()
-		cancelLifetime()
-		return nil, false, nil, interruptedActivationError(<-done)
-	}
-}
-
-func runActivation(activation Activation, activate func(Activation) error) (err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("daemon: activation panic: %v", recovered)
+		return Activation{}, abort(ErrRuntimeNotReady, false)
+	case serveErr := <-serveDone:
+		if serveErr == nil {
+			serveErr = ErrSessionServerStopped
 		}
-	}()
-	return activate(activation)
+		return Activation{}, abort(serveErr, true)
+	case startErr := <-serveStarted:
+		if startErr != nil {
+			return Activation{}, abort(startErr, false)
+		}
+		r.mu.Lock()
+		if !r.serverTerminal {
+			r.serverLive = true
+		}
+		r.mu.Unlock()
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return Activation{}, abort(ctxErr, false)
+	}
+	select {
+	case <-r.stop:
+		err = r.startupStopCause()
+	case <-signalCh:
+		err = ErrRuntimeNotReady
+	case serveErr := <-serveDone:
+		if serveErr == nil {
+			serveErr = ErrSessionServerStopped
+		}
+		err = serveErr
+	default:
+	}
+	if err != nil {
+		return Activation{}, abort(err, false)
+	}
+
+	r.mu.Lock()
+	r.lifecycle.mu.Lock()
+	if r.stopping || r.finished || !r.serverLive || r.serverTerminal || r.lifecycle.progress.State != LifecycleStarting || ctx.Err() != nil {
+		state := r.lifecycle.progress.State
+		r.lifecycle.mu.Unlock()
+		r.mu.Unlock()
+		return Activation{}, abort(
+			errors.Join(fmt.Errorf("daemon: Begin lost activation authority in state %s", state), ctx.Err()),
+			false,
+		)
+	}
+	r.activationCancel = cancelActivation
+	r.serveCancel = cancelServe
+	generation := r.controllerGeneration
+	r.lifecycle.mu.Unlock()
+	r.mu.Unlock()
+	activation = Activation{runtime: r, generation: generation, ctx: activationCtx}
+	go r.runStarted(listener, lock, signalCh, stopSignals, serveDone)
+	return activation, nil
 }
 
-func interruptedActivationError(err error) error {
-	if err == nil || errors.Is(err, context.Canceled) {
+func (r *Runtime) startupStopCause() error {
+	r.mu.Lock()
+	lifecycle := r.lifecycle
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
+	defer r.mu.Unlock()
+	if lifecycle.fatal != nil {
+		return lifecycle.fatal
+	}
+	if r.startupFailure != nil {
+		return r.startupFailure
+	}
+	if lifecycle.progress.State == LifecycleReady {
 		return nil
 	}
-	return fmt.Errorf("daemon: settle interrupted activation: %w", err)
+	if lifecycle.progress.State == LifecycleDraining && lifecycle.publication != nil && lifecycle.publication.publishedSet {
+		return nil
+	}
+	return ErrRuntimeNotReady
+}
+
+func (r *Runtime) signalStop() {
+	r.stopOnce.Do(func() {
+		r.mu.Lock()
+		r.stopping = true
+		r.mu.Unlock()
+		r.stop <- struct{}{}
+	})
+}
+
+func (r *Runtime) markServerTerminal(serveErr error) error {
+	r.mu.Lock()
+	lifecycle := r.lifecycle
+	lifecycle.mu.Lock()
+	r.serverLive = false
+	r.serverTerminal = true
+	cancel := r.activationCancel
+	switch lifecycle.progress.State {
+	case LifecycleStarting, LifecycleReady:
+		if serveErr == nil {
+			serveErr = ErrSessionServerStopped
+		}
+		if lifecycle.progress.Sequence == math.MaxUint64 {
+			serveErr = ErrSequenceExhausted
+			lifecycle.setFatalLocked(serveErr)
+		} else {
+			r.startupFailure = serveErr
+			if lifecycle.publication != nil {
+				lifecycle.publication.invalidateStagedLocked()
+			}
+			lifecycle.invalidateActivitiesLocked()
+			if err := lifecycle.advanceTerminalLocked(LifecycleFailed, lifecycle.progress.Detail); err != nil {
+				panic("daemon: server terminalization violated sequence preflight")
+			}
+		}
+	case LifecycleFailed:
+		if r.startupFailure != nil {
+			serveErr = r.startupFailure
+		}
+	case LifecycleDraining:
+		if serveErr == nil || errors.Is(serveErr, context.Canceled) || errors.Is(serveErr, net.ErrClosed) {
+			serveErr = nil
+		}
+	}
+	lifecycle.mu.Unlock()
+	r.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if serveErr != nil {
+		r.signalStop()
+	}
+	return serveErr
+}
+
+//nolint:contextcheck // Shutdown must outlive the signal or serving context that initiated it.
+func (r *Runtime) runStarted(
+	listener net.Listener,
+	lock *proc.FileLockHandle, signalCh <-chan os.Signal,
+	stopSignals func(),
+	serveDone <-chan error,
+) {
+	defer stopSignals()
+	var cause error
+	servedEarly := false
+	select {
+	case <-r.stop:
+		cause = r.startupStopCause()
+	case <-signalCh:
+		cause = r.startupStopCause()
+	case serveErr := <-serveDone:
+		servedEarly = true
+		cause = serveErr
+	}
+	r.mu.Lock()
+	if r.serverTerminal && r.startupFailure != nil {
+		cause = r.startupFailure
+	}
+	cancelActivation := r.activationCancel
+	cancelServe := r.serveCancel
+	r.mu.Unlock()
+	shutdownErr := r.shutdown(listener, lock, cancelActivation, cancelServe, serveDone, servedEarly)
+	r.finish(errors.Join(cause, shutdownErr))
 }
 
 func (r *Runtime) begin() bool {
@@ -409,7 +540,15 @@ func (r *Runtime) begin() bool {
 	return true
 }
 
+//nolint:contextcheck // Terminal lifecycle publication is not request-scoped.
 func (r *Runtime) finish(err error) {
+	progress := r.lifecycle.Snapshot()
+	switch progress.State {
+	case LifecycleStarting:
+		_ = r.lifecycle.fail()
+	case LifecycleReady:
+		_ = r.Drain()
+	}
 	r.mu.Lock()
 	r.runErr = err
 	r.finished = true
@@ -417,32 +556,335 @@ func (r *Runtime) finish(err error) {
 	r.mu.Unlock()
 }
 
-func (r *Runtime) publishReady() error {
-	health, err := r.Health(context.Background())
-	if err != nil {
-		return err
+// Lifecycle returns the singular read-only runtime publication view.
+func (r *Runtime) Lifecycle() LifecycleView { return r.lifecycle }
+
+// Context returns the preparation lifetime canceled by failure or drain.
+func (a Activation) Context() context.Context {
+	if a.ctx == nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		return ctx
 	}
-	if health.State != StateHealthy || health.Draining {
-		return fmt.Errorf(
-			"%w: state=%q draining=%t",
-			ErrRuntimeNotReady,
-			health.State,
-			health.Draining,
-		)
+	return a.ctx
+}
+
+// UpdateProgress publishes copied opaque Starting progress.
+func (a Activation) UpdateProgress(detail []byte) error {
+	if len(detail) > MaxLifecycleDetailBytes {
+		return fmt.Errorf("daemon: lifecycle detail bytes=%d exceeds %d", len(detail), MaxLifecycleDetailBytes)
 	}
+	if a.runtime == nil {
+		return ErrPublicationStale
+	}
+	r := a.runtime
 	r.mu.Lock()
+	lifecycle := r.lifecycle
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
 	defer r.mu.Unlock()
-	if r.stopping {
-		return ErrRuntimeNotReady
+	if a.generation != r.controllerGeneration || r.finished {
+		return ErrPublicationStale
 	}
-	if r.isReady {
-		return ErrRuntimeReady
+	if lifecycle.fatal != nil {
+		return lifecycle.fatal
 	}
-	r.isReady = true
-	close(r.ready)
+	if lifecycle.progress.State == LifecycleDraining {
+		return ErrDraining
+	}
+	if lifecycle.progress.State != LifecycleStarting {
+		return ErrPublicationStale
+	}
+	if bytes.Equal(lifecycle.progress.Detail, detail) {
+		return nil
+	}
+	return lifecycle.advanceStartingProgressLocked(detail)
+}
+
+// CommitReady atomically installs publication and opens Ready-only admission.
+func (a Activation) CommitReady(publication Publication) error {
+	if a.runtime == nil || publication.core == nil {
+		return ErrPublicationStale
+	}
+	r := a.runtime
+	r.mu.Lock()
+	lifecycle := r.lifecycle
+	lifecycle.mu.Lock()
+	if a.runtime != publication.core.runtime || a.generation != publication.generation ||
+		a.generation != publication.core.generation || publication.core != lifecycle.publication ||
+		publication.token != publication.core.token ||
+		!publication.core.stagedSet || publication.stage != publication.core.nextStage || r.finished ||
+		!r.serverLive || r.serverTerminal {
+		lifecycle.mu.Unlock()
+		r.mu.Unlock()
+		return ErrPublicationStale
+	}
+	if lifecycle.fatal != nil {
+		cause := lifecycle.fatal
+		lifecycle.mu.Unlock()
+		r.mu.Unlock()
+		return cause
+	}
+	if lifecycle.progress.State == LifecycleDraining {
+		lifecycle.mu.Unlock()
+		r.mu.Unlock()
+		return ErrDraining
+	}
+	if lifecycle.progress.State != LifecycleStarting {
+		lifecycle.mu.Unlock()
+		r.mu.Unlock()
+		return ErrPublicationUnavailable
+	}
+	core := publication.core
+	if lifecycle.progress.Sequence >= math.MaxUint64-1 {
+		cause := ErrSequenceExhausted
+		lifecycle.setFatalLocked(cause)
+		cancel := r.activationCancel
+		lifecycle.mu.Unlock()
+		r.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		r.signalStop()
+		return cause
+	}
+	core.published = core.staged
+	core.publishedSet = true
+	core.publishedStage = publication.stage
+	core.staged = nil
+	core.stagedSet = false
+	r.startupFailure = nil
+	if err := lifecycle.advanceLocked(LifecycleReady, lifecycle.progress.Detail); err != nil {
+		panic("daemon: commit readiness violated reserved lifecycle sequence")
+	}
+	lifecycle.mu.Unlock()
+	r.mu.Unlock()
 	return nil
 }
 
+// Fail atomically publishes Failed and terminates this preparation generation.
+func (a Activation) Fail(cause error) error {
+	if cause == nil {
+		return errors.New("daemon: activation failure cause is required")
+	}
+	if a.runtime == nil {
+		return ErrPublicationStale
+	}
+	r := a.runtime
+	lifecycle := r.lifecycle
+	r.mu.Lock()
+	lifecycle.mu.Lock()
+	if a.generation != r.controllerGeneration || r.finished || lifecycle.progress.State != LifecycleStarting {
+		lifecycle.mu.Unlock()
+		r.mu.Unlock()
+		return ErrPublicationStale
+	}
+	if lifecycle.fatal != nil {
+		cause := lifecycle.fatal
+		lifecycle.mu.Unlock()
+		r.mu.Unlock()
+		return cause
+	}
+	if lifecycle.progress.Sequence == math.MaxUint64 {
+		sequenceErr := ErrSequenceExhausted
+		lifecycle.setFatalLocked(sequenceErr)
+		cancel := r.activationCancel
+		lifecycle.mu.Unlock()
+		r.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		r.signalStop()
+		return sequenceErr
+	}
+	r.startupFailure = cause
+	cancel := r.activationCancel
+	lifecycle.invalidateActivitiesLocked()
+	if lifecycle.publication != nil {
+		lifecycle.publication.invalidateStagedLocked()
+	}
+	if err := lifecycle.advanceTerminalLocked(LifecycleFailed, lifecycle.progress.Detail); err != nil {
+		panic("daemon: activation failure violated sequence preflight")
+	}
+	lifecycle.mu.Unlock()
+	r.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	r.signalStop()
+	return nil
+}
+
+func (r *Runtime) bindPublication(token *publicationToken) (*publicationCore, error) {
+	if token == nil {
+		return nil, errors.New("daemon: publication token is required")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.started {
+		return nil, errors.New("daemon: publication must be bound before Begin")
+	}
+	if r.publication != nil {
+		return nil, errors.New("daemon: runtime publication is already bound")
+	}
+	core := &publicationCore{
+		runtime: r, lifecycle: r.lifecycle, token: token, generation: r.controllerGeneration,
+	}
+	r.publication = core
+	r.lifecycle.publication = core
+	return core, nil
+}
+
+func (r *Runtime) admitReady() (Publication, func(), error) {
+	lifecycle := r.lifecycle
+	lifecycle.mu.Lock()
+	if lifecycle.fatal != nil {
+		err := lifecycle.fatal
+		lifecycle.mu.Unlock()
+		return Publication{}, nil, err
+	}
+	if lifecycle.progress.State == LifecycleDraining {
+		lifecycle.mu.Unlock()
+		return Publication{}, nil, ErrDraining
+	}
+	core := lifecycle.publication
+	if lifecycle.progress.State != LifecycleReady || core == nil || !core.publishedSet {
+		lifecycle.mu.Unlock()
+		return Publication{}, nil, ErrRuntimeNotReady
+	}
+	publication := Publication{core: core, token: core.token, generation: core.generation, stage: core.publishedStage}
+	lease := &publicationLease{alive: true}
+	publication.lease = lease
+	lifecycle.inflight++
+	lifecycle.mu.Unlock()
+	return publication, sync.OnceFunc(func() { r.finishAdmission(lease) }), nil
+}
+
+func (r *Runtime) admitProtected() (Publication, func(), error) {
+	lifecycle := r.lifecycle
+	lifecycle.mu.Lock()
+	if lifecycle.fatal != nil {
+		err := lifecycle.fatal
+		lifecycle.mu.Unlock()
+		return Publication{}, nil, err
+	}
+	if lifecycle.progress.State == LifecycleDraining || lifecycle.progress.State == LifecycleFailed {
+		lifecycle.mu.Unlock()
+		return Publication{}, nil, ErrDraining
+	}
+	lifecycle.inflight++
+	lifecycle.mu.Unlock()
+	return Publication{}, sync.OnceFunc(func() { r.finishAdmission(nil) }), nil
+}
+
+func (r *Runtime) finishAdmission(lease *publicationLease) {
+	lifecycle := r.lifecycle
+	lifecycle.mu.Lock()
+	if lease != nil {
+		lease.alive = false
+	}
+	lifecycle.inflight--
+	if lifecycle.inflight == 0 && lifecycle.settled != nil {
+		close(lifecycle.settled)
+		lifecycle.settled = nil
+	}
+	lifecycle.mu.Unlock()
+}
+
+func (r *Runtime) settleAdmission(ctx context.Context) error {
+	lifecycle := r.lifecycle
+	lifecycle.mu.Lock()
+	if lifecycle.inflight == 0 {
+		lifecycle.mu.Unlock()
+		return nil
+	}
+	if lifecycle.settled == nil {
+		lifecycle.settled = make(chan struct{})
+	}
+	settled := lifecycle.settled
+	lifecycle.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-settled:
+		return nil
+	}
+}
+
+// Drain atomically closes Ready-only admission and cancels preparation.
+func (r *Runtime) Drain() error {
+	r.mu.Lock()
+	started, finished := r.started, r.finished
+	if !started {
+		r.mu.Unlock()
+		return ErrRuntimeNotRunning
+	}
+	if finished {
+		r.mu.Unlock()
+		return ErrRuntimeClosed
+	}
+	r.lifecycle.mu.Lock()
+	var transitionErr error
+	fatal := r.lifecycle.fatal
+	if fatal != nil {
+		fencedChildren := r.revokeChildFencesLocked()
+		cancel := r.activationCancel
+		r.lifecycle.mu.Unlock()
+		r.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		_ = r.server.CloseRuntimeIntake()
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), r.shutdownTimeout())
+		stopErr := stopFencedChildren(stopCtx, fencedChildren)
+		stopCancel()
+		if stopErr != nil {
+			r.fatalFenceSettlement(errors.Join(fatal, stopErr))
+		}
+		r.signalStop()
+		return errors.Join(fatal, stopErr)
+	}
+	switch r.lifecycle.progress.State {
+	case LifecycleFailed, LifecycleDraining:
+	case LifecycleStarting, LifecycleReady:
+		if r.lifecycle.progress.Sequence == math.MaxUint64 {
+			transitionErr = ErrSequenceExhausted
+			r.lifecycle.setFatalLocked(transitionErr)
+		} else {
+			if r.lifecycle.publication != nil {
+				r.lifecycle.publication.invalidateStagedLocked()
+			}
+			if err := r.lifecycle.advanceTerminalLocked(LifecycleDraining, r.lifecycle.progress.Detail); err != nil {
+				panic("daemon: runtime drain violated sequence preflight")
+			}
+			r.lifecycle.invalidateActivitiesLocked()
+		}
+	default:
+		r.lifecycle.mu.Unlock()
+		r.mu.Unlock()
+		return errors.New("daemon: invalid lifecycle state")
+	}
+	cancel := r.activationCancel
+	fencedChildren := r.revokeChildFencesLocked()
+	r.lifecycle.mu.Unlock()
+	r.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	_ = r.server.CloseRuntimeIntake()
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), r.shutdownTimeout())
+	stopErr := stopFencedChildren(stopCtx, fencedChildren)
+	stopCancel()
+	if stopErr != nil {
+		r.fatalFenceSettlement(stopErr)
+	}
+	if transitionErr != nil {
+		r.signalStop()
+	}
+	return errors.Join(transitionErr, stopErr)
+}
+
+//nolint:contextcheck // Drain is immediate; ctx bounds only the stop request.
 func (r *Runtime) requestStop(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -456,114 +898,204 @@ func (r *Runtime) requestStop(ctx context.Context) error {
 	if finished {
 		return ErrRuntimeClosed
 	}
-	r.stopOnce.Do(func() {
-		r.mu.Lock()
-		r.stopping = true
-		r.mu.Unlock()
-		r.stop <- struct{}{}
-	})
-	return nil
+	progress := r.lifecycle.Snapshot()
+	var drainErr error
+	if progress.State != LifecycleFailed && progress.State != LifecycleDraining {
+		drainErr = r.Drain()
+	}
+	r.signalStop()
+	return drainErr
 }
 
-func (r *Runtime) listen(ctx context.Context) (net.Listener, *os.File, bool, error) {
-	shouldExit := false
-	entrant := proc.SingleEntrant{
-		Socket:  r.cfg.Socket,
-		Timeout: r.cfg.ListenerWait,
-		Evict: func() (bool, error) {
-			conn, err := net.DialTimeout("unix", r.cfg.Socket, 100*time.Millisecond)
-			if err != nil {
-				if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ECONNREFUSED) {
-					return true, nil
-				}
-				return false, fmt.Errorf("daemon: probe incumbent listener: %w", err)
-			}
-			_ = conn.Close()
-			shouldExit = true
-			return false, errRuntimeExitSelf
-		},
+func (r *Runtime) listen(ctx context.Context) (net.Listener, *proc.FileLockHandle, bool, error) {
+	wait := r.cfg.ListenerWait
+	if wait <= 0 {
+		wait = 30 * time.Second
 	}
-	listener, lock, err := entrant.Listen(ctx)
-	if shouldExit && errors.Is(err, errRuntimeExitSelf) {
+	spec := proc.FileLockSpec{Path: r.cfg.Socket + ".lock", Mode: proc.FileLockExclusive, Deadline: wait}
+	lock, err := spec.TryAcquire()
+	if err != nil && !errors.Is(err, proc.ErrLockBusy) {
+		return nil, nil, false, fmt.Errorf("daemon: acquire listener lock: %w", err)
+	}
+	conn, probeErr := net.DialTimeout("unix", r.cfg.Socket, 100*time.Millisecond)
+	if probeErr == nil {
+		_ = conn.Close()
+		if lock != nil {
+			_ = lock.Close()
+		}
 		return nil, nil, true, nil
 	}
+	if !errors.Is(probeErr, os.ErrNotExist) && !errors.Is(probeErr, syscall.ENOENT) && !errors.Is(probeErr, syscall.ECONNREFUSED) {
+		if lock != nil {
+			_ = lock.Close()
+		}
+		return nil, nil, false, fmt.Errorf("daemon: probe incumbent listener: %w", probeErr)
+	}
+	if lock == nil {
+		lock, err = spec.Acquire(ctx)
+		if err != nil {
+			return nil, nil, false, fmt.Errorf("daemon: wait for listener lock: %w", err)
+		}
+	}
+	_ = os.Remove(r.cfg.Socket)
+	listener, err := net.Listen("unix", r.cfg.Socket)
 	if err != nil {
-		return nil, nil, false, fmt.Errorf("daemon: acquire listener: %w", err)
+		_ = lock.Close()
+		return nil, nil, false, fmt.Errorf("daemon: bind listener: %w", err)
+	}
+	if err := os.Chmod(r.cfg.Socket, 0o600); err != nil {
+		_ = listener.Close()
+		_ = lock.Close()
+		return nil, nil, false, fmt.Errorf("daemon: chmod listener: %w", err)
 	}
 	return listener, lock, false, nil
 }
 
 func (r *Runtime) shutdown(
-	parent context.Context,
 	listener net.Listener,
-	lock *os.File,
-	cancelActivation context.CancelFunc,
+	lock *proc.FileLockHandle, cancelActivation context.CancelFunc,
 	cancelServe context.CancelFunc,
 	serveDone <-chan error,
 	servedEarly bool,
 ) error {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), r.shutdownTimeout())
+	ctx, cancel := context.WithTimeout(context.Background(), r.shutdownTimeout())
 	defer cancel()
 
 	var errs []error
-	r.cfg.Admission.Close()
-	if err := r.cfg.Server.CloseIntake(); err != nil && !errors.Is(err, net.ErrClosed) {
+	if err := r.Drain(); err != nil && !errors.Is(err, ErrDraining) {
+		errs = append(errs, fmt.Errorf("daemon: drain runtime: %w", err))
+	}
+	if err := r.server.CloseRuntimeIntake(); err != nil && !errors.Is(err, net.ErrClosed) {
 		errs = append(errs, fmt.Errorf("daemon: close intake: %w", err))
-	}
-	if err := r.cfg.Admission.Settle(ctx); err != nil {
-		errs = append(errs, fmt.Errorf("daemon: settle admission: %w", err))
-	}
-	if err := settleWorkers(ctx, r.cfg.Workers); err != nil {
-		errs = append(errs, fmt.Errorf("daemon: settle workers: %w", err))
 	}
 	cancelActivation()
 	cancelServe()
+	settled := true
+	if err := r.settleAdmission(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("daemon: settle admission: %w", err))
+		settled = false
+	}
+	if err := r.workerClaim.Close(ctx); err != nil {
+		errs = append(errs, errors.Join(ErrShutdownIncomplete, fmt.Errorf("daemon: settle workers: %w", err)))
+		settled = false
+	}
+	if err := r.cfg.Children.Shutdown(ctx); err != nil {
+		errs = append(errs, errors.Join(ErrShutdownIncomplete, fmt.Errorf("daemon: settle children: %w", err)))
+		settled = false
+	}
+	var serveErr error
 	if !servedEarly {
-		if err := <-serveDone; err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {
-			errs = append(errs, fmt.Errorf("daemon: join session server: %w", err))
+		select {
+		case serveErr = <-serveDone:
+		case <-ctx.Done():
+			errs = append(errs, errors.Join(ErrShutdownIncomplete, fmt.Errorf("daemon: join session server: %w", ctx.Err())))
+			settled = false
 		}
 	}
-	if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-		errs = append(errs, fmt.Errorf("daemon: close listener: %w", err))
+	if serveErr != nil {
+		errs = append(errs, serveErr)
 	}
-	if err := lock.Close(); err != nil {
-		errs = append(errs, fmt.Errorf("daemon: close listener lock: %w", err))
+	if settled {
+		r.lifecycle.mu.Lock()
+		if r.lifecycle.publication != nil {
+			r.lifecycle.publication.clearLocked()
+		}
+		r.lifecycle.mu.Unlock()
+		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			errs = append(errs, errors.Join(ErrShutdownIncomplete, fmt.Errorf("daemon: close listener: %w", err)))
+			settled = false
+		}
 	}
-	if err := r.cfg.State.Close(); err != nil {
-		errs = append(errs, fmt.Errorf("daemon: close state: %w", err))
+	if settled {
+		if err := lock.Close(); err != nil {
+			errs = append(errs, errors.Join(ErrShutdownIncomplete, fmt.Errorf("daemon: close listener lock: %w", err)))
+			settled = false
+		}
 	}
-	if err := r.cfg.Resources.Close(); err != nil {
-		errs = append(errs, fmt.Errorf("daemon: close resources: %w", err))
+	if !settled {
+		r.retainOwnership(listener, lock)
+		if !errors.Is(errors.Join(errs...), ErrShutdownIncomplete) {
+			errs = append(errs, ErrShutdownIncomplete)
+		}
 	}
 	return errors.Join(errs...)
 }
 
-func (r *Runtime) closeAcquired(parent context.Context, listener net.Listener, lock *os.File) error {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), r.shutdownTimeout())
+func (r *Runtime) abortBegin(
+	cause error,
+	listener net.Listener,
+	lock *proc.FileLockHandle, cancelActivation context.CancelFunc,
+	cancelServe context.CancelFunc,
+	serveDone <-chan error,
+	joined bool,
+) error {
+	ctx, cancel := context.WithTimeout(context.Background(), r.shutdownTimeout())
 	defer cancel()
+	_ = r.Drain()
+	_ = r.server.CloseRuntimeIntake()
+	cancelActivation()
+	cancelServe()
+	var serveErr error
+	if !joined {
+		select {
+		case serveErr = <-serveDone:
+		case <-ctx.Done():
+			r.retainOwnership(listener, lock)
+			return errors.Join(cause, ErrShutdownIncomplete, fmt.Errorf("daemon: join session server: %w", ctx.Err()))
+		}
+	}
+	if serveErr != nil {
+		cause = serveErr
+	}
+	closeErr := r.closeAcquired(ctx, listener, lock)
+	return errors.Join(cause, closeErr)
+}
 
+func (r *Runtime) retainOwnership(listener net.Listener, lock *proc.FileLockHandle) {
+	r.mu.Lock()
+	r.retainedListener = listener
+	r.retainedLock = lock
+	r.mu.Unlock()
+}
+
+//nolint:contextcheck // Drain is immediate while ctx bounds resource settlement.
+func (r *Runtime) closeAcquired(ctx context.Context, listener net.Listener, lock *proc.FileLockHandle) error {
 	var errs []error
-	r.cfg.Admission.Close()
-	if err := r.cfg.Server.CloseIntake(); err != nil && !errors.Is(err, net.ErrClosed) {
+	_ = r.Drain()
+	if err := r.server.CloseRuntimeIntake(); err != nil && !errors.Is(err, net.ErrClosed) {
 		errs = append(errs, fmt.Errorf("daemon: close intake: %w", err))
 	}
-	if err := r.cfg.Admission.Settle(ctx); err != nil {
+	settled := true
+	if err := r.settleAdmission(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("daemon: settle admission: %w", err))
+		settled = false
 	}
-	if err := settleWorkers(ctx, r.cfg.Workers); err != nil {
-		errs = append(errs, fmt.Errorf("daemon: settle workers: %w", err))
+	if err := r.releaseUnactivatedWorkers(ctx); err != nil {
+		errs = append(errs, errors.Join(ErrShutdownIncomplete, fmt.Errorf("daemon: release runtime workers: %w", err)))
+		settled = false
 	}
-	if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-		errs = append(errs, fmt.Errorf("daemon: close listener: %w", err))
+	if settled {
+		r.lifecycle.mu.Lock()
+		if r.lifecycle.publication != nil {
+			r.lifecycle.publication.clearLocked()
+		}
+		r.lifecycle.mu.Unlock()
+		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			errs = append(errs, errors.Join(ErrShutdownIncomplete, fmt.Errorf("daemon: close listener: %w", err)))
+			settled = false
+		}
 	}
-	if err := lock.Close(); err != nil {
-		errs = append(errs, fmt.Errorf("daemon: close listener lock: %w", err))
+	if settled {
+		if err := lock.Close(); err != nil {
+			errs = append(errs, errors.Join(ErrShutdownIncomplete, fmt.Errorf("daemon: close listener lock: %w", err)))
+			settled = false
+		}
 	}
-	if err := r.cfg.State.Close(); err != nil {
-		errs = append(errs, fmt.Errorf("daemon: close state: %w", err))
-	}
-	if err := r.cfg.Resources.Close(); err != nil {
-		errs = append(errs, fmt.Errorf("daemon: close resources: %w", err))
+	if !settled {
+		r.retainOwnership(listener, lock)
+		if !errors.Is(errors.Join(errs...), ErrShutdownIncomplete) {
+			errs = append(errs, ErrShutdownIncomplete)
+		}
 	}
 	return errors.Join(errs...)
 }
@@ -571,27 +1103,52 @@ func (r *Runtime) closeAcquired(parent context.Context, listener net.Listener, l
 func (r *Runtime) closeUnstarted(parent context.Context) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), r.shutdownTimeout())
 	defer cancel()
-	workerErr := settleWorkers(ctx, r.cfg.Workers)
-	stateErr := r.cfg.State.Close()
-	resourceErr := r.cfg.Resources.Close()
-	return errors.Join(
-		wrapRuntimeClose("settle workers", workerErr),
-		wrapRuntimeClose("close state", stateErr),
-		wrapRuntimeClose("close resources", resourceErr),
-	)
+	if err := r.releaseUnactivatedWorkers(ctx); err != nil {
+		return wrapShutdownIncomplete("release runtime workers", err)
+	}
+	return nil
 }
 
-func settleWorkers(ctx context.Context, workers Workers) error {
-	workers.Close()
-	workers.Cancel()
-	return workers.Wait(ctx)
+func (r *Runtime) releaseUnactivatedWorkers(ctx context.Context) error {
+	r.mu.Lock()
+	claim := r.workerClaim
+	activated := r.workerActivated
+	childrenClaimed := r.childrenClaimed
+	r.mu.Unlock()
+	if claim != nil {
+		var err error
+		if activated {
+			err = claim.Close(ctx)
+		} else {
+			err = claim.Release(ctx)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	r.mu.Lock()
+	if r.workerClaim == claim {
+		r.workerClaim = nil
+		r.workerActivated = false
+		r.trustWorkers = nil
+	}
+	r.mu.Unlock()
+	if childrenClaimed {
+		if err := r.cfg.Children.ReleaseRuntime(); err != nil {
+			return err
+		}
+		r.mu.Lock()
+		r.childrenClaimed = false
+		r.mu.Unlock()
+	}
+	return nil
 }
 
-func wrapRuntimeClose(action string, err error) error {
+func wrapShutdownIncomplete(action string, err error) error {
 	if err == nil {
 		return nil
 	}
-	return fmt.Errorf("daemon: %s: %w", action, err)
+	return errors.Join(ErrShutdownIncomplete, fmt.Errorf("daemon: %s: %w", action, err))
 }
 
 func (r *Runtime) shutdownTimeout() time.Duration {

@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/daemonkit/peer"
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/wire"
 )
 
 const (
@@ -118,11 +118,11 @@ func requireVerifier(t *testing.T) {
 
 func resolvesTo(t *testing.T, conn *net.UnixConn, req string) bool {
 	t.Helper()
-	peer, err := wire.PeerFromConn(conn)
+	identity, err := peer.FromConn(conn)
 	if err != nil {
 		t.Fatalf("PeerFromConn: %v", err)
 	}
-	guest, err := copyGuest(peer.Audit)
+	guest, err := copyGuest(identity.Audit)
 	if err != nil {
 		return false
 	}
@@ -170,22 +170,22 @@ func TestPolicyCheckAcceptsSubstitutedPeer_TF1(t *testing.T) {
 
 	conn := spawnPeerSub(t, fixture, "")
 
-	peer, err := wire.PeerFromConn(conn)
+	identity, err := peer.FromConn(conn)
 	if err != nil {
 		t.Fatalf("PeerFromConn: %v", err)
 	}
-	if err := p.Check(peer); !errors.Is(err, ErrUntrustedPeer) {
+	if err := p.Check(identity); !errors.Is(err, ErrUntrustedPeer) {
 		t.Fatalf("baseline Check = %v, want ErrUntrustedPeer (connector is not the fixture)", err)
 	}
 	if _, err := conn.Write([]byte{1}); err != nil {
 		t.Fatalf("signal helper: %v", err)
 	}
 	if !eventually(t, 5*time.Second, func() bool {
-		peer, err := wire.PeerFromConn(conn)
+		identity, err := peer.FromConn(conn)
 		if err != nil {
 			return false
 		}
-		return p.Check(peer) == nil
+		return p.Check(identity) == nil
 	}) {
 		t.Fatal("Policy.Check never accepted the substituted fixture peer — substitution not observed")
 	}
@@ -193,7 +193,7 @@ func TestPolicyCheckAcceptsSubstitutedPeer_TF1(t *testing.T) {
 
 func TestPeerTokenPIDReuse_TF2(t *testing.T) {
 	conn := spawnPeerSub(t, "/bin/sleep", "86400")
-	peer, err := wire.PeerFromConn(conn)
+	peer, err := peer.FromConn(conn)
 	if err != nil {
 		t.Fatalf("PeerFromConn: %v", err)
 	}

@@ -9,7 +9,7 @@ import (
 	"sync"
 
 	"github.com/ebitengine/purego"
-	"github.com/yasyf/daemonkit/wire"
+	peer "github.com/yasyf/daemonkit/peer"
 )
 
 const (
@@ -114,7 +114,7 @@ func derefStringSym(lib uintptr, name string) (uintptr, error) {
 	return value, nil
 }
 
-func verifyCodeIdentity(peer wire.Peer, identity CodeIdentity) error {
+func verifyCodeIdentity(peer peer.Identity, identity CodeIdentity) error {
 	if len(peer.Audit) != 32 {
 		return fmt.Errorf("%w: audit token is %d bytes, want 32", ErrNoVerifier, len(peer.Audit))
 	}

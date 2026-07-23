@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 const keepAliveGolden = `<?xml version="1.0" encoding="UTF-8"?>
@@ -150,17 +150,16 @@ func TestAppKeepAliveValidation(t *testing.T) {
 	}
 }
 
-type taskRunnerFunc func(context.Context, supervise.Task) error
+type taskRunnerFunc func(context.Context, worker.CommandRequest) (worker.CommandResult, error)
 
-func (f taskRunnerFunc) Run(ctx context.Context, task supervise.Task) error { return f(ctx, task) }
+func (f taskRunnerFunc) Run(ctx context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
+	return f(ctx, task)
+}
 
-func launchctlRunner(fn func(context.Context, ...string) (string, error)) supervise.TaskRunner {
-	return taskRunnerFunc(func(ctx context.Context, task supervise.Task) error {
+func launchctlRunner(fn func(context.Context, ...string) (string, error)) taskRunner {
+	return taskRunnerFunc(func(ctx context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
 		output, err := fn(ctx, task.Args...)
-		if task.Stdout != nil {
-			_, _ = task.Stdout.Write([]byte(output))
-		}
-		return err
+		return worker.CommandResult{Stdout: []byte(output)}, err
 	})
 }
 
@@ -198,7 +197,7 @@ func TestAppKeepAliveUninstallBootout(t *testing.T) {
 				t.Fatalf("WritePlist() = %v", err)
 			}
 			var gotArgs []string
-			k.Runner = launchctlRunner(func(_ context.Context, args ...string) (string, error) {
+			k.runner = launchctlRunner(func(_ context.Context, args ...string) (string, error) {
 				gotArgs = args
 				return "launchctl output", tc.bootoutErr
 			})
@@ -235,7 +234,7 @@ func TestAppKeepAliveInstallEnableBeforeBootstrap(t *testing.T) {
 	}
 
 	var verbs []string
-	k.Runner = launchctlRunner(func(_ context.Context, args ...string) (string, error) {
+	k.runner = launchctlRunner(func(_ context.Context, args ...string) (string, error) {
 		verbs = append(verbs, args[0])
 		return "", nil
 	})
@@ -248,7 +247,7 @@ func TestAppKeepAliveInstallEnableBeforeBootstrap(t *testing.T) {
 
 	errDisabled := errors.New("enable: Input/output error")
 	verbs = nil
-	k.Runner = launchctlRunner(func(_ context.Context, args ...string) (string, error) {
+	k.runner = launchctlRunner(func(_ context.Context, args ...string) (string, error) {
 		verbs = append(verbs, args[0])
 		if args[0] == "enable" {
 			return "", errDisabled

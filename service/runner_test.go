@@ -12,26 +12,30 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 func TestRunCombinedCancellationReapsDaemonizedDescendantAndRecord(t *testing.T) {
 	store := &proc.FileStore{Path: filepath.Join(t.TempDir(), "workers.json")}
 	reaper := &proc.Reaper{Store: store, Generation: "service-test"}
-	pool, err := supervise.NewPool(1, reaper)
+	runtime, err := newControllerWorkerRuntime(1, reaper)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := runtime.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
-		pool.Cancel()
-		_ = pool.Wait(context.Background())
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = runtime.Close(ctx)
 	})
 
 	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
 	ctx, cancel := context.WithCancel(t.Context())
 	result := make(chan error, 1)
 	go func() {
-		_, err := runCombined(ctx, pool, proc.RecoveryTask, "/bin/sh", "-c",
+		_, err := runCombined(ctx, runtime, "/bin/sh", "-c",
 			`trap '' TERM; (trap '' TERM; while :; do sleep 1; done) & echo $! > "$1"; wait`,
 			"service-runner", pidFile)
 		result <- err
@@ -58,11 +62,10 @@ func TestRunCombinedCancellationReapsDaemonizedDescendantAndRecord(t *testing.T)
 }
 
 func TestRunCombinedBoundsOutputWithoutStrandingWorker(t *testing.T) {
-	runner := taskRunnerFunc(func(_ context.Context, task supervise.Task) error {
-		_, _ = task.Stdout.Write([]byte(strings.Repeat("x", commandOutputLimit+1)))
-		return nil
+	runner := taskRunnerFunc(func(_ context.Context, _ worker.CommandRequest) (worker.CommandResult, error) {
+		return worker.CommandResult{Stdout: []byte(strings.Repeat("x", commandOutputLimit+1))}, nil
 	})
-	output, err := runCombined(t.Context(), runner, proc.RecoveryTask, "/usr/bin/true")
+	output, err := runCombined(t.Context(), runner, "/usr/bin/true")
 	if !errors.Is(err, errCommandOutputLimit) {
 		t.Fatalf("runCombined oversized output error = %v", err)
 	}

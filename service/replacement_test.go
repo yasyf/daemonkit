@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 type replacementLaunchd struct {
@@ -21,34 +21,30 @@ type replacementLaunchd struct {
 	events []string
 }
 
-func (l *replacementLaunchd) run(_ context.Context, task supervise.Task) error {
+func (l *replacementLaunchd) run(_ context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
 	l.events = append(l.events, strings.Join(task.Args, " "))
 	if len(task.Args) == 0 {
-		return errors.New("empty launchctl arguments")
+		return worker.CommandResult{}, errors.New("empty launchctl arguments")
 	}
+	var err error
 	switch task.Args[0] {
 	case "print":
 		if l.loaded[task.Args[1]] {
-			return nil
+			break
 		}
-		return launchctlExit(launchctlNotLoadedExit)
+		err = launchctlExit(launchctlNotLoadedExit)
 	case "bootout":
 		if len(task.Args) > 1 {
 			l.loaded[task.Args[1]] = false
 		}
-		return nil
 	case "bootstrap":
-		return nil
 	case "enable":
-		return nil
 	case "kickstart":
 		if len(task.Args) > 1 {
 			l.loaded[task.Args[1]] = true
 		}
-		return nil
-	default:
-		return nil
 	}
+	return worker.CommandResult{}, err
 }
 
 func newReplacementController(

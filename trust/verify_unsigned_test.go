@@ -6,11 +6,11 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit/peer"
 )
 
 func TestUnsignedVerifierFailsClosed(t *testing.T) {
-	err := verifyRequirement(wire.Peer{}, Requirement{})
+	err := verifyRequirement(peer.Identity{}, Requirement{})
 	if err == nil {
 		t.Fatal("verifyRequirement() = nil, want an error")
 	}

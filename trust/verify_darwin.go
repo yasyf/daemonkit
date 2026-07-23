@@ -10,7 +10,7 @@ import (
 	"sync"
 
 	"github.com/ebitengine/purego"
-	"github.com/yasyf/daemonkit/wire"
+	peer "github.com/yasyf/daemonkit/peer"
 )
 
 // Dynamic code-signing status bits, verified against xnu's cs_blobs.h.
@@ -179,7 +179,7 @@ func derefStringSym(lib uintptr, name string) (uintptr, error) {
 
 // Any failure is ErrUntrustedPeer; a missing token or verifier is
 // ErrNoVerifier. Both fail closed.
-func verifyRequirement(peer wire.Peer, req Requirement) error {
+func verifyRequirement(peer peer.Identity, req Requirement) error {
 	if len(peer.Audit) != 32 {
 		return fmt.Errorf("%w: audit token is %d bytes, want 32", ErrNoVerifier, len(peer.Audit))
 	}

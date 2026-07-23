@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+
+	"github.com/yasyf/daemonkit/daemon"
 )
 
 const sessionGenerationBytes = 16
@@ -15,6 +17,8 @@ var (
 	ErrDuplicateID = errors.New("wire: duplicate request id")
 	// ErrStreamOrder means stream chunks arrived out of sequence.
 	ErrStreamOrder = errors.New("wire: stream sequence violation")
+	// ErrSessionCapacity means the authenticated server has no session slot.
+	ErrSessionCapacity = errors.New("wire: session capacity exhausted")
 )
 
 // ResponseCode is a stable machine-readable terminal status.
@@ -23,8 +27,17 @@ type ResponseCode string
 const (
 	// ResponseCodeRuntimeStarting identifies pre-ready non-dispatch.
 	ResponseCodeRuntimeStarting ResponseCode = "runtime_starting"
-	// ResponseCodeServerDraining identifies closed-intake non-dispatch.
-	ResponseCodeServerDraining ResponseCode = "server_draining"
+	// ResponseCodeRuntimeDraining identifies closed-intake non-dispatch.
+	ResponseCodeRuntimeDraining ResponseCode = "runtime_draining"
+	// ResponseCodeBuildMismatch identifies an exact wire-build rejection.
+	ResponseCodeBuildMismatch ResponseCode = "build_mismatch"
+	// ResponseCodeSessionCapacity identifies transient session saturation.
+	ResponseCodeSessionCapacity ResponseCode = "session_capacity"
+	// ResponseCodePeerUntrusted identifies terminal peer rejection.
+	ResponseCodePeerUntrusted ResponseCode = "peer_untrusted"
+	// ResponseCodePermissionDenied rejects an authenticated role without exact
+	// private-control authority.
+	ResponseCodePermissionDenied ResponseCode = "permission_denied"
 )
 
 // WireIdentity is exchanged during the mandatory exact-version handshake.
@@ -42,16 +55,26 @@ type handshakeIdentity struct {
 	Session   []byte `json:"session,omitempty"`
 }
 
+type handshakeAck struct {
+	Protocol  uint16       `json:"protocol"`
+	WireBuild string       `json:"wire_build"`
+	Session   []byte       `json:"session,omitempty"`
+	Rejected  bool         `json:"rejected,omitempty"`
+	Code      ResponseCode `json:"code,omitempty"`
+	Reason    string       `json:"reason,omitempty"`
+}
+
 // Request is one admitted request on a persistent session.
 type Request struct {
-	ID        uint64
-	Op        Op
-	Tenant    string
-	Peer      Peer
-	WireBuild string
-	Payload   []byte
-	Chunks    <-chan Chunk
-	Session   *AcceptedSession
+	ID          uint64
+	Op          Op
+	Tenant      string
+	Peer        Peer
+	WireBuild   string
+	Payload     []byte
+	Chunks      <-chan Chunk
+	Session     *AcceptedSession
+	Publication daemon.Publication
 }
 
 // Chunk is one ordered streaming payload.
@@ -85,12 +108,32 @@ type RejectionError struct {
 
 func (e *RejectionError) Error() string { return e.Reason }
 
-func (e *RejectionError) Unwrap() error {
-	switch e.Code {
+func (e *RejectionError) Unwrap() error { return responseCodeCause(e.Code) }
+
+// HandshakeRejectionError is an authenticated server's typed HelloAck denial.
+type HandshakeRejectionError struct {
+	Code   ResponseCode
+	Reason string
+}
+
+func (e *HandshakeRejectionError) Error() string { return e.Reason }
+
+func (e *HandshakeRejectionError) Unwrap() error { return responseCodeCause(e.Code) }
+
+func responseCodeCause(code ResponseCode) error {
+	switch code {
 	case ResponseCodeRuntimeStarting:
 		return ErrNotReady
-	case ResponseCodeServerDraining:
+	case ResponseCodeRuntimeDraining:
 		return ErrDraining
+	case ResponseCodeBuildMismatch:
+		return ErrBuildMismatch
+	case ResponseCodeSessionCapacity:
+		return ErrSessionCapacity
+	case ResponseCodePeerUntrusted:
+		return ErrUntrustedPeer
+	case ResponseCodePermissionDenied:
+		return ErrPermissionDenied
 	default:
 		return nil
 	}
@@ -105,11 +148,3 @@ type StreamResponse struct {
 // Handler runs one request. Its context is cancelled by a cancel frame,
 // disconnect, server shutdown, or the earlier client/server deadline.
 type Handler func(ctx context.Context, req Request) (any, error)
-
-// Admission gates every request before dispatch. A failure proves non-dispatch.
-type Admission interface {
-	Admit() (done func(), err error)
-	Close()
-	Draining() bool
-	Settle(context.Context) error
-}

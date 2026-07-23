@@ -2,37 +2,31 @@ package wire
 
 import (
 	"errors"
-	"io"
+	"fmt"
 	"os"
 	"time"
 
 	"github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/internal/runtimeauth"
+	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/trust"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 // RuntimeConfig composes the sole product session server with daemonkit's
-// process runtime, readiness barrier, and receipt-authenticated stop route.
+// process runtime and receipt-authenticated stop route.
 type RuntimeConfig struct {
-	Socket                    string
-	RuntimeBuild              string
-	RuntimeProtocol           int
-	Wire                      *Server
-	Classifier                ProtectedSessionClassifier
-	ReservedProtectedSessions int
-	StopVerifier              StopControlVerifier
-	Observations              []ObservationRoute
-	Readiness                 ReadinessBarrier
-	BootstrapRoutes           []BootstrapRoute
+	Socket           string
+	RuntimeBuild     string
+	RuntimeProtocol  int
+	Wire             *Server
+	TrustPolicy      trust.TrustPolicy
+	StopControlStore *proc.FileStore
+	Observations     []ObservationRoute
 
-	ListenerWait time.Duration
-	Admission    daemon.Admission
-	Workers      daemon.Workers
-	State        io.Closer
-	Resources    daemon.Resources
-	Activate     func(daemon.Activation) error
-	Busy         func() bool
-	HealthState  func() daemon.State
-
+	ListenerWait    time.Duration
+	Workers         *worker.Pool
+	Children        *proc.Manager
 	ShutdownTimeout time.Duration
 	Signals         <-chan os.Signal
 }
@@ -46,12 +40,17 @@ func NewRuntime(config RuntimeConfig) (*daemon.Runtime, error) {
 	if config.Wire.WireBuild == "" {
 		return nil, errors.New("wire: runtime server build is required")
 	}
-	composed, err := runtimeauth.Build(daemon.RuntimeConfig{
-		Socket: config.Socket, RuntimeBuild: config.RuntimeBuild, RuntimeProtocol: config.RuntimeProtocol,
-		ListenerWait: config.ListenerWait, Admission: config.Admission, Server: config.Wire,
-		Workers: config.Workers, State: config.State, Resources: config.Resources,
-		Activate: config.Activate, Busy: config.Busy, HealthState: config.HealthState,
-		ShutdownTimeout: config.ShutdownTimeout, Signals: config.Signals,
+	if err := config.TrustPolicy.Validate(); err != nil {
+		return nil, fmt.Errorf("wire: runtime trust policy: %w", err)
+	}
+	composed, err := runtimeauth.Build(runtimeauth.Composition{
+		RuntimeConfig: daemon.RuntimeConfig{
+			Socket: config.Socket, RuntimeBuild: config.RuntimeBuild, RuntimeProtocol: config.RuntimeProtocol,
+			ListenerWait: config.ListenerWait, Workers: config.Workers, Children: config.Children,
+			ShutdownTimeout: config.ShutdownTimeout, Signals: config.Signals,
+		},
+		TrustPolicy: config.TrustPolicy,
+		Server:      runtimeServerAdapter{server: config.Wire, trustPolicy: config.TrustPolicy},
 	})
 	if err != nil {
 		return nil, err
@@ -62,13 +61,9 @@ func NewRuntime(config RuntimeConfig) (*daemon.Runtime, error) {
 	}
 	if err := config.Wire.bindRuntime(
 		config.RuntimeBuild,
-		config.Classifier,
-		config.ReservedProtectedSessions,
 		runtime,
-		config.StopVerifier,
+		config.StopControlStore,
 		config.Observations,
-		config.Readiness,
-		config.BootstrapRoutes,
 	); err != nil {
 		return nil, err
 	}

@@ -3,110 +3,85 @@ package wire
 import (
 	"context"
 	"errors"
+	"time"
+
+	"github.com/yasyf/daemonkit/daemon"
 )
 
-// ReadinessBarrier owns product bootstrap between live wire acceptance and
-// publication of daemon readiness.
-type ReadinessBarrier interface {
-	BeforeReady(context.Context) error
-	AfterReady(error)
-	Published() bool
+// MaxReadinessDetailBytes bounds opaque product progress on the wire.
+const MaxReadinessDetailBytes = daemon.MaxLifecycleDetailBytes
+
+// RuntimeReadinessState is one exact lifecycle publication state.
+type RuntimeReadinessState = daemon.LifecycleState
+
+const (
+	// RuntimeStarting means consumer preparation has not committed readiness.
+	RuntimeStarting = daemon.LifecycleStarting
+	// RuntimeReady means the exact consumer publication is live.
+	RuntimeReady = daemon.LifecycleReady
+	// RuntimeFailed means preparation or serving failed terminally.
+	RuntimeFailed = daemon.LifecycleFailed
+	// RuntimeDraining means new Ready-only admission is closed.
+	RuntimeDraining = daemon.LifecycleDraining
+)
+
+var (
+	// ErrReadinessProgress means a lifecycle publication is structurally invalid.
+	ErrReadinessProgress = errors.New("wire: invalid runtime readiness progress")
+	// ErrReadinessNoProgress means a runtime did not advance before its progress bound.
+	ErrReadinessNoProgress = errors.New("wire: runtime readiness made no progress")
+	// ErrRuntimeFailed means the exact runtime failed before readiness.
+	ErrRuntimeFailed = errors.New("wire: runtime failed before readiness")
+	// ErrRuntimeBuildMismatch means the connected runtime build is not exact.
+	ErrRuntimeBuildMismatch = errors.New("wire: runtime build mismatch")
+	// ErrProcessGenerationMismatch means the connected process generation is not exact.
+	ErrProcessGenerationMismatch = errors.New("wire: runtime process generation mismatch")
+	// ErrRuntimeReceiptUnavailable means no authenticated runtime receipt was published.
+	ErrRuntimeReceiptUnavailable = errors.New("wire: runtime receipt is unavailable")
+)
+
+// RuntimeIdentity identifies one exact product runtime process.
+type RuntimeIdentity struct {
+	RuntimeBuild      string `json:"runtime_build"`
+	ProcessGeneration string `json:"process_generation"`
 }
 
-// BootstrapRequest is the immutable authenticated view available to a
-// pre-ready route authorizer.
-type BootstrapRequest struct {
-	Op        Op
-	Tenant    string
-	Peer      Peer
-	WireBuild string
-	Payload   []byte
+// RuntimeReceipt proves the exact runtime process returned by an authenticated
+// runtime control session.
+type RuntimeReceipt struct {
+	identity RuntimeIdentity
 }
 
-// BootstrapAuthorizer authenticates one classifier-protected pre-ready call.
-type BootstrapAuthorizer func(context.Context, BootstrapRequest) error
+// Identity returns the immutable runtime process identity carried by the receipt.
+func (r RuntimeReceipt) Identity() RuntimeIdentity { return r.identity }
 
-// BootstrapRoute permits one registered business op before readiness only
-// after its product authorizer accepts the authenticated peer.
-type BootstrapRoute struct {
-	Op        Op
-	Authorize BootstrapAuthorizer
-}
+// ReadinessProgress is daemonkit's atomic lifecycle progress snapshot.
+type ReadinessProgress = daemon.LifecycleProgress
 
-func (s *Server) runReadiness(ctx context.Context, ready func() error) error {
-	err := s.readiness.BeforeReady(ctx)
-	if err != nil {
-		s.readiness.AfterReady(err)
-		return err
-	}
-	if err = ctx.Err(); err != nil {
-		s.readiness.AfterReady(err)
-		return err
-	}
-	s.publicationMu.Lock()
-	defer s.publicationMu.Unlock()
-	s.readiness.AfterReady(nil)
-	if !s.readiness.Published() {
-		return errors.New("wire: readiness barrier did not publish")
-	}
-	if err = ready(); err != nil {
-		s.readiness.AfterReady(err)
-		if s.readiness.Published() {
-			return errors.Join(err, errors.New("wire: failed readiness remained published"))
-		}
-		return err
-	}
-	return nil
-}
-
-func (s *Server) installReadinessContext(parent context.Context) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(parent)
-	s.mu.Lock()
-	if s.readinessCancel != nil {
-		s.mu.Unlock()
-		cancel()
-		panic("wire: readiness context installed twice")
-	}
-	s.readinessCancel = cancel
-	s.mu.Unlock()
-	return ctx, cancel
-}
-
-func (s *Server) clearReadinessContext(cancel context.CancelFunc) {
-	cancel()
-	s.mu.Lock()
-	s.readinessCancel = nil
-	s.mu.Unlock()
+// RuntimeClientConfig configures lifecycle discovery without pinning a runtime.
+type RuntimeClientConfig struct {
+	Client            ClientConfig
+	NoProgressTimeout time.Duration
 }
 
 func (s *Server) authorizePreReady(
-	ctx context.Context,
+	_ context.Context,
 	entry entry,
-	request BootstrapRequest,
-) (func(), error) {
-	s.publicationMu.RLock()
-	s.mu.Lock()
-	readiness := s.readiness
-	ready := s.readyPublished
-	authorize := s.bootstrapRoutes[request.Op]
-	s.mu.Unlock()
-	if readiness != nil {
-		ready = readiness.Published()
+	_ Request,
+) error {
+	lifecycle := s.lifecycle
+	if lifecycle == nil {
+		return ErrNotReady
 	}
-	if ready {
-		s.publicationMu.RUnlock()
-		return func() {}, nil
+	progress := lifecycle.Snapshot()
+	if progress.State == RuntimeDraining {
+		return ErrDraining
 	}
-	if entry.preReady {
-		return s.publicationMu.RUnlock, nil
+	if entry.route == routeLifecycle {
+		return nil
 	}
-	if entry.route != routeBusiness || authorize == nil {
-		s.publicationMu.RUnlock()
-		return nil, ErrNotReady
+	if progress.State != RuntimeReady {
+		return ErrNotReady
 	}
-	if err := authorize(ctx, request); err != nil {
-		s.publicationMu.RUnlock()
-		return nil, err
-	}
-	return s.publicationMu.RUnlock, nil
+	return nil
 }

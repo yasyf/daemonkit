@@ -4,9 +4,43 @@
 package runtimeauth
 
 import (
+	"context"
 	"errors"
+	"net"
 	"sync"
+
+	peeridentity "github.com/yasyf/daemonkit/peer"
+	"github.com/yasyf/daemonkit/worker"
 )
+
+// Admission is the internal runtime-to-wire admission capability.
+type Admission func() (any, func(), error)
+
+// ServerExit linearizes transport termination into the private controller
+// before the transport settles lifecycle subscribers.
+type ServerExit func(error) error
+
+// PeerFencePermit commits one verified child only after the wire handshake is established.
+type PeerFencePermit struct {
+	Commit   func() (func(), error)
+	Rollback func()
+}
+
+// PeerFence provisionally verifies one exact armed child identity.
+type PeerFence func(context.Context, peeridentity.Identity) (*PeerFencePermit, error)
+
+// SessionServer is the internal authenticated transport boundary.
+type SessionServer interface {
+	ServeRuntime(context.Context, net.Listener, any, *worker.RuntimeClaim, Admission, Admission, PeerFence, ServerExit, chan<- error) error
+	CloseRuntimeIntake() error
+}
+
+// Composition carries an internal transport capability into daemon assembly.
+type Composition struct {
+	RuntimeConfig any
+	TrustPolicy   any
+	Server        SessionServer
+}
 
 type builder func(config any) (any, error)
 

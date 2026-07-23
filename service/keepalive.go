@@ -14,8 +14,8 @@ import (
 
 	"github.com/yasyf/daemonkit/codeidentity"
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 const openPath = "/usr/bin/open"
@@ -42,18 +42,17 @@ type AppKeepAlive struct {
 	// RestartPolicy defines when launchd restarts the app waiter. Required.
 	RestartPolicy RestartPolicy
 	// Runner owns every launchctl invocation as a disposable process group.
-	Runner supervise.TaskRunner
+	Runner *worker.Pool
+	runner taskRunner
 }
 
-// AppProcessReaper durably owns one exact app process through bounded termination.
-type AppProcessReaper interface {
+type appProcessReaper interface {
 	Reap(context.Context) error
 	TrackIdentity(context.Context, proc.Identity, proc.RecoveryClass) (proc.Record, error)
 	Terminate(context.Context, proc.Record) error
 }
 
-// AppOwnedProcessRecovery settles durable child and process-group records left by the app.
-type AppOwnedProcessRecovery interface {
+type appOwnedProcessRecovery interface {
 	Reap(context.Context) error
 }
 
@@ -64,11 +63,13 @@ type AppStopSpec struct {
 	CodeIdentity   codeidentity.CodeIdentity
 	// PolicyDigest is the opaque digest bound by the prior signed-side session.
 	PolicyDigest codeidentity.PolicyDigest
-	Reaper       AppProcessReaper
+	Reaper       *proc.Reaper
 	// RecoveryClass names the barrier required before a retired app receipt is
 	// acknowledged.
 	RecoveryClass proc.RecoveryClass
-	Dependents    AppOwnedProcessRecovery
+	Dependents    *proc.Reaper
+	reaper        appProcessReaper
+	dependents    appOwnedProcessRecovery
 
 	peerFromConn func(net.Conn) (wire.Peer, error)
 	processes    func(string) ([]proc.Identity, error)
@@ -93,21 +94,15 @@ type AuthenticatedAppPeer struct {
 }
 
 func (k AppKeepAlive) launchctl(ctx context.Context, args ...string) (string, error) {
-	return runCombined(ctx, k.Runner, proc.RecoveryService, "/bin/launchctl", args...)
+	runner := taskRunner(k.Runner)
+	if k.runner != nil {
+		runner = k.runner
+	}
+	return runCombined(ctx, runner, "/bin/launchctl", args...)
 }
 
 // NewAuthenticatedAppPeer binds one signed-side accepted identity to an exact
 // daemon-facing process proof without exposing its entitlement policy.
-func NewAuthenticatedAppPeer(accepted codeidentity.AcceptedIdentity) AuthenticatedAppPeer {
-	peer := accepted.Peer()
-	return AuthenticatedAppPeer{
-		PID: peer.PID, UID: peer.UID, StartTime: peer.StartTime, Boot: peer.Boot,
-		Executable: peer.Executable, AuditTokenDigest: sha256.Sum256(peer.Audit),
-		CodeIdentity: accepted.CodeIdentity(),
-		PolicyDigest: accepted.PolicyDigest(),
-	}
-}
-
 const keepAlivePlist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -193,7 +188,7 @@ func (k AppKeepAlive) WritePlist() (string, error) {
 // and at every login. Bootout kills only the blocked open waiter, and the
 // fresh open attaches via -W instead of starting a second copy.
 func (k AppKeepAlive) Install(ctx context.Context) error {
-	if k.Runner == nil {
+	if k.Runner == nil && k.runner == nil {
 		return errors.New("service: disposable task runner is required")
 	}
 	plist, err := k.WritePlist()
@@ -236,7 +231,15 @@ func (k AppKeepAlive) Stop(
 	if expected.PolicyDigest != spec.PolicyDigest {
 		return errors.New("keepalive agent: authenticated app peer trust requirement changed")
 	}
-	if err := spec.Reaper.Reap(ctx); err != nil {
+	reaper := appProcessReaper(spec.Reaper)
+	if spec.reaper != nil {
+		reaper = spec.reaper
+	}
+	dependents := appOwnedProcessRecovery(spec.Dependents)
+	if spec.dependents != nil {
+		dependents = spec.dependents
+	}
+	if err := reaper.Reap(ctx); err != nil {
 		return fmt.Errorf("reap preexisting fixed app workers: %w", err)
 	}
 	deadline := spec.timeNow().Add(spec.stopDeadline())
@@ -268,7 +271,7 @@ func (k AppKeepAlive) Stop(
 				_ = conn.Close()
 				return errors.New("fixed app peer changed after authenticated proof")
 			}
-			record, err := spec.Reaper.TrackIdentity(ctx, peer.ProcessIdentity(), spec.RecoveryClass)
+			record, err := reaper.TrackIdentity(ctx, peer.ProcessIdentity(), spec.RecoveryClass)
 			if err != nil {
 				_ = conn.Close()
 				return fmt.Errorf("durably track fixed app: %w", err)
@@ -278,7 +281,7 @@ func (k AppKeepAlive) Stop(
 				return err
 			}
 			closeErr := conn.Close()
-			if err := spec.Reaper.Terminate(ctx, record); err != nil {
+			if err := reaper.Terminate(ctx, record); err != nil {
 				return fmt.Errorf("terminate fixed app: %w", err)
 			}
 			if closeErr != nil {
@@ -299,7 +302,7 @@ func (k AppKeepAlive) Stop(
 			if quietSince.IsZero() {
 				quietSince = now
 			} else if now.Sub(quietSince) >= spec.stopQuiet() {
-				if err := spec.Dependents.Reap(ctx); err != nil {
+				if err := dependents.Reap(ctx); err != nil {
 					return fmt.Errorf("reap fixed app dependents: %w", err)
 				}
 				return nil
@@ -338,10 +341,10 @@ func (k AppKeepAlive) validateStop(spec AppStopSpec) (string, error) {
 	if err := k.validate(); err != nil {
 		return "", err
 	}
-	if k.Runner == nil {
+	if k.Runner == nil && k.runner == nil {
 		return "", errors.New("service: disposable task runner is required")
 	}
-	if spec.Dial == nil || spec.Reaper == nil || spec.Dependents == nil {
+	if spec.Dial == nil || (spec.Reaper == nil && spec.reaper == nil) || (spec.Dependents == nil && spec.dependents == nil) {
 		return "", errors.New("keepalive agent: app stop requires a dialer, durable reaper, and dependent recovery")
 	}
 	if spec.PolicyDigest == (codeidentity.PolicyDigest{}) {
@@ -506,7 +509,7 @@ func (k AppKeepAlive) Uninstall(ctx context.Context) error {
 	if err := k.validate(); err != nil {
 		return err
 	}
-	if k.Runner == nil {
+	if k.Runner == nil && k.runner == nil {
 		return errors.New("service: disposable task runner is required")
 	}
 	if err := k.bootout(ctx); err != nil {

@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"time"
 
 	"github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/version"
 )
 
@@ -14,18 +17,15 @@ type stopAuthorityContextKey struct{}
 
 type runtimeControl interface {
 	Health(context.Context) (daemon.Health, error)
+	Lifecycle() daemon.LifecycleView
 	Shutdown(context.Context) error
 }
 
 func (s *Server) bindRuntime(
 	build string,
-	classifier ProtectedSessionClassifier,
-	reserved int,
 	control runtimeControl,
-	stopVerifier StopControlVerifier,
+	stopStore *proc.FileStore,
 	observations []ObservationRoute,
-	readiness ReadinessBarrier,
-	bootstrapRoutes []BootstrapRoute,
 ) error {
 	if control == nil {
 		return errors.New("wire: runtime control is required")
@@ -33,24 +33,33 @@ func (s *Server) bindRuntime(
 	if build == "" {
 		return errors.New("wire: runtime build is required")
 	}
-	if classifier == nil {
-		return errors.New("wire: protected session classifier is required")
+	if stopStore == nil {
+		return errors.New("wire: stop control store is required")
 	}
-	if err := classifier.Validate(); err != nil {
-		return fmt.Errorf("wire: protected session classifier: %w", err)
-	}
-	if stopVerifier == nil {
-		return errors.New("wire: stop control verifier is required")
-	}
-	if err := stopVerifier.Validate(); err != nil {
-		return fmt.Errorf("wire: stop control verifier: %w", err)
-	}
-	if reserved <= 0 || reserved > s.maxSessions() {
-		return fmt.Errorf("wire: reserved protected sessions %d outside [1,%d]", reserved, s.maxSessions())
+	executable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("wire: trust verifier executable: %w", err)
 	}
 	observation, err := observationHandlers(observations, s.maxFrame())
 	if err != nil {
 		return err
+	}
+	health, err := control.Health(context.Background())
+	if err != nil {
+		return fmt.Errorf("wire: runtime health identity: %w", err)
+	}
+	if health.ProcessGeneration == "" {
+		return errors.New("wire: runtime process generation is required")
+	}
+	if health.RuntimeBuild != build {
+		return fmt.Errorf(
+			"wire: runtime health build %q does not match configured build %q", health.RuntimeBuild, build,
+		)
+	}
+	lifecycleView := control.Lifecycle()
+	lifecycle, ok := lifecycleView.(*daemon.Lifecycle)
+	if !ok || lifecycle == nil {
+		return errors.New("wire: runtime lifecycle is required")
 	}
 	stopHandler := func(ctx context.Context, req Request) (any, error) {
 		var message stopControlRequest
@@ -101,27 +110,20 @@ func (s *Server) bindRuntime(
 	if s.started {
 		return errors.New("wire: runtime cannot be bound after Serve")
 	}
-	if s.stopControlVerifier != nil || s.protectedSessionClassifier != nil || s.reservedProtectedSessions != 0 {
+	if s.stopControlStore != nil {
 		return errors.New("wire: runtime is already bound")
 	}
 	if s.handlers == nil {
 		s.handlers = make(map[Op]entry)
 	}
-	bootstrap := make(map[Op]BootstrapAuthorizer, len(bootstrapRoutes))
-	for _, route := range bootstrapRoutes {
-		if readiness == nil {
-			return errors.New("wire: bootstrap routes require a readiness barrier")
-		}
-		if route.Authorize == nil {
-			return fmt.Errorf("wire: bootstrap route %q requires an authorizer", route.Op)
-		}
-		if _, duplicate := bootstrap[route.Op]; duplicate {
-			return fmt.Errorf("wire: bootstrap route %q is duplicated", route.Op)
-		}
-		bootstrap[route.Op] = route.Authorize
-	}
 	if _, exists := s.handlers[stopControlOp]; exists {
 		return fmt.Errorf("wire: stop control op %q is already registered", stopControlOp)
+	}
+	if _, exists := s.handlers[runtimeReadinessSubscribeOp]; exists {
+		return fmt.Errorf("wire: runtime readiness op %q is already registered", runtimeReadinessSubscribeOp)
+	}
+	if _, exists := s.handlers[runtimeReceiptOp]; exists {
+		return fmt.Errorf("wire: runtime receipt op %q is already registered", runtimeReceiptOp)
 	}
 	for op := range observation {
 		if _, exists := s.handlers[op]; exists {
@@ -129,30 +131,59 @@ func (s *Server) bindRuntime(
 		}
 	}
 	s.handlers[stopControlOp] = entry{class: classControl, route: routeStop, h: stopHandler}
+	s.handlers[runtimeReadinessSubscribeOp] = entry{
+		class: classControl, route: routeLifecycle,
+		h: func(_ context.Context, req Request) (any, error) {
+			var message runtimeReadinessSubscribeRequest
+			if err := decodeStrict(req.Payload, &message); err != nil {
+				return nil, fmt.Errorf("wire: decode runtime readiness: %w", err)
+			}
+			if message.Protocol != ProtocolVersion {
+				return nil, fmt.Errorf("%w: readiness protocol=%d", ErrProtocolVersion, message.Protocol)
+			}
+			if req.Session == nil {
+				return nil, errors.New("wire: readiness session is required")
+			}
+			if err := s.subscribeReadiness(req.Session.s); err != nil {
+				return nil, err
+			}
+			return runtimeReadinessSubscribeResponse{Protocol: ProtocolVersion}, nil
+		},
+	}
+	runtimeIdentity := RuntimeIdentity{
+		RuntimeBuild: build, ProcessGeneration: health.ProcessGeneration,
+	}
+	s.handlers[runtimeReceiptOp] = entry{
+		class: classControl, route: routeLifecycle,
+		h: func(_ context.Context, req Request) (any, error) {
+			var message runtimeReceiptRequest
+			if err := decodeStrict(req.Payload, &message); err != nil {
+				return nil, fmt.Errorf("wire: decode runtime receipt: %w", err)
+			}
+			if message.Protocol != ProtocolVersion {
+				return nil, fmt.Errorf("%w: runtime receipt protocol=%d", ErrProtocolVersion, message.Protocol)
+			}
+			return runtimeReceiptResponse{
+				Protocol: ProtocolVersion, RuntimeIdentity: runtimeIdentity,
+			}, nil
+		},
+	}
 	for op, handler := range observation {
 		s.handlers[op] = entry{
 			class: classControl, route: routeObservation, h: handler,
-			preReady: observationAvailableBeforeReady(observations, op),
 		}
 	}
-	s.protectedSessionClassifier = classifier
-	s.reservedProtectedSessions = reserved
-	s.stopControlVerifier = stopVerifier
-	health, err := control.Health(context.Background())
-	if err != nil {
-		return fmt.Errorf("wire: runtime health identity: %w", err)
-	}
-	if health.ProcessGeneration == "" {
-		return errors.New("wire: runtime process generation is required")
-	}
+	s.trustExecutable = executable
+	s.stopControlStore = stopStore
 	s.stopTargetProcessGeneration = health.ProcessGeneration
-	s.hasObservations = len(observation) != 0
-	s.readiness = readiness
-	s.bootstrapRoutes = bootstrap
+	s.runtimeBuild = build
+	s.processGeneration = health.ProcessGeneration
+	s.hasObservations = true
+	s.lifecycle = lifecycle
 	return nil
 }
 
-func (s *Server) authorizeStopControl(ctx context.Context, peer Peer, payload []byte) (context.Context, error) {
+func (s *Server) authorizeStopControl(ctx context.Context, peer Peer, role trust.PeerRole, payload []byte) (context.Context, error) {
 	var message stopControlRequest
 	if err := decodeStrict(payload, &message); err != nil {
 		return ctx, fmt.Errorf("wire: decode stop control authorization: %w", err)
@@ -160,12 +191,34 @@ func (s *Server) authorizeStopControl(ctx context.Context, peer Peer, payload []
 	if message.Version != 1 {
 		return ctx, errors.New("wire: invalid stop control request")
 	}
-	authority, err := s.stopControlVerifier.VerifyStopControl(ctx, peer, s.stopTargetProcessGeneration)
+	if !s.trustPolicy.AllowsStop(role) {
+		return ctx, ErrPermissionDenied
+	}
+	authority, consumed, err := s.stopControlStore.ConsumeStopControl(
+		ctx, peer.ProcessIdentity(), string(role), s.stopTargetProcessGeneration, time.Now(),
+	)
 	if err != nil {
-		return ctx, err
+		return ctx, fmt.Errorf("wire: consume stop control record: %w", err)
+	}
+	if !consumed {
+		return ctx, errors.New("wire: no exact unexpired stop control authority")
 	}
 	if authority.TargetProcessGeneration != s.stopTargetProcessGeneration {
 		return ctx, errors.New("wire: stop control verifier returned another runtime generation")
 	}
 	return context.WithValue(ctx, stopAuthorityContextKey{}, authority), nil
+}
+
+func (s *Server) authorizeLifecycleControl(op Op, role trust.PeerRole) error {
+	allowed := false
+	switch op {
+	case runtimeReceiptOp:
+		allowed = s.trustPolicy.AllowsReceipt(role)
+	case runtimeReadinessSubscribeOp:
+		allowed = s.trustPolicy.AllowsReadiness(role)
+	}
+	if !allowed {
+		return ErrPermissionDenied
+	}
+	return nil
 }

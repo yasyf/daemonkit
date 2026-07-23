@@ -28,69 +28,6 @@ const (
 	StopIntentUninstall StopIntent = "uninstall"
 )
 
-// StopControlVerifier authenticates the exact process receipt and product role
-// permitted to request cross-process runtime settlement.
-type StopControlVerifier interface {
-	Validate() error
-	VerifyStopControl(context.Context, Peer, string) (proc.Record, error)
-}
-
-// StopVerifier composes product-specific peer identity with the generic exact,
-// one-shot durable stop receipt.
-type StopVerifier struct {
-	Classifier ProtectedSessionClassifier
-	Role       string
-	Store      proc.StopControlStore
-}
-
-// Validate rejects a verifier without all three independent authorities.
-func (v StopVerifier) Validate() error {
-	if v.Classifier == nil {
-		return errors.New("wire: stop verifier classifier is required")
-	}
-	if err := v.Classifier.Validate(); err != nil {
-		return fmt.Errorf("wire: stop verifier classifier: %w", err)
-	}
-	if v.Role == "" {
-		return errors.New("wire: stop verifier role is required")
-	}
-	if v.Store == nil {
-		return errors.New("wire: stop verifier store is required")
-	}
-	return nil
-}
-
-// VerifyStopControl authenticates product identity, exact role, and atomically
-// consumes the complete unexpired process authority.
-func (v StopVerifier) VerifyStopControl(
-	ctx context.Context,
-	peer Peer,
-	targetProcessGeneration string,
-) (proc.Record, error) {
-	if err := v.Validate(); err != nil {
-		return proc.Record{}, err
-	}
-	accepted, err := v.Classifier.Classify(ctx, peer)
-	if err != nil {
-		return proc.Record{}, err
-	}
-	if !accepted {
-		return proc.Record{}, ErrProtectedSessionRequired
-	}
-	record, consumed, err := v.Store.ConsumeStopControl(
-		ctx, peer.ProcessIdentity(), v.Role, targetProcessGeneration, time.Now(),
-	)
-	if err != nil {
-		return proc.Record{}, fmt.Errorf("wire: consume stop control record: %w", err)
-	}
-	if !consumed {
-		return proc.Record{}, errors.New("wire: no exact unexpired stop control authority")
-	}
-	return record, nil
-}
-
-var _ StopControlVerifier = StopVerifier{}
-
 // StopControlConfig identifies one exact runtime and bounds proof of its
 // endpoint and process settlement.
 type StopControlConfig struct {

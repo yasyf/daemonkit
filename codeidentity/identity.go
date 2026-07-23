@@ -3,7 +3,6 @@
 package codeidentity
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -11,7 +10,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/yasyf/daemonkit/wire"
+	peer "github.com/yasyf/daemonkit/peer"
 )
 
 // ErrUntrustedPeer is returned when a peer fails a code-identity check.
@@ -91,7 +90,7 @@ type CodePolicy struct {
 }
 
 // Check verifies one peer against the code-only policy.
-func (p CodePolicy) Check(peer wire.Peer) error {
+func (p CodePolicy) Check(peer peer.Identity) error {
 	if peer.UID != os.Geteuid() {
 		return fmt.Errorf("%w: uid %d != %d", ErrUntrustedPeer, peer.UID, os.Geteuid())
 	}
@@ -99,18 +98,4 @@ func (p CodePolicy) Check(peer wire.Peer) error {
 		return err
 	}
 	return verifyCodeIdentity(peer, p.Identity)
-}
-
-// AcceptedIdentity is signed-side proof bound to one exact peer, code
-// identity, and opaque policy digest.
-type AcceptedIdentity interface {
-	Peer() wire.Peer
-	CodeIdentity() CodeIdentity
-	PolicyDigest() PolicyDigest
-}
-
-// IdentityAcceptor verifies one exact signed peer and returns its accepted
-// code identity plus opaque signed-side policy digest.
-type IdentityAcceptor interface {
-	Accept(context.Context, wire.Peer) (AcceptedIdentity, error)
 }

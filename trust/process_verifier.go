@@ -1,18 +1,18 @@
 package trust
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
+	"time"
 
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
-	"github.com/yasyf/daemonkit/wire"
+	peer "github.com/yasyf/daemonkit/peer"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 const (
@@ -28,13 +28,15 @@ const (
 
 // ProcessVerifier runs code-identity verification in a disposable child.
 type ProcessVerifier struct {
-	Runner     supervise.TaskRunner
+	Runner interface {
+		RunVerifier(context.Context, worker.CommandRequest) (worker.CommandResult, error)
+	}
 	Executable string
 	Policy     Policy
 }
 
 // Check verifies peer in a child that is killed and reaped when ctx expires.
-func (v ProcessVerifier) Check(ctx context.Context, peer wire.Peer) error {
+func (v ProcessVerifier) Check(ctx context.Context, peer peer.Identity) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -58,13 +60,14 @@ func (v ProcessVerifier) Check(ctx context.Context, peer wire.Peer) error {
 	if len(payload) > maxVerifierPayload {
 		return fmt.Errorf("trust: verifier request is %d bytes, maximum is %d", len(payload), maxVerifierPayload)
 	}
-	var output boundedBuffer
-	output.limit = maxVerifierResponse
-	err = v.Runner.Run(ctx, supervise.Task{
-		RecoveryClass: proc.RecoveryTrust,
-		Path:          v.Executable,
-		Args:          []string{verifierChildMode, base64.RawURLEncoding.EncodeToString(payload)},
-		Stdout:        &output,
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return errors.New("trust: verifier deadline is required")
+	}
+	result, err := v.Runner.RunVerifier(ctx, worker.CommandRequest{
+		Path: v.Executable, Dir: filepath.Dir(v.Executable),
+		Args:         []string{verifierChildMode, base64.RawURLEncoding.EncodeToString(payload)},
+		TotalTimeout: time.Until(deadline),
 	})
 	if err != nil {
 		return fmt.Errorf("trust: run verifier child: %w", err)
@@ -73,7 +76,10 @@ func (v ProcessVerifier) Check(ctx context.Context, peer wire.Peer) error {
 		return err
 	}
 	var response verifierResponse
-	if err := json.Unmarshal(output.Bytes(), &response); err != nil {
+	if len(result.Stdout) > maxVerifierResponse {
+		return fmt.Errorf("trust: verifier response is %d bytes, maximum is %d", len(result.Stdout), maxVerifierResponse)
+	}
+	if err := json.Unmarshal(result.Stdout, &response); err != nil {
 		return fmt.Errorf("trust: decode verifier response: %w", err)
 	}
 	if response.Protocol != verifierProtocol {
@@ -139,26 +145,13 @@ func RunVerifierChild(arguments []string, stdout io.Writer) (bool, error) {
 }
 
 type verifierRequest struct {
-	Protocol    int          `json:"protocol"`
-	Peer        wire.Peer    `json:"peer"`
-	Requirement *Requirement `json:"requirement,omitempty"`
+	Protocol    int           `json:"protocol"`
+	Peer        peer.Identity `json:"peer"`
+	Requirement *Requirement  `json:"requirement,omitempty"`
 }
 
 type verifierResponse struct {
 	Protocol int    `json:"protocol"`
 	Result   string `json:"result"`
 	Error    string `json:"error,omitempty"`
-}
-
-type boundedBuffer struct {
-	bytes.Buffer
-	limit int
-}
-
-func (b *boundedBuffer) Write(payload []byte) (int, error) {
-	remaining := b.limit - b.Len()
-	if remaining <= 0 || len(payload) > remaining {
-		return 0, errors.New("trust: verifier response exceeded limit")
-	}
-	return b.Buffer.Write(payload)
 }

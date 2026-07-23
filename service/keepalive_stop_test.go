@@ -100,7 +100,7 @@ func fixedAppFixture(t *testing.T) (AppKeepAlive, AppStopSpec, AuthenticatedAppP
 		ExecutableName: "Fixed",
 		CodeIdentity:   requirement.CodeIdentity(),
 		PolicyDigest:   validationDigest,
-		Reaper:         reaper, Dependents: recordingAppRecovery{events: events},
+		reaper:         reaper, dependents: recordingAppRecovery{events: events},
 		RecoveryClass: proc.RecoveryHolder,
 		Dial: func(context.Context) (net.Conn, error) {
 			*events = append(*events, "dial")
@@ -133,7 +133,7 @@ func fixedAppFixture(t *testing.T) (AppKeepAlive, AppStopSpec, AuthenticatedAppP
 	}
 	keepalive := AppKeepAlive{
 		Label: "com.example.fixed", AppPath: app, BundleID: "com.example.fixed", RestartPolicy: RestartAlways,
-		Runner: launchctlRunner(func(context.Context, ...string) (string, error) {
+		runner: launchctlRunner(func(context.Context, ...string) (string, error) {
 			t.Fatal("unexpected launchctl invocation")
 			return "", nil
 		}),
@@ -144,7 +144,7 @@ func fixedAppFixture(t *testing.T) (AppKeepAlive, AppStopSpec, AuthenticatedAppP
 func launchState(t *testing.T, keepalive *AppKeepAlive, events *[]string, loaded *bool) {
 	t.Helper()
 	notLoadedErr := shExit(t, 3)
-	keepalive.Runner = launchctlRunner(func(_ context.Context, args ...string) (string, error) {
+	keepalive.runner = launchctlRunner(func(_ context.Context, args ...string) (string, error) {
 		switch args[0] {
 		case "print":
 			*events = append(*events, "print")
@@ -170,7 +170,7 @@ func TestAppKeepAliveStopVerifiesTracksBootsOutTerminatesAndProvesAbsence(t *tes
 	keepalive, spec, expected, events, _ := fixedAppFixture(t)
 	live := true
 	loaded := true
-	reaper := spec.Reaper.(*recordingAppReaper)
+	reaper := spec.reaper.(*recordingAppReaper)
 	reaper.onTerminate = func() { live = false }
 	spec.Dial = func(context.Context) (net.Conn, error) {
 		*events = append(*events, "dial")
@@ -189,7 +189,7 @@ func TestAppKeepAliveStopVerifiesTracksBootsOutTerminatesAndProvesAbsence(t *tes
 		return nil, nil
 	}
 	launchState(t, &keepalive, events, &loaded)
-	spec.Dependents = recordingAppRecovery{events: events}
+	spec.dependents = recordingAppRecovery{events: events}
 	err := keepalive.Stop(t.Context(), spec, expected)
 	if err != nil {
 		t.Fatal(err)
@@ -208,7 +208,7 @@ func TestAppKeepAliveStopRejectsAuthenticatedReplacement(t *testing.T) {
 	keepalive, spec, expected, events, executable := fixedAppFixture(t)
 	generation := 1
 	loaded := true
-	reaper := spec.Reaper.(*recordingAppReaper)
+	reaper := spec.reaper.(*recordingAppReaper)
 	reaper.onTerminate = func() {
 		if generation == 1 {
 			generation = 2
@@ -248,7 +248,7 @@ func TestAppKeepAliveStopWaitsForRebindingLiveAppBeforeBootout(t *testing.T) {
 	keepalive, spec, expected, events, _ := fixedAppFixture(t)
 	live, bound := true, false
 	loaded := true
-	reaper := spec.Reaper.(*recordingAppReaper)
+	reaper := spec.reaper.(*recordingAppReaper)
 	reaper.onTerminate = func() { live = false }
 	spec.Dial = func(context.Context) (net.Conn, error) {
 		if !bound {
@@ -368,7 +368,7 @@ func TestAppKeepAliveStopRejectsSignatureAndPIDReuseBeforeBootout(t *testing.T) 
 		{"signature", func(spec *AppStopSpec) {
 			spec.checkPeer = func(wire.Peer, codeidentity.CodeIdentity) error { return codeidentity.ErrUntrustedPeer }
 		}},
-		{"pid reuse", func(spec *AppStopSpec) { spec.Reaper.(*recordingAppReaper).trackErr = proc.ErrIdentityChanged }},
+		{"pid reuse", func(spec *AppStopSpec) { spec.reaper.(*recordingAppReaper).trackErr = proc.ErrIdentityChanged }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			keepalive, spec, expected, events, _ := fixedAppFixture(t)
@@ -413,7 +413,7 @@ func TestAppKeepAliveStopRejectsExactProofMismatch(t *testing.T) {
 func TestAppKeepAliveStopReapsStaleWorkersBeforeDial(t *testing.T) {
 	keepalive, spec, expected, events, _ := fixedAppFixture(t)
 	want := errors.New("stale worker settlement failed")
-	spec.Reaper.(*recordingAppReaper).reapErr = want
+	spec.reaper.(*recordingAppReaper).reapErr = want
 	spec.Dial = func(context.Context) (net.Conn, error) {
 		t.Fatal("dialed before stale worker recovery")
 		return nil, nil

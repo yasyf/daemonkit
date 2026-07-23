@@ -2,11 +2,14 @@ package wire
 
 import (
 	"errors"
+	"io"
 	"net"
 	"os"
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/yasyf/daemonkit/internal/duplexconn"
 )
 
 const frameDeadlineTestTimeout = 40 * time.Millisecond
@@ -96,7 +99,7 @@ func TestCodecWriteFrameJoinsWriteAndClearDeadlineFailures(t *testing.T) {
 	})
 	codec.WriteTimeout = time.Second
 
-	complete, err := codec.writeFrame(Frame{Kind: FrameHello, Flags: FlagEnd, Payload: []byte(`{}`)})
+	_, complete, err := codec.writeFrame(Frame{Kind: FrameHello, Flags: FlagEnd, Payload: []byte(`{}`)})
 	if complete {
 		t.Fatal("writeFrame complete = true, want false")
 	}
@@ -122,12 +125,62 @@ func TestCodecWriteFramePreservesCompleteOnClearDeadlineFailure(t *testing.T) {
 		readDone <- err
 	}()
 
-	complete, err := codec.writeFrame(want)
+	_, complete, err := codec.writeFrame(want)
 	if !complete {
 		t.Fatal("writeFrame complete = false, want true")
 	}
 	if !errors.Is(err, clearErr) {
 		t.Fatalf("writeFrame error = %v, want clear failure", err)
+	}
+	if err := <-readDone; err != nil {
+		t.Fatalf("peer ReadFrame: %v", err)
+	}
+}
+
+func TestCodecReadFrameIgnoresClosedTransportWhileClearingCompletedFrame(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	codec := NewCodec(&deadlineFaultConn{Conn: server, clearReadErr: net.ErrClosed})
+	codec.ReadTimeout = time.Second
+	want := Frame{Kind: FrameHello, Flags: FlagEnd, Payload: []byte(`{}`)}
+	writeDone := make(chan error, 1)
+	go func() { writeDone <- NewCodec(client).WriteFrame(want) }()
+
+	got, err := codec.ReadFrame()
+	if err != nil {
+		t.Fatalf("ReadFrame: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ReadFrame frame = %#v, want %#v", got, want)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatalf("peer WriteFrame: %v", err)
+	}
+}
+
+func TestCodecWriteFrameIgnoresClosedTransportWhileClearingCompletedFrame(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	codec := NewCodec(&deadlineFaultConn{Conn: client, clearWriteErr: io.ErrClosedPipe})
+	codec.WriteTimeout = time.Second
+	want := Frame{Kind: FrameHello, Flags: FlagEnd, Payload: []byte(`{}`)}
+	readDone := make(chan error, 1)
+	go func() {
+		got, err := NewCodec(server).ReadFrame()
+		if err == nil && !reflect.DeepEqual(got, want) {
+			err = errors.New("peer received the wrong frame")
+		}
+		readDone <- err
+	}()
+
+	_, complete, err := codec.writeFrame(want)
+	if err != nil {
+		t.Fatalf("writeFrame: %v", err)
+	}
+	if !complete {
+		t.Fatal("writeFrame complete = false, want true")
 	}
 	if err := <-readDone; err != nil {
 		t.Fatalf("peer ReadFrame: %v", err)
@@ -146,20 +199,20 @@ func newFrameDeadlineDuplexPair(t *testing.T) (net.Conn, net.Conn) {
 		_ = leftToRightWriter.Close()
 		t.Fatalf("right-to-left pipe: %v", err)
 	}
-	left, err := NewDuplexConn(rightToLeftReader, leftToRightWriter)
+	left, err := duplexconn.New(rightToLeftReader, leftToRightWriter)
 	if err != nil {
 		_ = leftToRightReader.Close()
 		_ = leftToRightWriter.Close()
 		_ = rightToLeftReader.Close()
 		_ = rightToLeftWriter.Close()
-		t.Fatalf("left NewDuplexConn: %v", err)
+		t.Fatalf("left duplex connection: %v", err)
 	}
-	right, err := NewDuplexConn(leftToRightReader, rightToLeftWriter)
+	right, err := duplexconn.New(leftToRightReader, rightToLeftWriter)
 	if err != nil {
 		_ = left.Close()
 		_ = leftToRightReader.Close()
 		_ = rightToLeftWriter.Close()
-		t.Fatalf("right NewDuplexConn: %v", err)
+		t.Fatalf("right duplex connection: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = left.Close()

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/yasyf/daemonkit/daemon"
 )
 
 // DefaultObservationMaxResponse bounds an observation response when the route
@@ -15,11 +17,12 @@ const DefaultObservationMaxResponse = 64 << 10
 // ObservationRequest is the immutable authenticated view available to a
 // read-only observation handler.
 type ObservationRequest struct {
-	Op        Op
-	Tenant    string
-	Peer      Peer
-	WireBuild string
-	Payload   []byte
+	Op          Op
+	Tenant      string
+	Peer        Peer
+	WireBuild   string
+	Payload     []byte
+	Publication daemon.Publication
 }
 
 // ObservationResponse is one bounded unary JSON response.
@@ -33,27 +36,19 @@ type ObservationHandler func(context.Context, ObservationRequest) (ObservationRe
 
 // ObservationRoute declares one suite-qualified immutable observation op.
 type ObservationRoute struct {
-	Op                   Op
-	MaxResponseBytes     int
-	AvailableBeforeReady bool
-	Handler              ObservationHandler
+	Op               Op
+	MaxResponseBytes int
+	Handler          ObservationHandler
 }
 
 func observationHandlers(routes []ObservationRoute, maxFrame int) (map[Op]Handler, error) {
 	handlers := make(map[Op]Handler, len(routes))
-	preReady := 0
 	for _, route := range routes {
 		if err := validateObservationRoute(route, maxFrame); err != nil {
 			return nil, err
 		}
 		if _, exists := handlers[route.Op]; exists {
 			return nil, fmt.Errorf("wire: observation op %q is duplicated", route.Op)
-		}
-		if route.AvailableBeforeReady {
-			preReady++
-			if preReady > 1 {
-				return nil, errors.New("wire: only one pre-ready observation route is allowed")
-			}
 		}
 		maxResponse := route.MaxResponseBytes
 		if maxResponse == 0 {
@@ -63,7 +58,8 @@ func observationHandlers(routes []ObservationRoute, maxFrame int) (map[Op]Handle
 		handlers[route.Op] = func(ctx context.Context, req Request) (any, error) {
 			response, err := handler(ctx, ObservationRequest{
 				Op: req.Op, Tenant: req.Tenant, Peer: req.Peer, WireBuild: req.WireBuild,
-				Payload: append([]byte(nil), req.Payload...),
+				Payload:     append([]byte(nil), req.Payload...),
+				Publication: req.Publication,
 			})
 			if err != nil {
 				return nil, err
@@ -91,9 +87,6 @@ func validateObservationRoute(route ObservationRoute, maxFrame int) error {
 	if strings.Count(op, ".") < 2 || strings.HasPrefix(op, ".") || strings.HasSuffix(op, ".") {
 		return fmt.Errorf("wire: observation op %q must be suite-qualified", route.Op)
 	}
-	if route.AvailableBeforeReady && !strings.HasSuffix(op, ".runtime.health") {
-		return fmt.Errorf("wire: pre-ready observation op %q must be suite runtime health", route.Op)
-	}
 	limit := route.MaxResponseBytes
 	if limit < 0 {
 		return fmt.Errorf("wire: observation op %q response limit must not be negative", route.Op)
@@ -105,13 +98,4 @@ func validateObservationRoute(route ObservationRoute, maxFrame int) error {
 		return fmt.Errorf("wire: observation op %q response limit %d exceeds frame limit %d", route.Op, limit, maxFrame)
 	}
 	return nil
-}
-
-func observationAvailableBeforeReady(routes []ObservationRoute, op Op) bool {
-	for _, route := range routes {
-		if route.Op == op {
-			return route.AvailableBeforeReady
-		}
-	}
-	return false
 }

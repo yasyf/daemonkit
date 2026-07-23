@@ -18,7 +18,8 @@ import (
 	"strings"
 
 	"github.com/yasyf/daemonkit/codeidentity"
-	"github.com/yasyf/daemonkit/wire"
+	peer "github.com/yasyf/daemonkit/peer"
+	"github.com/yasyf/daemonkit/proc"
 )
 
 // ErrUntrustedPeer is returned when a peer fails the trust check.
@@ -28,7 +29,16 @@ var ErrUntrustedPeer = errors.New("trust: untrusted peer")
 // no code-identity verifier is available — never a downgrade to UID-only.
 var ErrNoVerifier = errors.New("trust: no code-identity verifier for a configured requirement")
 
+// ErrAmbiguousRole means a peer satisfied more than one protected role.
+var ErrAmbiguousRole = errors.New("trust: peer satisfies multiple protected roles")
+
 const appGroupsEntitlement = "com.apple.security.application-groups"
+
+// PeerRole names one exact signed peer authority.
+type PeerRole string
+
+// PolicyDigest is the canonical identity of one complete compiled trust policy.
+type PolicyDigest [sha256.Size]byte
 
 // EntitlementMatch is one closed required-entitlement predicate.
 type EntitlementMatch uint8
@@ -161,13 +171,248 @@ type Policy struct {
 	Requirement *Requirement
 }
 
+// TrustPolicyConfig declares the complete role and private-control authority
+// compiled into one immutable TrustPolicy.
+//
+//nolint:revive // The exact public name distinguishes the compiled policy from per-peer Policy.
+type TrustPolicyConfig struct {
+	ExpectedUID    int
+	Roles          map[PeerRole]Requirement
+	StopRoles      []PeerRole
+	ReceiptRoles   []PeerRole
+	ReadinessRoles []PeerRole
+	HandoffRoles   []PeerRole
+}
+
+// TrustPolicy is an immutable compiled runtime trust policy.
+//
+//nolint:revive // The exact public name distinguishes runtime authority from per-peer Policy.
+type TrustPolicy struct {
+	expectedUID    int
+	roles          map[PeerRole]Requirement
+	roleNames      []PeerRole
+	stopRoles      map[PeerRole]struct{}
+	receiptRoles   map[PeerRole]struct{}
+	readinessRoles map[PeerRole]struct{}
+	handoffRoles   map[PeerRole]struct{}
+}
+
+// NewTrustPolicy validates and deep-copies a complete runtime trust policy.
+func NewTrustPolicy(config TrustPolicyConfig) (TrustPolicy, error) {
+	if config.ExpectedUID != os.Geteuid() {
+		return TrustPolicy{}, fmt.Errorf("trust: expected UID %d must equal effective UID %d", config.ExpectedUID, os.Geteuid())
+	}
+	if len(config.Roles) == 0 {
+		return TrustPolicy{}, errors.New("trust: at least one protected role is required")
+	}
+	policy := TrustPolicy{
+		expectedUID:    config.ExpectedUID,
+		roles:          make(map[PeerRole]Requirement, len(config.Roles)),
+		stopRoles:      make(map[PeerRole]struct{}, len(config.StopRoles)),
+		receiptRoles:   make(map[PeerRole]struct{}, len(config.ReceiptRoles)),
+		readinessRoles: make(map[PeerRole]struct{}, len(config.ReadinessRoles)),
+		handoffRoles:   make(map[PeerRole]struct{}, len(config.HandoffRoles)),
+	}
+	digests := make(map[codeidentity.PolicyDigest]PeerRole, len(config.Roles))
+	for role, requirement := range config.Roles {
+		if strings.TrimSpace(string(role)) == "" {
+			return TrustPolicy{}, errors.New("trust: protected role is empty")
+		}
+		if err := requirement.validate(); err != nil {
+			return TrustPolicy{}, fmt.Errorf("trust: role %q: %w", role, err)
+		}
+		digest, err := requirement.ValidationDigest()
+		if err != nil {
+			return TrustPolicy{}, fmt.Errorf("trust: role %q digest: %w", role, err)
+		}
+		if prior, exists := digests[digest]; exists {
+			return TrustPolicy{}, fmt.Errorf("trust: roles %q and %q have equivalent requirements", prior, role)
+		}
+		digests[digest] = role
+		policy.roles[role] = cloneRequirement(requirement)
+		policy.roleNames = append(policy.roleNames, role)
+	}
+	sort.Slice(policy.roleNames, func(i, j int) bool { return policy.roleNames[i] < policy.roleNames[j] })
+	if err := compileRoleSet("stop", config.StopRoles, policy.roles, policy.stopRoles); err != nil {
+		return TrustPolicy{}, err
+	}
+	if len(policy.stopRoles) != 1 {
+		return TrustPolicy{}, errors.New("trust: stop authority requires exactly one role")
+	}
+	if err := compileRoleSet("receipt", config.ReceiptRoles, policy.roles, policy.receiptRoles); err != nil {
+		return TrustPolicy{}, err
+	}
+	if err := compileRoleSet("readiness", config.ReadinessRoles, policy.roles, policy.readinessRoles); err != nil {
+		return TrustPolicy{}, err
+	}
+	if err := compileRoleSetOptional("handoff", config.HandoffRoles, policy.roles, policy.handoffRoles); err != nil {
+		return TrustPolicy{}, err
+	}
+	lifecycleRoles := make(map[PeerRole]struct{}, len(policy.receiptRoles)+len(policy.readinessRoles))
+	for role := range policy.receiptRoles {
+		lifecycleRoles[role] = struct{}{}
+	}
+	for role := range policy.readinessRoles {
+		lifecycleRoles[role] = struct{}{}
+	}
+	if len(lifecycleRoles) > 2 {
+		return TrustPolicy{}, errors.New("trust: lifecycle roles exceed the fixed capacity of two")
+	}
+	for role := range policy.stopRoles {
+		if _, exists := lifecycleRoles[role]; exists {
+			return TrustPolicy{}, fmt.Errorf("trust: role %q overlaps stop and lifecycle authority", role)
+		}
+		if _, exists := policy.handoffRoles[role]; exists {
+			return TrustPolicy{}, fmt.Errorf("trust: role %q overlaps stop and handoff authority", role)
+		}
+	}
+	for role := range lifecycleRoles {
+		if _, exists := policy.handoffRoles[role]; exists {
+			return TrustPolicy{}, fmt.Errorf("trust: role %q overlaps lifecycle and handoff authority", role)
+		}
+	}
+	return policy, nil
+}
+
+func compileRoleSet(name string, source []PeerRole, roles map[PeerRole]Requirement, target map[PeerRole]struct{}) error {
+	if len(source) == 0 {
+		return fmt.Errorf("trust: %s roles are required", name)
+	}
+	for _, role := range source {
+		if _, ok := roles[role]; !ok {
+			return fmt.Errorf("trust: %s role %q is not declared", name, role)
+		}
+		if _, duplicate := target[role]; duplicate {
+			return fmt.Errorf("trust: duplicate %s role %q", name, role)
+		}
+		target[role] = struct{}{}
+	}
+	return nil
+}
+
+func compileRoleSetOptional(name string, source []PeerRole, roles map[PeerRole]Requirement, target map[PeerRole]struct{}) error {
+	if len(source) == 0 {
+		return nil
+	}
+	return compileRoleSet(name, source, roles, target)
+}
+
+func cloneRequirement(source Requirement) Requirement {
+	clone := source
+	clone.RequiredEntitlements = make(map[string]EntitlementRequirement, len(source.RequiredEntitlements))
+	for key, value := range source.RequiredEntitlements {
+		clone.RequiredEntitlements[key] = value
+	}
+	return clone
+}
+
+// Validate rejects the zero value; constructed policies are already valid.
+func (p TrustPolicy) Validate() error {
+	if len(p.roles) == 0 || len(p.stopRoles) == 0 || len(p.receiptRoles) == 0 || len(p.readinessRoles) == 0 || p.handoffRoles == nil {
+		return errors.New("trust: policy was not constructed by NewTrustPolicy")
+	}
+	return nil
+}
+
+// ExpectedUID returns the exact kernel UID floor.
+func (p TrustPolicy) ExpectedUID() int { return p.expectedUID }
+
+// RoleNames returns the canonical protected-role order.
+func (p TrustPolicy) RoleNames() []PeerRole { return append([]PeerRole(nil), p.roleNames...) }
+
+// Requirement returns a deep copy of one compiled role requirement.
+func (p TrustPolicy) Requirement(role PeerRole) (Requirement, bool) {
+	requirement, ok := p.roles[role]
+	return cloneRequirement(requirement), ok
+}
+
+// AllowsStop reports exact stop-control authority for role.
+func (p TrustPolicy) AllowsStop(role PeerRole) bool { _, ok := p.stopRoles[role]; return ok }
+
+// AllowsReceipt reports exact runtime-receipt authority for role.
+func (p TrustPolicy) AllowsReceipt(role PeerRole) bool { _, ok := p.receiptRoles[role]; return ok }
+
+// AllowsReadiness reports exact readiness-subscription authority for role.
+func (p TrustPolicy) AllowsReadiness(role PeerRole) bool { _, ok := p.readinessRoles[role]; return ok }
+
+// AllowsHandoff reports exact connected-FD broker authority for role.
+func (p TrustPolicy) AllowsHandoff(role PeerRole) bool { _, ok := p.handoffRoles[role]; return ok }
+
+// SignatureDigest returns the exact compiled signed-role policy identity.
+func (p TrustPolicy) SignatureDigest(role PeerRole) (proc.SignatureDigest, bool) {
+	requirement, ok := p.roles[role]
+	if !ok {
+		return proc.SignatureDigest{}, false
+	}
+	digest, err := requirement.ValidationDigest()
+	if err != nil {
+		return proc.SignatureDigest{}, false
+	}
+	signature, err := proc.NewSignatureDigest([32]byte(digest))
+	if err != nil {
+		return proc.SignatureDigest{}, false
+	}
+	return signature, true
+}
+
+// ValidationDigest returns the deterministic domain-separated identity of
+// every compiled role, requirement, UID, and private-control authority set.
+func (p TrustPolicy) ValidationDigest() (PolicyDigest, error) {
+	if err := p.Validate(); err != nil {
+		return PolicyDigest{}, err
+	}
+	h := sha256.New()
+	writeDigestString(h, "daemonkit.trust-policy.v1")
+	var uid [8]byte
+	binary.BigEndian.PutUint64(uid[:], uint64(p.expectedUID)) //nolint:gosec // Validation pins a nonnegative effective UID.
+	_, _ = h.Write(uid[:])
+	for _, role := range p.roleNames {
+		writeDigestString(h, string(role))
+		requirement, ok := p.roles[role]
+		if !ok {
+			return PolicyDigest{}, errors.New("trust: compiled role requirement is absent")
+		}
+		digest, err := requirement.ValidationDigest()
+		if err != nil {
+			return PolicyDigest{}, err
+		}
+		writeDigestBytes(h, digest[:])
+	}
+	writeRoleSetDigest(h, "stop", p.stopRoles)
+	writeRoleSetDigest(h, "receipt", p.receiptRoles)
+	writeRoleSetDigest(h, "readiness", p.readinessRoles)
+	writeRoleSetDigest(h, "handoff", p.handoffRoles)
+	var digest PolicyDigest
+	copy(digest[:], h.Sum(nil))
+	return digest, nil
+}
+
+func writeDigestBytes(h hash.Hash, value []byte) {
+	var length [8]byte
+	binary.BigEndian.PutUint64(length[:], uint64(len(value)))
+	_, _ = h.Write(length[:])
+	_, _ = h.Write(value)
+}
+
+func writeRoleSetDigest(h hash.Hash, name string, roles map[PeerRole]struct{}) {
+	writeDigestString(h, name)
+	ordered := make([]PeerRole, 0, len(roles))
+	for role := range roles {
+		ordered = append(ordered, role)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	for _, role := range ordered {
+		writeDigestString(h, string(role))
+	}
+}
+
 // Check enforces the same-effective-UID floor, then any configured
 // Requirement against the peer's audit token; a Requirement with no verifier
 // fails closed (ErrNoVerifier). LOCAL_PEERTOKEN is a query-time process
 // reference, not an immutable record of the connector. Descriptor delegation
 // or substitution by another process satisfying the same signed policy before
 // this check remains a platform limitation.
-func (p Policy) Check(peer wire.Peer) error {
+func (p Policy) Check(peer peer.Identity) error {
 	if peer.UID != os.Geteuid() {
 		return fmt.Errorf("%w: uid %d != %d", ErrUntrustedPeer, peer.UID, os.Geteuid())
 	}

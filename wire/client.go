@@ -1,6 +1,7 @@
 package wire
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -124,10 +125,13 @@ type Client struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	nextID   atomic.Uint64
-	outbound chan outboundFrame
-	events   *boundedStream[Event]
-	eventOut chan Event
+	nextID    atomic.Uint64
+	outbound  chan outboundFrame
+	events    *boundedStream[Event]
+	eventOut  chan Event
+	lifecycle *latestStream[[]byte]
+
+	lifecycleValidator func([]byte) (bool, error)
 
 	mu      sync.Mutex
 	pending map[uint64]*ClientCall
@@ -202,6 +206,25 @@ func NewClient(ctx context.Context, config ClientConfig) (*Client, error) {
 }
 
 func newClient(ctx context.Context, config ClientConfig) (*Client, error) {
+	return newClientWithLifecycleValidator(ctx, config, nil)
+}
+
+func newLifecycleClient(
+	ctx context.Context,
+	config ClientConfig,
+	validator func([]byte) (bool, error),
+) (*Client, error) {
+	if validator == nil {
+		return nil, errors.New("wire: lifecycle validator is required")
+	}
+	return newClientWithLifecycleValidator(ctx, config, validator)
+}
+
+func newClientWithLifecycleValidator(
+	ctx context.Context,
+	config ClientConfig,
+	validator func([]byte) (bool, error),
+) (*Client, error) {
 	parameters, err := validateClientConfig(config)
 	if err != nil {
 		return nil, err
@@ -244,6 +267,8 @@ func newClient(ctx context.Context, config ClientConfig) (*Client, error) {
 		outbound:                make(chan outboundFrame, positiveOr(config.OutboundQueue, defaultOutboundQueue)),
 		events:                  newBoundedStream[Event](eventCap),
 		eventOut:                make(chan Event),
+		lifecycle:               newLatestStream[[]byte](),
+		lifecycleValidator:      validator,
 		pending:                 make(map[uint64]*ClientCall),
 		goAway:                  make(chan struct{}),
 		streamCap:               streamCap,
@@ -298,6 +323,30 @@ func (c *Client) WireBuild() string { return c.wireBuild }
 
 // Events returns the bounded server-pushed event stream.
 func (c *Client) Events() <-chan Event { return c.eventOut }
+
+func (c *Client) nextLifecycle(ctx context.Context) ([]byte, error) {
+	payload, err := c.lifecycle.next(ctx)
+	if errors.Is(err, errStreamClosed) {
+		return payload, c.sessionErr()
+	}
+	return payload, err
+}
+
+func (c *Client) tryLifecycle() ([]byte, bool, error) {
+	payload, ok, err := c.lifecycle.try()
+	if errors.Is(err, errStreamClosed) {
+		return payload, true, c.sessionErr()
+	}
+	return payload, ok, err
+}
+
+func (c *Client) validateLifecycle(payload []byte) (bool, error) {
+	validator := c.lifecycleValidator
+	if validator == nil {
+		return false, errors.New("wire: lifecycle validator is not installed")
+	}
+	return validator(payload)
+}
 
 // Call sends a unary request without response-stream negotiation and waits for
 // its terminal response.
@@ -671,45 +720,68 @@ func clientHandshake(codec *Codec, wireBuild string) (WireIdentity, error) {
 	if frame.Kind != FrameHelloAck || frame.ID != 0 || frame.Sequence != 0 || frame.Flags != FlagEnd || frame.Op != "" || frame.Tenant != "" {
 		return WireIdentity{}, fmt.Errorf("%w: invalid acknowledge", ErrHandshake)
 	}
-	var identity handshakeIdentity
-	if err := decodeStrict(frame.Payload, &identity); err != nil {
-		return WireIdentity{}, fmt.Errorf("%w: identity: %w", ErrHandshake, err)
+	var ack handshakeAck
+	if err := decodeStrict(frame.Payload, &ack); err != nil {
+		return WireIdentity{}, fmt.Errorf("%w: acknowledge: %w", ErrHandshake, err)
 	}
-	if identity.Protocol != ProtocolVersion {
-		return WireIdentity{}, fmt.Errorf("%w: identity got %d", ErrProtocolVersion, identity.Protocol)
+	if ack.Protocol != ProtocolVersion {
+		return WireIdentity{}, fmt.Errorf("%w: acknowledge got %d", ErrProtocolVersion, ack.Protocol)
 	}
-	if identity.WireBuild == "" {
+	if ack.WireBuild == "" {
 		return WireIdentity{}, fmt.Errorf("%w: empty server wire build", ErrHandshake)
 	}
-	if len(identity.Session) != sessionGenerationBytes {
+	if ack.WireBuild != wireBuild {
+		return WireIdentity{}, fmt.Errorf(
+			"%w: server=%q client=%q", ErrBuildMismatch, ack.WireBuild, wireBuild,
+		)
+	}
+	if ack.Rejected {
+		if len(ack.Session) != 0 || ack.Code == "" || ack.Reason == "" {
+			return WireIdentity{}, fmt.Errorf("%w: invalid rejection", ErrHandshake)
+		}
+		switch ack.Code {
+		case ResponseCodeSessionCapacity, ResponseCodePeerUntrusted, ResponseCodeBuildMismatch:
+		default:
+			return WireIdentity{}, fmt.Errorf("%w: invalid rejection code %q", ErrHandshake, ack.Code)
+		}
+		return WireIdentity{}, &HandshakeRejectionError{Code: ack.Code, Reason: ack.Reason}
+	}
+	if ack.Code != "" || ack.Reason != "" {
+		return WireIdentity{}, fmt.Errorf("%w: success carried rejection", ErrHandshake)
+	}
+	if len(ack.Session) != sessionGenerationBytes {
 		return WireIdentity{}, fmt.Errorf("%w: invalid session generation", ErrHandshake)
 	}
-	return WireIdentity(identity), nil
+	return WireIdentity{Protocol: ack.Protocol, WireBuild: ack.WireBuild, Session: ack.Session}, nil
 }
 
 func (c *Client) writeLoop() {
 	defer c.loopWG.Done()
 	defer c.closeWriter()
 	for {
+		var outgoing outboundFrame
 		select {
-		case outgoing := <-c.outbound:
-			result := frameSendResult{state: frameNotSent, err: outgoing.ctx.Err()}
-			if result.err == nil {
-				var committed bool
-				committed, result.err = c.codec.writeFrame(outgoing.frame)
-				switch {
-				case committed:
-					result.state = frameCommitted
-				}
-			}
-			outgoing.done <- result
-			if result.err != nil {
-				if !errors.Is(result.err, context.Canceled) && !errors.Is(result.err, context.DeadlineExceeded) {
-					c.fail(fmt.Errorf("wire: write: %w", result.err))
-					return
-				}
-			}
+		case outgoing = <-c.outbound:
 		case <-c.ctx.Done():
+			return
+		}
+		result := frameSendResult{state: frameNotSent, err: outgoing.ctx.Err()}
+		if result.err == nil {
+			var started, committed bool
+			started, committed, result.err = c.codec.writeFrame(outgoing.frame)
+			switch {
+			case committed:
+				result.state = frameCommitted
+			case started:
+				result.state = frameDeliveryUnknown
+			}
+		}
+		outgoing.done <- result
+		if result.err != nil && !errors.Is(result.err, context.Canceled) && !errors.Is(result.err, context.DeadlineExceeded) {
+			if errors.Is(result.err, ErrFrameTooLarge) || errors.Is(result.err, ErrInvalidFrame) {
+				continue
+			}
+			c.fail(fmt.Errorf("wire: write: %w", result.err))
 			return
 		}
 	}
@@ -760,6 +832,14 @@ func (c *Client) readLoop(ctx context.Context) {
 				c.fail(err)
 				return
 			}
+		case FrameLifecycle:
+			if err := c.receiveLifecycle(frame); err != nil {
+				if errors.Is(err, errStreamClosed) && ctx.Err() != nil {
+					return
+				}
+				c.fail(err)
+				return
+			}
 		case FrameWindow:
 			if err := c.receiveWindow(frame); err != nil {
 				c.fail(err)
@@ -779,13 +859,34 @@ func (c *Client) readLoop(ctx context.Context) {
 	}
 }
 
+func (c *Client) receiveLifecycle(frame Frame) error {
+	if frame.ID != 0 || frame.Op != "" || frame.Flags != FlagEnd || frame.Sequence != 0 ||
+		frame.Tenant != "" || len(frame.Payload) == 0 {
+		return fmt.Errorf("%w: lifecycle frame", ErrInvalidFrame)
+	}
+	payload := append([]byte(nil), frame.Payload...)
+	terminal, err := c.validateLifecycle(payload)
+	if err != nil {
+		return fmt.Errorf("wire: validate lifecycle: %w", err)
+	}
+	if terminal {
+		err = c.lifecycle.offerTerminalExact(payload, bytes.Equal)
+	} else {
+		err = c.lifecycle.offer(payload)
+	}
+	if err != nil {
+		return fmt.Errorf("wire: receive lifecycle: %w", err)
+	}
+	return nil
+}
+
 func (c *Client) receiveResponse(frame Frame) error {
 	if frame.ID == 0 || frame.Flags != FlagEnd || frame.Op != "" || frame.Tenant != "" {
 		return fmt.Errorf("%w: response frame", ErrInvalidFrame)
 	}
 	var response Response
 	if err := decodeStrict(frame.Payload, &response); err != nil {
-		return fmt.Errorf("wire: decode response: %w", err)
+		return fmt.Errorf("%w: decode response: %w", ErrInvalidFrame, err)
 	}
 	call := c.removePending(frame.ID)
 	var ackErr error
@@ -905,6 +1006,7 @@ func (c *Client) fail(err error) {
 		c.cancel()
 		_ = c.conn.Close()
 		c.events.close()
+		c.lifecycle.close()
 		for _, call := range pending {
 			call.mu.Lock()
 			if !call.receiveEnded {

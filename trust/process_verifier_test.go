@@ -1,52 +1,17 @@
 package trust
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
+	"github.com/yasyf/daemonkit/peer"
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit/worker"
 )
-
-func TestProcessVerifierUsesExactChildProtocol(t *testing.T) {
-	runner := directVerifierRunner{}
-	verifier := ProcessVerifier{
-		Runner: runner, Executable: "/Applications/Holder.app/Contents/MacOS/Holder",
-		Policy: Policy{},
-	}
-	if err := verifier.Check(t.Context(), wire.Peer{UID: os.Geteuid()}); err != nil {
-		t.Fatalf("Check trusted peer: %v", err)
-	}
-	if err := verifier.Check(t.Context(), wire.Peer{UID: os.Geteuid() + 1}); !errors.Is(err, ErrUntrustedPeer) {
-		t.Fatalf("Check foreign peer = %v, want ErrUntrustedPeer", err)
-	}
-}
-
-func TestProcessVerifierPropagatesCancellationToRunner(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	called := false
-	verifier := ProcessVerifier{
-		Runner: verifierRunnerFunc(func(context.Context, supervise.Task) error {
-			called = true
-			return nil
-		}),
-		Executable: "/Applications/Holder.app/Contents/MacOS/Holder",
-	}
-	if err := verifier.Check(ctx, wire.Peer{}); !errors.Is(err, context.Canceled) {
-		t.Fatalf("Check canceled = %v", err)
-	}
-	if called {
-		t.Fatal("canceled verifier started a child")
-	}
-}
 
 func TestRunVerifierChildHardCutsMalformedRequests(t *testing.T) {
 	if recognized, err := RunVerifierChild([]string{"consumer-mode"}, os.Stdout); err != nil || recognized {
@@ -60,61 +25,13 @@ func TestRunVerifierChildHardCutsMalformedRequests(t *testing.T) {
 	}
 }
 
-func TestProcessVerifierRejectsMalformedAndOversizedResponses(t *testing.T) {
-	for _, test := range []struct {
-		name string
-		run  verifierRunnerFunc
-		want string
-	}{
-		{
-			name: "malformed",
-			run: func(_ context.Context, task supervise.Task) error {
-				_, err := task.Stdout.Write([]byte("not-json"))
-				return err
-			},
-			want: "decode verifier response",
-		},
-		{
-			name: "oversized",
-			run: func(_ context.Context, task supervise.Task) error {
-				_, err := task.Stdout.Write(bytes.Repeat([]byte("x"), maxVerifierResponse+1))
-				return err
-			},
-			want: "response exceeded limit",
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			verifier := ProcessVerifier{
-				Runner: test.run, Executable: "/Applications/Holder.app/Contents/MacOS/Holder",
-			}
-			if err := verifier.Check(t.Context(), wire.Peer{}); err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("Check = %v, want %q", err, test.want)
-			}
-		})
-	}
-}
-
-func TestProcessVerifierPreservesRunnerFailure(t *testing.T) {
-	runnerErr := errors.New("runner failed closed")
-	verifier := ProcessVerifier{
-		Runner:     verifierRunnerFunc(func(context.Context, supervise.Task) error { return runnerErr }),
-		Executable: "/Applications/Holder.app/Contents/MacOS/Holder",
-	}
-	if err := verifier.Check(t.Context(), wire.Peer{}); !errors.Is(err, runnerErr) {
-		t.Fatalf("Check = %v, want runner failure", err)
-	}
-}
-
-func TestProcessVerifierSupervisedCancellationReapsAndReusesDedicatedLane(t *testing.T) {
+func TestProcessVerifierCancellationReapsAndReusesDedicatedLane(t *testing.T) {
 	directory := t.TempDir()
 	executable := filepath.Join(directory, "verifier-child")
 	script := `#!/bin/sh
 if mkdir "$0.state" 2>/dev/null; then
     trap '' TERM
-    while :; do
-        sleep 3600 &
-        wait $!
-    done
+    while :; do sleep 3600 & wait $!; done
 fi
 printf '{"protocol":1,"result":"trusted"}\n'
 `
@@ -123,24 +40,41 @@ printf '{"protocol":1,"result":"trusted"}\n'
 	}
 	store := &proc.FileStore{Path: filepath.Join(directory, "workers.json")}
 	reaper := &proc.Reaper{Store: store, Generation: "trust-test"}
-	pool, err := supervise.NewPool(1, reaper)
+	pool, err := worker.NewPool(worker.Config{
+		Capacity: 1, QueueCapacity: 1, MaxTotalRun: 5 * time.Second,
+		MaxStdinBytes: maxVerifierPayload, MaxStdoutBytes: maxVerifierResponse, MaxStderrBytes: maxVerifierResponse,
+	}, reaper)
 	if err != nil {
 		t.Fatal(err)
 	}
+	claim, err := pool.ClaimRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := claim.Recover(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := claim.Activate(); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
-		pool.Cancel()
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		if err := pool.Wait(ctx); err != nil {
+		if err := claim.Close(ctx); err != nil {
 			t.Errorf("wait for verifier pool: %v", err)
 		}
 	})
-	verifier := ProcessVerifier{Runner: pool, Executable: executable}
-	blockedCtx, cancel := context.WithCancel(t.Context())
+	verifier := ProcessVerifier{Runner: claim, Executable: executable}
+	blockedCtx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	blocked := make(chan error, 1)
-	go func() { blocked <- verifier.Check(blockedCtx, wire.Peer{UID: os.Geteuid()}) }()
+	go func() { blocked <- verifier.Check(blockedCtx, peer.Identity{UID: os.Geteuid()}) }()
 	deadline := time.Now().Add(3 * time.Second)
 	for {
+		select {
+		case err := <-blocked:
+			t.Fatalf("blocking verifier exited before entering: %v", err)
+		default:
+		}
 		if _, err := os.Stat(executable + ".state"); err == nil {
 			break
 		} else if !errors.Is(err, os.ErrNotExist) {
@@ -158,7 +92,7 @@ printf '{"protocol":1,"result":"trusted"}\n'
 
 	nextCtx, cancelNext := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancelNext()
-	if err := verifier.Check(nextCtx, wire.Peer{UID: os.Geteuid()}); err != nil {
+	if err := verifier.Check(nextCtx, peer.Identity{UID: os.Geteuid()}); err != nil {
 		t.Fatalf("next Check after reaping: %v", err)
 	}
 	records, err := store.Load(t.Context())
@@ -169,14 +103,3 @@ printf '{"protocol":1,"result":"trusted"}\n'
 		t.Fatalf("verifier records after settled checks = %#v", records)
 	}
 }
-
-type directVerifierRunner struct{}
-
-func (directVerifierRunner) Run(_ context.Context, task supervise.Task) error {
-	_, err := RunVerifierChild(task.Args, task.Stdout)
-	return err
-}
-
-type verifierRunnerFunc func(context.Context, supervise.Task) error
-
-func (f verifierRunnerFunc) Run(ctx context.Context, task supervise.Task) error { return f(ctx, task) }

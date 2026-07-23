@@ -61,6 +61,8 @@ const (
 	FrameWindow
 	// FrameAck confirms that a terminal response reached the client.
 	FrameAck
+	// FrameLifecycle carries one daemon-owned lifecycle snapshot.
+	FrameLifecycle
 )
 
 // FrameFlags modifies a frame without changing its kind.
@@ -125,7 +127,11 @@ func (c *Codec) ReadFrame() (frame Frame, err error) {
 			return Frame{}, fmt.Errorf("wire: set read deadline: %w", err)
 		}
 		defer func() {
-			err = errors.Join(err, clearReadDeadline(c.conn))
+			clearErr := clearReadDeadline(c.conn)
+			if err == nil && isCompletedFrameClose(clearErr) {
+				clearErr = nil
+			}
+			err = errors.Join(err, clearErr)
 		}()
 	}
 	var prefix [4]byte
@@ -158,27 +164,28 @@ func (c *Codec) ReadFrame() (frame Frame, err error) {
 
 // WriteFrame writes one complete frame under the configured bound.
 func (c *Codec) WriteFrame(frame Frame) error {
-	_, err := c.writeFrame(frame)
+	_, _, err := c.writeFrame(frame)
 	return err
 }
 
-// writeFrame reports whether the complete length-framed packet reached the
-// connection writer. A partial packet cannot dispatch at the peer.
-func (c *Codec) writeFrame(frame Frame) (complete bool, err error) {
+// writeFrame reports whether any and all length-framed packet bytes reached
+// the connection writer. A partial packet cannot dispatch at the peer but its
+// delivery remains unknown to the caller.
+func (c *Codec) writeFrame(frame Frame) (started, complete bool, err error) {
 	body, err := encodeFrame(frame)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	limit := c.MaxFrame
 	if limit <= 0 {
 		limit = DefaultMaxFrame
 	}
 	if len(body) > limit {
-		return false, fmt.Errorf("%w: %d > %d", ErrFrameTooLarge, len(body), limit)
+		return false, false, fmt.Errorf("%w: %d > %d", ErrFrameTooLarge, len(body), limit)
 	}
 	bodyLength, err := uint32Length("body", len(body))
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	packet := make([]byte, 4+len(body))
 	binary.BigEndian.PutUint32(packet[:4], bodyLength)
@@ -187,18 +194,27 @@ func (c *Codec) writeFrame(frame Frame) (complete bool, err error) {
 	defer c.writeMu.Unlock()
 	if c.WriteTimeout > 0 {
 		if err := c.conn.SetWriteDeadline(time.Now().Add(c.WriteTimeout)); err != nil {
-			return false, fmt.Errorf("wire: set write deadline: %w", err)
+			return false, false, fmt.Errorf("wire: set write deadline: %w", err)
 		}
 		defer func() {
-			err = errors.Join(err, clearWriteDeadline(c.conn))
+			clearErr := clearWriteDeadline(c.conn)
+			if err == nil && complete && isCompletedFrameClose(clearErr) {
+				clearErr = nil
+			}
+			err = errors.Join(err, clearErr)
 		}()
 	}
 	written, err := writeFull(c.conn, packet)
+	started = written != 0
 	complete = written == len(packet)
 	if err != nil {
-		return complete, fmt.Errorf("wire: write frame: %w", err)
+		return started, complete, fmt.Errorf("wire: write frame: %w", err)
 	}
-	return true, nil
+	return true, true, nil
+}
+
+func isCompletedFrameClose(err error) bool {
+	return errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe)
 }
 
 func clearReadDeadline(conn net.Conn) error {
@@ -298,7 +314,7 @@ func decodeFrame(body []byte) (Frame, error) {
 	return frame, nil
 }
 
-func (k FrameKind) valid() bool { return k >= FrameHello && k <= FrameAck }
+func (k FrameKind) valid() bool { return k >= FrameHello && k <= FrameLifecycle }
 
 func uint32Length(field string, value int) (uint32, error) {
 	if value < 0 || uint64(value) > math.MaxUint32 {
@@ -385,6 +401,11 @@ func validateFrame(frame Frame) error {
 		if frame.Flags != FlagEnd || frame.ID == 0 || frame.Sequence != 0 || frame.DeadlineUnixMilli != 0 ||
 			frame.Op != "" || frame.Tenant != "" || len(frame.Payload) != sessionGenerationBytes {
 			return fmt.Errorf("%w: acknowledgement frame", ErrInvalidFrame)
+		}
+	case FrameLifecycle:
+		if frame.Flags != FlagEnd || frame.ID != 0 || frame.Sequence != 0 || frame.DeadlineUnixMilli != 0 ||
+			frame.Op != "" || frame.Tenant != "" || len(frame.Payload) == 0 {
+			return fmt.Errorf("%w: lifecycle frame", ErrInvalidFrame)
 		}
 	}
 	return nil

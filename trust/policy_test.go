@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit/peer"
 )
 
 func TestRequirementDRString(t *testing.T) {
@@ -54,7 +54,7 @@ func TestRequirementValidation(t *testing.T) {
 
 func TestCheckUIDFloorRejectsForeignUID(t *testing.T) {
 	p := Policy{}
-	peer := wire.Peer{UID: os.Getuid() + 1}
+	peer := peer.Identity{UID: os.Getuid() + 1}
 	err := p.Check(peer)
 	if !errors.Is(err, ErrUntrustedPeer) {
 		t.Errorf("Check(foreign uid) = %v, want ErrUntrustedPeer", err)
@@ -63,14 +63,14 @@ func TestCheckUIDFloorRejectsForeignUID(t *testing.T) {
 
 func TestCheckUIDOnlyPassesSameUID(t *testing.T) {
 	p := Policy{}
-	if err := p.Check(wire.Peer{UID: os.Getuid()}); err != nil {
+	if err := p.Check(peer.Identity{UID: os.Getuid()}); err != nil {
 		t.Errorf("Check(same uid, no requirement) = %v, want nil", err)
 	}
 }
 
 func TestCheckConfiguredRequirementValidatesFields(t *testing.T) {
 	p := Policy{Requirement: &Requirement{TeamID: "SXKCTF23Q2"}}
-	err := p.Check(wire.Peer{UID: os.Getuid()})
+	err := p.Check(peer.Identity{UID: os.Getuid()})
 	if err == nil {
 		t.Fatal("Check with an invalid Requirement = nil, want an error")
 	}
@@ -83,7 +83,7 @@ func TestCheckFailsClosedWithoutVerifier(t *testing.T) {
 	p := Policy{Requirement: &Requirement{
 		TeamID: "SXKCTF23Q2", SigningIdentifier: "com.yasyf.daemonkit.x",
 	}}
-	err := p.Check(wire.Peer{UID: os.Getuid()})
+	err := p.Check(peer.Identity{UID: os.Getuid()})
 	if !errors.Is(err, ErrNoVerifier) {
 		t.Errorf("Check(no verifier) = %v, want ErrNoVerifier (fail closed)", err)
 	}
@@ -155,5 +155,84 @@ func TestRequirementValidationDigestIsCanonicalAndComplete(t *testing.T) {
 	}
 	if changed == firstDigest {
 		t.Fatal("App Group requirement did not affect opaque validation digest")
+	}
+}
+
+func trustPolicyRequirement(identifier string) Requirement {
+	return Requirement{TeamID: "SXKCTF23Q2", SigningIdentifier: identifier}
+}
+
+func trustPolicyConfig() TrustPolicyConfig {
+	return TrustPolicyConfig{
+		ExpectedUID: os.Geteuid(),
+		Roles: map[PeerRole]Requirement{
+			"stop":      trustPolicyRequirement("com.yasyf.daemonkit.stop"),
+			"lifecycle": trustPolicyRequirement("com.yasyf.daemonkit.lifecycle"),
+			"broker":    trustPolicyRequirement("com.yasyf.daemonkit.broker"),
+		},
+		StopRoles: []PeerRole{"stop"}, ReceiptRoles: []PeerRole{"lifecycle"},
+		ReadinessRoles: []PeerRole{"lifecycle"}, HandoffRoles: []PeerRole{"broker"},
+	}
+}
+
+func TestTrustPolicyIsImmutableAndCanonical(t *testing.T) {
+	config := trustPolicyConfig()
+	policy, err := NewTrustPolicy(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := policy.ValidationDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.Roles["broker"] = trustPolicyRequirement("com.yasyf.changed")
+	config.HandoffRoles[0] = "stop"
+	names := policy.RoleNames()
+	names[0] = "changed"
+	second, err := policy.ValidationDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second || !policy.AllowsHandoff("broker") || policy.AllowsHandoff("stop") {
+		t.Fatalf("policy mutated: first=%x second=%x names=%v", first, second, policy.RoleNames())
+	}
+}
+
+func TestTrustPolicyAllowsDisabledHandoff(t *testing.T) {
+	config := trustPolicyConfig()
+	config.HandoffRoles = nil
+	policy, err := NewTrustPolicy(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := policy.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if policy.AllowsHandoff("broker") {
+		t.Fatal("disabled handoff granted authority")
+	}
+}
+
+func TestTrustPolicyRejectsCrossBucketOverlapAndLifecycleOverflow(t *testing.T) {
+	for name, mutate := range map[string]func(*TrustPolicyConfig){
+		"stop lifecycle": func(c *TrustPolicyConfig) { c.StopRoles = []PeerRole{"lifecycle"} },
+		"stop handoff":   func(c *TrustPolicyConfig) { c.StopRoles = []PeerRole{"broker"} },
+		"lifecycle handoff": func(c *TrustPolicyConfig) {
+			c.HandoffRoles = []PeerRole{"lifecycle"}
+		},
+		"lifecycle overflow": func(c *TrustPolicyConfig) {
+			c.Roles["lifecycle-2"] = trustPolicyRequirement("com.yasyf.daemonkit.lifecycle-2")
+			c.Roles["lifecycle-3"] = trustPolicyRequirement("com.yasyf.daemonkit.lifecycle-3")
+			c.ReceiptRoles = []PeerRole{"lifecycle", "lifecycle-2"}
+			c.ReadinessRoles = []PeerRole{"lifecycle-3"}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			config := trustPolicyConfig()
+			mutate(&config)
+			if _, err := NewTrustPolicy(config); err == nil {
+				t.Fatal("invalid authority layout succeeded")
+			}
+		})
 	}
 }

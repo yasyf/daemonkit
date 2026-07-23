@@ -16,7 +16,7 @@ import (
 
 	dkdaemon "github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 const (
@@ -55,11 +55,9 @@ func (c ControllerConfig) validate() error {
 }
 
 type controllerRuntime interface {
-	supervise.TaskRunner
-	Recover(context.Context) error
-	Close()
-	Cancel()
-	Wait(context.Context) error
+	taskRunner
+	Start(context.Context) error
+	Close(context.Context) error
 }
 
 type serviceReceiptRecovery interface {
@@ -130,7 +128,7 @@ func NewController(ctx context.Context, config ControllerConfig) (*Controller, e
 		Store:      &proc.FileStore{Path: config.ProcessPath},
 		Generation: generation,
 	}
-	runtime, err := supervise.NewPool(config.WorkerLimit, reaper)
+	runtime, err := newControllerWorkerRuntime(config.WorkerLimit, reaper)
 	if err != nil {
 		_ = store.Close()
 		return nil, err
@@ -168,14 +166,12 @@ func newControllerWithRuntime(
 		if err == nil {
 			return
 		}
-		runtime.Close()
-		runtime.Cancel()
 		waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), controllerCloseBound)
 		defer cancel()
-		_ = runtime.Wait(waitCtx)
+		_ = runtime.Close(waitCtx)
 		_ = store.Close()
 	}()
-	if err := runtime.Recover(ctx); err != nil {
+	if err := runtime.Start(ctx); err != nil {
 		return nil, err
 	}
 	state, err := store.Load(ctx)
@@ -323,16 +319,7 @@ func (c *Controller) settleClose(
 			closeErr = ctx.Err()
 		}
 	}
-	c.runtime.Close()
-	waited := make(chan error, 1)
-	go func() { waited <- c.runtime.Wait(context.WithoutCancel(ctx)) }()
-	var waitErr error
-	select {
-	case waitErr = <-waited:
-	case <-ctx.Done():
-		c.runtime.Cancel()
-		waitErr = errors.Join(ctx.Err(), <-waited)
-	}
+	waitErr := c.runtime.Close(ctx)
 	return errors.Join(closeErr, waitErr, c.store.Close())
 }
 
@@ -585,7 +572,7 @@ func (c *Controller) reload(ctx context.Context, agent Agent, path string) error
 }
 
 func (c *Controller) launchctl(ctx context.Context, args ...string) (string, error) {
-	return runCombined(ctx, c.runtime, proc.RecoveryService, "/bin/launchctl", args...)
+	return runCombined(ctx, c.runtime, "/bin/launchctl", args...)
 }
 
 func desiredAgents(agents []Agent) (map[string]Agent, error) {
@@ -611,9 +598,9 @@ func desiredAgents(agents []Agent) (map[string]Agent, error) {
 }
 
 func launchctlExitCode(err error) int {
-	var exitErr *supervise.ExitError
+	var exitErr *worker.ExitError
 	if errors.As(err, &exitErr) {
-		return exitErr.ExitCode()
+		return exitErr.ExitCode
 	}
 	return -1
 }

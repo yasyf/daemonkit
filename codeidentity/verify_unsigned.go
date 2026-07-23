@@ -5,9 +5,9 @@ package codeidentity
 import (
 	"fmt"
 
-	"github.com/yasyf/daemonkit/wire"
+	peer "github.com/yasyf/daemonkit/peer"
 )
 
-func verifyCodeIdentity(_ wire.Peer, _ CodeIdentity) error {
+func verifyCodeIdentity(_ peer.Identity, _ CodeIdentity) error {
 	return fmt.Errorf("%w: unsigned build", ErrNoVerifier)
 }

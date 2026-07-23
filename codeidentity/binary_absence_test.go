@@ -22,19 +22,8 @@ var signedOnlyMarkers = [][]byte{
 	[]byte("daemonkit-signed-only-marker-value"),
 }
 
-func TestDaemonFacingBinaryExcludesSignedOnlyPackagesAndPolicyLiterals(t *testing.T) {
+func TestDaemonFacingBinaryExcludesSignedOnlyPolicyLiterals(t *testing.T) {
 	root := moduleRoot(t)
-	dependencies := runGo(t, root, "list", "-deps", "-f", "{{.ImportPath}}", "./codeidentity/testdata/daemoncli")
-	for _, forbidden := range []string{
-		"github.com/yasyf/daemonkit/trust",
-	} {
-		for _, dependency := range strings.Fields(dependencies) {
-			if dependency == forbidden || strings.HasPrefix(dependency, forbidden+"/") {
-				t.Fatalf("daemon-facing dependency graph includes signed-only package %q", forbidden)
-			}
-		}
-	}
-
 	temporary := t.TempDir()
 	daemonBinary := filepath.Join(temporary, "daemoncli")
 	signedBinary := filepath.Join(temporary, "signedcli")

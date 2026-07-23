@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit/peer"
 	"golang.org/x/sys/unix"
 )
 
@@ -46,7 +46,7 @@ func fixtureBin(t *testing.T, name string) string {
 	return p
 }
 
-func peerOf(t *testing.T, bin string) wire.Peer {
+func peerOf(t *testing.T, bin string) peer.Identity {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "dk-tr")
 	if err != nil {
@@ -90,7 +90,7 @@ func peerOf(t *testing.T, bin string) wire.Peer {
 	}
 	t.Cleanup(func() { _ = conn.Close() })
 
-	peer, err := wire.PeerFromConn(conn.(*net.UnixConn))
+	peer, err := peer.FromConn(conn.(*net.UnixConn))
 	if err != nil {
 		t.Fatalf("PeerFromConn: %v", err)
 	}

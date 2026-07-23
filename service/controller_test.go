@@ -13,54 +13,39 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 type controllerRuntimeStub struct {
 	mu sync.Mutex
 
-	events      *[]string
-	recoverErr  error
-	run         func(context.Context, supervise.Task) error
-	wait        func(context.Context) error
-	closeCalls  int
-	cancelCalls int
+	events     *[]string
+	startErr   error
+	run        func(context.Context, worker.CommandRequest) (worker.CommandResult, error)
+	close      func(context.Context) error
+	closeCalls int
 }
 
-func (r *controllerRuntimeStub) Recover(context.Context) error {
-	r.record("recover")
-	return r.recoverErr
+func (r *controllerRuntimeStub) Start(context.Context) error {
+	r.record("start")
+	return r.startErr
 }
 
-func (r *controllerRuntimeStub) Run(ctx context.Context, task supervise.Task) error {
-	if task.RecoveryClass != proc.RecoveryService {
-		return fmt.Errorf("task recovery class = %q, want %q", task.RecoveryClass, proc.RecoveryService)
-	}
+func (r *controllerRuntimeStub) Run(ctx context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
 	r.record("run:" + strings.Join(task.Args, " "))
 	if r.run != nil {
 		return r.run(ctx, task)
 	}
-	return nil
+	return worker.CommandResult{}, nil
 }
 
-func (r *controllerRuntimeStub) Close() {
+func (r *controllerRuntimeStub) Close(ctx context.Context) error {
 	r.mu.Lock()
 	r.closeCalls++
 	r.mu.Unlock()
 	r.record("close-runtime")
-}
-
-func (r *controllerRuntimeStub) Cancel() {
-	r.mu.Lock()
-	r.cancelCalls++
-	r.mu.Unlock()
-	r.record("cancel-runtime")
-}
-
-func (r *controllerRuntimeStub) Wait(ctx context.Context) error {
-	r.record("wait-runtime")
-	if r.wait != nil {
-		return r.wait(ctx)
+	if r.close != nil {
+		return r.close(ctx)
 	}
 	return nil
 }
@@ -201,22 +186,19 @@ func controllerAgent(t *testing.T, label string) Agent {
 	}
 }
 
-func launchctlExit(code int) error { return &supervise.ExitError{Code: code} }
+func launchctlExit(code int) error { return &worker.ExitError{ExitCode: code} }
 
-func launchctlStub(fn func([]string) (string, error)) func(context.Context, supervise.Task) error {
-	return func(_ context.Context, task supervise.Task) error {
+func launchctlStub(fn func([]string) (string, error)) func(context.Context, worker.CommandRequest) (worker.CommandResult, error) {
+	return func(_ context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
 		out, err := fn(task.Args)
-		if task.Stdout != nil {
-			_, _ = task.Stdout.Write([]byte(out))
-		}
-		return err
+		return worker.CommandResult{Stdout: []byte(out)}, err
 	}
 }
 
 func newTestController(
 	t *testing.T,
 	state controllerState,
-	run func(context.Context, supervise.Task) error,
+	run func(context.Context, worker.CommandRequest) (worker.CommandResult, error),
 	events *[]string,
 ) (*Controller, *controllerRuntimeStub, *controllerStoreStub, *controllerReceiptsStub) {
 	t.Helper()
@@ -373,8 +355,8 @@ func TestControllerRecoveryDoesNotAcknowledgeBeforeConvergence(t *testing.T) {
 	if receipts.calls != 0 {
 		t.Fatalf("receipt recovery calls = %d, want 0", receipts.calls)
 	}
-	if runtime.closeCalls != 1 || runtime.cancelCalls != 1 || store.closeCalls != 1 {
-		t.Fatalf("constructor cleanup = close %d cancel %d store %d", runtime.closeCalls, runtime.cancelCalls, store.closeCalls)
+	if runtime.closeCalls != 1 || store.closeCalls != 1 {
+		t.Fatalf("constructor cleanup = close %d store %d", runtime.closeCalls, store.closeCalls)
 	}
 }
 
@@ -409,7 +391,7 @@ func TestControllerRecoveryVerifiesExactAgentWithoutRelaunch(t *testing.T) {
 	}, run, &events)
 	_ = controller
 	want := []string{
-		"recover", "load", "run:print " + serviceTarget(agent.Label),
+		"start", "load", "run:print " + serviceTarget(agent.Label),
 		"run:enable " + serviceTarget(agent.Label),
 		fmt.Sprintf("recover-receipts:%d", proc.RecoveryService),
 		fmt.Sprintf("recover-receipts:%d", proc.RecoveryStopControl),
@@ -1000,10 +982,10 @@ func TestControllerCloseCancelsAdmittedOperationAtBoundAndRejectsNewWork(t *test
 	agent := controllerAgent(t, "com.example.close")
 	started := make(chan struct{})
 	var once sync.Once
-	run := func(ctx context.Context, _ supervise.Task) error {
+	run := func(ctx context.Context, _ worker.CommandRequest) (worker.CommandResult, error) {
 		once.Do(func() { close(started) })
 		<-ctx.Done()
-		return ctx.Err()
+		return worker.CommandResult{}, ctx.Err()
 	}
 	controller, runtime, store, _ := newTestController(t, controllerState{
 		Desired: map[string]Agent{}, Applied: map[string]Agent{},
@@ -1022,8 +1004,8 @@ func TestControllerCloseCancelsAdmittedOperationAtBoundAndRejectsNewWork(t *test
 	if err := controller.Converge(context.Background(), nil); !errors.Is(err, ErrControllerClosed) {
 		t.Fatalf("post-close Converge() = %v", err)
 	}
-	if runtime.closeCalls != 1 || runtime.cancelCalls != 1 || store.closeCalls != 1 {
-		t.Fatalf("close calls = runtime %d cancel %d store %d", runtime.closeCalls, runtime.cancelCalls, store.closeCalls)
+	if runtime.closeCalls != 1 || store.closeCalls != 1 {
+		t.Fatalf("close calls = runtime %d store %d", runtime.closeCalls, store.closeCalls)
 	}
 }
 

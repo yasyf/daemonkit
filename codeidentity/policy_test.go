@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit/peer"
 )
 
 func TestCodePolicyRejectsForeignUIDBeforeCodeVerification(t *testing.T) {
@@ -13,7 +13,7 @@ func TestCodePolicyRejectsForeignUIDBeforeCodeVerification(t *testing.T) {
 		TeamID:            "ABCDE12345",
 		SigningIdentifier: "com.example.daemonkit",
 	}}
-	err := policy.Check(wire.Peer{UID: os.Geteuid() + 1})
+	err := policy.Check(peer.Identity{UID: os.Geteuid() + 1})
 	if !errors.Is(err, ErrUntrustedPeer) {
 		t.Fatalf("Check() = %v, want ErrUntrustedPeer", err)
 	}
@@ -25,7 +25,7 @@ func TestCodePolicyRejectsInvalidIdentityBeforeCodeVerification(t *testing.T) {
 		{TeamID: "ABCDE12345"},
 		{TeamID: `BAD"TEAM`, SigningIdentifier: "com.example.daemonkit"},
 	} {
-		err := (CodePolicy{Identity: identity}).Check(wire.Peer{UID: os.Geteuid()})
+		err := (CodePolicy{Identity: identity}).Check(peer.Identity{UID: os.Geteuid()})
 		if err == nil || errors.Is(err, ErrNoVerifier) {
 			t.Fatalf("Check(%+v) = %v, want identity validation error", identity, err)
 		}
@@ -37,7 +37,7 @@ func TestCodePolicyFailsClosedWithoutUsableAuditToken(t *testing.T) {
 		TeamID:            "ABCDE12345",
 		SigningIdentifier: "com.example.daemonkit",
 	}}
-	err := policy.Check(wire.Peer{UID: os.Geteuid()})
+	err := policy.Check(peer.Identity{UID: os.Geteuid()})
 	if !errors.Is(err, ErrNoVerifier) {
 		t.Fatalf("Check() = %v, want ErrNoVerifier", err)
 	}

@@ -29,6 +29,8 @@ type Health struct {
 	PID int
 	// State is the coarse health verdict.
 	State State
+	// Detail is copied product health context.
+	Detail []byte
 	// Draining reports whether the peer is shedding work ahead of exit.
 	Draining bool
 	// Busy reports product work outside the runtime's admission and worker lanes.

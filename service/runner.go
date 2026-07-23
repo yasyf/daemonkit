@@ -1,26 +1,27 @@
 package service
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os/exec"
 	"path/filepath"
-	"sync"
 
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 const commandOutputLimit = 1 << 20
 
 var errCommandOutputLimit = errors.New("service: command output exceeded limit")
 
+type taskRunner interface {
+	Run(context.Context, worker.CommandRequest) (worker.CommandResult, error)
+}
+
 func runCombined(
 	ctx context.Context,
-	runner supervise.TaskRunner,
-	class proc.RecoveryClass,
+	runner taskRunner,
 	path string,
 	args ...string,
 ) (string, error) {
@@ -31,12 +32,17 @@ func runCombined(
 	if err != nil {
 		return "", err
 	}
-	output := &boundedCommandOutput{remaining: commandOutputLimit}
-	runErr := runner.Run(ctx, supervise.Task{
-		RecoveryClass: class,
-		Path:          path, Args: append([]string(nil), args...), Stdout: output, Stderr: output,
+	result, runErr := runner.Run(ctx, worker.CommandRequest{
+		Path: path, Dir: filepath.Dir(path), Args: append([]string(nil), args...),
+		TotalTimeout: controllerCloseBound,
 	})
-	return string(output.bytes()), errors.Join(runErr, output.err())
+	output := append(append([]byte(nil), result.Stdout...), result.Stderr...)
+	var outputErr error
+	if len(output) > commandOutputLimit {
+		output = output[:commandOutputLimit]
+		outputErr = errCommandOutputLimit
+	}
+	return string(output), errors.Join(runErr, outputErr)
 }
 
 func exactCommandPath(path string) (string, error) {
@@ -53,36 +59,50 @@ func exactCommandPath(path string) (string, error) {
 	return path, nil
 }
 
-type boundedCommandOutput struct {
-	mu        sync.Mutex
-	buffer    bytes.Buffer
-	remaining int
-	overflow  bool
+type controllerWorkerRuntime struct {
+	pool      *worker.Pool
+	claim     *worker.RuntimeClaim
+	recovered bool
+	activated bool
 }
 
-func (b *boundedCommandOutput) Write(payload []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	accepted := min(len(payload), b.remaining)
-	_, _ = b.buffer.Write(payload[:accepted])
-	b.remaining -= accepted
-	if accepted != len(payload) {
-		b.overflow = true
+func newControllerWorkerRuntime(limit int, reaper *proc.Reaper) (*controllerWorkerRuntime, error) {
+	pool, err := worker.NewPool(worker.Config{
+		Capacity: limit, QueueCapacity: limit, MaxTotalRun: controllerCloseBound,
+		MaxStdinBytes: 0, MaxStdoutBytes: commandOutputLimit, MaxStderrBytes: commandOutputLimit,
+	}, reaper)
+	if err != nil {
+		return nil, err
 	}
-	return len(payload), nil
-}
-
-func (b *boundedCommandOutput) bytes() []byte {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return append([]byte(nil), b.buffer.Bytes()...)
-}
-
-func (b *boundedCommandOutput) err() error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.overflow {
-		return errCommandOutputLimit
+	claim, err := pool.ClaimRuntime()
+	if err != nil {
+		return nil, err
 	}
+	return &controllerWorkerRuntime{pool: pool, claim: claim}, nil
+}
+
+func (r *controllerWorkerRuntime) Start(ctx context.Context) error {
+	if err := r.claim.Recover(ctx); err != nil {
+		return err
+	}
+	r.recovered = true
+	if err := r.claim.Activate(); err != nil {
+		return err
+	}
+	r.activated = true
 	return nil
+}
+
+func (r *controllerWorkerRuntime) Run(ctx context.Context, request worker.CommandRequest) (worker.CommandResult, error) {
+	return r.pool.Run(ctx, request)
+}
+
+func (r *controllerWorkerRuntime) Close(ctx context.Context) error {
+	if r.activated {
+		return r.claim.Close(ctx)
+	}
+	if r.recovered {
+		return r.claim.Release(ctx)
+	}
+	return worker.ErrRuntimeOwnership
 }

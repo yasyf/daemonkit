@@ -9,10 +9,15 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"os"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/internal/runtimeauth"
+	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/trust"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 var (
@@ -27,6 +32,9 @@ var (
 	// ErrProtectedSessionRequired means a protected request came from an
 	// authenticated ordinary session rather than a protected peer.
 	ErrProtectedSessionRequired = errors.New("wire: protected session required")
+	// ErrPermissionDenied means an authenticated role lacks authority for a
+	// private daemonkit control operation.
+	ErrPermissionDenied = errors.New("wire: control permission denied")
 	// ErrObservationBusy means the bounded observation lane is occupied.
 	ErrObservationBusy = errors.New("wire: observation lane is busy")
 	// ErrObservationUnary means an observation attempted streamed input.
@@ -48,7 +56,9 @@ const (
 )
 
 var reservedOps = map[Op]struct{}{
-	stopControlOp: {},
+	stopControlOp:               {},
+	runtimeReadinessSubscribeOp: {},
+	runtimeReceiptOp:            {},
 }
 
 type class uint8
@@ -63,14 +73,16 @@ type routeClass uint8
 const (
 	routeBusiness routeClass = iota
 	routeObservation
+	routeLifecycle
 	routeStop
 )
 
+type daemonAdmission func() (daemon.Publication, func(), error)
+
 type entry struct {
-	class    class
-	route    routeClass
-	h        Handler
-	preReady bool
+	class class
+	route routeClass
+	h     Handler
 }
 
 type job struct {
@@ -85,21 +97,22 @@ type result struct {
 	err error
 }
 
-type sessionCapacity uint8
+type readinessSubscription struct {
+	done      chan struct{}
+	start     chan struct{}
+	startOnce sync.Once
+}
 
-const (
-	ordinarySessionCapacity sessionCapacity = iota + 1
-	protectedSessionCapacity
-)
+type sessionCapacity struct {
+	role      trust.PeerRole
+	protected bool
+}
 
 // Server serves persistent, multiplexed v1 sessions on a listener owned by its caller.
 // Register business, observation, and stop-control handlers before Serve.
 type Server struct {
 	// WireBuild is the stable schema identity sent during the mandatory handshake.
 	WireBuild string
-	// Trust augments the non-optional same-effective-uid trust floor. It must
-	// return when ctx is canceled.
-	Trust func(context.Context, Peer) error
 	// Ladder supplies per-operation server deadlines.
 	Ladder Ladder
 	// Workers caps simultaneous concurrent handlers.
@@ -125,43 +138,49 @@ type Server struct {
 	// Log receives accept and session diagnostics.
 	Log *slog.Logger
 
-	mu                          sync.Mutex
-	handlers                    map[Op]entry
-	onActivity                  func()
-	listener                    net.Listener
-	started                     bool
-	draining                    bool
-	sessions                    map[*session]struct{}
-	streamWindow                uint32
-	protectedSessionClassifier  ProtectedSessionClassifier
-	reservedProtectedSessions   int
-	stopControlVerifier         StopControlVerifier
-	stopTargetProcessGeneration string
-	hasObservations             bool
-	readiness                   ReadinessBarrier
-	readinessCancel             context.CancelFunc
-	readyPublished              bool
-	bootstrapRoutes             map[Op]BootstrapAuthorizer
-	publicationMu               sync.RWMutex
+	mu                           sync.Mutex
+	handlers                     map[Op]entry
+	listener                     net.Listener
+	started                      bool
+	sessions                     map[*session]struct{}
+	streamWindow                 uint32
+	trustPolicy                  trust.TrustPolicy
+	trustWorkers                 *worker.RuntimeClaim
+	trustExecutable              string
+	stopControlStore             *proc.FileStore
+	stopTargetProcessGeneration  string
+	hasObservations              bool
+	lifecycle                    *daemon.Lifecycle
+	runtimeBuild                 string
+	processGeneration            string
+	readinessMu                  sync.Mutex
+	readinessSubscribers         map[*session]*readinessSubscription
+	readinessSubscriptionsClosed bool
 
-	queue                 chan job
-	slots                 chan struct{}
-	observationSlots      chan struct{}
-	ordinarySessionSlots  chan struct{}
-	protectedSessionSlots chan struct{}
-	poolWG                sync.WaitGroup
-	sessionWG             sync.WaitGroup
-	closeOnce             sync.Once
+	queue                chan job
+	slots                chan struct{}
+	observationSlots     chan struct{}
+	ordinarySessionSlots chan struct{}
+	protectedRoleSlots   map[trust.PeerRole]chan struct{}
+	poolWG               sync.WaitGroup
+	sessionWG            sync.WaitGroup
+	closeOnce            sync.Once
 }
 
-// RegisterControl registers a control handler outside the worker pool.
-func (s *Server) RegisterControl(op Op, h Handler) {
-	s.register(op, classControl, routeBusiness, h)
+// HandlerSpec defines one Ready-only product handler.
+type HandlerSpec struct {
+	Op         Op
+	Handler    Handler
+	Concurrent bool
 }
 
-// RegisterConcurrent registers a bounded worker-pool handler.
-func (s *Server) RegisterConcurrent(op Op, h Handler) {
-	s.register(op, classConcurrent, routeBusiness, h)
+// Register registers one Ready-only product handler.
+func (s *Server) Register(spec HandlerSpec) {
+	class := classControl
+	if spec.Concurrent {
+		class = classConcurrent
+	}
+	s.register(spec.Op, class, routeBusiness, spec.Handler)
 }
 
 func (s *Server) register(op Op, class class, route routeClass, h Handler) {
@@ -188,24 +207,19 @@ func (s *Server) register(op Op, class class, route routeClass, h Handler) {
 	s.handlers[op] = entry{class: class, route: route, h: h}
 }
 
-// OnActivity installs a callback invoked immediately before each admitted handler.
-func (s *Server) OnActivity(f func()) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.started {
-		panic("wire: activity callback cannot change after Serve")
-	}
-	s.onActivity = f
-}
-
 // Serve accepts v1 sessions until ctx is cancelled. admit runs for every
 // request that clears the pre-admission checks; its done runs when the
 // request's execution settles, including cancellation and write-failure paths.
-func (s *Server) Serve(
+// Returning from Serve is process-terminal.
+func (s *Server) serveRuntime(
 	ctx context.Context,
 	listener net.Listener,
-	ready func() error,
-	admit, admitProtected func() (func(), error),
+	lifecycle *daemon.Lifecycle,
+	trustWorkers *worker.RuntimeClaim,
+	admit, admitProtected daemonAdmission,
+	peerFence runtimeauth.PeerFence,
+	serverExit runtimeauth.ServerExit,
+	started chan<- error,
 ) error {
 	if listener == nil {
 		return errors.New("wire: listener is required")
@@ -216,60 +230,42 @@ func (s *Server) Serve(
 	if admitProtected == nil {
 		return errors.New("wire: protected admission callback is required")
 	}
-	if ready == nil {
-		return errors.New("wire: readiness callback is required")
+	if lifecycle == nil {
+		return errors.New("wire: lifecycle controller is required")
+	}
+	if trustWorkers == nil {
+		return errors.New("wire: trust worker pool is required")
+	}
+	if peerFence == nil {
+		return errors.New("wire: child peer-fence authority is required")
+	}
+	if serverExit == nil {
+		return errors.New("wire: server exit authority is required")
+	}
+	s.mu.Lock()
+	if s.trustWorkers != nil && s.trustWorkers != trustWorkers {
+		s.mu.Unlock()
+		return errors.New("wire: trust worker pool differs from bound runtime")
+	}
+	s.trustWorkers = trustWorkers
+	s.mu.Unlock()
+	if s.lifecycle == nil {
+		s.lifecycle = lifecycle
+	} else if s.lifecycle != lifecycle {
+		return errors.New("wire: lifecycle controller differs from bound runtime")
 	}
 	workers, err := s.start(listener)
 	if err != nil {
+		if started != nil {
+			started <- err
+		}
 		return err
 	}
 	s.startWorkers(workers)
-	if s.readiness == nil {
-		if err := ready(); err != nil {
-			_ = s.CloseIntake()
-			s.stopWorkers()
-			return fmt.Errorf("wire: publish readiness: %w", err)
-		}
-		s.publishReady()
-	}
 	acceptDone := make(chan error, 1)
-	go func() { acceptDone <- s.accept(ctx, admit, admitProtected) }()
-	if s.readiness != nil {
-		readinessCtx, cancelReadiness := s.installReadinessContext(ctx)
-		defer s.clearReadinessContext(cancelReadiness)
-		readinessDone := make(chan error, 1)
-		go func() { readinessDone <- s.runReadiness(readinessCtx, ready) }()
-		select {
-		case readinessErr := <-readinessDone:
-			if readinessErr == nil {
-				s.publishReady()
-				break
-			}
-			_ = s.CloseIntake()
-			acceptErr := <-acceptDone
-			s.closeSessions()
-			s.sessionWG.Wait()
-			s.stopWorkers()
-			return errors.Join(
-				fmt.Errorf("wire: publish readiness: %w", readinessErr),
-				wrapAcceptError(acceptErr),
-			)
-		case acceptErr := <-acceptDone:
-			cancelReadiness()
-			readinessErr := <-readinessDone
-			s.closeSessions()
-			s.sessionWG.Wait()
-			s.stopWorkers()
-			return errors.Join(wrapAcceptError(acceptErr), readinessErr)
-		case <-ctx.Done():
-			_ = s.CloseIntake()
-			acceptErr := <-acceptDone
-			readinessErr := <-readinessDone
-			s.closeSessions()
-			s.sessionWG.Wait()
-			s.stopWorkers()
-			return errors.Join(wrapAcceptError(acceptErr), readinessErr)
-		}
+	go func() { acceptDone <- s.accept(ctx, admit, admitProtected, peerFence) }()
+	if started != nil {
+		started <- nil
 	}
 	var acceptErr error
 	select {
@@ -277,89 +273,15 @@ func (s *Server) Serve(
 		_ = s.CloseIntake()
 		acceptErr = <-acceptDone
 	case acceptErr = <-acceptDone:
-		if acceptErr == nil || errors.Is(acceptErr, net.ErrClosed) {
-			<-ctx.Done()
-		} else {
-			_ = s.CloseIntake()
-		}
+		_ = s.CloseIntake()
 	}
+	acceptErr = serverExit(wrapAcceptError(acceptErr))
 
+	s.settleReadiness()
 	s.closeSessions()
 	s.sessionWG.Wait()
 	s.stopWorkers()
-	return wrapAcceptError(acceptErr)
-}
-
-// ServeSession serves one daemonkit-issued existing duplex session through the
-// same handshake, capacity, admission, backpressure, cancellation, and drain
-// engine as listener sessions. It takes ownership of conn and joins the session
-// synchronously. Spawned-parent identities are always ordinary, so protected
-// observation and stop-control operations remain unavailable.
-func (s *Server) ServeSession(
-	ctx context.Context,
-	conn net.Conn,
-	identity SessionIdentity,
-	ready func() error,
-	admit, admitProtected func() (func(), error),
-) error {
-	if conn == nil {
-		return errors.New("wire: existing session connection is required")
-	}
-	if admit == nil {
-		return errors.New("wire: admission callback is required")
-	}
-	if admitProtected == nil {
-		return errors.New("wire: protected admission callback is required")
-	}
-	if ready == nil {
-		return errors.New("wire: readiness callback is required")
-	}
-	defer conn.Close()
-	peer, allowProtected, err := identity.authenticatedPeer()
-	if err != nil {
-		return err
-	}
-	workers, err := s.start(nil)
-	if err != nil {
-		return err
-	}
-	s.startWorkers(workers)
-	if err := ready(); err != nil {
-		s.stopWorkers()
-		return fmt.Errorf("wire: publish readiness: %w", err)
-	}
-	s.publishReady()
-	verifyCtx, cancelVerify := context.WithTimeout(ctx, s.peerVerificationTimeout())
-	protected := false
-	if allowProtected {
-		protected, err = s.verifyPeer(verifyCtx, peer)
-	} else {
-		err = s.verifyOrdinaryPeer(verifyCtx, peer)
-	}
-	cancelVerify()
-	if err != nil {
-		s.stopWorkers()
-		return err
-	}
-	capacity, ok := s.acquireSessionCapacity(protected)
-	if !ok {
-		s.stopWorkers()
-		return errors.New("wire: existing session capacity exhausted")
-	}
-	releaseCapacity := sync.OnceFunc(func() { s.releaseSessionCapacity(capacity) })
-	s.sessionWG.Add(1)
-	sessionErr := func() error {
-		defer releaseCapacity()
-		defer s.sessionWG.Done()
-		return s.serveConn(ctx, conn, peer, protected, admit, admitProtected, releaseCapacity)
-	}()
-	s.closeSessions()
-	s.sessionWG.Wait()
-	s.stopWorkers()
-	if isDisconnect(sessionErr) {
-		return nil
-	}
-	return sessionErr
+	return acceptErr
 }
 
 func (s *Server) start(listener net.Listener) (int, error) {
@@ -377,10 +299,6 @@ func (s *Server) start(listener net.Listener) (int, error) {
 	if s.started {
 		s.mu.Unlock()
 		return 0, ErrServerStarted
-	}
-	if err := s.validateBootstrapRoutesLocked(); err != nil {
-		s.mu.Unlock()
-		return 0, err
 	}
 	s.started = true
 	s.listener = listener
@@ -401,23 +319,17 @@ func (s *Server) start(listener net.Listener) (int, error) {
 	}
 	s.queue = make(chan job, backlog)
 	s.slots = make(chan struct{}, workers+backlog)
-	s.ordinarySessionSlots = make(chan struct{}, s.maxSessions()-s.reservedProtectedSessions)
-	s.protectedSessionSlots = make(chan struct{}, s.reservedProtectedSessions)
+	protectedRoles := s.protectedRoles()
+	s.ordinarySessionSlots = make(chan struct{}, s.maxSessions()-len(protectedRoles))
+	s.protectedRoleSlots = make(map[trust.PeerRole]chan struct{}, len(protectedRoles))
+	for role := range protectedRoles {
+		s.protectedRoleSlots[role] = make(chan struct{}, 1)
+	}
 	if s.hasObservations {
 		s.observationSlots = make(chan struct{}, 1)
 	}
 	s.mu.Unlock()
 	return workers, nil
-}
-
-func (s *Server) validateBootstrapRoutesLocked() error {
-	for op := range s.bootstrapRoutes {
-		registered, exists := s.handlers[op]
-		if !exists || registered.route != routeBusiness {
-			return fmt.Errorf("wire: bootstrap route %q is not a registered business route", op)
-		}
-	}
-	return nil
 }
 
 func (s *Server) startWorkers(workers int) {
@@ -443,22 +355,19 @@ func wrapAcceptError(err error) error {
 // sessions stay alive so admitted work and protected control can settle.
 func (s *Server) CloseIntake() error {
 	s.mu.Lock()
-	s.draining = true
 	listener := s.listener
-	cancelReadiness := s.readinessCancel
 	s.mu.Unlock()
-	if cancelReadiness != nil {
-		cancelReadiness()
-	}
-	if listener == nil {
-		return nil
-	}
+	s.readinessMu.Lock()
+	s.readinessSubscriptionsClosed = true
+	s.readinessMu.Unlock()
 	var err error
-	s.closeOnce.Do(func() { err = listener.Close() })
+	if listener != nil {
+		s.closeOnce.Do(func() { err = listener.Close() })
+	}
 	return err
 }
 
-func (s *Server) accept(ctx context.Context, admit, admitProtected func() (func(), error)) error {
+func (s *Server) accept(ctx context.Context, admit, admitProtected daemonAdmission, peerFence runtimeauth.PeerFence) error {
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
@@ -466,39 +375,49 @@ func (s *Server) accept(ctx context.Context, admit, admitProtected func() (func(
 		}
 		unix, ok := conn.(*net.UnixConn)
 		if !ok {
-			_ = conn.Close()
+			s.rejectHandshake(ctx, conn, ResponseCodePeerUntrusted, ErrUntrustedPeer)
 			continue
 		}
 		peer, err := PeerFromConn(unix)
 		if err != nil {
-			_ = conn.Close()
+			s.rejectHandshake(ctx, conn, ResponseCodePeerUntrusted, ErrUntrustedPeer)
 			s.Log.Debug("wire: reject unidentified peer", "err", err)
 			continue
 		}
 		verifyCtx, cancelVerify := context.WithTimeout(ctx, s.peerVerificationTimeout())
-		protected, err := s.verifyPeer(verifyCtx, peer)
-		cancelVerify()
+		role, protected, err := s.verifyPeer(verifyCtx, peer)
 		if err != nil {
-			_ = conn.Close()
+			cancelVerify()
+			s.rejectHandshake(ctx, conn, ResponseCodePeerUntrusted, ErrUntrustedPeer)
 			s.Log.Debug("wire: reject untrusted peer", "err", err)
 			continue
 		}
-		capacity, ok := s.acquireSessionCapacity(protected)
+		fencePermit, err := peerFence(verifyCtx, peer)
+		cancelVerify()
+		if err != nil {
+			s.rejectHandshake(ctx, conn, ResponseCodePeerUntrusted, ErrUntrustedPeer)
+			s.Log.Debug("wire: reject child peer fence", "err", err)
+			continue
+		}
+		capacity, ok := s.acquireSessionCapacity(role, protected)
 		if !ok {
-			_ = conn.Close()
+			if fencePermit != nil {
+				fencePermit.Rollback()
+			}
+			s.rejectHandshake(ctx, conn, ResponseCodeSessionCapacity, ErrSessionCapacity)
 			continue
 		}
 		s.sessionWG.Add(1)
-		go func(conn net.Conn, peer Peer, protected bool, capacity sessionCapacity) {
+		go func(conn net.Conn, peer Peer, role trust.PeerRole, protected bool, capacity sessionCapacity, fencePermit *runtimeauth.PeerFencePermit) {
 			releaseCapacity := sync.OnceFunc(func() { s.releaseSessionCapacity(capacity) })
 			defer func() {
 				releaseCapacity()
 				s.sessionWG.Done()
 			}()
-			if err := s.serveConn(ctx, conn, peer, protected, admit, admitProtected, releaseCapacity); err != nil && !isDisconnect(err) {
+			if err := s.serveConn(ctx, conn, peer, role, protected, admit, admitProtected, releaseCapacity, fencePermit); err != nil && !isDisconnect(err) {
 				s.Log.Debug("wire: session ended", "err", err)
 			}
-		}(conn, peer, protected, capacity)
+		}(conn, peer, role, protected, capacity, fencePermit)
 	}
 }
 
@@ -506,10 +425,15 @@ func (s *Server) serveConn(
 	ctx context.Context,
 	conn net.Conn,
 	peer Peer,
+	role trust.PeerRole,
 	protected bool,
-	admit, admitProtected func() (func(), error),
+	admit, admitProtected daemonAdmission,
 	releaseCapacity func(),
+	fencePermit *runtimeauth.PeerFencePermit,
 ) error {
+	if fencePermit != nil {
+		defer fencePermit.Rollback()
+	}
 	defer conn.Close()
 	stopContext := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stopContext()
@@ -526,6 +450,14 @@ func (s *Server) serveConn(
 		return err
 	}
 	codec.WriteTimeout = s.writeTimeout()
+	var settleFence func()
+	if fencePermit != nil {
+		settleFence, err = fencePermit.Commit()
+		if err != nil {
+			return err
+		}
+		defer settleFence()
+	}
 
 	sessCtx, cancel := context.WithCancel(ctx)
 	sess := &session{
@@ -535,6 +467,7 @@ func (s *Server) serveConn(
 		ctx:            sessCtx,
 		cancel:         cancel,
 		peer:           peer,
+		role:           role,
 		protected:      protected,
 		wireBuild:      identity.WireBuild,
 		generation:     generation,
@@ -542,6 +475,7 @@ func (s *Server) serveConn(
 		admitProtected: admitProtected,
 		outbound:       make(chan sessionOutbound, s.outboundQueue()),
 		eventCredits:   newCreditWindow(),
+		lifecycleLane:  newLatestWriteLane(),
 		requestsDone:   make(chan struct{}),
 		writerDone:     make(chan struct{}),
 		disconnected:   make(chan struct{}),
@@ -578,18 +512,46 @@ func (s *Server) serverHandshake(codec *Codec) (handshakeIdentity, []byte, error
 	if len(identity.Session) != 0 {
 		return handshakeIdentity{}, nil, fmt.Errorf("%w: client supplied a session generation", ErrHandshake)
 	}
+	if identity.WireBuild != s.WireBuild {
+		if err := s.writeHandshakeAck(codec, handshakeAck{
+			Protocol: ProtocolVersion, WireBuild: s.WireBuild, Rejected: true,
+			Code: ResponseCodeBuildMismatch, Reason: ErrBuildMismatch.Error(),
+		}); err != nil {
+			return handshakeIdentity{}, nil, fmt.Errorf("%w: reject build: %w", ErrHandshake, err)
+		}
+		return handshakeIdentity{}, nil, ErrBuildMismatch
+	}
 	generation := make([]byte, sessionGenerationBytes)
 	if _, err := rand.Read(generation); err != nil {
 		return handshakeIdentity{}, nil, fmt.Errorf("%w: generate session: %w", ErrHandshake, err)
 	}
-	payload, err := json.Marshal(handshakeIdentity{Protocol: ProtocolVersion, WireBuild: s.WireBuild, Session: generation})
-	if err != nil {
-		return handshakeIdentity{}, nil, err
-	}
-	if err := codec.WriteFrame(Frame{Kind: FrameHelloAck, Flags: FlagEnd, Payload: payload}); err != nil {
+	if err := s.writeHandshakeAck(codec, handshakeAck{
+		Protocol: ProtocolVersion, WireBuild: s.WireBuild, Session: generation,
+	}); err != nil {
 		return handshakeIdentity{}, nil, fmt.Errorf("%w: acknowledge: %w", ErrHandshake, err)
 	}
 	return identity, generation, nil
+}
+
+func (s *Server) rejectHandshake(ctx context.Context, conn net.Conn, code ResponseCode, cause error) {
+	defer conn.Close()
+	codec := NewCodec(conn)
+	codec.MaxFrame = s.maxFrame()
+	if err := codec.SetDeadline(earlierDeadline(ctx, s.handshakeTimeout())); err != nil {
+		return
+	}
+	_ = s.writeHandshakeAck(codec, handshakeAck{
+		Protocol: ProtocolVersion, WireBuild: s.WireBuild, Rejected: true,
+		Code: code, Reason: cause.Error(),
+	})
+}
+
+func (s *Server) writeHandshakeAck(codec *Codec, ack handshakeAck) error {
+	payload, err := json.Marshal(ack)
+	if err != nil {
+		return err
+	}
+	return codec.WriteFrame(Frame{Kind: FrameHelloAck, Flags: FlagEnd, Payload: payload})
 }
 
 func (s *Server) worker() {
@@ -631,9 +593,6 @@ func (s *Server) dispatch(ctx context.Context, e entry, req Request) (any, error
 }
 
 func (s *Server) invoke(ctx context.Context, req Request, h Handler) (any, error) {
-	if s.onActivity != nil {
-		s.onActivity()
-	}
 	return h(ctx, req)
 }
 
@@ -664,18 +623,6 @@ func (s *Server) lookup(op Op) (entry, bool) {
 	return e, ok
 }
 
-func (s *Server) isDraining() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.draining
-}
-
-func (s *Server) publishReady() {
-	s.mu.Lock()
-	s.readyPublished = true
-	s.mu.Unlock()
-}
-
 func (s *Server) addSession(sess *session) {
 	s.mu.Lock()
 	s.sessions[sess] = struct{}{}
@@ -686,6 +633,119 @@ func (s *Server) removeSession(sess *session) {
 	s.mu.Lock()
 	delete(s.sessions, sess)
 	s.mu.Unlock()
+	s.readinessMu.Lock()
+	delete(s.readinessSubscribers, sess)
+	s.readinessMu.Unlock()
+}
+
+//nolint:contextcheck // Subscription pumps are session-owned after the request returns.
+func (s *Server) subscribeReadiness(sess *session) error {
+	s.readinessMu.Lock()
+	if s.readinessSubscriptionsClosed {
+		s.readinessMu.Unlock()
+		return ErrDraining
+	}
+	if s.readinessSubscribers == nil {
+		s.readinessSubscribers = make(map[*session]*readinessSubscription)
+	}
+	if _, ok := s.readinessSubscribers[sess]; ok {
+		s.readinessMu.Unlock()
+		return errors.New("wire: readiness session is already subscribed")
+	}
+	subscription := &readinessSubscription{done: make(chan struct{}), start: make(chan struct{})}
+	s.readinessSubscribers[sess] = subscription
+	s.readinessMu.Unlock()
+	go s.awaitReadinessPump(sess, subscription)
+	return nil
+}
+
+func (s *Server) startReadiness(sess *session) {
+	s.readinessMu.Lock()
+	subscription := s.readinessSubscribers[sess]
+	s.readinessMu.Unlock()
+	if subscription != nil {
+		subscription.startOnce.Do(func() { close(subscription.start) })
+	}
+}
+
+func (s *Server) awaitReadinessPump(sess *session, subscription *readinessSubscription) {
+	defer close(subscription.done)
+	select {
+	case <-sess.ctx.Done():
+		return
+	case <-subscription.start:
+	}
+	s.pumpReadiness(sess)
+}
+
+func (s *Server) pumpReadiness(sess *session) {
+	sequence := uint64(0)
+	for {
+		progress := s.lifecycle.Snapshot()
+		if progress.Sequence > sequence {
+			sequence = progress.Sequence
+			payload, err := json.Marshal(runtimeReadinessEvent{
+				Protocol: ProtocolVersion, WireBuild: s.WireBuild,
+				RuntimeIdentity: RuntimeIdentity{
+					RuntimeBuild: s.runtimeBuild, ProcessGeneration: s.processGeneration,
+				},
+				Progress: progress,
+			})
+			if err != nil {
+				sess.close()
+				return
+			}
+			terminal := progress.State == RuntimeFailed || progress.State == RuntimeDraining
+			receipt, err := sess.offerLifecycle(payload, terminal)
+			if err != nil {
+				sess.close()
+				return
+			}
+			if terminal {
+				ctx, cancel := context.WithTimeout(context.WithoutCancel(sess.ctx), s.writeTimeout())
+				err = receipt.wait(ctx)
+				cancel()
+				if err != nil {
+					sess.close()
+				}
+				return
+			}
+		}
+		if _, err := s.lifecycle.WaitChange(sess.ctx, sequence); err != nil {
+			return
+		}
+	}
+}
+
+func (s *Server) waitReadinessTerminal(ctx context.Context) error {
+	s.readinessMu.Lock()
+	done := make([]<-chan struct{}, 0, len(s.readinessSubscribers))
+	for _, subscription := range s.readinessSubscribers {
+		done = append(done, subscription.done)
+	}
+	s.readinessMu.Unlock()
+	for _, settled := range done {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-settled:
+		}
+	}
+	return nil
+}
+
+//nolint:contextcheck // Terminal publication settlement uses its own bounded write context.
+func (s *Server) settleReadiness() {
+	if s.lifecycle == nil {
+		return
+	}
+	state := s.lifecycle.Snapshot().State
+	if state != RuntimeFailed && state != RuntimeDraining {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), s.writeTimeout())
+	defer cancel()
+	_ = s.waitReadinessTerminal(ctx)
 }
 
 func (s *Server) closeSessions() {
@@ -700,24 +760,40 @@ func (s *Server) closeSessions() {
 	}
 }
 
-func (s *Server) verifyPeer(ctx context.Context, peer Peer) (bool, error) {
+func (s *Server) verifyPeer(ctx context.Context, peer Peer) (trust.PeerRole, bool, error) {
 	if err := s.verifyOrdinaryPeer(ctx, peer); err != nil {
-		return false, err
+		return "", false, err
 	}
-	if s.protectedSessionClassifier == nil {
-		return false, nil
+	var matched trust.PeerRole
+	for _, role := range s.trustPolicy.RoleNames() {
+		requirement, ok := s.trustPolicy.Requirement(role)
+		if !ok {
+			return "", false, errors.New("wire: compiled trust role is absent")
+		}
+		verifier := trust.ProcessVerifier{
+			Runner: s.trustWorkers, Executable: s.trustExecutable,
+			Policy: trust.Policy{Requirement: &requirement},
+		}
+		if err := verifier.Check(ctx, peer); err == nil {
+			if matched != "" {
+				return "", false, trust.ErrAmbiguousRole
+			}
+			matched = role
+		} else if !errors.Is(err, trust.ErrUntrustedPeer) {
+			return "", false, err
+		}
 	}
-	return s.protectedSessionClassifier.Classify(ctx, peer)
+	protected := s.trustPolicy.AllowsStop(matched) || s.trustPolicy.AllowsReceipt(matched) ||
+		s.trustPolicy.AllowsReadiness(matched) || s.trustPolicy.AllowsHandoff(matched)
+	return matched, protected, nil
 }
 
 func (s *Server) verifyOrdinaryPeer(ctx context.Context, peer Peer) error {
-	if peer.UID != os.Geteuid() {
-		return fmt.Errorf("%w: uid %d != %d", ErrUntrustedPeer, peer.UID, os.Geteuid())
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	if s.Trust != nil {
-		if err := s.Trust(ctx, peer); err != nil {
-			return err
-		}
+	if peer.UID != s.trustPolicy.ExpectedUID() {
+		return fmt.Errorf("%w: uid %d != %d", ErrUntrustedPeer, peer.UID, s.trustPolicy.ExpectedUID())
 	}
 	return nil
 }
@@ -780,23 +856,26 @@ func (s *Server) maxSessions() int {
 
 func (s *Server) validateSessionCapacity() error {
 	maximum := s.maxSessions()
+	protected := len(s.protectedRoles())
 	switch {
 	case s.PeerVerificationTimeout < 0:
 		return errors.New("wire: peer verification timeout must not be negative")
-	case s.reservedProtectedSessions < 0:
-		return errors.New("wire: reserved protected sessions must not be negative")
-	case s.reservedProtectedSessions > maximum:
-		return fmt.Errorf("wire: reserved protected sessions %d exceed maximum sessions %d", s.reservedProtectedSessions, maximum)
-	case s.reservedProtectedSessions != 0 && s.protectedSessionClassifier == nil:
-		return errors.New("wire: protected session classifier is required when capacity is reserved")
-	case s.protectedSessionClassifier != nil:
-		if err := s.protectedSessionClassifier.Validate(); err != nil {
-			return fmt.Errorf("wire: protected session classifier: %w", err)
-		}
-		return nil
+	case protected > maximum:
+		return fmt.Errorf("wire: protected role capacity %d exceeds maximum sessions %d", protected, maximum)
 	default:
 		return nil
 	}
+}
+
+func (s *Server) protectedRoles() map[trust.PeerRole]struct{} {
+	roles := make(map[trust.PeerRole]struct{})
+	for _, role := range s.trustPolicy.RoleNames() {
+		if s.trustPolicy.AllowsStop(role) || s.trustPolicy.AllowsReceipt(role) ||
+			s.trustPolicy.AllowsReadiness(role) || s.trustPolicy.AllowsHandoff(role) {
+			roles[role] = struct{}{}
+		}
+	}
+	return roles
 }
 
 func (s *Server) acquireObservation() (func(), bool) {
@@ -808,31 +887,37 @@ func (s *Server) acquireObservation() (func(), bool) {
 	}
 }
 
-func (s *Server) acquireSessionCapacity(protected bool) (sessionCapacity, bool) {
+func (s *Server) acquireSessionCapacity(role trust.PeerRole, protected bool) (sessionCapacity, bool) {
 	if protected {
+		bucket := s.protectedRoleSlots[role]
+		if bucket == nil {
+			return sessionCapacity{}, false
+		}
 		select {
-		case s.protectedSessionSlots <- struct{}{}:
-			return protectedSessionCapacity, true
+		case bucket <- struct{}{}:
+			return sessionCapacity{role: role, protected: true}, true
 		default:
+			return sessionCapacity{}, false
 		}
 	}
 	select {
 	case s.ordinarySessionSlots <- struct{}{}:
-		return ordinarySessionCapacity, true
+		return sessionCapacity{}, true
 	default:
-		return 0, false
+		return sessionCapacity{}, false
 	}
 }
 
 func (s *Server) releaseSessionCapacity(capacity sessionCapacity) {
-	switch capacity {
-	case ordinarySessionCapacity:
-		<-s.ordinarySessionSlots
-	case protectedSessionCapacity:
-		<-s.protectedSessionSlots
-	default:
-		panic("wire: invalid session capacity release")
+	if capacity.protected {
+		bucket := s.protectedRoleSlots[capacity.role]
+		if bucket == nil {
+			panic("wire: invalid protected session capacity role")
+		}
+		<-bucket
+		return
 	}
+	<-s.ordinarySessionSlots
 }
 
 func earlierDeadline(ctx context.Context, timeout time.Duration) time.Time {
