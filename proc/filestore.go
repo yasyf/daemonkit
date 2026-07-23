@@ -47,8 +47,9 @@ type FileStore struct {
 	Path string
 	// MaxOutstanding bounds records plus unacknowledged receipts. Zero uses
 	// defaultMaxOutstanding.
-	MaxOutstanding uint64
-	stopControlNow func() time.Time
+	MaxOutstanding           uint64
+	stopControlNow           func() time.Time
+	stopControlAfterArmStamp func()
 }
 
 func (s *FileStore) maximumOutstanding() uint64 {
@@ -304,13 +305,18 @@ func (s *FileStore) Add(ctx context.Context, rec Record) error {
 	})
 }
 
-func (s *FileStore) addStopControl(ctx context.Context, rec Record, lifetime time.Duration) (Record, error) {
-	if rec.RecoveryClass != RecoveryStopControl || rec.ExpiresUnixMilli != 0 || lifetime <= 0 {
-		return Record{}, errors.New("proc: stop control admission is invalid")
+func stopControlPending(record Record) Record {
+	record.StopAuthorityState = StopAuthorityPending
+	record.ExpiresUnixMilli = 0
+	return record
+}
+
+func (s *FileStore) addStopControlPending(ctx context.Context, rec Record) (Record, error) {
+	if rec.RecoveryClass != RecoveryStopControl || rec.StopAuthorityState != StopAuthorityPending ||
+		rec.ExpiresUnixMilli != 0 {
+		return Record{}, errors.New("proc: pending stop control admission is invalid")
 	}
-	candidate := rec
-	candidate.ExpiresUnixMilli = 1
-	if err := candidate.Validate(); err != nil {
+	if err := rec.Validate(); err != nil {
 		return Record{}, err
 	}
 	maximum := s.maximumOutstanding()
@@ -334,9 +340,7 @@ func (s *FileStore) addStopControl(ctx context.Context, rec Record, lifetime tim
 			if err := decodeStored(value, &existing); err != nil {
 				return err
 			}
-			unstamped := existing
-			unstamped.ExpiresUnixMilli = 0
-			if unstamped != rec {
+			if stopControlPending(existing) != rec {
 				return fmt.Errorf("%w: process instance record changed", ErrIdentityChanged)
 			}
 			durable = existing
@@ -345,14 +349,6 @@ func (s *FileStore) addStopControl(ctx context.Context, rec Record, lifetime tim
 		outstanding := binary.BigEndian.Uint64(tx.Bucket(fileStoreMetaBucket).Get(fileStoreOutstandingKey))
 		if outstanding >= maximum {
 			return ErrReceiptBacklog
-		}
-		now := time.Now
-		if s.stopControlNow != nil {
-			now = s.stopControlNow
-		}
-		rec.ExpiresUnixMilli = now().Add(lifetime).UnixMilli()
-		if err := rec.Validate(); err != nil {
-			return err
 		}
 		encoded, err := encodeStored(rec)
 		if err != nil {
@@ -365,6 +361,138 @@ func (s *FileStore) addStopControl(ctx context.Context, rec Record, lifetime tim
 			return err
 		}
 		durable = rec
+		return nil
+	})
+	if err != nil {
+		return Record{}, err
+	}
+	return durable, nil
+}
+
+func (s *FileStore) armStopControl(ctx context.Context, pending Record, authorityWindow time.Duration) (Record, error) {
+	if pending.RecoveryClass != RecoveryStopControl || pending.StopAuthorityState != StopAuthorityPending ||
+		pending.ExpiresUnixMilli != 0 || authorityWindow <= 0 {
+		return Record{}, errors.New("proc: stop control arm is invalid")
+	}
+	if err := pending.Validate(); err != nil {
+		return Record{}, err
+	}
+	db, err := s.open(ctx)
+	if err != nil {
+		return Record{}, err
+	}
+	defer db.Close()
+	var durable Record
+	err = db.Update(func(tx *bolt.Tx) error {
+		key := []byte(recordKey(pending))
+		if tx.Bucket(fileStoreClaimsBucket).Get(key) != nil {
+			return errors.New("proc: pending stop control is claimed for reap")
+		}
+		if tx.Bucket(fileStoreReceiptIndexBucket).Get(key) != nil {
+			return errors.New("proc: pending stop control already has a retirement receipt")
+		}
+		if tx.Bucket(fileStoreStopConsumedBucket).Get(key) != nil {
+			return errors.New("proc: pending stop control was already consumed")
+		}
+		records := tx.Bucket(fileStoreRecordsBucket)
+		value := records.Get(key)
+		if value == nil {
+			return errors.New("proc: pending stop control record is missing")
+		}
+		var existing Record
+		if err := decodeStored(value, &existing); err != nil {
+			return err
+		}
+		if stopControlPending(existing) != pending {
+			return fmt.Errorf("%w: process instance record changed", ErrIdentityChanged)
+		}
+		switch existing.StopAuthorityState {
+		case StopAuthorityArmed:
+			durable = existing
+			return nil
+		case StopAuthorityRevoked:
+			return errors.New("proc: stop control authority is revoked")
+		case StopAuthorityPending:
+		default:
+			return errors.New("proc: stop control authority state is invalid")
+		}
+		now := time.Now
+		if s.stopControlNow != nil {
+			now = s.stopControlNow
+		}
+		stamp := now()
+		// The first window is private commit reserve. The second is the complete
+		// release/consume window that the controller must still observe post-commit.
+		expires := stamp.Add(authorityWindow).Add(authorityWindow)
+		existing.StopAuthorityState = StopAuthorityArmed
+		existing.ExpiresUnixMilli = expires.UnixMilli()
+		if err := existing.Validate(); err != nil {
+			return err
+		}
+		encoded, err := encodeStored(existing)
+		if err != nil {
+			return err
+		}
+		if err := records.Put(key, encoded); err != nil {
+			return err
+		}
+		durable = existing
+		if s.stopControlAfterArmStamp != nil {
+			s.stopControlAfterArmStamp()
+		}
+		return nil
+	})
+	if err != nil {
+		return Record{}, err
+	}
+	return durable, nil
+}
+
+func (s *FileStore) revokeStopControl(ctx context.Context, armed Record) (Record, error) {
+	if armed.RecoveryClass != RecoveryStopControl || armed.StopAuthorityState != StopAuthorityArmed ||
+		armed.ExpiresUnixMilli <= 0 {
+		return Record{}, errors.New("proc: stop control revoke is invalid")
+	}
+	if err := armed.Validate(); err != nil {
+		return Record{}, err
+	}
+	db, err := s.open(ctx)
+	if err != nil {
+		return Record{}, err
+	}
+	defer db.Close()
+	var durable Record
+	err = db.Update(func(tx *bolt.Tx) error {
+		key := []byte(recordKey(armed))
+		if tx.Bucket(fileStoreStopConsumedBucket).Get(key) != nil {
+			return errors.New("proc: consumed stop control cannot be revoked")
+		}
+		records := tx.Bucket(fileStoreRecordsBucket)
+		value := records.Get(key)
+		if value == nil {
+			return errors.New("proc: armed stop control record is missing")
+		}
+		var existing Record
+		if err := decodeStored(value, &existing); err != nil {
+			return err
+		}
+		if existing == armed {
+			existing.StopAuthorityState = StopAuthorityRevoked
+		} else {
+			revoked := armed
+			revoked.StopAuthorityState = StopAuthorityRevoked
+			if existing != revoked {
+				return fmt.Errorf("%w: process instance record changed", ErrIdentityChanged)
+			}
+		}
+		encoded, err := encodeStored(existing)
+		if err != nil {
+			return err
+		}
+		if err := records.Put(key, encoded); err != nil {
+			return err
+		}
+		durable = existing
 		return nil
 	})
 	if err != nil {
@@ -496,7 +624,8 @@ func (s *FileStore) ConsumeStopControl(
 			stored.StartTime != identity.StartTime || stored.Boot != identity.Boot ||
 			stored.Comm != identity.Comm || stored.Executable != identity.Executable ||
 			stored.AuditToken != identity.AuditToken || stored.Role != role ||
-			stored.TargetProcessGeneration != targetProcessGeneration {
+			stored.TargetProcessGeneration != targetProcessGeneration ||
+			stored.StopAuthorityState != StopAuthorityArmed {
 			return nil
 		}
 		if now.UnixMilli() >= stored.ExpiresUnixMilli {

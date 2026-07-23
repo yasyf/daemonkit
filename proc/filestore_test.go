@@ -210,59 +210,109 @@ func stopControlStoreRecord(pid int, expires time.Time) (Identity, Record) {
 		Executable: "/Applications/Fixed.app/Contents/MacOS/Fixed",
 		AuditToken: auditTokenForPID(pid, 17),
 	}
+	state := StopAuthorityArmed
+	expiresUnixMilli := expires.UnixMilli()
+	if expires.IsZero() {
+		state = StopAuthorityPending
+		expiresUnixMilli = 0
+	}
 	return identity, Record{
 		RecoveryClass: RecoveryStopControl,
 		PID:           identity.PID, StartTime: identity.StartTime, Boot: identity.Boot, Comm: identity.Comm,
 		Executable: identity.Executable, AuditToken: identity.AuditToken,
 		Generation: "controller-generation", Role: "com.example.stop", RuntimeBuild: "v2.0.0", RuntimeProtocol: 1,
-		TargetProcessGeneration: "runtime-generation", Intent: "upgrade", ExpiresUnixMilli: expires.UnixMilli(),
+		TargetProcessGeneration: "runtime-generation", Intent: "upgrade",
+		StopAuthorityState: state, ExpiresUnixMilli: expiresUnixMilli,
 	}
 }
 
-func TestFileStoreStopControlLifetimeStartsAtDurableStamp(t *testing.T) {
+func TestFileStoreStopControlArmCommitReserve(t *testing.T) {
+	const window = 5 * time.Second
 	stamp := time.UnixMilli(1_900_000_000_000)
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	store := &FileStore{
-		Path: filepath.Join(t.TempDir(), "recovery.db"),
-		stopControlNow: func() time.Time {
-			close(entered)
-			<-release
-			return stamp
-		},
-	}
-	_, record := stopControlStoreRecord(147, time.Time{})
-	record.ExpiresUnixMilli = 0
-	type outcome struct {
-		record Record
-		err    error
-	}
-	result := make(chan outcome, 1)
-	go func() {
-		got, err := store.addStopControl(context.Background(), record, 5*time.Second)
-		result <- outcome{record: got, err: err}
-	}()
-	<-entered
-	select {
-	case got := <-result:
-		t.Fatalf("stop control persisted before injected store delay released: %+v", got)
-	default:
-	}
-	close(release)
-	got := <-result
-	if got.err != nil {
-		t.Fatal(got.err)
-	}
-	if want := stamp.Add(5 * time.Second).UnixMilli(); got.record.ExpiresUnixMilli != want {
-		t.Fatalf("expiry = %d, want store stamp + lifetime = %d", got.record.ExpiresUnixMilli, want)
-	}
-	store.stopControlNow = func() time.Time { return stamp.Add(time.Hour) }
-	retry, err := store.addStopControl(t.Context(), record, 5*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if retry != got.record {
-		t.Fatalf("exact retry extended authority: got %+v want %+v", retry, got.record)
+	for _, test := range []struct {
+		name       string
+		delay      time.Duration
+		fullWindow bool
+	}{
+		{name: "within-reserve", delay: 4 * time.Second, fullWindow: true},
+		{name: "reserve-exhausted", delay: 6 * time.Second, fullWindow: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			store := &FileStore{
+				Path:           filepath.Join(t.TempDir(), "recovery.db"),
+				stopControlNow: func() time.Time { return stamp },
+				stopControlAfterArmStamp: func() {
+					close(entered)
+					<-release
+				},
+			}
+			identity, pending := stopControlStoreRecord(147, time.Time{})
+			durablePending, err := store.addStopControlPending(t.Context(), pending)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, ok, err := store.ConsumeStopControl(
+				t.Context(), identity, pending.Role, pending.TargetProcessGeneration, stamp,
+			); err != nil || ok || got != (Record{}) {
+				t.Fatalf("pending consume = %+v, %v, %v; want zero, false, nil", got, ok, err)
+			}
+			type outcome struct {
+				record Record
+				err    error
+			}
+			result := make(chan outcome, 1)
+			go func() {
+				got, err := store.armStopControl(context.Background(), durablePending, window)
+				result <- outcome{record: got, err: err}
+			}()
+			<-entered
+			select {
+			case got := <-result:
+				t.Fatalf("arm committed before injected post-stamp barrier released: %+v", got)
+			default:
+			}
+			releaseNow := stamp.Add(test.delay)
+			close(release)
+			got := <-result
+			if got.err != nil {
+				t.Fatal(got.err)
+			}
+			if got.record.StopAuthorityState != StopAuthorityArmed {
+				t.Fatalf("state = %q, want armed", got.record.StopAuthorityState)
+			}
+			if want := stamp.Add(2 * window).UnixMilli(); got.record.ExpiresUnixMilli != want {
+				t.Fatalf("expiry = %d, want private reserve + window = %d", got.record.ExpiresUnixMilli, want)
+			}
+			fullWindow := !releaseNow.Add(window).After(time.UnixMilli(got.record.ExpiresUnixMilli))
+			if fullWindow != test.fullWindow {
+				t.Fatalf("full window = %v, want %v", fullWindow, test.fullWindow)
+			}
+			store.stopControlNow = func() time.Time { return stamp.Add(time.Hour) }
+			retry, err := store.armStopControl(t.Context(), durablePending, window)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if retry != got.record {
+				t.Fatalf("exact arm retry extended authority: got %+v want %+v", retry, got.record)
+			}
+			if test.fullWindow {
+				return
+			}
+			revoked, err := store.revokeStopControl(t.Context(), got.record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if revoked.StopAuthorityState != StopAuthorityRevoked {
+				t.Fatalf("state = %q, want revoked", revoked.StopAuthorityState)
+			}
+			if consumed, ok, err := store.ConsumeStopControl(
+				t.Context(), identity, pending.Role, pending.TargetProcessGeneration, releaseNow,
+			); err != nil || ok || consumed != (Record{}) {
+				t.Fatalf("revoked consume = %+v, %v, %v; want zero, false, nil", consumed, ok, err)
+			}
+		})
 	}
 }
 

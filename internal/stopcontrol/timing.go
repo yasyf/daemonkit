@@ -4,8 +4,10 @@ package stopcontrol
 
 import "time"
 
-// The v1 timing contract keeps authority consumption shorter than child
-// settlement and gives the parent a strictly longer observation ceiling.
+// The v1 timing contract keeps the complete post-commit authority window
+// shorter than child settlement and gives the parent a strictly longer
+// observation ceiling. Durable arming privately reserves one additional
+// AuthorityBound and never releases a child unless this full window remains.
 const (
 	IdentityBound        time.Duration = 5 * time.Second
 	AuthorityBound       time.Duration = 5 * time.Second

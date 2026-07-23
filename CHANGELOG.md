@@ -15,8 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deterministically outranks concurrent readiness and shutdown signals.
 - Session shutdown accepts a child that exits successfully when daemonkit closes
   its owned duplex connection instead of reporting that clean EOF as a failure.
-- Stop-control authority now starts when the durable process record is stamped,
-  so store latency cannot consume the one-shot authorization window.
+- Stop-control children are durably pending before arming, and are released only
+  when the committed authority still retains its complete fixed consumption
+  window; exhausted commit reserve is durably revoked and reaped.
 
 ## [0.8.0] - 2026-07-23
 

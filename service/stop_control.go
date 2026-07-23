@@ -28,9 +28,11 @@ const (
 )
 
 type stopControlTiming struct {
-	identity  time.Duration
-	authority time.Duration
-	operation time.Duration
+	identity    time.Duration
+	authority   time.Duration
+	operation   time.Duration
+	now         func() time.Time
+	afterRevoke func()
 }
 
 func (t stopControlTiming) withDefaults() stopControlTiming {
@@ -42,6 +44,9 @@ func (t stopControlTiming) withDefaults() stopControlTiming {
 	}
 	if t.operation == 0 {
 		t.operation = stopcontract.ParentOperationBound
+	}
+	if t.now == nil {
+		t.now = time.Now
 	}
 	return t
 }
@@ -179,10 +184,27 @@ func (c *Controller) StopRuntime(
 		spec.TargetProcessGeneration, string(spec.Intent), timing.authority,
 	)
 	cancelAuthority()
+	if record.RecoveryClass == proc.RecoveryStopControl {
+		tracked = &record
+	}
 	if err != nil {
 		return wire.StopResult{}, fmt.Errorf("service: record stop control: %w", err)
 	}
-	tracked = &record
+	if record.StopAuthorityState != proc.StopAuthorityArmed ||
+		timing.now().Add(timing.authority).After(time.UnixMilli(record.ExpiresUnixMilli)) {
+		revokeCtx, cancelRevoke := context.WithTimeout(context.WithoutCancel(opCtx), timing.identity)
+		revoked, revokeErr := c.stopReaper.RevokeStopControl(revokeCtx, record)
+		cancelRevoke()
+		if revokeErr == nil {
+			tracked = &revoked
+			if timing.afterRevoke != nil {
+				timing.afterRevoke()
+			}
+		}
+		return wire.StopResult{}, errors.Join(
+			errors.New("service: stop control authority does not retain the full window"), revokeErr,
+		)
+	}
 	if _, err := releaseWriter.Write([]byte{1}); err != nil {
 		return wire.StopResult{}, fmt.Errorf("service: release stop control: %w", err)
 	}

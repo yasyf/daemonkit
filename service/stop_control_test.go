@@ -20,7 +20,10 @@ import (
 	"github.com/yasyf/daemonkit/wire"
 )
 
-const stopControlHelperMode = "DAEMONKIT_TEST_STOP_CONTROL_MODE"
+const (
+	stopControlHelperMode          = "DAEMONKIT_TEST_STOP_CONTROL_MODE"
+	stopControlHelperReleaseMarker = "DAEMONKIT_TEST_STOP_CONTROL_RELEASE_MARKER"
+)
 
 func TestStopControlSpecRequiresExactAbsoluteRolePath(t *testing.T) {
 	for _, path := range []string{"daemon", "./daemon", "/tmp/../tmp/daemon"} {
@@ -130,12 +133,17 @@ func TestStopControlHelperProcess(_ *testing.T) {
 	if _, err := io.ReadFull(release, released[:]); err != nil || released[0] != 1 {
 		os.Exit(93)
 	}
+	if marker := os.Getenv(stopControlHelperReleaseMarker); marker != "" {
+		if err := os.WriteFile(marker, []byte("released"), 0o600); err != nil {
+			os.Exit(96)
+		}
+	}
 	if mode == "after-release" {
 		select {}
 	}
 	if mode == "after-authority-expiry" || mode == "declined" {
 		if mode == "after-authority-expiry" {
-			time.Sleep(80 * time.Millisecond)
+			time.Sleep(400 * time.Millisecond)
 		}
 		result := stopChildResult{Result: wire.StopResult{
 			ProcessGeneration: "runtime-generation",
@@ -210,9 +218,11 @@ func TestStopRuntimeSeparatesAuthorityExpiryFromOperationSettlement(t *testing.T
 		t.Fatal(err)
 	}
 	store := &proc.FileStore{Path: filepath.Join(t.TempDir(), "workers.db")}
+	releaseMarker := filepath.Join(t.TempDir(), "released")
+	t.Setenv(stopControlHelperReleaseMarker, releaseMarker)
 	controller := &Controller{
 		stopReaper: &proc.Reaper{Store: store, Generation: generation},
-		stopTiming: stopControlTiming{identity: 5 * time.Second, authority: 20 * time.Millisecond, operation: 5 * time.Second},
+		stopTiming: stopControlTiming{identity: 5 * time.Second, authority: 250 * time.Millisecond, operation: 5 * time.Second},
 	}
 	result, err := controller.StopRuntime(t.Context(), StopControlSpec{
 		Executable: executable,
@@ -225,6 +235,89 @@ func TestStopRuntimeSeparatesAuthorityExpiryFromOperationSettlement(t *testing.T
 	}
 	if !result.Stopped || result.ProcessGeneration != "runtime-generation" {
 		t.Fatalf("result = %+v", result)
+	}
+	if data, err := os.ReadFile(releaseMarker); err != nil || string(data) != "released" {
+		t.Fatalf("release marker = %q, %v; want released", data, err)
+	}
+}
+
+func TestStopRuntimeRevokesWithoutReleaseWhenFullAuthorityWindowWasConsumed(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	executable, err = filepath.EvalSymlinks(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(stopControlHelperMode, "after-authority-expiry")
+	generation, err := proc.ProcessGeneration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &proc.FileStore{Path: filepath.Join(t.TempDir(), "workers.db")}
+	releaseMarker := filepath.Join(t.TempDir(), "released")
+	t.Setenv(stopControlHelperReleaseMarker, releaseMarker)
+	revoked := make(chan struct{})
+	finish := make(chan struct{})
+	controller := &Controller{
+		stopReaper: &proc.Reaper{Store: store, Generation: generation},
+		stopTiming: stopControlTiming{
+			identity: 5 * time.Second, authority: 50 * time.Millisecond, operation: 5 * time.Second,
+			now: func() time.Time { return time.Now().Add(time.Second) },
+			afterRevoke: func() {
+				close(revoked)
+				<-finish
+			},
+		},
+	}
+	type outcome struct {
+		err error
+	}
+	result := make(chan outcome, 1)
+	go func() {
+		_, err := controller.StopRuntime(context.Background(), StopControlSpec{
+			Executable: executable,
+			Args:       []string{"-test.run=^TestStopControlHelperProcess$"},
+			Role:       "com.example.stop", RuntimeBuild: "v2.0.0", RuntimeProtocol: 1,
+			TargetProcessGeneration: "runtime-generation", Intent: wire.StopIntentRestart,
+		})
+		result <- outcome{err: err}
+	}()
+	<-revoked
+	records, err := store.Load(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].StopAuthorityState != proc.StopAuthorityRevoked {
+		t.Fatalf("records before cleanup = %+v, want one revoked stop child", records)
+	}
+	if _, err := os.Stat(releaseMarker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("release marker before cleanup: %v; FD4 must remain unreadable", err)
+	}
+	identity := proc.Identity{
+		PID: records[0].PID, StartTime: records[0].StartTime, Boot: records[0].Boot,
+		Comm: records[0].Comm, Executable: records[0].Executable, AuditToken: records[0].AuditToken,
+	}
+	if consumed, ok, err := store.ConsumeStopControl(
+		t.Context(), identity, records[0].Role, records[0].TargetProcessGeneration, time.Now(),
+	); err != nil || ok || consumed != (proc.Record{}) {
+		t.Fatalf("revoked consume = %+v, %v, %v; want zero, false, nil", consumed, ok, err)
+	}
+	close(finish)
+	got := <-result
+	if got.err == nil || !strings.Contains(got.err.Error(), "authority does not retain the full window") {
+		t.Fatalf("StopRuntime error = %v, want full-window rejection", got.err)
+	}
+	records, err = store.Load(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("records after fail-closed cleanup = %+v, want none", records)
+	}
+	if _, err := os.Stat(releaseMarker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("release marker after cleanup: %v; FD4 was released", err)
 	}
 }
 

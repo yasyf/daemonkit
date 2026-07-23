@@ -21,6 +21,18 @@ const (
 	recordSchemaVersion    = 1
 )
 
+// StopAuthorityState is the durable admission state of one stop-control child.
+type StopAuthorityState string
+
+const (
+	// StopAuthorityPending is durable but cannot be consumed.
+	StopAuthorityPending StopAuthorityState = "pending"
+	// StopAuthorityArmed is durable and may be consumed exactly once.
+	StopAuthorityArmed StopAuthorityState = "armed"
+	// StopAuthorityRevoked remains durable for recovery but cannot be consumed.
+	StopAuthorityRevoked StopAuthorityState = "revoked"
+)
+
 // errNoProc is a definitive "gone", distinct from a probe failure (Undetermined, fails closed).
 var errNoProc = errors.New("no such process")
 
@@ -62,14 +74,16 @@ type Record struct {
 	// SessionID is the dedicated session created with a process-group leader.
 	// It remains the group's durable kernel identity after the leader exits.
 	SessionID int `json:"session_id,omitempty"`
-	// Role, RuntimeBuild, RuntimeProtocol, TargetProcessGeneration, Intent, and ExpiresUnixMilli are
-	// present only for one-shot stop-control process receipts.
-	Role                    string `json:"role,omitempty"`
-	RuntimeBuild            string `json:"runtime_build,omitempty"`
-	RuntimeProtocol         int    `json:"runtime_protocol,omitempty"`
-	TargetProcessGeneration string `json:"target_process_generation,omitempty"`
-	Intent                  string `json:"intent,omitempty"`
-	ExpiresUnixMilli        int64  `json:"expires_unix_milli,omitempty"`
+	// Role, RuntimeBuild, RuntimeProtocol, TargetProcessGeneration, Intent,
+	// StopAuthorityState, and ExpiresUnixMilli are present only for one-shot
+	// stop-control process receipts.
+	Role                    string             `json:"role,omitempty"`
+	RuntimeBuild            string             `json:"runtime_build,omitempty"`
+	RuntimeProtocol         int                `json:"runtime_protocol,omitempty"`
+	TargetProcessGeneration string             `json:"target_process_generation,omitempty"`
+	Intent                  string             `json:"intent,omitempty"`
+	StopAuthorityState      StopAuthorityState `json:"stop_authority_state,omitempty"`
+	ExpiresUnixMilli        int64              `json:"expires_unix_milli,omitempty"`
 }
 
 // Validate rejects an incomplete durable process identity.
@@ -92,12 +106,23 @@ func (r Record) Validate() error {
 	}
 	if r.RecoveryClass == RecoveryStopControl {
 		if r.Role == "" || r.RuntimeBuild == "" || r.RuntimeProtocol <= 0 || r.TargetProcessGeneration == "" ||
-			(r.Intent != "upgrade" && r.Intent != "restart" && r.Intent != "uninstall") ||
-			r.ExpiresUnixMilli <= 0 || r.ProcessGroup {
+			(r.Intent != "upgrade" && r.Intent != "restart" && r.Intent != "uninstall") || r.ProcessGroup {
 			return fmt.Errorf("%w: incomplete stop-control authority", ErrInvalidRecord)
 		}
+		switch r.StopAuthorityState {
+		case StopAuthorityPending:
+			if r.ExpiresUnixMilli != 0 {
+				return fmt.Errorf("%w: pending stop authority has an expiry", ErrInvalidRecord)
+			}
+		case StopAuthorityArmed, StopAuthorityRevoked:
+			if r.ExpiresUnixMilli <= 0 {
+				return fmt.Errorf("%w: settled stop authority has no expiry", ErrInvalidRecord)
+			}
+		default:
+			return fmt.Errorf("%w: invalid stop authority state", ErrInvalidRecord)
+		}
 	} else if r.Role != "" || r.RuntimeBuild != "" || r.RuntimeProtocol != 0 || r.TargetProcessGeneration != "" ||
-		r.Intent != "" || r.ExpiresUnixMilli != 0 {
+		r.Intent != "" || r.StopAuthorityState != "" || r.ExpiresUnixMilli != 0 {
 		return fmt.Errorf("%w: non-stop record carries stop authority", ErrInvalidRecord)
 	}
 	return nil
@@ -284,8 +309,9 @@ func (r *Reaper) trackIdentityRecord(ctx context.Context, rec Record) (Record, e
 	return rec, nil
 }
 
-// TrackStopControl durably authorizes one exact already-running child to issue
-// one bounded stop request against one target runtime generation.
+// TrackStopControl durably records one exact already-running child as pending,
+// then arms one stop request with a private commit reserve equal to the fixed
+// post-commit authorityWindow.
 func (r *Reaper) TrackStopControl(
 	ctx context.Context,
 	identity Identity,
@@ -293,7 +319,7 @@ func (r *Reaper) TrackStopControl(
 	protocol int,
 	targetProcessGeneration string,
 	intent string,
-	authorityLifetime time.Duration,
+	authorityWindow time.Duration,
 ) (Record, error) {
 	record := Record{
 		RecoveryClass: RecoveryStopControl,
@@ -301,14 +327,42 @@ func (r *Reaper) TrackStopControl(
 		Comm: identity.Comm, Generation: r.Generation, Executable: identity.Executable,
 		AuditToken: identity.AuditToken, Role: role, RuntimeBuild: build, RuntimeProtocol: protocol,
 		TargetProcessGeneration: targetProcessGeneration, Intent: intent,
+		StopAuthorityState: StopAuthorityPending,
 	}
 	store, ok := r.Store.(interface {
-		addStopControl(context.Context, Record, time.Duration) (Record, error)
+		addStopControlPending(context.Context, Record) (Record, error)
+		armStopControl(context.Context, Record, time.Duration) (Record, error)
 	})
 	if !ok {
 		return Record{}, errors.New("proc: stop control requires the durable file store")
 	}
-	return store.addStopControl(ctx, record, authorityLifetime)
+	pending, err := store.addStopControlPending(ctx, record)
+	if err != nil {
+		return Record{}, err
+	}
+	if pending.StopAuthorityState == StopAuthorityArmed {
+		return pending, nil
+	}
+	if pending.StopAuthorityState == StopAuthorityRevoked {
+		return pending, errors.New("proc: stop control authority is revoked")
+	}
+	armed, err := store.armStopControl(ctx, pending, authorityWindow)
+	if err != nil {
+		return pending, err
+	}
+	return armed, nil
+}
+
+// RevokeStopControl makes an armed authority non-consumable while retaining
+// the exact process record for synchronous cleanup or restart recovery.
+func (r *Reaper) RevokeStopControl(ctx context.Context, record Record) (Record, error) {
+	store, ok := r.Store.(interface {
+		revokeStopControl(context.Context, Record) (Record, error)
+	})
+	if !ok {
+		return Record{}, errors.New("proc: stop control requires the durable file store")
+	}
+	return store.revokeStopControl(ctx, record)
 }
 
 // StopControlStore atomically consumes one exact one-shot stop authority.
