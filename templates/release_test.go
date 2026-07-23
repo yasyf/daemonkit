@@ -13,9 +13,11 @@ func TestReleaseTemplateOwnsAtomicReleaseAndStableCaskPublication(t *testing.T) 
 	}
 	workflow := string(payload)
 	const (
-		workflowRef    = "83ee384b1d4fe25a8e4aa7258bb76d55e1593735"
-		draftActionRef = "54e3e194bda69896894a82c17fcdb2822beefab5"
-		tapActionRef   = "19c3d5013032ad9c88f9a8f1170d1f366c19b8d9"
+		workflowRef           = "83ee384b1d4fe25a8e4aa7258bb76d55e1593735"
+		stageDraftActionRef   = "e4c3108e693681df1a3c666bae80e890bc44cf3e"
+		publishDraftActionRef = "54e3e194bda69896894a82c17fcdb2822beefab5"
+		renderFormulaRef      = "19c3d5013032ad9c88f9a8f1170d1f366c19b8d9"
+		publishTapRef         = "9ca67392d45d66b6ae01e262383c8f3138d56f5e"
 	)
 
 	required := []string{
@@ -25,8 +27,8 @@ func TestReleaseTemplateOwnsAtomicReleaseAndStableCaskPublication(t *testing.T) 
 		"asset_name: __CASK_TOKEN__",
 		"needs.version.outputs.stable == 'true'",
 		"needs.release.outputs.changed == 'true'",
-		"stage-draft-release@" + draftActionRef,
-		"publish-draft-release@" + draftActionRef,
+		"stage-draft-release@" + stageDraftActionRef,
+		"publish-draft-release@" + publishDraftActionRef,
 		"release-id: ${{ steps.draft.outputs['release-id'] }}",
 		"manifest: ${{ runner.temp }}/app-release-assets",
 		"make-latest: ${{ needs.version.outputs.stable == 'true' }}",
@@ -38,8 +40,8 @@ func TestReleaseTemplateOwnsAtomicReleaseAndStableCaskPublication(t *testing.T) 
 		"older than registered cask version",
 		"cask template must install the full .app",
 		"cask template must not install this application as a bare binary",
-		"render-formula@" + tapActionRef,
-		"actions/publish@" + tapActionRef,
+		"render-formula@" + renderFormulaRef,
+		"actions/publish@" + publishTapRef,
 		"cmp tap-staging/Casks/__CASK_TOKEN__.rb \"$published\"",
 	}
 	for _, value := range required {
@@ -56,32 +58,28 @@ func TestReleaseTemplateOwnsAtomicReleaseAndStableCaskPublication(t *testing.T) 
 		"release-app.yml@54e3e194bda69896894a82c17fcdb2822beefab5",
 		"release-app.yml@8f422c652d836c40f9cc5a9d893d4120b26bc681",
 		"release-app.yml@0f472e87dac4a05f0d275c2b3f8c69adb20929d0",
+		"stage-draft-release@54e3e194bda69896894a82c17fcdb2822beefab5",
+		"actions/publish@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9",
 	} {
 		if strings.Contains(workflow, forbidden) {
 			t.Fatalf("release template retains deleted contract %q", forbidden)
 		}
 	}
-	if strings.Count(workflow, "stage-draft-release@"+draftActionRef) != 1 ||
-		strings.Count(workflow, "publish-draft-release@"+draftActionRef) != 1 {
+	if strings.Count(workflow, "stage-draft-release@"+stageDraftActionRef) != 1 ||
+		strings.Count(workflow, "publish-draft-release@"+publishDraftActionRef) != 1 {
 		t.Fatal("release template must stage and publish exactly one caller-owned draft")
 	}
-	if strings.Count(workflow, draftActionRef) != 2 {
-		t.Fatal("release template must pin both draft actions to the verified release identity")
-	}
-	if strings.Count(workflow, "actions/publish@"+tapActionRef) != 1 {
+	if strings.Count(workflow, "actions/publish@"+publishTapRef) != 1 {
 		t.Fatal("release template must publish the cask exactly once")
-	}
-	if strings.Count(workflow, tapActionRef) != 2 {
-		t.Fatal("release template must pin both tap actions to the verified tap identity")
 	}
 	ordered := []string{
 		"actions/download-artifact@v8",
-		"stage-draft-release@" + draftActionRef,
+		"stage-draft-release@" + stageDraftActionRef,
 		"name: Render the cask",
 		"name: Test the rendered cask locally",
-		"publish-draft-release@" + draftActionRef,
+		"publish-draft-release@" + publishDraftActionRef,
 		"name: Verify the public release asset",
-		"actions/publish@" + tapActionRef,
+		"actions/publish@" + publishTapRef,
 		"name: Verify the published cask and asset",
 	}
 	previous := -1
