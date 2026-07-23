@@ -1,12 +1,14 @@
 //go:build darwin
 
-package fetch
+package deployment
 
 import (
 	"context"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/yasyf/daemonkit/codeidentity"
 )
 
 // TestCodesignVerifierRejectsUnsigned exercises the real production seam:
@@ -22,11 +24,11 @@ func TestCodesignVerifierRejectsUnsigned(t *testing.T) {
 	}
 	appPath := filepath.Dir(filepath.Dir(app))
 
-	dr, err := testIdentity.DRString()
+	dr, err := (codeidentity.CodeIdentity{TeamID: "ABCDE12345", SigningIdentifier: "com.example.Unsigned"}).DRString()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := New().Verifier.Verify(context.Background(), appPath, dr); err == nil {
+	if _, err := New().verifier.Verify(context.Background(), appPath, dr); err == nil {
 		t.Fatal("codesign verifier accepted an unsigned bundle")
 	}
 }

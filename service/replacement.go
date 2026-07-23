@@ -66,6 +66,42 @@ func NewPlan(agents []Agent) (Plan, error) {
 	return planFromAgents(canonical)
 }
 
+// RestorePlan reconstructs one previously validated durable plan without
+// requiring that every old executable is resident in the current namespace.
+func RestorePlan(agents []Agent, expected PlanDigest) (Plan, error) {
+	canonical, err := canonicalPlanAgents(agents)
+	if err != nil {
+		return Plan{}, err
+	}
+	plan, err := planFromAgents(canonical)
+	if err != nil {
+		return Plan{}, err
+	}
+	if plan.digest != expected {
+		return Plan{}, errors.New("service: restored plan digest does not match its agents")
+	}
+	return plan, nil
+}
+
+func canonicalPlanAgents(agents []Agent) (map[string]Agent, error) {
+	canonical := make(map[string]Agent, len(agents))
+	for _, agent := range agents {
+		if _, err := agent.Plist(); err != nil {
+			return nil, fmt.Errorf("service: validate plan agent %q: %w", agent.Label, err)
+		}
+		if _, duplicate := canonical[agent.Label]; duplicate {
+			return nil, fmt.Errorf("service: duplicate plan agent label %q", agent.Label)
+		}
+		agent.Args = append([]string(nil), agent.Args...)
+		agent.Env = cloneStrings(agent.Env)
+		agent.AssociatedBundleIdentifiers, _ = canonicalAssociatedBundleIdentifiers(
+			agent.AssociatedBundleIdentifiers,
+		)
+		canonical[agent.Label] = agent
+	}
+	return canonical, nil
+}
+
 func planFromAgents(agents map[string]Agent) (Plan, error) {
 	type encodedAgent struct {
 		Label string          `json:"label"`

@@ -1,4 +1,4 @@
-package fetch
+package deployment
 
 import (
 	"archive/zip"
@@ -16,7 +16,7 @@ import (
 func unzip(src, dest string) error {
 	r, err := zip.OpenReader(src)
 	if err != nil {
-		return fmt.Errorf("fetch: open zip: %w", err)
+		return fmt.Errorf("deployment: open zip: %w", err)
 	}
 	defer r.Close()
 	for _, entry := range r.File {
@@ -36,7 +36,7 @@ func extractEntry(entry *zip.File, dest string) error {
 		return mkdirAllNoSymlink(dest, target, 0o750)
 	}
 	if err := mkdirAllNoSymlink(dest, filepath.Dir(target), 0o750); err != nil {
-		return fmt.Errorf("fetch: mkdir %q: %w", filepath.Dir(target), err)
+		return fmt.Errorf("deployment: mkdir %q: %w", filepath.Dir(target), err)
 	}
 	if entry.Mode()&os.ModeSymlink != 0 {
 		return extractSymlink(entry, target, dest)
@@ -47,20 +47,20 @@ func extractEntry(entry *zip.File, dest string) error {
 func extractFile(entry *zip.File, target string) error {
 	rc, err := entry.Open()
 	if err != nil {
-		return fmt.Errorf("fetch: open entry %q: %w", entry.Name, err)
+		return fmt.Errorf("deployment: open entry %q: %w", entry.Name, err)
 	}
 	defer rc.Close()
 	out, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, entry.Mode().Perm())
 	if err != nil {
-		return fmt.Errorf("fetch: create %q: %w", target, err)
+		return fmt.Errorf("deployment: create %q: %w", target, err)
 	}
 	_, copyErr := io.Copy(out, rc) //nolint:gosec // G110: asset SHA-256 is verified against the pinned release checksum before unzip
 	closeErr := out.Close()
 	if copyErr != nil {
-		return fmt.Errorf("fetch: write %q: %w", target, copyErr)
+		return fmt.Errorf("deployment: write %q: %w", target, copyErr)
 	}
 	if closeErr != nil {
-		return fmt.Errorf("fetch: close %q: %w", target, closeErr)
+		return fmt.Errorf("deployment: close %q: %w", target, closeErr)
 	}
 	return nil
 }
@@ -68,12 +68,12 @@ func extractFile(entry *zip.File, target string) error {
 func extractSymlink(entry *zip.File, target, dest string) error {
 	rc, err := entry.Open()
 	if err != nil {
-		return fmt.Errorf("fetch: open entry %q: %w", entry.Name, err)
+		return fmt.Errorf("deployment: open entry %q: %w", entry.Name, err)
 	}
 	link, err := io.ReadAll(rc)
 	rc.Close()
 	if err != nil {
-		return fmt.Errorf("fetch: read link %q: %w", entry.Name, err)
+		return fmt.Errorf("deployment: read link %q: %w", entry.Name, err)
 	}
 	dst := string(link)
 	if filepath.IsAbs(dst) {
@@ -84,7 +84,7 @@ func extractSymlink(entry *zip.File, target, dest string) error {
 		return fmt.Errorf("%w: symlink %q -> %q", ErrUnsafeArchive, entry.Name, dst)
 	}
 	if err := os.Symlink(dst, target); err != nil {
-		return fmt.Errorf("fetch: symlink %q: %w", target, err)
+		return fmt.Errorf("deployment: symlink %q: %w", target, err)
 	}
 	return nil
 }

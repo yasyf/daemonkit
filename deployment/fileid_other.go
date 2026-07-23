@@ -1,6 +1,6 @@
 //go:build !darwin && !linux
 
-package fetch
+package deployment
 
 import (
 	"errors"
@@ -13,9 +13,9 @@ type fileID struct {
 }
 
 func identifyPath(string) (fileID, error) {
-	return fileID{}, errors.New("fetch: durable file identity is unsupported on this platform")
+	return fileID{}, errors.New("deployment: durable file identity is unsupported on this platform")
 }
 
 func identifyAt(*os.File, string) (fileID, error) {
-	return fileID{}, errors.New("fetch: durable file identity is unsupported on this platform")
+	return fileID{}, errors.New("deployment: durable file identity is unsupported on this platform")
 }

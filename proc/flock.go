@@ -86,6 +86,32 @@ func (s FileLockSpec) Acquire(ctx context.Context) (*FileLockHandle, error) {
 	return fileLockPoll(ctx, f, s.Path, s.Mode)
 }
 
+// AcquireExisting waits for ownership of an already-created exact lock file.
+// It never creates directories or files and never repairs permissions.
+func (s FileLockSpec) AcquireExisting(ctx context.Context) (*FileLockHandle, error) {
+	if err := s.validate(); err != nil {
+		return nil, err
+	}
+	if ctx == nil {
+		return nil, fmt.Errorf("%w: nil context", ErrInvalidFileLock)
+	}
+	ctx, cancel := context.WithTimeout(ctx, s.Deadline)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("flock %s: %w", s.Path, err)
+	}
+	fd, err := openExistingFileLock(s.Path)
+	if err != nil {
+		return nil, fmt.Errorf("open existing lock %s: %w", s.Path, err)
+	}
+	f := os.NewFile(uintptr(fd), s.Path)
+	if err := verifyFileLock(f, s.Path, false); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return fileLockPoll(ctx, f, s.Path, s.Mode)
+}
+
 // TryAcquire attempts ownership once and returns ErrLockBusy on contention.
 func (s FileLockSpec) TryAcquire() (*FileLockHandle, error) {
 	if err := s.validate(); err != nil {
@@ -200,6 +226,10 @@ func validateFileLockPath(path string) error {
 }
 
 func secureFileLock(f *os.File, path string) error {
+	return verifyFileLock(f, path, true)
+}
+
+func verifyFileLock(f *os.File, path string, repairMode bool) error {
 	info, err := f.Stat()
 	if err != nil {
 		return fmt.Errorf("stat lock %s: %w", path, err)
@@ -223,6 +253,9 @@ func secureFileLock(f *os.File, path string) error {
 	}
 	if pathInfo.Mode()&os.ModeSymlink != 0 || !os.SameFile(info, pathInfo) {
 		return fmt.Errorf("%w: lock %s changed during open", ErrUnsafeLockFile, path)
+	}
+	if info.Mode().Perm() != 0o600 && !repairMode {
+		return fmt.Errorf("%w: lock %s mode is %#o, want 0600", ErrUnsafeLockFile, path, info.Mode().Perm())
 	}
 	if info.Mode().Perm() != 0o600 {
 		if err := f.Chmod(0o600); err != nil {

@@ -1,6 +1,6 @@
 //go:build darwin || linux
 
-package fetch
+package deployment
 
 import (
 	"fmt"

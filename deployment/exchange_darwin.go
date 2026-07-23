@@ -1,6 +1,6 @@
 //go:build darwin
 
-package fetch
+package deployment
 
 import (
 	"os"

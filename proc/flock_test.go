@@ -102,6 +102,54 @@ func TestFileLockRespectsContext(t *testing.T) {
 	}
 }
 
+func TestFileLockAcquireExistingNeverCreatesOrRepairs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing", "status.lock")
+	_, err := (FileLockSpec{Path: path, Mode: FileLockShared, Deadline: time.Second}).AcquireExisting(t.Context())
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("AcquireExisting error = %v, want os.ErrNotExist", err)
+	}
+	if _, err := os.Lstat(filepath.Dir(path)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("AcquireExisting created parent: %v", err)
+	}
+	dir := t.TempDir()
+	path = filepath.Join(dir, "unsafe.lock")
+	if err := os.WriteFile(path, nil, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	_, err = (FileLockSpec{Path: path, Mode: FileLockShared, Deadline: time.Second}).AcquireExisting(t.Context())
+	if !errors.Is(err, ErrUnsafeLockFile) {
+		t.Fatalf("AcquireExisting unsafe error = %v", err)
+	}
+	info, statErr := os.Stat(path)
+	if statErr != nil || info.Mode().Perm() != 0o640 {
+		t.Fatalf("AcquireExisting repaired mode = %v, %v", info.Mode(), statErr)
+	}
+}
+
+func TestFileLockAcquireExistingSharesExistingInode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "status.lock")
+	exclusive, err := (FileLockSpec{Path: path, Mode: FileLockExclusive, Deadline: time.Second}).Acquire(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	_, err = (FileLockSpec{Path: path, Mode: FileLockShared, Deadline: time.Second}).AcquireExisting(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("AcquireExisting during exclusive lock = %v", err)
+	}
+	if err := exclusive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	shared, err := (FileLockSpec{Path: path, Mode: FileLockShared, Deadline: time.Second}).AcquireExisting(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shared.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 const (
 	fileLockExclusiveChildEnv = "DAEMONKIT_FILE_LOCK_EXCLUSIVE_TEST_PATH"
 	fileLockExclusiveReadyEnv = "DAEMONKIT_FILE_LOCK_EXCLUSIVE_TEST_READY"

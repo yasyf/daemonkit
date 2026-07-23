@@ -1,6 +1,6 @@
 //go:build linux
 
-package fetch
+package deployment
 
 import (
 	"os"
