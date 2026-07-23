@@ -14,9 +14,11 @@ actor ServerRequestState {
     private var terminalAcknowledged = false
     private var terminalAckWaiter: CheckedContinuation<Void, Error>?
     private var terminalAckTimer: Task<Void, Never>?
+    private let receiveOfferHook: (@Sendable () async -> Void)?
 
-    init(capacity: Int) {
+    init(capacity: Int, receiveOfferHook: (@Sendable () async -> Void)? = nil) {
         channel = SocketBoundedChannel(capacity: capacity)
+        self.receiveOfferHook = receiveOfferHook
     }
 
     func attach(_ task: Task<Void, Never>) {
@@ -43,6 +45,7 @@ actor ServerRequestState {
 
     func receive(_ frame: SessionFrame) async {
         guard !canceled else { return }
+        guard !terminalSent, !finished else { return }
         guard !ended else {
             await fail(SessionTransportError.invalidFrame("request stream already ended"))
             return
@@ -67,12 +70,16 @@ actor ServerRequestState {
         if end {
             ended = true
         }
+        await receiveOfferHook?()
         let accepted = await channel.offer(SocketRequestChunk(
             sequence: frame.sequence,
             payload: frame.payload,
             end: end
         ))
         guard accepted else {
+            if canceled || terminalSent || finished {
+                return
+            }
             await fail(SessionTransportError.invalidFrame("request stream exceeded granted window"))
             return
         }

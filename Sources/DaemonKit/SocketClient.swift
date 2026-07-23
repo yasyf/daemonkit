@@ -12,17 +12,19 @@ public final class SocketCall: @unchecked Sendable {
     public let id: UInt64
     public let chunks: SocketChunkStream
 
-    private let client: SocketClient
+    private let client: SocketClientCore
+    private let owner: SocketClient
     private let state: ClientRequestState
 
-    fileprivate init(client: SocketClient, id: UInt64, state: ClientRequestState) {
+    fileprivate init(owner: SocketClient, client: SocketClientCore, id: UInt64, state: ClientRequestState) {
+        self.owner = owner
         self.client = client
         self.id = id
         self.state = state
         chunks = SocketChunkStream(channel: state.chunkChannel) { [client, state] in
             Task { await Self.cancel(client: client, id: id, state: state) }
         } consumptionOperation: { [client] _ in
-            try await client.write(SessionFrame(kind: .window, id: id, sequence: 1))
+            try await client.writeSettlement(SessionFrame(kind: .window, id: id, sequence: 1))
         }
     }
 
@@ -60,7 +62,7 @@ public final class SocketCall: @unchecked Sendable {
         await Self.cancel(client: client, id: id, state: state)
     }
 
-    fileprivate static func cancel(client: SocketClient, id: UInt64, state: ClientRequestState) async {
+    fileprivate static func cancel(client: SocketClientCore, id: UInt64, state: ClientRequestState) async {
         let shouldCancel = state.cancelLock.withLock {
             guard !state.cancelSent, !state.isTerminal() else { return false }
             state.cancelSent = true
@@ -81,8 +83,12 @@ public final class SocketCall: @unchecked Sendable {
         let timer = Task { [weak client, weak state] in
             try? await Task.sleep(nanoseconds: nanoseconds)
             guard let client, let state else { return }
-            if !state.isTerminal() {
-                client.fail(SessionTransportError.cancellationDidNotSettle)
+            await client.cancellationTimeoutHook?()
+            let error = SessionTransportError.cancellationDidNotSettle
+            let won = await state.finish(throwing: error)
+            await client.cancellationTimeoutResultHook?(won)
+            if won {
+                client.fail(error)
             }
         }
         state.attachCancellationTimer(timer)
@@ -91,38 +97,32 @@ public final class SocketCall: @unchecked Sendable {
 
 /// A persistent, multiplexed exact-v1 unix-socket client.
 public final class SocketClient: @unchecked Sendable {
+    let core: SocketClientCore
+
+    public init(
+        path: String,
+        build: String,
+        configuration: Configuration = .init(),
+        trust: PeerTrust
+    ) async throws {
+        core = try await SocketClientCore(
+            path: path,
+            build: build,
+            configuration: configuration,
+            trust: trust
+        )
+    }
+
+    deinit {
+        core.abort()
+    }
+}
+
+final class SocketClientCore: @unchecked Sendable {
     private enum CloseState {
         case open
         case closing([ClientRequestState])
         case closed
-    }
-
-    public struct Configuration: Sendable {
-        public var maximumFrameBytes: Int
-        public var streamQueueDepth: Int
-        public var eventQueueDepth: Int
-        public var maximumPendingWrites: Int
-        public var handshakeTimeout: TimeInterval
-        public var writeTimeout: TimeInterval
-        public var cancellationSettlementTimeout: TimeInterval
-
-        public init(
-            maximumFrameBytes: Int = daemonKitDefaultMaximumFrameBytes,
-            streamQueueDepth: Int = 16,
-            eventQueueDepth: Int = 16,
-            maximumPendingWrites: Int = 64,
-            handshakeTimeout: TimeInterval = 10,
-            writeTimeout: TimeInterval = 10,
-            cancellationSettlementTimeout: TimeInterval = 5
-        ) {
-            self.maximumFrameBytes = maximumFrameBytes
-            self.streamQueueDepth = streamQueueDepth
-            self.eventQueueDepth = eventQueueDepth
-            self.maximumPendingWrites = maximumPendingWrites
-            self.handshakeTimeout = handshakeTimeout
-            self.writeTimeout = writeTimeout
-            self.cancellationSettlementTimeout = cancellationSettlementTimeout
-        }
     }
 
     private struct Bootstrap {
@@ -135,23 +135,23 @@ public final class SocketClient: @unchecked Sendable {
     }
 
     /// Events pushed by the server, bounded by ``Configuration/eventQueueDepth``.
-    public var events: SocketEventStream {
+    var events: SocketEventStream {
         SocketEventStream(channel: eventChannel) { [weak self] in
             Task { await self?.close() }
         } consumptionOperation: { [weak self] _ in
             guard let self else { throw SessionTransportError.disconnected }
-            try await write(SessionFrame(kind: .window, sequence: 1))
+            try await writeSettlement(SessionFrame(kind: .window, sequence: 1))
         }
     }
 
     /// Server build identity established by the mandatory handshake.
-    public let peerBuild: String
+    let peerBuild: String
     private let sessionGeneration: Data
 
     private let descriptor: Int32
     private let codec: SessionFrameCodec
     private let writer: SessionWriter
-    fileprivate let configuration: Configuration
+    fileprivate let configuration: SocketClient.Configuration
     private let readQueue: DispatchQueue
     private let lock = NSLock()
     private let closeLatch = AsyncLatch()
@@ -166,11 +166,13 @@ public final class SocketClient: @unchecked Sendable {
     var requestSendHook: (@Sendable () async -> Void)?
     var requestSendDrainWaitHook: (@Sendable () -> Void)?
     var receiveStreamOfferHook: (@Sendable () async -> Void)?
+    var cancellationTimeoutHook: (@Sendable () async -> Void)?
+    var cancellationTimeoutResultHook: (@Sendable (Bool) async -> Void)?
 
-    public init(
+    init(
         path: String,
         build: String,
-        configuration: Configuration = .init(),
+        configuration: SocketClient.Configuration,
         trust: PeerTrust
     ) async throws {
         guard !build.isEmpty else { throw SessionTransportError.handshake("empty build") }
@@ -218,7 +220,8 @@ public final class SocketClient: @unchecked Sendable {
     }
 
     /// Opens a request. Set endInput false when request chunks will follow.
-    public func open(
+    func open(
+        owner: SocketClient,
         operation: String,
         tenant: String = "",
         payload: Data = Data(),
@@ -267,7 +270,7 @@ public final class SocketClient: @unchecked Sendable {
             if requestCommitted {
                 await SocketCall.cancel(client: self, id: id, state: state)
             } else {
-                await state.finish(throwing: CancellationError())
+                _ = await state.finish(throwing: CancellationError())
                 _ = remove(id)
             }
             throw CancellationError()
@@ -275,27 +278,11 @@ public final class SocketClient: @unchecked Sendable {
             fail(error)
             throw error
         }
-        return SocketCall(client: self, id: id, state: state)
-    }
-
-    /// Sends a unary request and waits for its terminal response.
-    public func call(
-        operation: String,
-        tenant: String = "",
-        payload: Data = Data(),
-        deadline: Date? = nil
-    ) async throws -> SocketTerminal {
-        let call = try await open(
-            operation: operation,
-            tenant: tenant,
-            payload: payload,
-            deadline: deadline
-        )
-        return try await call.response()
+        return SocketCall(owner: owner, client: self, id: id, state: state)
     }
 
     /// Sends go-away, then closes the session and fails every pending call.
-    public func close() async {
+    func close() async {
         await withTaskCancellationHandler {
             if let requests = beginGracefulClose() {
                 await Self.settle(requests, throwing: SessionTransportError.disconnected)
@@ -310,10 +297,13 @@ public final class SocketClient: @unchecked Sendable {
         }
     }
 
-    /// Immediately aborts the session without attempting a protocol write.
-    public func abort() async {
+    func abortAndWait() async {
         beginAbort(error: SessionTransportError.disconnected)
         await closeLatch.wait()
+    }
+
+    func abort() {
+        beginAbort(error: SessionTransportError.disconnected)
     }
 
     private func beginAbort(error: Error) {
@@ -358,7 +348,30 @@ public final class SocketClient: @unchecked Sendable {
         if isClosed {
             throw SessionTransportError.disconnected
         }
-        try await writer.writeSettlement(frame)
+        do {
+            try await writer.writeSettlement(frame)
+        } catch {
+            fail(error)
+            throw error
+        }
+    }
+
+    fileprivate func writeCommitted(_ frame: SessionFrame) async throws {
+        let isClosed = lock.withLock {
+            if case .closed = closeState {
+                return true
+            }
+            return false
+        }
+        if isClosed {
+            throw SessionTransportError.disconnected
+        }
+        do {
+            try await writer.writeCommitted(frame)
+        } catch {
+            fail(error)
+            throw error
+        }
     }
 
     private func beginGracefulClose() -> [ClientRequestState]? {
@@ -400,13 +413,13 @@ public final class SocketClient: @unchecked Sendable {
     private static func settle(_ requests: [ClientRequestState], throwing error: Error) async {
         await withTaskGroup(of: Void.self) { group in
             for request in requests {
-                group.addTask { await request.finish(throwing: error) }
+                group.addTask { _ = await request.finish(throwing: error) }
             }
         }
     }
 }
 
-private extension SocketClient {
+private extension SocketClientCore {
     func receive(_ frame: SessionFrame) async throws -> Bool {
         switch frame.kind {
         case .response:
@@ -434,7 +447,7 @@ private extension SocketClient {
         guard let state = pendingState(frame.id) else { return }
         try await state.finish(returning: response.terminal) {
             if response.acknowledge {
-                try await self.write(SessionFrame(
+                try await self.writeSettlement(SessionFrame(
                     kind: .acknowledgment,
                     flags: .end,
                     id: frame.id,
@@ -544,11 +557,11 @@ private extension SocketClient {
     }
 }
 
-private extension SocketClient {
+private extension SocketClientCore {
     private static func bootstrap(
         path: String,
         build: String,
-        configuration: Configuration,
+        configuration: SocketClient.Configuration,
         trust: PeerTrust
     ) async throws -> Bootstrap {
         let owner = OwnedDescriptor()
@@ -747,17 +760,13 @@ private final class ClientRequestState: @unchecked Sendable {
             _ = try cachedResult()
             return
         }
-        await settlementHook?()
         cancelCancellationTimer()
-        await sender.close()
-        let finishChunks = receiveLock.withLock {
-            guard !receiveEnded else { return false }
+        receiveLock.withLock {
             receiveEnded = true
-            return true
         }
-        if finishChunks {
-            await chunkChannel.finish()
-        }
+        await chunkChannel.finish()
+        await settlementHook?()
+        await sender.close()
         do {
             try await beforePublishing()
         } catch {
@@ -798,7 +807,8 @@ private final class ClientRequestState: @unchecked Sendable {
         return SocketRequestChunk(sequence: frame.sequence, payload: frame.payload, end: ended)
     }
 
-    func finish(throwing error: Error) async {
+    @discardableResult
+    func finish(throwing error: Error) async -> Bool {
         let claimed = terminalLock.withLock {
             guard !settlementStarted else { return false }
             settlementStarted = true
@@ -807,26 +817,23 @@ private final class ClientRequestState: @unchecked Sendable {
         guard claimed else {
             await settlementWaitHook?()
             await settlementLatch.wait()
-            return
+            return false
         }
-        await settlementHook?()
         cancelCancellationTimer()
-        await sender.close()
-        let finishChunks = receiveLock.withLock {
+        receiveLock.withLock {
             discardingOutput = true
-            guard !receiveEnded else { return false }
             receiveEnded = true
-            return true
         }
-        if finishChunks {
-            await chunkChannel.finish(throwing: error)
-        }
+        await chunkChannel.finish(throwing: error)
+        await settlementHook?()
+        await sender.close()
         terminalLock.withLock {
             terminalError = error
             terminalReady = true
         }
         resultContinuation.finish(throwing: error)
         settlementLatch.finish()
+        return true
     }
 
     func cachedResult() throws -> SocketTerminal? {
@@ -860,12 +867,12 @@ private final class ClientRequestState: @unchecked Sendable {
     }
 
     func cancelIO() async {
-        await sender.close()
         receiveLock.withLock {
             receiveEnded = true
             discardingOutput = true
         }
         await chunkChannel.discard()
+        await sender.close()
     }
 
     func isDiscardingOutput() -> Bool {
@@ -903,7 +910,7 @@ private actor ClientRequestSender {
         self.drainWaitHook = drainWaitHook
     }
 
-    func send(client: SocketClient, id: UInt64, payload: Data, end: Bool) async throws {
+    func send(client: SocketClientCore, id: UInt64, payload: Data, end: Bool) async throws {
         guard !ended else {
             throw SessionTransportError.invalidFrame("request stream already ended")
         }
@@ -916,7 +923,8 @@ private actor ClientRequestSender {
         guard !ended else { throw CancellationError() }
         let current = try sequence.take()
         await sendHook?()
-        try await client.write(SessionFrame(
+        guard !ended else { throw CancellationError() }
+        try await client.writeCommitted(SessionFrame(
             kind: .stream,
             flags: end ? .end : [],
             id: id,

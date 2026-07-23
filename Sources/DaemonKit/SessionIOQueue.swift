@@ -76,12 +76,11 @@ final class OwnedDescriptor: @unchecked Sendable {
     }
 
     func cancel() {
-        let descriptor = lock.withLock {
+        lock.withLock {
             canceled = true
-            return self.descriptor
-        }
-        if descriptor >= 0 {
-            shutdown(descriptor, SHUT_RDWR)
+            if descriptor >= 0 {
+                shutdown(descriptor, SHUT_RDWR)
+            }
         }
     }
 

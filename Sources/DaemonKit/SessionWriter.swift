@@ -30,6 +30,8 @@ final class SessionWriter: @unchecked Sendable {
     private var accepting = true
     private var admitted = 0
     private var waiting: [Entry] = []
+    private var settlementWaiting: [Entry] = []
+    private var settlementTurnUsed = false
     private var active: [UUID: Entry] = [:]
     private var terminalError: Error?
 
@@ -57,7 +59,7 @@ final class SessionWriter: @unchecked Sendable {
                     continuation.resume(throwing: CancellationError())
                     return
                 }
-                submit(entry, cancellation: cancellation)
+                submit(entry, cancellation: cancellation, priority: false)
             }
         } onCancel: {
             if let id = cancellation.cancel() {
@@ -66,10 +68,17 @@ final class SessionWriter: @unchecked Sendable {
         }
     }
 
+    func writeCommitted(_ frame: SessionFrame) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let entry = Entry(frame: frame, continuation: continuation)
+            submit(entry, cancellation: nil, priority: false)
+        }
+    }
+
     func writeSettlement(_ frame: SessionFrame) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             let entry = Entry(frame: frame, continuation: continuation)
-            submit(entry, cancellation: nil)
+            submit(entry, cancellation: nil, priority: true)
         }
     }
 
@@ -80,8 +89,9 @@ final class SessionWriter: @unchecked Sendable {
             let rejected = lock.withLock { () -> [Entry]? in
                 guard accepting else { return nil }
                 accepting = false
-                let rejected = waiting
+                let rejected = waiting + settlementWaiting
                 waiting.removeAll()
+                settlementWaiting.removeAll()
                 active[entry.id] = entry
                 admitted += 1
                 enqueue(entry)
@@ -101,8 +111,9 @@ final class SessionWriter: @unchecked Sendable {
     func abort() {
         let rejected = lock.withLock {
             accepting = false
-            let rejected = waiting
+            let rejected = waiting + settlementWaiting
             waiting.removeAll()
+            settlementWaiting.removeAll()
             return rejected
         }
         for entry in rejected {
@@ -120,14 +131,24 @@ final class SessionWriter: @unchecked Sendable {
         }
     }
 
-    private func submit(_ entry: Entry, cancellation: CancellationRegistration?) {
+    private func submit(_ entry: Entry, cancellation: CancellationRegistration?, priority: Bool) {
         let error = lock.withLock { () -> Error? in
             guard cancellation?.isCanceled != true else { return CancellationError() }
             guard accepting else {
                 return terminalError ?? SessionTransportError.disconnected
             }
-            if admitted >= maximumPendingWrites {
-                waiting.append(entry)
+            if admitted >= 1 {
+                if priority {
+                    guard settlementWaiting.count < maximumPendingWrites else {
+                        return SessionTransportError.invalidFrame("settlement write queue exceeded capacity")
+                    }
+                    settlementWaiting.append(entry)
+                } else {
+                    guard waiting.count < maximumPendingWrites else {
+                        return SessionTransportError.invalidFrame("write queue exceeded capacity")
+                    }
+                    waiting.append(entry)
+                }
                 admissionHook?(entry.frame)
                 return nil
             }
@@ -170,8 +191,9 @@ final class SessionWriter: @unchecked Sendable {
             if case let .failure(error) = result, !(error is CancellationError) {
                 accepting = false
                 terminalError = error
-                let rejected = waiting
+                let rejected = waiting + settlementWaiting
                 waiting.removeAll()
+                settlementWaiting.removeAll()
                 return FinishResult(
                     completion: completion,
                     next: nil,
@@ -179,10 +201,20 @@ final class SessionWriter: @unchecked Sendable {
                     rejectionError: error
                 )
             }
-            guard accepting, !waiting.isEmpty else {
+            guard accepting, !settlementWaiting.isEmpty || !waiting.isEmpty else {
+                if settlementWaiting.isEmpty, waiting.isEmpty {
+                    settlementTurnUsed = false
+                }
                 return FinishResult(completion: completion, next: nil, rejected: [], rejectionError: nil)
             }
-            let next = waiting.removeFirst()
+            let next: Entry
+            if !settlementWaiting.isEmpty, waiting.isEmpty || !settlementTurnUsed {
+                next = settlementWaiting.removeFirst()
+                settlementTurnUsed = true
+            } else {
+                next = waiting.removeFirst()
+                settlementTurnUsed = false
+            }
             admitted += 1
             active[next.id] = next
             return FinishResult(completion: completion, next: next, rejected: [], rejectionError: nil)

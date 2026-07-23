@@ -2,8 +2,6 @@ import Darwin
 import Foundation
 import os
 
-let socketServerLog = Logger(subsystem: DaemonKit.loggingSubsystem, category: "SocketServer")
-
 /// A unix-domain persistent v1 session server.
 public final class SocketServer: @unchecked Sendable {
     public struct Configuration: Sendable {
@@ -137,7 +135,7 @@ public final class SocketServer: @unchecked Sendable {
     private var shutdownReadDescriptor: Int32 = -1
     private var shutdownWriteDescriptor: Int32 = -1
     private var sessions: [Int32: ServerSession] = [:]
-    private var connections: Set<Int32> = []
+    private var connections: Set<ServerConnection> = []
     var stopDrainHook: (@Sendable () async -> Void)?
     var startCommitHook: (@Sendable () async -> Void)?
     var stopFinishHook: (@Sendable () async -> Void)?
@@ -267,14 +265,14 @@ extension SocketServer {
             }
         }
         await stopDrainHook?()
-        let (active, descriptors) = lock.withLock {
+        let (active, connectionSnapshot): ([ServerSession], [ServerConnection]) = lock.withLock {
             (Array(sessions.values), Array(connections))
         }
         for session in active {
             session.close()
         }
-        for descriptor in descriptors {
-            shutdown(descriptor, SHUT_RDWR)
+        for connection in connectionSnapshot {
+            connection.shutdown()
         }
         await withCheckedContinuation { continuation in
             DispatchQueue.global().async { [sessionGroup] in
@@ -457,26 +455,28 @@ extension SocketServer {
                 socketServerLog.error("accept failed: \(String(cString: strerror(errno)), privacy: .public)")
                 continue
             }
+            let connection = ServerConnection(descriptor: descriptor)
             lock.lock()
             if connections.count >= configuration.maximumSessions {
                 lock.unlock()
-                Darwin.close(descriptor)
+                connection.close()
                 continue
             }
-            connections.insert(descriptor)
+            connections.insert(connection)
             lock.unlock()
             sessionGroup.enter()
             Task {
-                await self.serve(descriptor)
+                await self.serve(connection)
                 self.sessionGroup.leave()
             }
         }
     }
 
-    private func serve(_ descriptor: Int32) async {
+    private func serve(_ connection: ServerConnection) async {
+        let descriptor = connection.descriptor
         defer {
-            removeConnection(descriptor)
-            Darwin.close(descriptor)
+            removeConnection(connection)
+            connection.close()
         }
         do {
             let setupQueue = DispatchQueue(label: "com.yasyf.daemonkit.SocketServer.setup.\(descriptor)")
@@ -492,6 +492,7 @@ extension SocketServer {
             }
             let session = ServerSession(
                 descriptor: descriptor,
+                shutdown: { connection.shutdown() },
                 build: build,
                 peer: peer,
                 configuration: configuration,
@@ -524,9 +525,9 @@ extension SocketServer {
         lock.unlock()
     }
 
-    private func removeConnection(_ descriptor: Int32) {
+    private func removeConnection(_ connection: ServerConnection) {
         lock.lock()
-        connections.remove(descriptor)
+        connections.remove(connection)
         lock.unlock()
     }
 
@@ -574,6 +575,7 @@ final class ServerSession: @unchecked Sendable {
     private let peer: SocketPeer
     private let configuration: SocketServer.Configuration
     private let handler: @Sendable (SocketRequest) async -> SocketResponse
+    private let shutdownDescriptor: @Sendable () -> Void
     private let codec: SessionFrameCodec
     private let readQueue: DispatchQueue
     private let writer: SessionWriter
@@ -588,12 +590,14 @@ final class ServerSession: @unchecked Sendable {
 
     init(
         descriptor: Int32,
+        shutdown: @escaping @Sendable () -> Void,
         build: String,
         peer: SocketPeer,
         configuration: SocketServer.Configuration,
         handler: @escaping @Sendable (SocketRequest) async -> SocketResponse
     ) {
         self.descriptor = descriptor
+        shutdownDescriptor = shutdown
         serverBuild = build
         self.peer = peer
         self.configuration = configuration
@@ -682,12 +686,12 @@ final class ServerSession: @unchecked Sendable {
         lifecycle.close()
         writer.abort()
         Task { await eventWindow.close() }
-        shutdown(descriptor, SHUT_RDWR)
+        shutdownDescriptor()
     }
 
     func drainIO() async {
         writer.abort()
-        shutdown(descriptor, SHUT_RDWR)
+        shutdownDescriptor()
         await withCheckedContinuation { continuation in
             writer.afterDrained { [readQueue] in
                 readQueue.async {
@@ -752,7 +756,7 @@ final class ServerSession: @unchecked Sendable {
             Task { await state.cancel() }
         } consumptionOperation: { [weak self] _ in
             guard let self else { throw SessionTransportError.disconnected }
-            try await write(SessionFrame(kind: .window, id: frame.id, sequence: 1))
+            try await writeSettlement(SessionFrame(kind: .window, id: frame.id, sequence: 1))
         }
         try await write(SessionFrame(
             kind: .window,
@@ -909,17 +913,8 @@ private extension ServerSession {
         }
     }
 
-    private func sendError(id: UInt64, _ error: Error) async throws {
-        try await write(SessionFrame(
-            kind: .response,
-            flags: .end,
-            id: id,
-            payload: responseEnvelope(SocketTerminal(error: String(describing: error)))
-        ))
-    }
-
     private func sendRejected(id: UInt64, reason: String) async throws {
-        try await write(SessionFrame(
+        try await writeSettlement(SessionFrame(
             kind: .response,
             flags: .end,
             id: id,

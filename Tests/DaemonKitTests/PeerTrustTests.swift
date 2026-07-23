@@ -195,18 +195,21 @@ extension SocketTransportTests {
             try #require(withAddress(&address) { Darwin.bind(listener, $0, $1) } == 0)
             try #require(listen(listener, 1) == 0)
 
-            let settlement = Task.detached {
-                let peer = accept(listener, nil, nil)
-                guard peer >= 0 else {
-                    return Int(-1)
+            let peerQueue = DispatchQueue(label: "com.yasyf.daemonkit.tests.untrusted-peer")
+            let settlement = Task {
+                try await peerQueue.performIO {
+                    let peer = accept(listener, nil, nil)
+                    guard peer >= 0 else {
+                        return Int(-1)
+                    }
+                    defer { close(peer) }
+                    var poller = pollfd(fd: peer, events: Int16(POLLIN | POLLHUP), revents: 0)
+                    guard poll(&poller, 1, 5000) == 1 else {
+                        return Int(-2)
+                    }
+                    var byte: UInt8 = 0
+                    return read(peer, &byte, 1)
                 }
-                defer { close(peer) }
-                var poller = pollfd(fd: peer, events: Int16(POLLIN | POLLHUP), revents: 0)
-                guard poll(&poller, 1, 5000) == 1 else {
-                    return Int(-2)
-                }
-                var byte: UInt8 = 0
-                return read(peer, &byte, 1)
             }
 
             await #expect(throws: PeerTrust.TrustError.self) {
@@ -216,7 +219,7 @@ extension SocketTransportTests {
                     trust: PeerTrust(requirement: fixtureRequirement())
                 )
             }
-            #expect(await settlement.value == 0)
+            #expect(try await settlement.value == 0)
         }
 
         @Test func requiredEntitlementsMatchClosedTypedPredicates() throws {

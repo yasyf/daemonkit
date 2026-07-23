@@ -3,8 +3,6 @@ import Darwin
 import Foundation
 import Testing
 
-private let cooperativeStrict = ProcessInfo.processInfo.environment["LIBDISPATCH_COOPERATIVE_POOL_STRICT"] == "1"
-
 private actor AsyncGate {
     private var entered = false
     private var entryWaiters: [CheckedContinuation<Void, Never>] = []
@@ -31,6 +29,45 @@ private actor AsyncGate {
         let waiters = releaseWaiters
         releaseWaiters.removeAll()
         for waiter in waiters {
+            waiter.resume()
+        }
+    }
+}
+
+private actor OneShotGate {
+    private var used = false
+    private var entered = false
+    private var released = false
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        guard !used else { return }
+        used = true
+        entered = true
+        let pending = entryWaiters
+        entryWaiters.removeAll()
+        for waiter in pending {
+            waiter.resume()
+        }
+        if released {
+            return
+        }
+        await withCheckedContinuation { releaseWaiters.append($0) }
+    }
+
+    func waitUntilEntered() async {
+        if entered {
+            return
+        }
+        await withCheckedContinuation { entryWaiters.append($0) }
+    }
+
+    func release() {
+        released = true
+        let pending = releaseWaiters
+        releaseWaiters.removeAll()
+        for waiter in pending {
             waiter.resume()
         }
     }
@@ -106,6 +143,27 @@ private actor InvocationProbe {
     }
 }
 
+private actor BooleanProbe {
+    private var result: Bool?
+    private var waiters: [CheckedContinuation<Bool, Never>] = []
+
+    func record(_ result: Bool) {
+        self.result = result
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending {
+            waiter.resume(returning: result)
+        }
+    }
+
+    func value() async -> Bool {
+        if let result {
+            return result
+        }
+        return await withCheckedContinuation { waiters.append($0) }
+    }
+}
+
 private actor SingleChunkSource {
     private var emitted = false
 
@@ -140,22 +198,6 @@ private actor SocketSessionCapture {
 extension SocketTransportTests {
     @Suite(.timeLimit(.minutes(1)))
     struct SessionAsyncRuntimeTests {
-        @Test func sessionTimeReservesZeroAndSaturates() {
-            #expect(SessionTime.unixMilliseconds(Date(timeIntervalSince1970: -1)) == 1)
-            #expect(SessionTime.unixMilliseconds(Date(timeIntervalSince1970: 0)) == 1)
-            #expect(SessionTime.unixMilliseconds(Date(timeIntervalSince1970: -.infinity)) == 1)
-            #expect(SessionTime.unixMilliseconds(Date(timeIntervalSince1970: .nan)) == 1)
-            #expect(SessionTime.unixMilliseconds(Date(timeIntervalSince1970: .infinity)) == .max)
-            let past = SessionTime.unixMilliseconds(Date(timeIntervalSinceNow: -1))
-            #expect(past > 1)
-            #expect(SessionTime.remainingMilliseconds(until: past) == 0)
-            let nilDeadline = Date?.none.map(SessionTime.unixMilliseconds) ?? 0
-            #expect(nilDeadline == 0)
-            #expect(SessionTime.remainingMilliseconds(until: 1) == 0)
-            #expect(SessionFrameCodec.durationNanoseconds(.infinity) == .max)
-            #expect(SessionFrameCodec.deadline(after: 0) == nil)
-        }
-
         @Test func invalidPublicTransportBoundsFailBeforeIO() async {
             await #expect(throws: SessionTransportError.self) {
                 _ = try await SocketClient(
@@ -381,19 +423,19 @@ extension SocketTransportTests {
             }
         }
 
-        @Test func terminalSettlementAwaitsInFlightRequestWrite() async throws {
+        @Test func terminalSettlementCancelsPrewriteRequestChunk() async throws {
             try await withAsyncCleanup { cleanup in
                 let directory = try shortSocketDir()
                 cleanup.add { try? FileManager.default.removeItem(at: directory) }
                 let path = directory.appendingPathComponent("send-settlement.sock").path
                 let handlerGate = AsyncGate()
-                let streamEndObserved = CompletionProbe()
+                let streamChunkObserved = CompletionProbe()
                 let server = SocketServer(path: path, build: "send-settlement", trust: .sameEffectiveUser) { request in
                     if request.operation == "upload" {
                         Task {
                             do {
-                                for try await chunk in request.chunks where chunk.end {
-                                    await streamEndObserved.finish()
+                                for try await _ in request.chunks {
+                                    await streamChunkObserved.finish()
                                     return
                                 }
                             } catch {}
@@ -427,9 +469,8 @@ extension SocketTransportTests {
                 await drainWaiting.waitUntilFinished()
                 #expect(await !(responseDone.value()))
                 await sendGate.release()
-                try await sending.value
+                await #expect(throws: CancellationError.self) { try await sending.value }
                 _ = try await response.value
-                await streamEndObserved.waitUntilFinished()
                 client.requestSendHook = nil
                 client.requestSendDrainWaitHook = nil
                 await #expect(throws: SessionTransportError.self) {
@@ -438,6 +479,58 @@ extension SocketTransportTests {
                 await #expect(throws: SessionTransportError.self) {
                     try await call.closeSend()
                 }
+                let payload = Data(#"{"healthy":true}"#.utf8)
+                #expect(try await client.call(operation: "echo", payload: payload).payload == payload)
+                #expect(await !(streamChunkObserved.value()))
+            }
+        }
+
+        @Test func callerCancellationAfterStreamCommitKeepsSequenceContiguous() async throws {
+            try await withAsyncCleanup { cleanup in
+                let directory = try shortSocketDir()
+                cleanup.add { try? FileManager.default.removeItem(at: directory) }
+                let path = directory.appendingPathComponent("stream-commit-cancel.sock").path
+                let server = SocketServer(
+                    path: path,
+                    build: "stream-commit-cancel",
+                    trust: .sameEffectiveUser
+                ) { request in
+                    if request.operation == "upload" {
+                        do {
+                            var count = 0
+                            for try await chunk in request.chunks {
+                                count += 1
+                                if chunk.end {
+                                    break
+                                }
+                            }
+                            return .terminal(SocketTerminal(payload: Data(String(count).utf8)))
+                        } catch {
+                            return .terminal(SocketTerminal(error: String(describing: error)))
+                        }
+                    }
+                    return .terminal(SocketTerminal(payload: request.payload))
+                }
+                try await server.start()
+                cleanup.add { await server.stop() }
+                let client = try await SocketClient(
+                    path: path,
+                    build: "stream-commit-cancel",
+                    trust: .sameEffectiveUser
+                )
+                cleanup.add { await client.close() }
+                let committing = OneShotGate()
+                client.requestSendHook = { await committing.wait() }
+                let call = try await client.open(operation: "upload", endInput: false)
+                let first = Task { try await call.sendChunk(Data("first".utf8)) }
+                await committing.waitUntilEntered()
+                first.cancel()
+                await committing.release()
+                try await first.value
+                try await call.sendChunk(Data("second".utf8))
+                try await call.closeSend()
+                let terminal = try await call.response()
+                #expect(terminal.payload == Data("3".utf8))
                 let payload = Data(#"{"healthy":true}"#.utf8)
                 #expect(try await client.call(operation: "echo", payload: payload).payload == payload)
             }
@@ -477,7 +570,10 @@ extension SocketTransportTests {
                 client.requestSettlementWaitHook = nil
             }
         }
+    }
 
+    @Suite(.timeLimit(.minutes(1)))
+    struct SessionCancellationRaceTests {
         @Test func cancellationDuringResponseDeliveryKeepsSessionHealthy() async throws {
             try await withAsyncCleanup { cleanup in
                 let directory = try shortSocketDir()
@@ -510,10 +606,109 @@ extension SocketTransportTests {
                 #expect(try await client.call(operation: "echo", payload: payload).payload == payload)
             }
         }
+
+        @Test func cancellationDiscardsInboundWhileOutboundSendSettles() async throws {
+            try await withAsyncCleanup { cleanup in
+                let directory = try shortSocketDir()
+                cleanup.add { try? FileManager.default.removeItem(at: directory) }
+                let path = directory.appendingPathComponent("duplex-cancel.sock").path
+                let chunks = SingleChunkSource()
+                let server = SocketServer(path: path, build: "duplex-cancel", trust: .sameEffectiveUser) { request in
+                    if request.operation == "stream" {
+                        return .stream(SocketResponseStream(
+                            nextChunk: { await chunks.next() },
+                            terminal: { SocketTerminal() },
+                            cancel: {}
+                        ))
+                    }
+                    return .terminal(SocketTerminal(payload: request.payload))
+                }
+                try await server.start()
+                cleanup.add { await server.stop() }
+                let client = try await SocketClient(path: path, build: "duplex-cancel", trust: .sameEffectiveUser)
+                cleanup.add { await client.close() }
+                let sending = AsyncGate()
+                let delivering = AsyncGate()
+                let drainWaiting = CompletionProbe()
+                client.requestSendHook = { await sending.wait() }
+                client.requestSendDrainWaitHook = { Task { await drainWaiting.finish() } }
+                client.receiveStreamOfferHook = { await delivering.wait() }
+                let call = try await client.open(operation: "stream", endInput: false)
+                let send = Task { try await call.sendChunk(Data("late".utf8)) }
+                await sending.waitUntilEntered()
+                await delivering.waitUntilEntered()
+                let cancel = Task { await call.cancel() }
+                await drainWaiting.waitUntilFinished()
+                await delivering.release()
+                await sending.release()
+                await #expect(throws: CancellationError.self) { try await send.value }
+                await cancel.value
+                _ = try await call.response()
+                client.requestSendHook = nil
+                client.requestSendDrainWaitHook = nil
+                client.receiveStreamOfferHook = nil
+                let payload = Data(#"{"healthy":true}"#.utf8)
+                #expect(try await client.call(operation: "echo", payload: payload).payload == payload)
+            }
+        }
+
+        @Test func terminalSettlementWinsAgainstEligibleCancellationTimeout() async throws {
+            try await withAsyncCleanup { cleanup in
+                let directory = try shortSocketDir()
+                cleanup.add { try? FileManager.default.removeItem(at: directory) }
+                let path = directory.appendingPathComponent("timeout-race.sock").path
+                let handlerGate = AsyncGate()
+                let server = SocketServer(path: path, build: "timeout-race", trust: .sameEffectiveUser) { request in
+                    if request.operation == "wait" {
+                        await handlerGate.wait()
+                    }
+                    return .terminal(SocketTerminal(payload: request.payload))
+                }
+                try await server.start()
+                cleanup.add { await server.stop() }
+                let client = try await SocketClient(
+                    path: path,
+                    build: "timeout-race",
+                    configuration: .init(cancellationSettlementTimeout: 0.001),
+                    trust: .sameEffectiveUser
+                )
+                cleanup.add { await client.close() }
+                let timeoutGate = AsyncGate()
+                let timeoutResult = BooleanProbe()
+                client.cancellationTimeoutHook = { await timeoutGate.wait() }
+                client.cancellationTimeoutResultHook = { await timeoutResult.record($0) }
+                let call = try await client.open(operation: "wait")
+                await handlerGate.waitUntilEntered()
+                await call.cancel()
+                await timeoutGate.waitUntilEntered()
+                await handlerGate.release()
+                _ = try await call.response()
+                await timeoutGate.release()
+                #expect(await timeoutResult.value() == false)
+                client.cancellationTimeoutHook = nil
+                client.cancellationTimeoutResultHook = nil
+                let payload = Data(#"{"healthy":true}"#.utf8)
+                #expect(try await client.call(operation: "echo", payload: payload).payload == payload)
+            }
+        }
     }
 
     @Suite(.timeLimit(.minutes(1)))
     struct SessionCreditSettlementTests {
+        @Test func canceledRequestOfferDoesNotBecomeWindowOverflow() async throws {
+            let offering = AsyncGate()
+            let state = ServerRequestState(capacity: 1) { await offering.wait() }
+            let receive = Task {
+                await state.receive(SessionFrame(kind: .stream, id: 1, sequence: 0, payload: Data("chunk".utf8)))
+            }
+            await offering.waitUntilEntered()
+            await state.cancel()
+            await offering.release()
+            await receive.value
+            #expect(await state.error() == nil)
+            #expect(try await state.channel.next(onCancel: {}) == nil)
+        }
+
         @Test func terminalSettlementReleasesAnAdmittedNoCreditSender() async throws {
             try await withAsyncCleanup { cleanup in
                 let directory = try shortSocketDir()
@@ -596,7 +791,8 @@ extension SocketTransportTests {
             let second = Task { try await writer.write(secondFrame) }
             await admissionProbe.wait(for: 2)
             second.cancel()
-            let received = Task.detached { try readCodec.read(timeout: 2) }
+            let readQueue = DispatchQueue(label: "com.yasyf.daemonkit.tests.writer-read")
+            let received = Task { try await readQueue.performIO { try readCodec.read(timeout: 2) } }
             try await first.value
             await #expect(throws: CancellationError.self) { try await second.value }
             #expect(try await received.value.id == 1)
@@ -644,6 +840,62 @@ extension SocketTransportTests {
             #expect(await !(startProbe.contains(2)))
             await writer.drain()
         }
+
+        @Test func settlementWriteBypassesSaturatedOrdinaryQueueWithoutStarvingIt() async throws {
+            var descriptors: [Int32] = [-1, -1]
+            try #require(socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0)
+            defer {
+                Darwin.close(descriptors[0])
+                Darwin.close(descriptors[1])
+            }
+            var sendBuffer: Int32 = 4096
+            setsockopt(
+                descriptors[0],
+                SOL_SOCKET,
+                SO_SNDBUF,
+                &sendBuffer,
+                socklen_t(MemoryLayout<Int32>.size)
+            )
+            let admissions = FrameStartProbe()
+            let starts = FrameStartProbe()
+            let writer = SessionWriter(
+                codec: SessionFrameCodec(descriptor: descriptors[0], writeTimeout: 2),
+                maximumPendingWrites: 4,
+                label: "writer-priority-test",
+                admissionHook: { frame in Task { await admissions.record(frame.id) } },
+                startHook: { frame in Task { await starts.record(frame.id) } }
+            )
+            let first = Task {
+                try await writer.write(SessionFrame(
+                    kind: .stream,
+                    id: 1,
+                    payload: Data(repeating: 0xA5, count: 512 * 1024)
+                ))
+            }
+            await starts.wait(for: 1)
+            let ordinary = Task {
+                try await writer.write(SessionFrame(kind: .stream, id: 2, payload: Data("ordinary".utf8)))
+            }
+            await admissions.wait(for: 2)
+            let settlement = Task {
+                try await writer.writeSettlement(SessionFrame(kind: .cancel, flags: .end, id: 3))
+            }
+            await admissions.wait(for: 3)
+            let readQueue = DispatchQueue(label: "com.yasyf.daemonkit.tests.writer-priority-read")
+            let readDescriptor = descriptors[1]
+            let received = Task {
+                try await readQueue.performIO {
+                    let codec = SessionFrameCodec(descriptor: readDescriptor)
+                    return try (0 ..< 3).map { _ in try codec.read(timeout: 2).id }
+                }
+            }
+            try await first.value
+            try await settlement.value
+            try await ordinary.value
+            #expect(try await received.value == [1, 3, 2])
+            writer.abort()
+            await writer.drain()
+        }
     }
 
     @Suite(.timeLimit(.minutes(1)))
@@ -662,20 +914,23 @@ extension SocketTransportTests {
                 }
             } == 0)
             try #require(listen(listener, 1) == 0)
-            let accepted = Task.detached { () throws -> Int32 in
-                let peer = accept(listener, nil, nil)
-                guard peer >= 0 else {
-                    throw SessionTransportError.systemCall(operation: "accept", errno: errno)
-                }
-                do {
-                    let hello = try SessionFrameCodec(descriptor: peer).read()
-                    guard hello.kind == .hello else {
-                        throw SessionTransportError.handshake("expected client hello")
+            let peerQueue = DispatchQueue(label: "com.yasyf.daemonkit.tests.handshake-peer")
+            let accepted = Task {
+                try await peerQueue.performIO { () throws -> Int32 in
+                    let peer = accept(listener, nil, nil)
+                    guard peer >= 0 else {
+                        throw SessionTransportError.systemCall(operation: "accept", errno: errno)
                     }
-                    return peer
-                } catch {
-                    Darwin.close(peer)
-                    throw error
+                    do {
+                        let hello = try SessionFrameCodec(descriptor: peer).read()
+                        guard hello.kind == .hello else {
+                            throw SessionTransportError.handshake("expected client hello")
+                        }
+                        return peer
+                    } catch {
+                        Darwin.close(peer)
+                        throw error
+                    }
                 }
             }
             let connecting = Task {
@@ -690,21 +945,23 @@ extension SocketTransportTests {
             defer { Darwin.close(peer) }
             connecting.cancel()
             await #expect(throws: CancellationError.self) { try await connecting.value }
-            let observedEOF = Task.detached {
-                var buffer = [UInt8](repeating: 0, count: 4096)
-                while true {
-                    var descriptor = pollfd(fd: peer, events: Int16(POLLIN | POLLHUP), revents: 0)
-                    guard poll(&descriptor, 1, 1000) > 0 else { return false }
-                    let count = read(peer, &buffer, buffer.count)
-                    if count == 0 {
-                        return true
-                    }
-                    if count < 0, errno != EINTR {
-                        return false
+            let observedEOF = Task {
+                try await peerQueue.performIO {
+                    var buffer = [UInt8](repeating: 0, count: 4096)
+                    while true {
+                        var descriptor = pollfd(fd: peer, events: Int16(POLLIN | POLLHUP), revents: 0)
+                        guard poll(&descriptor, 1, 1000) > 0 else { return false }
+                        let count = read(peer, &buffer, buffer.count)
+                        if count == 0 {
+                            return true
+                        }
+                        if count < 0, errno != EINTR {
+                            return false
+                        }
                     }
                 }
             }
-            #expect(await observedEOF.value)
+            #expect(try await observedEOF.value)
         }
 
         @Test func droppingCanceledClientClosesPeerWithoutWaitingForSettlementTimer() async throws {

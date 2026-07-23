@@ -21,17 +21,20 @@ private func leaveStaleSocket(at path: String) {
     close(descriptor)
 }
 
-private func legacyLineIsRejected(at path: String) -> Bool {
-    let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
-    guard descriptor >= 0, var address = makeAddress(path: path) else { return false }
-    defer { close(descriptor) }
-    guard withAddress(&address, { connect(descriptor, $0, $1) }) == 0 else { return false }
-    var timeout = timeval(tv_sec: 1, tv_usec: 0)
-    setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-    let legacy = Data("{\"op\":\"health\"}\n".utf8)
-    _ = legacy.withUnsafeBytes { write(descriptor, $0.baseAddress, $0.count) }
-    var byte: UInt8 = 0
-    return read(descriptor, &byte, 1) == 0
+private func legacyLineIsRejected(at path: String) async throws -> Bool {
+    let queue = DispatchQueue(label: "com.yasyf.daemonkit.tests.legacy-client")
+    return try await queue.performIO {
+        let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard descriptor >= 0, var address = makeAddress(path: path) else { return false }
+        defer { close(descriptor) }
+        guard withAddress(&address, { connect(descriptor, $0, $1) }) == 0 else { return false }
+        var timeout = timeval(tv_sec: 1, tv_usec: 0)
+        setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        let legacy = Data("{\"op\":\"health\"}\n".utf8)
+        _ = legacy.withUnsafeBytes { write(descriptor, $0.baseAddress, $0.count) }
+        var byte: UInt8 = 0
+        return read(descriptor, &byte, 1) == 0
+    }
 }
 
 private final class ContinuationGate: @unchecked Sendable {
@@ -329,7 +332,7 @@ extension SocketTransportTests {
                 ) { _ in .terminal(SocketTerminal(payload: Data("null".utf8))) }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                #expect(legacyLineIsRejected(at: path))
+                #expect(try await legacyLineIsRejected(at: path))
             }
         }
 
