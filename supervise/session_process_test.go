@@ -131,6 +131,41 @@ func TestManagedSessionStopEscalatesAndClosesConnection(t *testing.T) {
 	}
 }
 
+func TestManagedSessionStopAcceptsCleanExitOnOwnedEOF(t *testing.T) {
+	registry := newFakeRegistry()
+	pool, err := NewPool(1, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := pool.StartSession(t.Context(), SessionProcessSpec{
+		RecoveryClass: proc.RecoveryTask,
+		Path:          "/bin/sh",
+		Args:          []string{"-c", `printf 'ready\n'; while IFS= read -r line; do :; done`},
+		Ready: func(_ context.Context, _ proc.Record, conn net.Conn) error {
+			line, err := bufio.NewReader(conn).ReadString('\n')
+			if err != nil {
+				return err
+			}
+			if line != "ready\n" {
+				return fmt.Errorf("ready line = %q", line)
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Stop(t.Context()); err != nil {
+		t.Fatalf("Stop = %v, want clean EOF settlement", err)
+	}
+	if err := session.Wait(t.Context()); !errors.Is(err, ErrProcessStopped) {
+		t.Fatalf("Wait = %v, want ErrProcessStopped", err)
+	}
+	if got := registry.recordCount(); got != 0 {
+		t.Fatalf("durable records = %d, want 0", got)
+	}
+}
+
 func TestManagedSessionExitClosesConnection(t *testing.T) {
 	registry := newFakeRegistry()
 	pool, err := NewPool(1, registry)

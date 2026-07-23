@@ -403,6 +403,35 @@ func TestManagedProcessBufferedExitOutranksCanceledContext(t *testing.T) {
 	}
 }
 
+func TestManagedProcessIntentionalCancelAcceptsConcurrentCleanExit(t *testing.T) {
+	registry := newFakeRegistry()
+	registry.ownsStarted = make(chan struct{})
+	pool := &Pool{
+		registry: registry,
+		active:   1,
+		changed:  make(chan struct{}),
+		workers:  map[uint64]context.CancelFunc{1: func() {}},
+		grace:    time.Millisecond,
+	}
+	process := &Process{
+		record: proc.Record{PID: 1 << 30}, pool: pool, workerID: 1,
+		cancel: func() {}, done: make(chan struct{}),
+	}
+	waited := make(chan error)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	go process.run(ctx, waited)
+	<-registry.ownsStarted
+	waited <- nil
+	<-process.done
+	process.mu.Lock()
+	result, stopResult := process.result, process.stopResult
+	process.mu.Unlock()
+	if !errors.Is(result, ErrProcessStopped) || stopResult != nil {
+		t.Fatalf("clean cancellation result = %v, stop result = %v", result, stopResult)
+	}
+}
+
 func TestManagedProcessSuccessfulReadinessLeavesExitForWait(t *testing.T) {
 	release := filepath.Join(t.TempDir(), "ready")
 	registry := newFakeRegistry()

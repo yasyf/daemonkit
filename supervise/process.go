@@ -344,7 +344,7 @@ func (p *Process) run(ctx context.Context, waited <-chan error) {
 					ErrUnsettledGroup,
 				)
 			}
-			result := errors.Join(stop.err, unexpectedWaitError(stop.waitErr), settleErr)
+			result := errors.Join(stop.err, settleErr)
 			p.complete(errors.Join(ErrProcessStopped, result), result)
 			return
 		}
