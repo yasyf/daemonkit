@@ -17,25 +17,39 @@ var (
 	ErrStreamOrder = errors.New("wire: stream sequence violation")
 )
 
-// BuildIdentity is exchanged during the mandatory exact-version handshake.
-type BuildIdentity struct {
-	Protocol       uint16 `json:"protocol"`
-	Build          string `json:"build"`
-	LifecycleBuild string `json:"lifecycle_build,omitempty"`
-	Session        []byte `json:"session,omitempty"`
+// ResponseCode is a stable machine-readable terminal status.
+type ResponseCode string
+
+const (
+	// ResponseCodeRuntimeStarting identifies pre-ready non-dispatch.
+	ResponseCodeRuntimeStarting ResponseCode = "runtime_starting"
+)
+
+// WireIdentity is exchanged during the mandatory exact-version handshake.
+//
+//nolint:revive // The qualifier distinguishes wire identity from process identity.
+type WireIdentity struct {
+	Protocol  uint16 `json:"protocol"`
+	WireBuild string `json:"wire_build"`
+	Session   []byte `json:"session,omitempty"`
+}
+
+type handshakeIdentity struct {
+	Protocol  uint16 `json:"protocol"`
+	WireBuild string `json:"wire_build"`
+	Session   []byte `json:"session,omitempty"`
 }
 
 // Request is one admitted request on a persistent session.
 type Request struct {
-	ID             uint64
-	Op             Op
-	Tenant         string
-	Peer           Peer
-	Build          string
-	LifecycleBuild string
-	Payload        []byte
-	Chunks         <-chan Chunk
-	Session        *AcceptedSession
+	ID        uint64
+	Op        Op
+	Tenant    string
+	Peer      Peer
+	WireBuild string
+	Payload   []byte
+	Chunks    <-chan Chunk
+	Session   *AcceptedSession
 }
 
 // Chunk is one ordered streaming payload.
@@ -55,9 +69,25 @@ type Event struct {
 type Response struct {
 	Rejected bool            `json:"rejected,omitempty"`
 	Ack      bool            `json:"ack,omitempty"`
+	Code     ResponseCode    `json:"code,omitempty"`
 	Reason   string          `json:"reason,omitempty"`
 	Err      string          `json:"err,omitempty"`
 	Payload  json.RawMessage `json:"payload,omitempty"`
+}
+
+// RejectionError is a typed rejected outcome.
+type RejectionError struct {
+	Code   ResponseCode
+	Reason string
+}
+
+func (e *RejectionError) Error() string { return e.Reason }
+
+func (e *RejectionError) Unwrap() error {
+	if e.Code == ResponseCodeRuntimeStarting {
+		return ErrNotReady
+	}
+	return nil
 }
 
 // StreamResponse asks the server to emit Chunks in order before its terminal response.

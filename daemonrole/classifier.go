@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/yasyf/daemonkit/version"
 	"github.com/yasyf/daemonkit/wire"
 )
 
@@ -69,11 +68,6 @@ func (c Classifier) Classify(ctx context.Context, peer wire.Peer) (bool, error) 
 		return false, fmt.Errorf("daemonrole: role target %q is not an executable regular file", target)
 	}
 	return peer.Executable == target, nil
-}
-
-// AuthorizeLifecycleBuild admits only the same daemon release or a strictly newer successor.
-func (Classifier) AuthorizeLifecycleBuild(serverBuild, peerBuild string) bool {
-	return peerBuild == serverBuild || version.Newer(peerBuild, serverBuild)
 }
 
 func validRoleID(role string) bool {

@@ -112,9 +112,8 @@ type Pool struct {
 	nextID   uint64
 	workers  map[uint64]context.CancelFunc
 
-	grace                time.Duration
-	untrackedKillTimeout time.Duration
-	signal               func(int, syscall.Signal) error
+	grace  time.Duration
+	signal func(int, syscall.Signal) error
 }
 
 // NewPool builds a worker pool. limit and registry are required.
@@ -126,13 +125,12 @@ func NewPool(limit int, registry WorkerRegistry) (*Pool, error) {
 		return nil, errors.New("supervise: worker registry is required")
 	}
 	return &Pool{
-		limit:                limit,
-		registry:             registry,
-		changed:              make(chan struct{}),
-		workers:              make(map[uint64]context.CancelFunc),
-		grace:                TerminationGrace,
-		untrackedKillTimeout: TerminationGrace,
-		signal:               syscall.Kill,
+		limit:    limit,
+		registry: registry,
+		changed:  make(chan struct{}),
+		workers:  make(map[uint64]context.CancelFunc),
+		grace:    TerminationGrace,
+		signal:   syscall.Kill,
 	}, nil
 }
 
@@ -565,35 +563,11 @@ func awaitWrapperReady(ctx context.Context, ready *os.File) error {
 }
 
 func (p *Pool) killUntrackedGroup(pid int) error {
-	timeout := p.untrackedKillTimeout
-	if timeout <= 0 {
-		timeout = TerminationGrace
+	err := p.signal(-pid, syscall.SIGKILL)
+	if err == nil || errors.Is(err, syscall.ESRCH) {
+		return nil
 	}
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-	var settlementErr error
-	for {
-		err := p.signal(-pid, syscall.SIGKILL)
-		if errors.Is(err, syscall.ESRCH) {
-			err = nil
-		}
-		if err == nil {
-			return settlementErr
-		}
-		settlementErr = errors.Join(settlementErr, wrapSignalError("kill untracked worker group", err))
-		retry := time.NewTimer(settlementRetry)
-		select {
-		case <-retry.C:
-		case <-deadline.C:
-			if !retry.Stop() {
-				select {
-				case <-retry.C:
-				default:
-				}
-			}
-			return errors.Join(settlementErr, ErrUnsettledGroup)
-		}
-	}
+	return errors.Join(wrapSignalError("kill untracked worker group", err), ErrUnsettledGroup)
 }
 
 func writePayload(stdin io.WriteCloser, payload []byte) error {

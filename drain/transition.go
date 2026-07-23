@@ -33,15 +33,15 @@ func (i *Intake) Admit() (done func(), err error) {
 	return i.admit(false)
 }
 
-// AdmitLifecycle admits lifecycle observation after ordinary intake closes.
-func (i *Intake) AdmitLifecycle() (done func(), err error) {
+// AdmitProtected admits protected control and observation after ordinary intake closes.
+func (i *Intake) AdmitProtected() (done func(), err error) {
 	return i.admit(true)
 }
 
-func (i *Intake) admit(lifecycle bool) (done func(), err error) {
+func (i *Intake) admit(protected bool) (done func(), err error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.draining && !lifecycle {
+	if i.draining && !protected {
 		return nil, ErrDraining
 	}
 	i.inflight++

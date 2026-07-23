@@ -143,7 +143,7 @@ func startSessionServer(t *testing.T, server *wire.Server, admit func() (func(),
 
 func newClient(t *testing.T, running *runningServer, config func(*wire.ClientConfig)) *wire.Client {
 	t.Helper()
-	cfg := wire.ClientConfig{Dial: wire.UnixDialer(running.path), Build: "server-test"}
+	cfg := wire.ClientConfig{Dial: wire.UnixDialer(running.path), WireBuild: "server-test"}
 	if config != nil {
 		config(&cfg)
 	}
@@ -168,7 +168,7 @@ func TestServeReadinessErrorClosesIntakeAndJoins(t *testing.T) {
 	}
 	want := errors.New("readiness refused")
 	var readyCalls atomic.Int32
-	server := &wire.Server{Build: "server-test"}
+	server := &wire.Server{WireBuild: "server-test"}
 	err = server.Serve(
 		context.Background(),
 		listener,
@@ -207,7 +207,7 @@ func TestServeDoesNotAdmitSessionsBeforeReadinessPublication(t *testing.T) {
 	publishReady := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	serveDone := make(chan error, 1)
-	server := &wire.Server{Build: "server-test"}
+	server := &wire.Server{WireBuild: "server-test"}
 	go func() {
 		serveDone <- server.Serve(
 			ctx,
@@ -226,7 +226,7 @@ func TestServeDoesNotAdmitSessionsBeforeReadinessPublication(t *testing.T) {
 	clientErr := make(chan error, 1)
 	go func() {
 		client, err := wire.NewClient(context.Background(), wire.ClientConfig{
-			Dial: wire.UnixDialer(path), Build: "server-test",
+			Dial: wire.UnixDialer(path), WireBuild: "server-test",
 		})
 		clientDone <- client
 		clientErr <- err
@@ -252,7 +252,7 @@ func TestServeDoesNotAdmitSessionsBeforeReadinessPublication(t *testing.T) {
 
 func TestCallDoesNotNegotiateResponseStream(t *testing.T) {
 	var calls atomic.Int32
-	server := &wire.Server{Build: "server-test"}
+	server := &wire.Server{WireBuild: "server-test"}
 	server.RegisterControl("mutate", func(context.Context, wire.Request) (any, error) {
 		calls.Add(1)
 		return true, nil
@@ -260,7 +260,7 @@ func TestCallDoesNotNegotiateResponseStream(t *testing.T) {
 	running := startSessionServer(t, server, func() (func(), error) { return func() {}, nil })
 	requestWritten := make(chan struct{})
 	client, err := wire.NewClient(context.Background(), wire.ClientConfig{
-		Build: "server-test",
+		WireBuild: "server-test",
 		Dial: func(ctx context.Context) (net.Conn, error) {
 			conn, err := wire.UnixDialer(running.path)(ctx)
 			if err != nil {
@@ -290,7 +290,7 @@ func TestCallDoesNotNegotiateResponseStream(t *testing.T) {
 
 func TestOpenClassifiesResponseWindowFailureAfterRequestCommitAsPostSend(t *testing.T) {
 	var calls atomic.Int32
-	server := &wire.Server{Build: "server-test"}
+	server := &wire.Server{WireBuild: "server-test"}
 	server.RegisterControl("mutate", func(context.Context, wire.Request) (any, error) {
 		calls.Add(1)
 		return true, nil
@@ -298,7 +298,7 @@ func TestOpenClassifiesResponseWindowFailureAfterRequestCommitAsPostSend(t *test
 	running := startSessionServer(t, server, func() (func(), error) { return func() {}, nil })
 	requestWritten := make(chan struct{})
 	client, err := wire.NewClient(context.Background(), wire.ClientConfig{
-		Build: "server-test",
+		WireBuild: "server-test",
 		Dial: func(ctx context.Context) (net.Conn, error) {
 			conn, err := wire.UnixDialer(running.path)(ctx)
 			if err != nil {
@@ -344,8 +344,8 @@ func TestCommittedRequestWinsConcurrentSessionFailure(t *testing.T) {
 				serverDone <- err
 				return
 			}
-			identity, err := json.Marshal(wire.BuildIdentity{
-				Protocol: wire.ProtocolVersion, Build: "server-test", Session: make([]byte, 16),
+			identity, err := json.Marshal(wire.WireIdentity{
+				Protocol: wire.ProtocolVersion, WireBuild: "server-test", Session: make([]byte, 16),
 			})
 			if err != nil {
 				serverDone <- err
@@ -367,8 +367,8 @@ func TestCommittedRequestWinsConcurrentSessionFailure(t *testing.T) {
 		}()
 
 		client, err := wire.NewClient(t.Context(), wire.ClientConfig{
-			Build: "server-test",
-			Dial:  func(context.Context) (net.Conn, error) { return wrapped, nil },
+			WireBuild: "server-test",
+			Dial:      func(context.Context) (net.Conn, error) { return wrapped, nil },
 		})
 		if err != nil {
 			t.Fatalf("attempt %d NewClient: %v", attempt, err)
@@ -389,7 +389,7 @@ func TestCommittedRequestWinsConcurrentSessionFailure(t *testing.T) {
 
 func TestCallClassifiesUnwrittenOversizedRequestAsPreSend(t *testing.T) {
 	var calls atomic.Int32
-	server := &wire.Server{Build: "server-test"}
+	server := &wire.Server{WireBuild: "server-test"}
 	server.RegisterControl("mutate", func(context.Context, wire.Request) (any, error) {
 		calls.Add(1)
 		return true, nil
@@ -441,7 +441,7 @@ func TestClientRejectsOversizedProtocolWindowsBeforeDial(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			var dials atomic.Int32
-			test.config.Build = "client-test"
+			test.config.WireBuild = "client-test"
 			test.config.Dial = func(context.Context) (net.Conn, error) {
 				dials.Add(1)
 				return nil, errors.New("dial invoked")
@@ -470,7 +470,7 @@ func TestServerRejectsOversizedProtocolWindowBeforeStarting(t *testing.T) {
 		t.Fatalf("Listen: %v", err)
 	}
 	defer listener.Close()
-	server := &wire.Server{Build: "server-test", StreamQueue: window}
+	server := &wire.Server{WireBuild: "server-test", StreamQueue: window}
 	admit := func() (func(), error) { return func() {}, nil }
 	err = server.Serve(
 		context.Background(),
@@ -485,7 +485,7 @@ func TestServerRejectsOversizedProtocolWindowBeforeStarting(t *testing.T) {
 }
 
 func TestPersistentSessionMultiplexesEventsAndStreams(t *testing.T) {
-	server := &wire.Server{Build: "server-test"}
+	server := &wire.Server{WireBuild: "server-test"}
 	server.RegisterConcurrent("echo", func(_ context.Context, request wire.Request) (any, error) {
 		return string(request.Payload), nil
 	})
@@ -505,8 +505,8 @@ func TestPersistentSessionMultiplexesEventsAndStreams(t *testing.T) {
 	var inflight atomic.Int32
 	running := startSessionServer(t, server, admitAll(&inflight))
 	client := newClient(t, running, nil)
-	if got := client.PeerBuild(); got.Protocol != wire.ProtocolVersion || got.Build != "server-test" {
-		t.Fatalf("PeerBuild = %#v", got)
+	if got := client.PeerWireIdentity(); got.Protocol != wire.ProtocolVersion || got.WireBuild != "server-test" {
+		t.Fatalf("PeerWireIdentity = %#v", got)
 	}
 
 	var wg sync.WaitGroup
@@ -580,7 +580,7 @@ func TestPersistentSessionMultiplexesEventsAndStreams(t *testing.T) {
 
 func TestAcceptedSessionDoneOutlivesUnaryAdmissionAndIsSessionScoped(t *testing.T) {
 	sessions := make(chan *wire.AcceptedSession, 2)
-	server := &wire.Server{Build: "server-test"}
+	server := &wire.Server{WireBuild: "server-test"}
 	server.RegisterControl("bind", func(_ context.Context, request wire.Request) (any, error) {
 		sessions <- request.Session
 		return true, nil
@@ -652,7 +652,7 @@ func TestAcceptedSessionDoneOutlivesUnaryAdmissionAndIsSessionScoped(t *testing.
 
 func TestAcceptedSessionDoneClosesOnServerShutdown(t *testing.T) {
 	sessions := make(chan *wire.AcceptedSession, 1)
-	server := &wire.Server{Build: "server-test"}
+	server := &wire.Server{WireBuild: "server-test"}
 	server.RegisterControl("bind", func(_ context.Context, request wire.Request) (any, error) {
 		sessions <- request.Session
 		return true, nil
@@ -682,7 +682,7 @@ func TestAcceptedSessionDisconnectedPrecedesBlockedRequestSettlement(t *testing.
 	release := make(chan struct{})
 	var releaseOnce sync.Once
 	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
-	server := &wire.Server{Build: "server-test"}
+	server := &wire.Server{WireBuild: "server-test"}
 	server.RegisterControl("block", func(ctx context.Context, request wire.Request) (any, error) {
 		sessions <- request.Session
 		close(entered)
@@ -728,7 +728,7 @@ func TestAcceptedSessionDisconnectedPrecedesBlockedGracefulClose(t *testing.T) {
 	release := make(chan struct{})
 	var releaseOnce sync.Once
 	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
-	server := &wire.Server{Build: "server-test"}
+	server := &wire.Server{WireBuild: "server-test"}
 	server.RegisterControl("block", func(ctx context.Context, request wire.Request) (any, error) {
 		sessions <- request.Session
 		close(entered)
@@ -773,7 +773,7 @@ func TestAcceptedSessionDisconnectedPrecedesBlockedServerStop(t *testing.T) {
 	release := make(chan struct{})
 	var releaseOnce sync.Once
 	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
-	server := &wire.Server{Build: "server-test"}
+	server := &wire.Server{WireBuild: "server-test"}
 	server.RegisterControl("block", func(ctx context.Context, request wire.Request) (any, error) {
 		sessions <- request.Session
 		close(entered)
@@ -810,7 +810,7 @@ func TestAcceptedSessionDisconnectedPrecedesBlockedServerStop(t *testing.T) {
 func TestClientAbortIsTypedAndWaitsForAcceptedSessionSettlement(t *testing.T) {
 	const attempts = 32
 	sessions := make(chan *wire.AcceptedSession, 1)
-	server := &wire.Server{Build: "server-test"}
+	server := &wire.Server{WireBuild: "server-test"}
 	server.RegisterControl("block", func(ctx context.Context, request wire.Request) (any, error) {
 		sessions <- request.Session
 		<-ctx.Done()
@@ -846,7 +846,7 @@ func TestNaturalClientCloseStrictlyAcknowledgesAndSettlesSession(t *testing.T) {
 	const attempts = 32
 	sessions := make(chan *wire.AcceptedSession, 1)
 	var active atomic.Int32
-	server := &wire.Server{Build: "server-test", MaxSessions: 1}
+	server := &wire.Server{WireBuild: "server-test", MaxSessions: 1}
 	server.RegisterControl("ping", func(_ context.Context, request wire.Request) (any, error) {
 		sessions <- request.Session
 		return true, nil
@@ -881,7 +881,7 @@ func TestNaturalClientCloseStrictlyAcknowledgesAndSettlesSession(t *testing.T) {
 
 func TestSessionSurvivesPastHandshakeDeadline(t *testing.T) {
 	const handshakeTimeout = 100 * time.Millisecond
-	server := &wire.Server{Build: "server-test", HandshakeTimeout: handshakeTimeout}
+	server := &wire.Server{WireBuild: "server-test", HandshakeTimeout: handshakeTimeout}
 	server.RegisterControl("ping", func(context.Context, wire.Request) (any, error) { return "pong", nil })
 	var inflight atomic.Int32
 	running := startSessionServer(t, server, admitAll(&inflight))
@@ -911,7 +911,7 @@ func TestClientHandshakeUsesEarlierCallerDeadline(t *testing.T) {
 	defer cancel()
 	started := time.Now()
 	_, err := wire.NewClient(ctx, wire.ClientConfig{
-		Build:            "client-test",
+		WireBuild:        "client-test",
 		HandshakeTimeout: 5 * time.Second,
 		Dial: func(context.Context) (net.Conn, error) {
 			return clientConn, nil
@@ -929,7 +929,7 @@ func TestAdmissionCompletesAfterTerminalFrameIsWritten(t *testing.T) {
 	const maxFrame = 16 << 20
 	handlerStarted := make(chan struct{})
 	admissionDone := make(chan struct{}, 1)
-	server := &wire.Server{Build: "server-test", MaxFrame: maxFrame}
+	server := &wire.Server{WireBuild: "server-test", MaxFrame: maxFrame}
 	server.RegisterControl("large", func(context.Context, wire.Request) (any, error) {
 		close(handlerStarted)
 		return strings.Repeat("x", 8<<20), nil
@@ -944,7 +944,7 @@ func TestAdmissionCompletesAfterTerminalFrameIsWritten(t *testing.T) {
 	defer conn.Close()
 	codec := wire.NewCodec(conn)
 	codec.MaxFrame = maxFrame
-	identity, err := json.Marshal(wire.BuildIdentity{Protocol: wire.ProtocolVersion, Build: "server-test"})
+	identity, err := json.Marshal(wire.WireIdentity{Protocol: wire.ProtocolVersion, WireBuild: "server-test"})
 	if err != nil {
 		t.Fatalf("Marshal identity: %v", err)
 	}
@@ -955,7 +955,7 @@ func TestAdmissionCompletesAfterTerminalFrameIsWritten(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read hello ack: %v", err)
 	}
-	var serverIdentity wire.BuildIdentity
+	var serverIdentity wire.WireIdentity
 	if err := json.Unmarshal(helloAck.Payload, &serverIdentity); err != nil {
 		t.Fatalf("decode server identity: %v", err)
 	}
@@ -1014,14 +1014,14 @@ func readSessionNonWindowFrame(t *testing.T, codec *wire.Codec) wire.Frame {
 	}
 }
 
-func openRawSession(t *testing.T, running *runningServer) (net.Conn, *wire.Codec, wire.BuildIdentity) {
+func openRawSession(t *testing.T, running *runningServer) (net.Conn, *wire.Codec, wire.WireIdentity) {
 	t.Helper()
 	conn, err := net.Dial("unix", running.path)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
 	codec := wire.NewCodec(conn)
-	identity, err := json.Marshal(wire.BuildIdentity{Protocol: wire.ProtocolVersion, Build: "server-test"})
+	identity, err := json.Marshal(wire.WireIdentity{Protocol: wire.ProtocolVersion, WireBuild: "server-test"})
 	if err != nil {
 		_ = conn.Close()
 		t.Fatalf("Marshal identity: %v", err)
@@ -1035,7 +1035,7 @@ func openRawSession(t *testing.T, running *runningServer) (net.Conn, *wire.Codec
 		_ = conn.Close()
 		t.Fatalf("read hello acknowledgement: %v", err)
 	}
-	var serverIdentity wire.BuildIdentity
+	var serverIdentity wire.WireIdentity
 	if err := json.Unmarshal(frame.Payload, &serverIdentity); err != nil {
 		_ = conn.Close()
 		t.Fatalf("decode server identity: %v", err)
@@ -1073,7 +1073,7 @@ func waitNoAdmissions(t *testing.T, active *atomic.Int32) {
 
 func TestTerminalAcknowledgementsAreBoundToWrittenRequestAndSession(t *testing.T) {
 	var active atomic.Int32
-	server := &wire.Server{Build: "server-test", WriteTimeout: time.Second}
+	server := &wire.Server{WireBuild: "server-test", WriteTimeout: time.Second}
 	server.RegisterConcurrent("ping", func(context.Context, wire.Request) (any, error) { return true, nil })
 	server.RegisterConcurrent("block", func(ctx context.Context, _ wire.Request) (any, error) {
 		<-ctx.Done()
@@ -1169,7 +1169,7 @@ func TestTerminalAcknowledgementsAreBoundToWrittenRequestAndSession(t *testing.T
 func TestBackpressuredResponseCancellationFailsSessionAndReleasesAdmission(t *testing.T) {
 	const maxFrame = 2 << 20
 	admissionDone := make(chan struct{}, 1)
-	server := &wire.Server{Build: "server-test", MaxFrame: maxFrame, OutboundQueue: 1}
+	server := &wire.Server{WireBuild: "server-test", MaxFrame: maxFrame, OutboundQueue: 1}
 	server.RegisterConcurrent("stream", func(context.Context, wire.Request) (any, error) {
 		chunks := make(chan []byte, 4)
 		payload := []byte(strings.Repeat("x", 1<<20))
@@ -1184,8 +1184,8 @@ func TestBackpressuredResponseCancellationFailsSessionAndReleasesAdmission(t *te
 	})
 	var blocked *blockAfterHandshakeConn
 	client, err := wire.NewClient(context.Background(), wire.ClientConfig{
-		Build:    "server-test",
-		MaxFrame: maxFrame,
+		WireBuild: "server-test",
+		MaxFrame:  maxFrame,
 		Dial: func(ctx context.Context) (net.Conn, error) {
 			conn, err := wire.UnixDialer(running.path)(ctx)
 			if err != nil {
@@ -1228,7 +1228,7 @@ func TestGoAwayInterruptsBlockedWriterAndSettlesEveryAdmission(t *testing.T) {
 	)
 	var active atomic.Int32
 	server := &wire.Server{
-		Build: "server-test", MaxFrame: maxFrame, Workers: requests, Backlog: requests,
+		WireBuild: "server-test", MaxFrame: maxFrame, Workers: requests, Backlog: requests,
 		InboundQueue: requests + 1, OutboundQueue: requests + 1,
 	}
 	server.RegisterConcurrent("large", func(context.Context, wire.Request) (any, error) {
@@ -1237,7 +1237,7 @@ func TestGoAwayInterruptsBlockedWriterAndSettlesEveryAdmission(t *testing.T) {
 	running := startSessionServer(t, server, admitAll(&active))
 	var blocked *blockAfterHandshakeConn
 	client, err := wire.NewClient(context.Background(), wire.ClientConfig{
-		Build: "server-test", MaxFrame: maxFrame, OutboundQueue: requests + 1,
+		WireBuild: "server-test", MaxFrame: maxFrame, OutboundQueue: requests + 1,
 		Dial: func(ctx context.Context) (net.Conn, error) {
 			conn, err := wire.UnixDialer(running.path)(ctx)
 			if err != nil {
@@ -1277,7 +1277,7 @@ func TestGoAwayInterruptsBlockedWriterAndSettlesEveryAdmission(t *testing.T) {
 
 func TestTerminalAcknowledgementTimeoutClosesSessionAndReleasesAdmission(t *testing.T) {
 	admissionDone := make(chan struct{}, 1)
-	server := &wire.Server{Build: "server-test", WriteTimeout: 50 * time.Millisecond}
+	server := &wire.Server{WireBuild: "server-test", WriteTimeout: 50 * time.Millisecond}
 	server.RegisterControl("ping", func(context.Context, wire.Request) (any, error) { return true, nil })
 	running := startSessionServer(t, server, func() (func(), error) {
 		return func() { admissionDone <- struct{}{} }, nil
@@ -1288,7 +1288,7 @@ func TestTerminalAcknowledgementTimeoutClosesSessionAndReleasesAdmission(t *test
 	}
 	defer conn.Close()
 	codec := wire.NewCodec(conn)
-	identity, _ := json.Marshal(wire.BuildIdentity{Protocol: wire.ProtocolVersion, Build: "server-test"})
+	identity, _ := json.Marshal(wire.WireIdentity{Protocol: wire.ProtocolVersion, WireBuild: "server-test"})
 	if err := codec.WriteFrame(wire.Frame{Kind: wire.FrameHello, Flags: wire.FlagEnd, Payload: identity}); err != nil {
 		t.Fatalf("write hello: %v", err)
 	}
@@ -1319,7 +1319,7 @@ func TestTerminalAcknowledgementTimeoutClosesSessionAndReleasesAdmission(t *test
 }
 
 func TestSlowEventConsumerBackpressuresWithoutDropping(t *testing.T) {
-	server := &wire.Server{Build: "server-test"}
+	server := &wire.Server{WireBuild: "server-test"}
 	server.RegisterControl("events", func(ctx context.Context, request wire.Request) (any, error) {
 		if err := request.Session.PushEvent(ctx, wire.Event{Topic: "one"}); err != nil {
 			return nil, err
@@ -1363,7 +1363,7 @@ func TestSlowEventConsumerBackpressuresWithoutDropping(t *testing.T) {
 }
 
 func TestSlowResponseConsumerBackpressuresWithoutDropping(t *testing.T) {
-	server := &wire.Server{Build: "server-test"}
+	server := &wire.Server{WireBuild: "server-test"}
 	server.RegisterControl("stream-many", func(context.Context, wire.Request) (any, error) {
 		chunks := make(chan []byte, 3)
 		chunks <- []byte("one")
@@ -1429,7 +1429,7 @@ func TestSlowResponseConsumerBackpressuresWithoutDropping(t *testing.T) {
 
 func TestCanceledCallSettlementTimeoutFailsSession(t *testing.T) {
 	release := make(chan struct{})
-	server := &wire.Server{Build: "server-test"}
+	server := &wire.Server{WireBuild: "server-test"}
 	server.RegisterControl("ignore-cancel", func(context.Context, wire.Request) (any, error) {
 		<-release
 		return true, nil
@@ -1454,7 +1454,7 @@ func TestCanceledCallSettlementTimeoutFailsSession(t *testing.T) {
 
 func TestRequestStreamOrderingAndCancellation(t *testing.T) {
 	canceled := make(chan struct{})
-	server := &wire.Server{Build: "server-test"}
+	server := &wire.Server{WireBuild: "server-test"}
 	server.RegisterControl("collect", func(_ context.Context, request wire.Request) (any, error) {
 		var values []string
 		for chunk := range request.Chunks {
@@ -1522,7 +1522,7 @@ func TestSlowRequestConsumerBackpressuresWithoutDropping(t *testing.T) {
 		chunkCount = 128
 		chunkBytes = 64 << 10
 	)
-	server := &wire.Server{Build: "server-test", StreamQueue: 2, MaxFrame: 2 << 20}
+	server := &wire.Server{WireBuild: "server-test", StreamQueue: 2, MaxFrame: 2 << 20}
 	server.RegisterControl("upload", func(_ context.Context, request wire.Request) (any, error) {
 		count := 0
 		bytes := 0
@@ -1567,7 +1567,7 @@ func TestSlowRequestConsumerBackpressuresWithoutDropping(t *testing.T) {
 
 func TestCanceledRequestStreamReapsHandlerAndPreservesSession(t *testing.T) {
 	settled := make(chan struct{})
-	server := &wire.Server{Build: "server-test", InboundQueue: 1, StreamQueue: 1}
+	server := &wire.Server{WireBuild: "server-test", InboundQueue: 1, StreamQueue: 1}
 	server.RegisterControl("upload", func(_ context.Context, request wire.Request) (any, error) {
 		for range request.Chunks {
 			continue
@@ -1603,7 +1603,7 @@ func TestCanceledRequestStreamReapsHandlerAndPreservesSession(t *testing.T) {
 }
 
 func TestBlockedUploadDoesNotBlockUnrelatedResponse(t *testing.T) {
-	server := &wire.Server{Build: "server-test", StreamQueue: 1}
+	server := &wire.Server{WireBuild: "server-test", StreamQueue: 1}
 	server.RegisterControl("upload", func(ctx context.Context, _ wire.Request) (any, error) {
 		<-ctx.Done()
 		return nil, ctx.Err()
@@ -1639,7 +1639,7 @@ func TestInboundQueueRejectsWithoutDispatch(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	var calls atomic.Int32
-	server := &wire.Server{Build: "server-test", InboundQueue: 1}
+	server := &wire.Server{WireBuild: "server-test", InboundQueue: 1}
 	server.RegisterControl("block", func(context.Context, wire.Request) (any, error) {
 		calls.Add(1)
 		close(entered)
@@ -1673,7 +1673,7 @@ func TestInboundQueueRejectsWithoutDispatch(t *testing.T) {
 
 func TestCloseIntakeRejectsOrdinaryRequestsOnAcceptedSession(t *testing.T) {
 	var calls atomic.Int32
-	server := &wire.Server{Build: "server-test"}
+	server := &wire.Server{WireBuild: "server-test"}
 	server.RegisterControl("mutate", func(context.Context, wire.Request) (any, error) {
 		calls.Add(1)
 		return true, nil
@@ -1696,7 +1696,7 @@ func TestCloseIntakeRejectsOrdinaryRequestsOnAcceptedSession(t *testing.T) {
 func TestMismatchedBuildRejectsMutationBeforeAdmission(t *testing.T) {
 	var calls atomic.Int32
 	var admissions atomic.Int32
-	server := &wire.Server{Build: "new-build"}
+	server := &wire.Server{WireBuild: "new-build"}
 	server.RegisterControl("mutate", func(context.Context, wire.Request) (any, error) {
 		calls.Add(1)
 		return true, nil
@@ -1705,7 +1705,7 @@ func TestMismatchedBuildRejectsMutationBeforeAdmission(t *testing.T) {
 		admissions.Add(1)
 		return func() {}, nil
 	})
-	client := newClient(t, running, func(config *wire.ClientConfig) { config.Build = "old-build" })
+	client := newClient(t, running, func(config *wire.ClientConfig) { config.WireBuild = "old-build" })
 	result, err := client.Call(context.Background(), "mutate", "", nil)
 	if err != nil {
 		t.Fatalf("Call: %v", err)
@@ -1719,7 +1719,7 @@ func TestMismatchedBuildRejectsMutationBeforeAdmission(t *testing.T) {
 }
 
 func TestMaxSessionsBoundsStalledHandshakes(t *testing.T) {
-	server := &wire.Server{Build: "server-test", MaxSessions: 1, HandshakeTimeout: time.Second}
+	server := &wire.Server{WireBuild: "server-test", MaxSessions: 1, HandshakeTimeout: time.Second}
 	var inflight atomic.Int32
 	running := startSessionServer(t, server, admitAll(&inflight))
 	stalled, err := net.Dial("unix", running.path)
@@ -1730,7 +1730,7 @@ func TestMaxSessionsBoundsStalledHandshakes(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	_, err = wire.NewClient(ctx, wire.ClientConfig{Dial: wire.UnixDialer(running.path), Build: "server-test"})
+	_, err = wire.NewClient(ctx, wire.ClientConfig{Dial: wire.UnixDialer(running.path), WireBuild: "server-test"})
 	if err == nil {
 		t.Fatal("second session unexpectedly passed a saturated handshake bound")
 	}
@@ -1738,7 +1738,7 @@ func TestMaxSessionsBoundsStalledHandshakes(t *testing.T) {
 
 func TestDuplicateRequestIDNeverDispatchesTwice(t *testing.T) {
 	var calls atomic.Int32
-	server := &wire.Server{Build: "server-test"}
+	server := &wire.Server{WireBuild: "server-test"}
 	server.RegisterControl("mutate", func(context.Context, wire.Request) (any, error) {
 		calls.Add(1)
 		return true, nil
@@ -1751,7 +1751,7 @@ func TestDuplicateRequestIDNeverDispatchesTwice(t *testing.T) {
 	}
 	defer conn.Close()
 	codec := wire.NewCodec(conn)
-	identity, err := json.Marshal(wire.BuildIdentity{Protocol: wire.ProtocolVersion, Build: "server-test"})
+	identity, err := json.Marshal(wire.WireIdentity{Protocol: wire.ProtocolVersion, WireBuild: "server-test"})
 	if err != nil {
 		t.Fatalf("Marshal identity: %v", err)
 	}

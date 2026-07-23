@@ -120,7 +120,7 @@ public final class SocketServer: @unchecked Sendable {
     }
 
     private let path: String
-    private let build: String
+    private let wireBuild: String
     private let configuration: Configuration
     private let trust: PeerTrust
     private let handler: @Sendable (SocketRequest) async -> SocketResponse
@@ -143,13 +143,13 @@ public final class SocketServer: @unchecked Sendable {
 
     public init(
         path: String,
-        build: String,
+        wireBuild: String,
         configuration: Configuration = .init(),
         trust: PeerTrust,
         handler: @escaping @Sendable (SocketRequest) async -> SocketResponse
     ) {
         self.path = path
-        self.build = build
+        self.wireBuild = wireBuild
         self.configuration = configuration
         self.trust = trust
         self.handler = handler
@@ -159,7 +159,7 @@ public final class SocketServer: @unchecked Sendable {
 extension SocketServer {
     /// Reclaims a stale socket, binds with mode 0600, and starts accepting sessions.
     public func start() async throws {
-        guard !build.isEmpty else { throw SocketServerError.emptyBuild }
+        guard !wireBuild.isEmpty else { throw SocketServerError.emptyWireBuild }
         guard configuration.maximumFrameBytes > 0,
               configuration.maximumActiveRequests > 0,
               configuration.maximumSessions > 0,
@@ -493,7 +493,7 @@ extension SocketServer {
             let session = ServerSession(
                 descriptor: descriptor,
                 shutdown: { connection.shutdown() },
-                build: build,
+                wireBuild: wireBuild,
                 peer: peer,
                 configuration: configuration,
                 handler: handler
@@ -571,7 +571,7 @@ extension SocketServer {
 
 final class ServerSession: @unchecked Sendable {
     let descriptor: Int32
-    private let serverBuild: String
+    private let serverWireBuild: String
     private let peer: SocketPeer
     private let configuration: SocketServer.Configuration
     private let handler: @Sendable (SocketRequest) async -> SocketResponse
@@ -591,14 +591,14 @@ final class ServerSession: @unchecked Sendable {
     init(
         descriptor: Int32,
         shutdown: @escaping @Sendable () -> Void,
-        build: String,
+        wireBuild: String,
         peer: SocketPeer,
         configuration: SocketServer.Configuration,
         handler: @escaping @Sendable (SocketRequest) async -> SocketResponse
     ) {
         self.descriptor = descriptor
         shutdownDescriptor = shutdown
-        serverBuild = build
+        serverWireBuild = wireBuild
         self.peer = peer
         self.configuration = configuration
         self.handler = handler
@@ -623,12 +623,12 @@ final class ServerSession: @unchecked Sendable {
 
     func run() async throws {
         do {
-            let clientBuild = try await handshake()
+            let clientWireBuild = try await handshake()
             while true {
                 let frame = try await read()
                 switch frame.kind {
                 case .request:
-                    try await receiveRequest(frame, clientBuild: clientBuild)
+                    try await receiveRequest(frame, clientWireBuild: clientWireBuild)
                 case .cancel:
                     try await receiveCancel(frame)
                 case .stream:
@@ -708,23 +708,23 @@ final class ServerSession: @unchecked Sendable {
         else {
             throw SessionTransportError.handshake("invalid hello")
         }
-        let identity = try JSONDecoder().decode(SessionBuildIdentity.self, from: frame.payload)
+        let identity = try JSONDecoder().decode(SessionWireIdentity.self, from: frame.payload)
         guard identity.protocolVersion == daemonKitSessionProtocolVersion else {
             throw SessionTransportError.unsupportedProtocolVersion(identity.protocolVersion)
         }
-        guard !identity.build.isEmpty else {
-            throw SessionTransportError.handshake("empty build")
+        guard !identity.wireBuild.isEmpty else {
+            throw SessionTransportError.handshake("empty wireBuild")
         }
         guard identity.session == nil else {
             throw SessionTransportError.handshake("client supplied a session generation")
         }
-        let payload = try JSONEncoder().encode(SessionBuildIdentity(
+        let payload = try JSONEncoder().encode(SessionWireIdentity(
             protocolVersion: daemonKitSessionProtocolVersion,
-            build: serverBuild,
+            wireBuild: serverWireBuild,
             session: generation
         ))
         try await write(SessionFrame(kind: .helloAck, flags: .end, payload: payload))
-        return identity.build
+        return identity.wireBuild
     }
 
     private func read(timeout: TimeInterval = 0) async throws -> SessionFrame {
@@ -738,11 +738,11 @@ final class ServerSession: @unchecked Sendable {
         case rejected(String)
     }
 
-    private func receiveRequest(_ frame: SessionFrame, clientBuild: String) async throws {
+    private func receiveRequest(_ frame: SessionFrame, clientWireBuild: String) async throws {
         guard frame.id != 0, !frame.operation.isEmpty, frame.sequence == 0 else {
             throw SessionTransportError.invalidFrame("request")
         }
-        let admission = try admit(frame, clientBuild: clientBuild)
+        let admission = try admit(frame, clientWireBuild: clientWireBuild)
         guard case let .accepted(state) = admission else {
             guard case let .rejected(reason) = admission else { return }
             try await sendRejected(id: frame.id, reason: reason)
@@ -771,7 +771,7 @@ final class ServerSession: @unchecked Sendable {
             payload: frame.payload,
             chunks: chunks,
             peer: peer,
-            peerBuild: clientBuild,
+            peerWireBuild: clientWireBuild,
             session: publicSession
         )
         let task = Task { [weak self] in
@@ -807,7 +807,7 @@ final class ServerSession: @unchecked Sendable {
 }
 
 private extension ServerSession {
-    private func admit(_ frame: SessionFrame, clientBuild: String) throws -> Admission {
+    private func admit(_ frame: SessionFrame, clientWireBuild: String) throws -> Admission {
         lock.lock()
         defer { lock.unlock() }
         guard frame.id > watermark, !seen.contains(frame.id) else {
@@ -822,8 +822,8 @@ private extension ServerSession {
         while seen.remove(watermark + 1) != nil {
             watermark += 1
         }
-        if clientBuild != serverBuild, !["health", "shutdown", "handoff"].contains(frame.operation) {
-            return .rejected("wire: client build does not match server build")
+        if clientWireBuild != serverWireBuild {
+            return .rejected("wire: client wireBuild does not match server wireBuild")
         }
         let state = ServerRequestState(capacity: configuration.streamQueueDepth)
         active[frame.id] = state

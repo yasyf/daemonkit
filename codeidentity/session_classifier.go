@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/yasyf/daemonkit/version"
 	"github.com/yasyf/daemonkit/wire"
 )
 
@@ -75,12 +74,6 @@ func (c FixedClassifier) Classify(ctx context.Context, peer wire.Peer) (bool, er
 		return false, fmt.Errorf("%w: accepted protected peer process identity changed", ErrUntrustedPeer)
 	}
 	return true, nil
-}
-
-// AuthorizeLifecycleBuild admits only the same daemon release or a strictly newer
-// successor to lifecycle routes.
-func (FixedClassifier) AuthorizeLifecycleBuild(serverBuild, peerBuild string) bool {
-	return peerBuild == serverBuild || version.Newer(peerBuild, serverBuild)
 }
 
 var _ wire.ProtectedSessionClassifier = FixedClassifier{}

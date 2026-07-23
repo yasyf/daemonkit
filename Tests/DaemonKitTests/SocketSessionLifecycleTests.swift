@@ -43,7 +43,7 @@ extension SocketTransportTests {
     struct SocketSessionLifecycleTests {
         @Test func acceptedSessionClosesExactlyOnPeerDisconnect() async throws {
             let fixture = try await makeFixture()
-            let client = try await SocketClient(path: fixture.path, build: "server-test", trust: .sameEffectiveUser)
+            let client = try await SocketClient(path: fixture.path, wireBuild: "server-test", trust: .sameEffectiveUser)
             _ = try await client.call(operation: "capture")
             let session = await fixture.capture.value()
             #expect(session.isConnected)
@@ -57,7 +57,7 @@ extension SocketTransportTests {
         @Test func acceptedSessionClosesOnServerStop() async throws {
             try await withAsyncCleanup { cleanup in
                 let fixture = try await makeFixture()
-                let client = try await SocketClient(path: fixture.path, build: "server-test", trust: .sameEffectiveUser)
+                let client = try await SocketClient(path: fixture.path, wireBuild: "server-test", trust: .sameEffectiveUser)
                 cleanup.add { await client.close() }
                 _ = try await client.call(operation: "capture")
                 let session = await fixture.capture.value()
@@ -75,7 +75,7 @@ extension SocketTransportTests {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             let path = directory.appendingPathComponent("s.sock").path
             let capture = SessionCapture()
-            let server = SocketServer(path: path, build: "server-test", trust: .sameEffectiveUser) { request in
+            let server = SocketServer(path: path, wireBuild: "server-test", trust: .sameEffectiveUser) { request in
                 await capture.record(request.session)
                 return .terminal(SocketTerminal(payload: Data("true".utf8)))
             }

@@ -28,6 +28,8 @@ const (
 	RecoveryTrust
 	// RecoveryHolder gates the aggregate holder recovery barrier.
 	RecoveryHolder
+	// RecoveryStopControl authenticates one pre-dispatch cross-process stop caller.
+	RecoveryStopControl
 )
 
 // Validate rejects an absent or unknown recovery class.
@@ -35,7 +37,7 @@ func (c RecoveryClass) Validate() error {
 	switch c {
 	case RecoverySourceOwner, RecoverySourceDriver, RecoveryBroker, RecoveryNativeMount,
 		RecoveryCatalogWorker, RecoveryObserver, RecoveryTask, RecoveryService,
-		RecoveryTrust, RecoveryHolder:
+		RecoveryTrust, RecoveryHolder, RecoveryStopControl:
 		return nil
 	default:
 		return fmt.Errorf("proc: invalid recovery class %d", c)

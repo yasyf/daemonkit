@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/yasyf/daemonkit/internal/runtimeauth"
 	"github.com/yasyf/daemonkit/proc"
 )
 
@@ -23,7 +24,7 @@ var errRuntimeExitSelf = errors.New("daemon: same-or-newer runtime already servi
 // Admission tracks admitted frames through their terminal responses.
 type Admission interface {
 	Admit() (done func(), err error)
-	AdmitLifecycle() (done func(), err error)
+	AdmitProtected() (done func(), err error)
 	Close()
 	Draining() bool
 	Settle(ctx context.Context) error
@@ -35,7 +36,7 @@ type SessionServer interface {
 		ctx context.Context,
 		listener net.Listener,
 		ready func() error,
-		admit, admitLifecycle func() (func(), error),
+		admit, admitProtected func() (func(), error),
 	) error
 	CloseIntake() error
 }
@@ -63,17 +64,12 @@ type Activation struct {
 }
 
 // RuntimeConfig defines one daemon process generation. Every ownership seam is
-// required so a partial shutdown cannot silently omit a lifecycle phase.
+// required so a partial shutdown cannot silently omit an owned phase.
 type RuntimeConfig struct {
-	Socket   string
-	Build    string
-	Protocol int
+	Socket          string
+	RuntimeBuild    string
+	RuntimeProtocol int
 
-	Peer         Peer
-	Contract     Contract
-	WaitMode     WaitMode
-	Grace        time.Duration
-	WaitTimeout  time.Duration
 	ListenerWait time.Duration
 	Admission    Admission
 	Server       SessionServer
@@ -81,14 +77,10 @@ type RuntimeConfig struct {
 	State        io.Closer
 	Resources    Resources
 	// Activate constructs and publishes the generation's owned state only after
-	// listener acquisition and takeover have established exclusive ownership.
+	// listener acquisition has established exclusive ownership.
 	// It must use Startup only for bounded construction and readiness, and
 	// Lifetime for resources retained after a successful return.
 	Activate func(Activation) error
-
-	// Handoff transfers external ownership during an upgrade. It is required
-	// exactly for ResourceOwner and is never called for ordinary shutdown.
-	Handoff func(ctx context.Context) error
 
 	// Busy reports consumer work outside Admission and Workers.
 	Busy func() bool
@@ -99,39 +91,46 @@ type RuntimeConfig struct {
 	Signals         <-chan os.Signal
 }
 
-type stopKind uint8
-
-const (
-	stopShutdown stopKind = iota + 1
-	stopHandoff
-)
-
-// Runtime is the sole lifecycle coordinator for one daemon generation.
+// Runtime is the sole process coordinator for one daemon generation.
 type Runtime struct {
-	cfg RuntimeConfig
-
-	mu       sync.Mutex
-	started  bool
-	finished bool
-	stopping bool
-	runErr   error
-	done     chan struct{}
-	ready    chan struct{}
-	isReady  bool
-	stop     chan stopKind
-	stopOnce sync.Once
+	cfg               RuntimeConfig
+	processGeneration string
+	mu                sync.Mutex
+	started           bool
+	finished          bool
+	stopping          bool
+	runErr            error
+	done              chan struct{}
+	ready             chan struct{}
+	isReady           bool
+	stop              chan struct{}
+	stopOnce          sync.Once
 }
 
-// NewRuntime validates cfg and constructs a single-use Runtime.
-func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
+func init() {
+	runtimeauth.Register(func(config any) (any, error) {
+		cfg, ok := config.(RuntimeConfig)
+		if !ok {
+			return nil, errors.New("daemon: invalid private runtime config")
+		}
+		return newRuntime(cfg)
+	})
+}
+
+func newRuntime(cfg RuntimeConfig) (*Runtime, error) {
 	if err := validateRuntimeConfig(cfg); err != nil {
 		return nil, err
 	}
+	generation, err := proc.ProcessGeneration()
+	if err != nil {
+		return nil, fmt.Errorf("daemon: derive process generation: %w", err)
+	}
 	return &Runtime{
-		cfg:   cfg,
-		done:  make(chan struct{}),
-		ready: make(chan struct{}),
-		stop:  make(chan stopKind, 1),
+		cfg:               cfg,
+		processGeneration: generation,
+		done:              make(chan struct{}),
+		ready:             make(chan struct{}),
+		stop:              make(chan struct{}, 1),
 	}, nil
 }
 
@@ -139,12 +138,10 @@ func validateRuntimeConfig(cfg RuntimeConfig) error {
 	switch {
 	case cfg.Socket == "":
 		return errors.New("daemon: runtime socket is required")
-	case cfg.Build == "":
+	case cfg.RuntimeBuild == "":
 		return errors.New("daemon: runtime build is required")
-	case cfg.Protocol <= 0:
+	case cfg.RuntimeProtocol <= 0:
 		return errors.New("daemon: runtime protocol must be positive")
-	case cfg.Peer == nil:
-		return errors.New("daemon: runtime peer is required")
 	case cfg.Admission == nil:
 		return errors.New("daemon: runtime admission is required")
 	case cfg.Server == nil:
@@ -158,27 +155,10 @@ func validateRuntimeConfig(cfg RuntimeConfig) error {
 	case cfg.Activate == nil:
 		return errors.New("daemon: runtime activation is required")
 	}
-	switch cfg.Contract {
-	case RequestDaemon:
-		if cfg.Handoff != nil {
-			return errors.New("daemon: request runtime must not configure resource handoff")
-		}
-	case ResourceOwner:
-		if cfg.Handoff == nil {
-			return errors.New("daemon: resource-owner runtime requires handoff")
-		}
-	default:
-		return fmt.Errorf("%w: %d", ErrUnknownContract, cfg.Contract)
-	}
-	switch cfg.WaitMode {
-	case SocketRelease, PIDExit:
-		return nil
-	default:
-		return fmt.Errorf("%w: %d", ErrUnknownWaitMode, cfg.WaitMode)
-	}
+	return nil
 }
 
-// Health returns the exact build/protocol and current lifecycle state.
+// Health returns the exact build, protocol, and current runtime state.
 func (r *Runtime) Health(ctx context.Context) (Health, error) {
 	if err := ctx.Err(); err != nil {
 		return Health{}, err
@@ -191,24 +171,27 @@ func (r *Runtime) Health(ctx context.Context) (Health, error) {
 	if r.cfg.Busy != nil {
 		busy = r.cfg.Busy()
 	}
+	r.mu.Lock()
+	stopping := r.stopping
+	draining := stopping || r.cfg.Admission.Draining()
+	ready := r.isReady && !stopping && !r.finished && !draining
+	generation := r.processGeneration
+	r.mu.Unlock()
 	return Health{
-		Build:    r.cfg.Build,
-		Protocol: r.cfg.Protocol,
-		PID:      os.Getpid(),
-		State:    state,
-		Draining: r.cfg.Admission.Draining(),
-		Busy:     busy,
+		RuntimeBuild:      r.cfg.RuntimeBuild,
+		RuntimeProtocol:   r.cfg.RuntimeProtocol,
+		ProcessGeneration: generation,
+		PID:               os.Getpid(),
+		State:             state,
+		Draining:          draining,
+		Busy:              busy,
+		Ready:             ready,
 	}, nil
 }
 
 // Shutdown requests an ordinary graceful shutdown and returns before teardown.
 func (r *Runtime) Shutdown(ctx context.Context) error {
-	return r.requestStop(ctx, stopShutdown)
-}
-
-// Handoff requests an upgrade handoff and returns before teardown.
-func (r *Runtime) Handoff(ctx context.Context) error {
-	return r.requestStop(ctx, stopHandoff)
+	return r.requestStop(ctx)
 }
 
 // Close requests shutdown and waits for Run to finish. Repeated calls return
@@ -225,7 +208,7 @@ func (r *Runtime) Close(ctx context.Context) error {
 		return err
 	}
 	r.mu.Unlock()
-	if err := r.requestStop(ctx, stopShutdown); err != nil && !errors.Is(err, ErrRuntimeClosed) {
+	if err := r.requestStop(ctx); err != nil && !errors.Is(err, ErrRuntimeClosed) {
 		return err
 	}
 	return r.Wait(ctx)
@@ -323,23 +306,19 @@ func (r *Runtime) Run(ctx context.Context) (err error) {
 			listener,
 			r.publishReady,
 			r.cfg.Admission.Admit,
-			r.cfg.Admission.AdmitLifecycle,
+			r.cfg.Admission.AdmitProtected,
 		)
 	}()
 
-	var kind stopKind
 	var cause error
 	var servedEarly bool
 	var serveErr error
 	select {
-	case kind = <-r.stop:
+	case <-r.stop:
 	case <-ctx.Done():
-		kind = stopShutdown
 		cause = ctx.Err()
 	case <-signalCh:
-		kind = stopShutdown
 	case serveErr = <-serveDone:
-		kind = stopShutdown
 		servedEarly = true
 		if serveErr == nil {
 			cause = ErrSessionServerStopped
@@ -349,7 +328,7 @@ func (r *Runtime) Run(ctx context.Context) (err error) {
 	}
 
 	shutdownErr := r.shutdown(
-		ctx, kind, listener, lock, cancelActivation, cancelServe, serveDone, servedEarly,
+		ctx, listener, lock, cancelActivation, cancelServe, serveDone, servedEarly,
 	)
 	return errors.Join(cause, shutdownErr)
 }
@@ -464,7 +443,7 @@ func (r *Runtime) publishReady() error {
 	return nil
 }
 
-func (r *Runtime) requestStop(ctx context.Context, kind stopKind) error {
+func (r *Runtime) requestStop(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -481,42 +460,31 @@ func (r *Runtime) requestStop(ctx context.Context, kind stopKind) error {
 		r.mu.Lock()
 		r.stopping = true
 		r.mu.Unlock()
-		r.stop <- kind
+		r.stop <- struct{}{}
 	})
 	return nil
 }
 
 func (r *Runtime) listen(ctx context.Context) (net.Listener, *os.File, bool, error) {
-	exitSelf := false
+	shouldExit := false
 	entrant := proc.SingleEntrant{
 		Socket:  r.cfg.Socket,
 		Timeout: r.cfg.ListenerWait,
 		Evict: func() (bool, error) {
-			outcome, err := Run(ctx, TakeoverConfig{
-				Self:        r.cfg.Build,
-				Protocol:    r.cfg.Protocol,
-				Peer:        r.cfg.Peer,
-				Contract:    r.cfg.Contract,
-				WaitMode:    r.cfg.WaitMode,
-				Grace:       r.cfg.Grace,
-				WaitTimeout: r.cfg.WaitTimeout,
-			})
+			conn, err := net.DialTimeout("unix", r.cfg.Socket, 100*time.Millisecond)
 			if err != nil {
-				return false, err
+				if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ECONNREFUSED) {
+					return true, nil
+				}
+				return false, fmt.Errorf("daemon: probe incumbent listener: %w", err)
 			}
-			switch outcome {
-			case ExitSelf:
-				exitSelf = true
-				return false, errRuntimeExitSelf
-			case Bind:
-				return true, nil
-			default:
-				return false, fmt.Errorf("daemon: unknown takeover outcome %d", outcome)
-			}
+			_ = conn.Close()
+			shouldExit = true
+			return false, errRuntimeExitSelf
 		},
 	}
 	listener, lock, err := entrant.Listen(ctx)
-	if exitSelf && errors.Is(err, errRuntimeExitSelf) {
+	if shouldExit && errors.Is(err, errRuntimeExitSelf) {
 		return nil, nil, true, nil
 	}
 	if err != nil {
@@ -527,7 +495,6 @@ func (r *Runtime) listen(ctx context.Context) (net.Listener, *os.File, bool, err
 
 func (r *Runtime) shutdown(
 	parent context.Context,
-	kind stopKind,
 	listener net.Listener,
 	lock *os.File,
 	cancelActivation context.CancelFunc,
@@ -549,12 +516,6 @@ func (r *Runtime) shutdown(
 	if err := settleWorkers(ctx, r.cfg.Workers); err != nil {
 		errs = append(errs, fmt.Errorf("daemon: settle workers: %w", err))
 	}
-	if kind == stopHandoff && r.cfg.Contract == ResourceOwner && len(errs) == 0 {
-		if err := r.cfg.Handoff(ctx); err != nil {
-			errs = append(errs, fmt.Errorf("daemon: handoff resources: %w", err))
-		}
-	}
-
 	cancelActivation()
 	cancelServe()
 	if !servedEarly {

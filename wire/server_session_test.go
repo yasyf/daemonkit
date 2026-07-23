@@ -44,7 +44,7 @@ func (c *partialFrameWriteConn) Close() error {
 }
 
 func TestServeSessionRoundTripGoAwayAndJoin(t *testing.T) {
-	server := &Server{Build: "session-test"}
+	server := &Server{WireBuild: "session-test"}
 	server.RegisterConcurrent("echo", func(_ context.Context, request Request) (any, error) {
 		return string(request.Payload), nil
 	})
@@ -79,7 +79,7 @@ func TestServeSessionRoundTripGoAwayAndJoin(t *testing.T) {
 
 func TestServeSessionGoAwayRejectsPartialFrameAcknowledgement(t *testing.T) {
 	var active atomic.Int32
-	server := &Server{Build: "session-test"}
+	server := &Server{WireBuild: "session-test"}
 	server.RegisterConcurrent("large", func(context.Context, Request) (any, error) {
 		return strings.Repeat("x", 1<<20), nil
 	})
@@ -120,7 +120,7 @@ func TestServeSessionGoAwayRejectsPartialFrameAcknowledgement(t *testing.T) {
 func TestServeSessionPropagatesCancellationAndJoinsHandlers(t *testing.T) {
 	entered := make(chan struct{})
 	settled := make(chan struct{})
-	server := &Server{Build: "session-test"}
+	server := &Server{WireBuild: "session-test"}
 	server.RegisterConcurrent("block", func(ctx context.Context, _ Request) (any, error) {
 		close(entered)
 		<-ctx.Done()
@@ -162,7 +162,7 @@ func TestServeSessionPropagatesCancellationAndJoinsHandlers(t *testing.T) {
 }
 
 func TestServeSessionContextCancellationClosesIdleTransport(t *testing.T) {
-	server := &Server{Build: "session-test"}
+	server := &Server{WireBuild: "session-test"}
 	clientConn, serverConn := net.Pipe()
 	identity := currentSessionIdentity(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -189,7 +189,7 @@ func TestServeSessionEOFAndOpaqueIdentityFailClosed(t *testing.T) {
 		identity := currentSessionIdentity(t)
 		done := make(chan error, 1)
 		go func() {
-			done <- (&Server{Build: "session-test"}).ServeSession(
+			done <- (&Server{WireBuild: "session-test"}).ServeSession(
 				context.Background(), serverConn, identity,
 				func() error { return nil }, allowSession, allowSession,
 			)
@@ -202,7 +202,7 @@ func TestServeSessionEOFAndOpaqueIdentityFailClosed(t *testing.T) {
 		clientConn, serverConn := net.Pipe()
 		defer clientConn.Close()
 		defer serverConn.Close()
-		err := (&Server{Build: "session-test"}).ServeSession(
+		err := (&Server{WireBuild: "session-test"}).ServeSession(
 			context.Background(), serverConn, SessionIdentity{},
 			func() error { return nil }, allowSession, allowSession,
 		)
@@ -216,7 +216,7 @@ func TestServeSessionEOFAndOpaqueIdentityFailClosed(t *testing.T) {
 		defer clientConn.Close()
 		identity := currentSessionIdentity(t)
 		identity.peer.StartTime += "-stale"
-		err := (&Server{Build: "session-test"}).ServeSession(
+		err := (&Server{WireBuild: "session-test"}).ServeSession(
 			context.Background(), serverConn, identity,
 			func() error { return nil }, allowSession, allowSession,
 		)
@@ -228,7 +228,7 @@ func TestServeSessionEOFAndOpaqueIdentityFailClosed(t *testing.T) {
 
 func TestServeSessionDoesNotElevateOrdinaryIdentity(t *testing.T) {
 	classifier := &countingSessionClassifier{}
-	server := &Server{Build: "session-test", ProtectedSessionClassifier: classifier}
+	server := &Server{WireBuild: "session-test", protectedSessionClassifier: classifier}
 	clientConn, serverConn := net.Pipe()
 	identity := currentSessionIdentity(t)
 	done := make(chan error, 1)
@@ -257,8 +257,6 @@ func (c *countingSessionClassifier) Classify(context.Context, Peer) (bool, error
 	return true, nil
 }
 
-func (*countingSessionClassifier) AuthorizeLifecycleBuild(string, string) bool { return true }
-
 func currentSessionIdentity(t *testing.T) SessionIdentity {
 	t.Helper()
 	identity, err := proc.Probe(os.Getpid())
@@ -275,7 +273,7 @@ func newExistingSessionClient(t *testing.T, conn net.Conn) *Client {
 	t.Helper()
 	var dialed atomic.Bool
 	client, err := NewClient(context.Background(), ClientConfig{
-		Build: "session-test",
+		WireBuild: "session-test",
 		Dial: func(context.Context) (net.Conn, error) {
 			if !dialed.CompareAndSwap(false, true) {
 				return nil, errors.New("session already dialed")

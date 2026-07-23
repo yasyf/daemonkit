@@ -101,13 +101,13 @@ public final class SocketClient: @unchecked Sendable {
 
     public init(
         path: String,
-        build: String,
+        wireBuild: String,
         configuration: Configuration = .init(),
         trust: PeerTrust
     ) async throws {
         core = try await SocketClientCore(
             path: path,
-            build: build,
+            wireBuild: wireBuild,
             configuration: configuration,
             trust: trust
         )
@@ -130,7 +130,7 @@ final class SocketClientCore: @unchecked Sendable {
         let codec: SessionFrameCodec
         let writer: SessionWriter
         let readQueue: DispatchQueue
-        let peerBuild: String
+        let peerWireBuild: String
         let sessionGeneration: Data
     }
 
@@ -144,8 +144,8 @@ final class SocketClientCore: @unchecked Sendable {
         }
     }
 
-    /// Server build identity established by the mandatory handshake.
-    let peerBuild: String
+    /// Server wireBuild identity established by the mandatory handshake.
+    let peerWireBuild: String
     private let sessionGeneration: Data
 
     private let descriptor: Int32
@@ -171,11 +171,11 @@ final class SocketClientCore: @unchecked Sendable {
 
     init(
         path: String,
-        build: String,
+        wireBuild: String,
         configuration: SocketClient.Configuration,
         trust: PeerTrust
     ) async throws {
-        guard !build.isEmpty else { throw SessionTransportError.handshake("empty build") }
+        guard !wireBuild.isEmpty else { throw SessionTransportError.handshake("empty wireBuild") }
         guard configuration.maximumFrameBytes > 0,
               (1 ... Int(UInt32.max)).contains(configuration.streamQueueDepth),
               (1 ... Int(UInt32.max)).contains(configuration.eventQueueDepth),
@@ -188,7 +188,7 @@ final class SocketClientCore: @unchecked Sendable {
         else { throw SessionTransportError.invalidFrame("timeout") }
         let bootstrap = try await Self.bootstrap(
             path: path,
-            build: build,
+            wireBuild: wireBuild,
             configuration: configuration,
             trust: trust
         )
@@ -198,7 +198,7 @@ final class SocketClientCore: @unchecked Sendable {
         codec = bootstrap.codec
         writer = bootstrap.writer
         eventChannel = SocketBoundedChannel(capacity: configuration.eventQueueDepth)
-        peerBuild = bootstrap.peerBuild
+        peerWireBuild = bootstrap.peerWireBuild
         sessionGeneration = bootstrap.sessionGeneration
         let codec = bootstrap.codec
         let readQueue = bootstrap.readQueue
@@ -511,12 +511,12 @@ private extension SocketClientCore {
 
     private static func handshake(
         codec: SessionFrameCodec,
-        build: String,
+        wireBuild: String,
         timeout: TimeInterval
-    ) throws -> SessionBuildIdentity {
-        let payload = try JSONEncoder().encode(SessionBuildIdentity(
+    ) throws -> SessionWireIdentity {
+        let payload = try JSONEncoder().encode(SessionWireIdentity(
             protocolVersion: daemonKitSessionProtocolVersion,
-            build: build
+            wireBuild: wireBuild
         ))
         try codec.write(SessionFrame(kind: .hello, flags: .end, payload: payload))
         let response = try codec.read(timeout: timeout)
@@ -525,11 +525,11 @@ private extension SocketClientCore {
         else {
             throw SessionTransportError.handshake("invalid acknowledgment")
         }
-        let identity = try JSONDecoder().decode(SessionBuildIdentity.self, from: response.payload)
+        let identity = try JSONDecoder().decode(SessionWireIdentity.self, from: response.payload)
         guard identity.protocolVersion == daemonKitSessionProtocolVersion else {
             throw SessionTransportError.unsupportedProtocolVersion(identity.protocolVersion)
         }
-        guard !identity.build.isEmpty else { throw SessionTransportError.handshake("empty server build") }
+        guard !identity.wireBuild.isEmpty else { throw SessionTransportError.handshake("empty server wireBuild") }
         return identity
     }
 
@@ -560,7 +560,7 @@ private extension SocketClientCore {
 private extension SocketClientCore {
     private static func bootstrap(
         path: String,
-        build: String,
+        wireBuild: String,
         configuration: SocketClient.Configuration,
         trust: PeerTrust
     ) async throws -> Bootstrap {
@@ -588,7 +588,7 @@ private extension SocketClientCore {
                 )
                 writer = sessionWriter
                 let identity = try await readQueue.performIO {
-                    try handshake(codec: codec, build: build, timeout: configuration.handshakeTimeout)
+                    try handshake(codec: codec, wireBuild: wireBuild, timeout: configuration.handshakeTimeout)
                 }
                 guard let session = identity.session, session.count == 16 else {
                     throw SessionTransportError.handshake("invalid session generation")
@@ -604,7 +604,7 @@ private extension SocketClientCore {
                     codec: codec,
                     writer: sessionWriter,
                     readQueue: readQueue,
-                    peerBuild: identity.build,
+                    peerWireBuild: identity.wireBuild,
                     sessionGeneration: session
                 )
             } catch {

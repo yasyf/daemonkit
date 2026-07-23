@@ -68,6 +68,14 @@ type Result struct {
 	Response Response
 }
 
+// Rejection returns a typed error for a rejected result and nil otherwise.
+func (r Result) Rejection() error {
+	if r.Outcome != Rejected || !r.Response.Rejected {
+		return nil
+	}
+	return &RejectionError{Code: r.Response.Code, Reason: r.Response.Reason}
+}
+
 // OpenError reports whether a request frame was committed before Open failed.
 type OpenError struct {
 	Outcome Outcome
@@ -88,8 +96,7 @@ type Dialer func(ctx context.Context) (net.Conn, error)
 // ClientConfig configures one persistent multiplexed client session.
 type ClientConfig struct {
 	Dial                    Dialer
-	Build                   string
-	LifecycleBuild          string
+	WireBuild               string
 	Ladder                  Ladder
 	MaxFrame                int
 	OutboundQueue           int
@@ -102,11 +109,11 @@ type ClientConfig struct {
 
 // Client is one persistent, concurrent v1 session.
 type Client struct {
-	conn   net.Conn
-	codec  *Codec
-	build  string
-	peer   BuildIdentity
-	ladder Ladder
+	conn      net.Conn
+	codec     *Codec
+	wireBuild string
+	peer      WireIdentity
+	ladder    Ladder
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -185,11 +192,15 @@ type callResult struct {
 
 // NewClient dials and completes the mandatory exact-v1 handshake before returning.
 func NewClient(ctx context.Context, config ClientConfig) (*Client, error) {
+	return newClient(ctx, config)
+}
+
+func newClient(ctx context.Context, config ClientConfig) (*Client, error) {
 	if config.Dial == nil {
 		return nil, errors.New("wire: Dial is required")
 	}
-	if config.Build == "" {
-		return nil, errors.New("wire: Build is required")
+	if config.WireBuild == "" {
+		return nil, errors.New("wire: WireBuild is required")
 	}
 	streamCap := positiveOr(config.StreamQueue, defaultStreamQueue)
 	eventCap := positiveOr(config.EventQueue, defaultStreamQueue)
@@ -213,7 +224,7 @@ func NewClient(ctx context.Context, config ClientConfig) (*Client, error) {
 		_ = conn.Close()
 		return nil, err
 	}
-	peer, err := clientHandshake(codec, config.Build, config.LifecycleBuild)
+	peer, err := clientHandshake(codec, config.WireBuild)
 	if err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -227,7 +238,7 @@ func NewClient(ctx context.Context, config ClientConfig) (*Client, error) {
 	c := &Client{
 		conn:                    conn,
 		codec:                   codec,
-		build:                   config.Build,
+		wireBuild:               config.WireBuild,
 		peer:                    peer,
 		ladder:                  config.Ladder,
 		ctx:                     clientCtx,
@@ -252,8 +263,8 @@ func NewClient(ctx context.Context, config ClientConfig) (*Client, error) {
 	return c, nil
 }
 
-// PeerBuild returns the server identity established by the handshake.
-func (c *Client) PeerBuild() BuildIdentity { return c.peer }
+// PeerWireIdentity returns the server identity established by the handshake.
+func (c *Client) PeerWireIdentity() WireIdentity { return c.peer }
 
 // Events returns the bounded server-pushed event stream.
 func (c *Client) Events() <-chan Event { return c.eventOut }
@@ -608,40 +619,35 @@ func (c *Client) close(parent context.Context) error {
 	return c.closeErr
 }
 
-func clientHandshake(codec *Codec, build, lifecycleBuild string) (BuildIdentity, error) {
-	payload, err := json.Marshal(BuildIdentity{
-		Protocol: ProtocolVersion, Build: build, LifecycleBuild: lifecycleBuild,
-	})
+func clientHandshake(codec *Codec, wireBuild string) (WireIdentity, error) {
+	payload, err := json.Marshal(handshakeIdentity{Protocol: ProtocolVersion, WireBuild: wireBuild})
 	if err != nil {
-		return BuildIdentity{}, err
+		return WireIdentity{}, err
 	}
 	if err := codec.WriteFrame(Frame{Kind: FrameHello, Flags: FlagEnd, Payload: payload}); err != nil {
-		return BuildIdentity{}, fmt.Errorf("%w: write hello: %w", ErrHandshake, err)
+		return WireIdentity{}, fmt.Errorf("%w: write hello: %w", ErrHandshake, err)
 	}
 	frame, err := codec.ReadFrame()
 	if err != nil {
-		return BuildIdentity{}, fmt.Errorf("%w: read acknowledge: %w", ErrHandshake, err)
+		return WireIdentity{}, fmt.Errorf("%w: read acknowledge: %w", ErrHandshake, err)
 	}
 	if frame.Kind != FrameHelloAck || frame.ID != 0 || frame.Sequence != 0 || frame.Flags != FlagEnd || frame.Op != "" || frame.Tenant != "" {
-		return BuildIdentity{}, fmt.Errorf("%w: invalid acknowledge", ErrHandshake)
+		return WireIdentity{}, fmt.Errorf("%w: invalid acknowledge", ErrHandshake)
 	}
-	var identity BuildIdentity
+	var identity handshakeIdentity
 	if err := decodeStrict(frame.Payload, &identity); err != nil {
-		return BuildIdentity{}, fmt.Errorf("%w: identity: %w", ErrHandshake, err)
+		return WireIdentity{}, fmt.Errorf("%w: identity: %w", ErrHandshake, err)
 	}
 	if identity.Protocol != ProtocolVersion {
-		return BuildIdentity{}, fmt.Errorf("%w: identity got %d", ErrProtocolVersion, identity.Protocol)
+		return WireIdentity{}, fmt.Errorf("%w: identity got %d", ErrProtocolVersion, identity.Protocol)
 	}
-	if identity.Build == "" {
-		return BuildIdentity{}, fmt.Errorf("%w: empty server build", ErrHandshake)
-	}
-	if lifecycleBuild != "" && identity.LifecycleBuild == "" {
-		return BuildIdentity{}, fmt.Errorf("%w: empty server lifecycle build", ErrHandshake)
+	if identity.WireBuild == "" {
+		return WireIdentity{}, fmt.Errorf("%w: empty server wire build", ErrHandshake)
 	}
 	if len(identity.Session) != sessionGenerationBytes {
-		return BuildIdentity{}, fmt.Errorf("%w: invalid session generation", ErrHandshake)
+		return WireIdentity{}, fmt.Errorf("%w: invalid session generation", ErrHandshake)
 	}
-	return identity, nil
+	return WireIdentity(identity), nil
 }
 
 func (c *Client) writeLoop() {

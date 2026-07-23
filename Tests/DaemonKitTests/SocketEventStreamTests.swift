@@ -20,7 +20,7 @@ extension SocketTransportTests {
                 let path = directory.appendingPathComponent("events.sock").path
                 let eventCount = 128
                 let eventSize = 64 * 1024
-                let server = SocketServer(path: path, build: "event-test", trust: .sameEffectiveUser) { request in
+                let server = SocketServer(path: path, wireBuild: "event-test", trust: .sameEffectiveUser) { request in
                     if request.operation == "echo" {
                         return .terminal(SocketTerminal(payload: request.payload))
                     }
@@ -40,7 +40,7 @@ extension SocketTransportTests {
                 cleanup.add { await server.stop() }
                 let client = try await SocketClient(
                     path: path,
-                    build: "event-test",
+                    wireBuild: "event-test",
                     configuration: .init(eventQueueDepth: 2),
                     trust: .sameEffectiveUser
                 )
@@ -69,12 +69,12 @@ extension SocketTransportTests {
                 let directory = try eventSocketDirectory()
                 cleanup.add { try? FileManager.default.removeItem(at: directory) }
                 let path = directory.appendingPathComponent("events.sock").path
-                let server = SocketServer(path: path, build: "event-test", trust: .sameEffectiveUser) { _ in
+                let server = SocketServer(path: path, wireBuild: "event-test", trust: .sameEffectiveUser) { _ in
                     .terminal(SocketTerminal())
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try await SocketClient(path: path, build: "event-test", trust: .sameEffectiveUser)
+                let client = try await SocketClient(path: path, wireBuild: "event-test", trust: .sameEffectiveUser)
                 let waiting = Task {
                     var iterator = client.events.makeAsyncIterator()
                     return try await iterator.next()

@@ -225,7 +225,6 @@ func TestManagedProcessTrackFailureHasBoundedUntrackedCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPool: %v", err)
 	}
-	pool.untrackedKillTimeout = 40 * time.Millisecond
 	pool.signal = func(int, syscall.Signal) error { return syscall.EPERM }
 	started := time.Now()
 	_, err = pool.Start(context.Background(), managedProcessSpec(t, marker))

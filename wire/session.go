@@ -26,15 +26,11 @@ type AcceptedSession struct{ s *session }
 // Peer returns the OS identity captured once from the accepted socket.
 func (s *AcceptedSession) Peer() Peer { return s.s.peer }
 
-// Build returns the client build supplied by the mandatory handshake.
-func (s *AcceptedSession) Build() string { return s.s.build }
-
-// LifecycleBuild returns the client release identity supplied for protected
-// lifecycle traffic. Ordinary sessions return an empty string.
-func (s *AcceptedSession) LifecycleBuild() string { return s.s.lifecycleBuild }
+// WireBuild returns the client schema build supplied by the mandatory handshake.
+func (s *AcceptedSession) WireBuild() string { return s.s.wireBuild }
 
 // Protected reports whether pre-capacity trust classified this exact session
-// for lifecycle or other protected service traffic.
+// for protected control and observation traffic.
 func (s *AcceptedSession) Protected() bool { return s.s.protected }
 
 // Done closes after this exact authenticated session is fully settled and
@@ -64,11 +60,10 @@ type session struct {
 	cancel         context.CancelFunc
 	peer           Peer
 	protected      bool
-	build          string
-	lifecycleBuild string
+	wireBuild      string
 	generation     []byte
 	admit          func() (func(), error)
-	admitLifecycle func() (func(), error)
+	admitProtected func() (func(), error)
 	accepted       *AcceptedSession
 	outbound       chan sessionOutbound
 	eventCredits   *creditWindow
@@ -330,6 +325,10 @@ func (s *session) receiveRequest(ctx context.Context, frame Frame) error {
 		s.mu.Unlock()
 		return s.sendError(ctx, frame.ID, fmt.Errorf("wire: unknown op %q", frame.Op))
 	}
+	if entry.route == routeObservation && frame.Flags&FlagEnd == 0 {
+		s.mu.Unlock()
+		return s.sendRejected(ctx, frame.ID, ErrObservationUnary.Error())
+	}
 	requestCtx, cancel := s.server.requestContext(ctx, frame)
 	state := &requestState{
 		cancel:          cancel,
@@ -371,27 +370,44 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 	}()
 
 	switch entry.route {
-	case routeLifecycle:
-		authorized := s.protected && s.lifecycleBuild != ""
-		if authorized && frame.Op != Op("health") {
-			authorized = s.server.ProtectedSessionClassifier.AuthorizeLifecycleBuild(
-				s.server.LifecycleBuild, s.lifecycleBuild,
-			)
-		}
-		if !authorized {
-			if err := s.sendRejected(sessionCtx, frame.ID, ErrProtectedSessionRequired.Error()); err != nil {
-				s.closeOnRequestError()
-			}
-			return
-		}
-	case routeBusiness:
-		if s.build != s.server.Build {
+	case routeStop:
+		if s.wireBuild != s.server.WireBuild {
 			if err := s.sendRejected(sessionCtx, frame.ID, ErrBuildMismatch.Error()); err != nil {
 				s.closeOnRequestError()
 			}
 			return
 		}
-		if s.server.isDraining() {
+		var err error
+		requestCtx, err = s.server.authorizeStopControl(requestCtx, s.peer, frame.Payload)
+		if err != nil {
+			if err := s.sendRejected(sessionCtx, frame.ID, err.Error()); err != nil {
+				s.closeOnRequestError()
+			}
+			return
+		}
+	case routeBusiness, routeObservation:
+		if s.wireBuild != s.server.WireBuild {
+			if err := s.sendRejected(sessionCtx, frame.ID, ErrBuildMismatch.Error()); err != nil {
+				s.closeOnRequestError()
+			}
+			return
+		}
+		releasePublication, err := s.server.authorizePreReady(requestCtx, entry, BootstrapRequest{
+			Op: frame.Op, Tenant: frame.Tenant, Peer: s.peer, WireBuild: s.wireBuild,
+			Payload: append([]byte(nil), frame.Payload...),
+		})
+		if err != nil {
+			code := ResponseCode("")
+			if errors.Is(err, ErrNotReady) {
+				code = ResponseCodeRuntimeStarting
+			}
+			if err := s.sendRejectedCode(sessionCtx, frame.ID, code, err.Error()); err != nil {
+				s.closeOnRequestError()
+			}
+			return
+		}
+		defer releasePublication()
+		if entry.route == routeBusiness && s.server.isDraining() {
 			if err := s.sendRejected(sessionCtx, frame.ID, ErrDraining.Error()); err != nil {
 				s.closeOnRequestError()
 			}
@@ -401,8 +417,20 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 		panic("wire: invalid route class")
 	}
 	admit := s.admit
-	if entry.route == routeLifecycle {
-		admit = s.admitLifecycle
+	var releaseObservation func()
+	if entry.route == routeStop || entry.route == routeObservation {
+		admit = s.admitProtected
+	}
+	if entry.route == routeObservation {
+		var ok bool
+		releaseObservation, ok = s.server.acquireObservation()
+		if !ok {
+			if err := s.sendRejected(sessionCtx, frame.ID, ErrObservationBusy.Error()); err != nil {
+				s.closeOnRequestError()
+			}
+			return
+		}
+		defer releaseObservation()
 	}
 	done, err := admit()
 	if err != nil {
@@ -420,15 +448,14 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 	finishAdmission = done
 
 	req := Request{
-		ID:             frame.ID,
-		Op:             frame.Op,
-		Tenant:         frame.Tenant,
-		Peer:           s.peer,
-		Build:          s.build,
-		LifecycleBuild: s.lifecycleBuild,
-		Payload:        append([]byte(nil), frame.Payload...),
-		Chunks:         state.chunks,
-		Session:        s.accepted,
+		ID:        frame.ID,
+		Op:        frame.Op,
+		Tenant:    frame.Tenant,
+		Peer:      s.peer,
+		WireBuild: s.wireBuild,
+		Payload:   append([]byte(nil), frame.Payload...),
+		Chunks:    state.chunks,
+		Session:   s.accepted,
 	}
 	value, err := s.server.dispatch(requestCtx, entry, req)
 	if requestErr := requestCtx.Err(); requestErr != nil {
@@ -693,7 +720,11 @@ func (s *session) sendError(ctx context.Context, id uint64, err error) error {
 }
 
 func (s *session) sendRejected(ctx context.Context, id uint64, reason string) error {
-	return s.sendResponse(ctx, id, Response{Rejected: true, Reason: reason})
+	return s.sendRejectedCode(ctx, id, "", reason)
+}
+
+func (s *session) sendRejectedCode(ctx context.Context, id uint64, code ResponseCode, reason string) error {
+	return s.sendResponse(ctx, id, Response{Rejected: true, Code: code, Reason: reason})
 }
 
 func (s *session) sendAdmittedRejected(

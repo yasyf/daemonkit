@@ -21,7 +21,7 @@ go: added github.com/yasyf/daemonkit v<version>
 Add the package to your dependencies and link the `DaemonKit` library product into your app or helper target:
 
 ```swift
-.package(url: "https://github.com/yasyf/daemonkit", exact: "0.3.2"),
+.package(url: "https://github.com/yasyf/daemonkit", exact: "0.8.0"),
 ```
 
 </details>
@@ -31,7 +31,7 @@ Driving with an agent? Paste this:
 ```text
 Add github.com/yasyf/daemonkit to my Go module (go get github.com/yasyf/daemonkit@latest),
 check the package table in its README for what has landed, and replace this repo's
-hand-rolled daemon lifecycle (spawn, singleton socket, version takeover) with
+hand-rolled daemon process ownership (spawn, singleton socket, drain, stop control) with
 daemonkit's primitives.
 ```
 
@@ -45,7 +45,11 @@ A daemon that owns kernel state — a FUSE mount, a keychain session — can't r
 
 ### Retire the old daemon when a new version ships
 
-Two versions of the same daemon meet on one socket after every upgrade. The kit's answer: probe health and version first, never evict a tie, hand off when the peer advertises it, and treat "I couldn't tell" as "do nothing" — a busy daemon holding real resources is never killed for being older. Draining hands the old daemon's work to the new one instead of dropping it.
+The service controller observes the product's typed runtime health, starts an
+exact hidden role from the fixed executable, and durably authorizes that one
+process to call `daemon.control.stop`. The runtime validates and consumes the
+one-shot authority before draining. The controller waits for both the endpoint
+and exact process identity to settle before it starts the replacement.
 
 ### Trust the process on the other end of the socket
 
@@ -58,15 +62,14 @@ One row per package; the Status column is each surface's live state.
 | Surface | Owns | Status |
 |---|---|---|
 | `proc` | Detached spawn, single-entrant sockets, process caps, child reaping, exact epoch-1 durable process ledger | Landed |
-| `service` | `Agent` LaunchAgent lifecycle with required typed restart policy and exact epoch-1 controller state, installed in bootout, bootstrap, enable, kickstart order, plus the `AppKeepAlive` agent (`open -g -W`) for signed holder apps | Landed |
+| `service` | Exact desired/applied/loaded LaunchAgent state with typed restart policy, durable convergence, and signed-app stop ownership | Landed |
 | `version` | Release/dev version taxonomy, newest-wins skew | Landed |
 | `paths` | The `~/<app>` state layout: daemon socket, HTTP handshake file, per-subject artifacts, start lock, sqlite database, daemon log, turn-snapshot scratch dirs | Landed |
 | `bundle` | Info.plist reads, stable `.app` path conventions | Landed |
 | `fetch` | Exact release identity, signed `.app` verification, atomic real-directory publication, and strict v1 crash recovery | Landed |
-| `wire` | Exact-v1 persistent session transport, bounded multiplexing and delivery, peer credentials | Landed |
-| `wire/lifeproto` | The exact-v1 frozen lifecycle envelope (health, shutdown, hello, handoff) — Go and Swift bindings generated from one schema, pinned byte-identical by a shared golden fixture | Landed |
+| `wire` | Exact-v1 persistent business transport, typed product observations, receipt-authenticated stop control, and the sole composed daemon runtime constructor | Landed |
 | `trust` | Codesign peer verification (audit-token designated requirements) | Landed |
-| `daemon` | Takeover ladder, skew watch, idle exit | Landed |
+| `daemon` | Opaque process runtime, readiness, ordered shutdown, skew observation, embedded processes, and idle exit | Landed |
 | `drain` | Drain-on-upgrade: journals, fences, dead-peer adoption | Landed |
 | `supervise` | Bounded disposable workers and managed long-lived process handles with pre-exec durable identity, readiness gating, cancellation settlement, and cross-generation orphan recovery | Landed |
 | `Sources/DaemonKit` | Swift: signed-process App Group resolution, socket serving, peer trust (same-UID floor + designated-requirement pinning), `SMAppService` login items, snapshot watching | Landed |
@@ -77,7 +80,7 @@ The LaunchAgents `service` writes use no socket activation — the daemon binds 
 daemonkit-managed path. FuseKit's holder runtime is embedded in the consumer
 app; daemonkit and FuseKit do not ship or fetch a separate generic holder.
 
-Status: v0.7.1 is the hard-cut release line consumed by FuseKit and the manually
+Status: v0.8.0 is the hard-cut release line consumed by FuseKit and the manually
 migrated fleet. Protocol and durable-state epochs begin at 1 with exact equality;
 the API stabilizes at v1.0.0.
 

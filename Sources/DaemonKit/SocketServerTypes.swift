@@ -10,7 +10,7 @@ public enum SocketServerError: Error, Sendable {
     case chmodFailed(path: String, errno: Int32)
     case listenFailed(errno: Int32)
     case alreadyRunning
-    case emptyBuild
+    case emptyWireBuild
 }
 
 /// The immutable OS identity captured from an accepted socket.
@@ -34,7 +34,7 @@ public struct SocketRequest: Sendable {
     public let payload: Data
     public let chunks: SocketChunkStream
     public let peer: SocketPeer
-    public let peerBuild: String
+    public let peerWireBuild: String
     public let session: SocketSession
 }
 

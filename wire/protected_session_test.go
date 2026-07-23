@@ -15,14 +15,12 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/codeidentity"
-	"github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/wire"
 )
 
 type protectedClassifier struct {
-	classify  func(context.Context, wire.Peer) (bool, error)
-	authorize func(string, string) bool
-	err       error
+	classify func(context.Context, wire.Peer) (bool, error)
+	err      error
 }
 
 func (c protectedClassifier) Validate() error { return c.err }
@@ -31,30 +29,22 @@ func (c protectedClassifier) Classify(ctx context.Context, peer wire.Peer) (bool
 	return c.classify(ctx, peer)
 }
 
-func (c protectedClassifier) AuthorizeLifecycleBuild(serverBuild, peerBuild string) bool {
-	if c.authorize == nil {
-		return true
-	}
-	return c.authorize(serverBuild, peerBuild)
-}
-
-func TestProtectedSessionsSurviveIdleOrdinarySaturation(t *testing.T) {
+func TestProtectedSessionSurvivesIdleOrdinarySaturation(t *testing.T) {
 	server := &wire.Server{
-		Build: "server-test", LifecycleBuild: "v1.0.0", MaxSessions: 3, ReservedProtectedSessions: 2,
-		ProtectedSessionClassifier: protectedClassifier{classify: func(_ context.Context, peer wire.Peer) (bool, error) {
-			return peer.PID == os.Getpid(), nil
-		}},
+		WireBuild: "server-test", MaxSessions: 3,
 	}
+	wire.ConfigureProtectedForTest(server, protectedClassifier{classify: func(_ context.Context, peer wire.Peer) (bool, error) {
+		return peer.PID == os.Getpid(), nil
+	}}, 2)
 	server.RegisterControl("native-bootstrap", func(context.Context, wire.Request) (any, error) {
 		return "ready", nil
 	})
-	server.RegisterLifecycle(protectedTestLifecycle{})
 	running := startSessionServer(t, server, admitAll(&atomic.Int32{}))
 	helper := startIdleSessionHelper(t, running.path, true)
 	defer helper.close(t)
 
 	native, err := wire.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(running.path), Build: "server-test",
+		Dial: wire.UnixDialer(running.path), WireBuild: "server-test",
 	})
 	if err != nil {
 		t.Fatalf("protected native bootstrap session: %v", err)
@@ -63,93 +53,6 @@ func TestProtectedSessionsSurviveIdleOrdinarySaturation(t *testing.T) {
 	result, err := native.Call(t.Context(), "native-bootstrap", "", nil)
 	if err != nil || result.Outcome != wire.Delivered {
 		t.Fatalf("native bootstrap call = %#v, %v", result, err)
-	}
-
-	lifecycle := &wire.LifecyclePeer{Config: wire.ClientConfig{
-		Dial: wire.UnixDialer(running.path), Build: "server-test", LifecycleBuild: "v2.0.0",
-	}}
-	defer lifecycle.Close()
-	health, err := lifecycle.Health(t.Context())
-	if err != nil {
-		t.Fatalf("protected lifecycle session: %v", err)
-	}
-	if health.Build != "holder-v1" {
-		t.Fatalf("lifecycle health = %#v", health)
-	}
-}
-
-func TestLifecycleRejectsOrdinarySameUIDSessionAndAcceptsProtectedSession(t *testing.T) {
-	var protect atomic.Bool
-	lifecycleState := &countingProtectedLifecycle{}
-	server := &wire.Server{
-		Build: "server-test", LifecycleBuild: "v1.0.0", MaxSessions: 2, ReservedProtectedSessions: 1,
-		ProtectedSessionClassifier: protectedClassifier{classify: func(context.Context, wire.Peer) (bool, error) {
-			return protect.Load(), nil
-		}},
-	}
-	server.RegisterLifecycle(lifecycleState)
-	running := startSessionServer(t, server, admitAll(&atomic.Int32{}))
-	ordinary := &wire.LifecyclePeer{Config: wire.ClientConfig{
-		Dial: wire.UnixDialer(running.path), Build: "server-test", LifecycleBuild: "v2.0.0",
-	}}
-	if _, err := ordinary.Health(t.Context()); err == nil || !strings.Contains(err.Error(), wire.ErrProtectedSessionRequired.Error()) {
-		t.Fatalf("ordinary lifecycle Health = %v, want protected rejection", err)
-	}
-	_ = ordinary.Close()
-	if lifecycleState.health.Load() != 0 {
-		t.Fatal("ordinary lifecycle request reached handler")
-	}
-
-	protect.Store(true)
-	protected := &wire.LifecyclePeer{Config: wire.ClientConfig{
-		Dial: wire.UnixDialer(running.path), Build: "server-test", LifecycleBuild: "v2.0.0",
-	}}
-	defer protected.Close()
-	if _, err := protected.Health(t.Context()); err != nil {
-		t.Fatalf("protected lifecycle Health: %v", err)
-	}
-	if lifecycleState.health.Load() != 1 {
-		t.Fatalf("protected lifecycle handler calls = %d", lifecycleState.health.Load())
-	}
-}
-
-func TestLifecycleHealthObservesAnyProtectedReleaseButMutationRequiresSameOrNewer(t *testing.T) {
-	executable, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	executable, err = filepath.EvalSymlinks(executable)
-	if err != nil {
-		t.Fatal(err)
-	}
-	server := &wire.Server{
-		Build: "synckit.rpc.v1", LifecycleBuild: "v1.2.0", MaxSessions: 3, ReservedProtectedSessions: 1,
-		ProtectedSessionClassifier: codeidentity.FixedClassifier{Executable: executable},
-	}
-	server.RegisterLifecycle(protectedTestLifecycle{})
-	running := startSessionServer(t, server, admitAll(&atomic.Int32{}))
-	for _, test := range []struct {
-		build string
-		ok    bool
-	}{
-		{build: "v1.1.0"},
-		{build: "v1.2.0", ok: true},
-		{build: "v1.3.0", ok: true},
-	} {
-		peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
-			Dial: wire.UnixDialer(running.path), Build: "synckit.rpc.v1", LifecycleBuild: test.build,
-		}}
-		if _, err := peer.Health(t.Context()); err != nil {
-			t.Fatalf("build %s lifecycle Health: %v", test.build, err)
-		}
-		err := peer.Handoff(t.Context())
-		_ = peer.Close()
-		if test.ok && err != nil {
-			t.Fatalf("build %s lifecycle Handoff: %v", test.build, err)
-		}
-		if !test.ok && (err == nil || !strings.Contains(err.Error(), wire.ErrProtectedSessionRequired.Error())) {
-			t.Fatalf("build %s lifecycle Handoff = %v, want protected rejection", test.build, err)
-		}
 	}
 }
 
@@ -164,9 +67,9 @@ func TestBusinessRoutesRequireExactBuildBeforeHandlerDispatch(t *testing.T) {
 	}
 	var calls atomic.Int32
 	server := &wire.Server{
-		Build: "v1.2.0", MaxSessions: 3, ReservedProtectedSessions: 1,
-		ProtectedSessionClassifier: codeidentity.FixedClassifier{Executable: executable},
+		WireBuild: "v1.2.0", MaxSessions: 3,
 	}
+	wire.ConfigureProtectedForTest(server, codeidentity.FixedClassifier{Executable: executable}, 1)
 	server.RegisterControl("business", func(context.Context, wire.Request) (any, error) {
 		calls.Add(1)
 		return true, nil
@@ -174,7 +77,7 @@ func TestBusinessRoutesRequireExactBuildBeforeHandlerDispatch(t *testing.T) {
 	running := startSessionServer(t, server, admitAll(&atomic.Int32{}))
 	for _, build := range []string{"v1.1.0", "v1.3.0"} {
 		client, err := wire.NewClient(t.Context(), wire.ClientConfig{
-			Dial: wire.UnixDialer(running.path), Build: build,
+			Dial: wire.UnixDialer(running.path), WireBuild: build,
 		})
 		if err != nil {
 			t.Fatalf("build %s client: %v", build, err)
@@ -193,7 +96,7 @@ func TestBusinessRoutesRequireExactBuildBeforeHandlerDispatch(t *testing.T) {
 	}
 
 	client, err := wire.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(running.path), Build: "v1.2.0",
+		Dial: wire.UnixDialer(running.path), WireBuild: "v1.2.0",
 	})
 	if err != nil {
 		t.Fatalf("exact-build client: %v", err)
@@ -212,16 +115,16 @@ func TestBusinessRoutesRequireExactBuildBeforeHandlerDispatch(t *testing.T) {
 
 func TestGracefulCloseSettlesProtectedCapacityBeforeReturn(t *testing.T) {
 	server := &wire.Server{
-		Build: "server-test", MaxSessions: 1, ReservedProtectedSessions: 1,
-		ProtectedSessionClassifier: protectedClassifier{
-			classify: func(context.Context, wire.Peer) (bool, error) { return true, nil },
-		},
+		WireBuild: "server-test", MaxSessions: 1,
 	}
+	wire.ConfigureProtectedForTest(server, protectedClassifier{
+		classify: func(context.Context, wire.Peer) (bool, error) { return true, nil },
+	}, 1)
 	server.RegisterControl("probe", func(context.Context, wire.Request) (any, error) { return true, nil })
 	running := startSessionServer(t, server, admitAll(&atomic.Int32{}))
 	for iteration := range 100 {
 		client, err := wire.NewClient(t.Context(), wire.ClientConfig{
-			Dial: wire.UnixDialer(running.path), Build: "server-test",
+			Dial: wire.UnixDialer(running.path), WireBuild: "server-test",
 		})
 		if err != nil {
 			t.Fatalf("iteration %d client: %v", iteration, err)
@@ -238,18 +141,18 @@ func TestGracefulCloseSettlesProtectedCapacityBeforeReturn(t *testing.T) {
 func TestUntrustedPeerIsRejectedBeforeProtectedCapacityClassification(t *testing.T) {
 	var classifications atomic.Int32
 	server := &wire.Server{
-		Build: "server-test", MaxSessions: 1, ReservedProtectedSessions: 1,
+		WireBuild: "server-test", MaxSessions: 1,
 		Trust: func(_ context.Context, peer wire.Peer) error {
 			if peer.PID != os.Getpid() {
 				return wire.ErrUntrustedPeer
 			}
 			return nil
 		},
-		ProtectedSessionClassifier: protectedClassifier{classify: func(context.Context, wire.Peer) (bool, error) {
-			classifications.Add(1)
-			return true, nil
-		}},
 	}
+	wire.ConfigureProtectedForTest(server, protectedClassifier{classify: func(context.Context, wire.Peer) (bool, error) {
+		classifications.Add(1)
+		return true, nil
+	}}, 1)
 	server.RegisterControl("probe", func(context.Context, wire.Request) (any, error) { return true, nil })
 	running := startSessionServer(t, server, admitAll(&atomic.Int32{}))
 	helper := startIdleSessionHelper(t, running.path, false)
@@ -259,7 +162,7 @@ func TestUntrustedPeerIsRejectedBeforeProtectedCapacityClassification(t *testing
 	}
 
 	client, err := wire.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(running.path), Build: "server-test",
+		Dial: wire.UnixDialer(running.path), WireBuild: "server-test",
 	})
 	if err != nil {
 		t.Fatalf("trusted protected session after rejection: %v", err)
@@ -274,7 +177,7 @@ func TestBlockingPeerVerifierIsTimedOutBeforeNextProtectedAdmission(t *testing.T
 	entered := make(chan struct{})
 	var calls atomic.Int32
 	server := &wire.Server{
-		Build: "server-test", MaxSessions: 2, ReservedProtectedSessions: 1,
+		WireBuild: "server-test", MaxSessions: 2,
 		PeerVerificationTimeout: 25 * time.Millisecond,
 		Trust: func(ctx context.Context, _ wire.Peer) error {
 			if calls.Add(1) == 1 {
@@ -284,10 +187,10 @@ func TestBlockingPeerVerifierIsTimedOutBeforeNextProtectedAdmission(t *testing.T
 			}
 			return nil
 		},
-		ProtectedSessionClassifier: protectedClassifier{classify: func(context.Context, wire.Peer) (bool, error) {
-			return true, nil
-		}},
 	}
+	wire.ConfigureProtectedForTest(server, protectedClassifier{classify: func(context.Context, wire.Peer) (bool, error) {
+		return true, nil
+	}}, 1)
 	server.RegisterControl("probe", func(context.Context, wire.Request) (any, error) { return true, nil })
 	running := startSessionServer(t, server, admitAll(&atomic.Int32{}))
 	stalled, err := net.Dial("unix", running.path)
@@ -303,7 +206,7 @@ func TestBlockingPeerVerifierIsTimedOutBeforeNextProtectedAdmission(t *testing.T
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
 	client, err := wire.NewClient(ctx, wire.ClientConfig{
-		Dial: wire.UnixDialer(running.path), Build: "server-test",
+		Dial: wire.UnixDialer(running.path), WireBuild: "server-test",
 	})
 	if err != nil {
 		t.Fatalf("protected admission after verifier timeout: %v", err)
@@ -316,18 +219,20 @@ func TestBlockingPeerVerifierIsTimedOutBeforeNextProtectedAdmission(t *testing.T
 
 func TestProtectedSessionCapacityConfigurationIsExact(t *testing.T) {
 	for _, test := range []struct {
-		name   string
-		server *wire.Server
+		name       string
+		server     *wire.Server
+		classifier wire.ProtectedSessionClassifier
+		reserved   int
 	}{
-		{name: "negative", server: &wire.Server{Build: "test", ReservedProtectedSessions: -1}},
-		{name: "negative verification timeout", server: &wire.Server{Build: "test", PeerVerificationTimeout: -1}},
+		{name: "negative", server: &wire.Server{WireBuild: "test"}, reserved: -1},
+		{name: "negative verification timeout", server: &wire.Server{WireBuild: "test", PeerVerificationTimeout: -1}},
 		{name: "exceeds maximum", server: &wire.Server{
-			Build: "test", MaxSessions: 1, ReservedProtectedSessions: 2,
-			ProtectedSessionClassifier: protectedClassifier{classify: func(context.Context, wire.Peer) (bool, error) { return true, nil }},
-		}},
-		{name: "missing classifier", server: &wire.Server{Build: "test", ReservedProtectedSessions: 1}},
+			WireBuild: "test", MaxSessions: 1,
+		}, classifier: protectedClassifier{classify: func(context.Context, wire.Peer) (bool, error) { return true, nil }}, reserved: 2},
+		{name: "missing classifier", server: &wire.Server{WireBuild: "test"}, reserved: 1},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			wire.ConfigureProtectedForTest(test.server, test.classifier, test.reserved)
 			directory, err := os.MkdirTemp("/tmp", "dk-wire-")
 			if err != nil {
 				t.Fatal(err)
@@ -350,35 +255,6 @@ func TestProtectedSessionCapacityConfigurationIsExact(t *testing.T) {
 		})
 	}
 }
-
-type protectedTestLifecycle struct{}
-
-type countingProtectedLifecycle struct{ health atomic.Int32 }
-
-func (l *countingProtectedLifecycle) Health(context.Context) (daemon.Health, error) {
-	l.health.Add(1)
-	return daemon.Health{Build: "holder-v1", Protocol: 1, State: daemon.StateHealthy}, nil
-}
-
-func (*countingProtectedLifecycle) Shutdown(context.Context) error { return nil }
-func (*countingProtectedLifecycle) Handoff(context.Context) error  { return nil }
-
-func protectAllLifecycleSessions(server *wire.Server) {
-	if server.LifecycleBuild == "" {
-		server.LifecycleBuild = "v1.0.0"
-	}
-	server.ReservedProtectedSessions = 1
-	server.ProtectedSessionClassifier = protectedClassifier{
-		classify: func(context.Context, wire.Peer) (bool, error) { return true, nil },
-	}
-}
-
-func (protectedTestLifecycle) Health(context.Context) (daemon.Health, error) {
-	return daemon.Health{Build: "holder-v1", Protocol: 1, State: daemon.StateHealthy}, nil
-}
-
-func (protectedTestLifecycle) Shutdown(context.Context) error { return nil }
-func (protectedTestLifecycle) Handoff(context.Context) error  { return nil }
 
 type idleSessionHelper struct {
 	cmd   *exec.Cmd
@@ -434,7 +310,7 @@ func TestWireIdleSessionHelper(_ *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	client, err := wire.NewClient(ctx, wire.ClientConfig{
-		Dial: wire.UnixDialer(os.Getenv("DAEMONKIT_IDLE_SESSION_SOCKET")), Build: "server-test",
+		Dial: wire.UnixDialer(os.Getenv("DAEMONKIT_IDLE_SESSION_SOCKET")), WireBuild: "server-test",
 	})
 	if err != nil {
 		fmt.Println("rejected")

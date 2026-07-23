@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -23,9 +24,15 @@ var (
 	ErrServerStarted = errors.New("wire: server already started")
 	// ErrBuildMismatch means an ordinary request came from a different build.
 	ErrBuildMismatch = errors.New("wire: client build does not match server build")
-	// ErrProtectedSessionRequired means a lifecycle request came from an
+	// ErrProtectedSessionRequired means a protected request came from an
 	// authenticated ordinary session rather than a protected peer.
 	ErrProtectedSessionRequired = errors.New("wire: protected session required")
+	// ErrObservationBusy means the bounded observation lane is occupied.
+	ErrObservationBusy = errors.New("wire: observation lane is busy")
+	// ErrObservationUnary means an observation attempted streamed input.
+	ErrObservationUnary = errors.New("wire: observations require unary input")
+	// ErrNotReady means the route cannot dispatch before runtime publication.
+	ErrNotReady = errors.New("wire: runtime is starting")
 )
 
 const (
@@ -41,9 +48,7 @@ const (
 )
 
 var reservedOps = map[Op]struct{}{
-	"health":   {},
-	"shutdown": {},
-	"handoff":  {},
+	stopControlOp: {},
 }
 
 type class uint8
@@ -57,13 +62,15 @@ type routeClass uint8
 
 const (
 	routeBusiness routeClass = iota
-	routeLifecycle
+	routeObservation
+	routeStop
 )
 
 type entry struct {
-	class class
-	route routeClass
-	h     Handler
+	class    class
+	route    routeClass
+	h        Handler
+	preReady bool
 }
 
 type job struct {
@@ -86,13 +93,10 @@ const (
 )
 
 // Server serves persistent, multiplexed v1 sessions on a listener owned by its caller.
-// Register handlers and lifecycle controls before Serve.
+// Register business, observation, and stop-control handlers before Serve.
 type Server struct {
-	// Build is the server build identity sent during the mandatory handshake.
-	Build string
-	// LifecycleBuild is the daemon release identity used only for protected
-	// lifecycle authorization. It is required when lifecycle handlers exist.
-	LifecycleBuild string
+	// WireBuild is the stable schema identity sent during the mandatory handshake.
+	WireBuild string
 	// Trust augments the non-optional same-effective-uid trust floor. It must
 	// return when ctx is canceled.
 	Trust func(context.Context, Peer) error
@@ -110,12 +114,6 @@ type Server struct {
 	StreamQueue int
 	// MaxSessions caps accepted and handshaking connections.
 	MaxSessions int
-	// ReservedProtectedSessions withholds capacity from ordinary peers so exact
-	// authenticated lifecycle and bootstrap peers cannot be starved.
-	ReservedProtectedSessions int
-	// ProtectedSessionClassifier authenticates protected peers and their
-	// lifecycle build relationship.
-	ProtectedSessionClassifier ProtectedSessionClassifier
 	// PeerVerificationTimeout bounds pre-capacity trust and classification.
 	PeerVerificationTimeout time.Duration
 	// MaxFrame caps each encoded frame.
@@ -127,18 +125,28 @@ type Server struct {
 	// Log receives accept and session diagnostics.
 	Log *slog.Logger
 
-	mu           sync.Mutex
-	handlers     map[Op]entry
-	hasLifecycle bool
-	onActivity   func()
-	listener     net.Listener
-	started      bool
-	draining     bool
-	sessions     map[*session]struct{}
-	streamWindow uint32
+	mu                          sync.Mutex
+	handlers                    map[Op]entry
+	onActivity                  func()
+	listener                    net.Listener
+	started                     bool
+	draining                    bool
+	sessions                    map[*session]struct{}
+	streamWindow                uint32
+	protectedSessionClassifier  ProtectedSessionClassifier
+	reservedProtectedSessions   int
+	stopControlVerifier         StopControlVerifier
+	stopTargetProcessGeneration string
+	hasObservations             bool
+	readiness                   ReadinessBarrier
+	readinessCancel             context.CancelFunc
+	readyPublished              bool
+	bootstrapRoutes             map[Op]BootstrapAuthorizer
+	publicationMu               sync.RWMutex
 
 	queue                 chan job
 	slots                 chan struct{}
+	observationSlots      chan struct{}
 	ordinarySessionSlots  chan struct{}
 	protectedSessionSlots chan struct{}
 	poolWG                sync.WaitGroup
@@ -160,8 +168,11 @@ func (s *Server) register(op Op, class class, route routeClass, h Handler) {
 	if op == "" || h == nil {
 		panic("wire: operation and handler are required")
 	}
-	if _, reserved := reservedOps[op]; reserved && route != routeLifecycle {
-		panic(fmt.Sprintf("wire: op %q is a reserved lifecycle op", op))
+	if _, reserved := reservedOps[op]; reserved && route != routeStop {
+		panic(fmt.Sprintf("wire: op %q is a reserved control op", op))
+	}
+	if strings.HasPrefix(string(op), "daemon.") && route != routeStop {
+		panic(fmt.Sprintf("wire: op %q uses daemonkit's private namespace", op))
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -175,9 +186,6 @@ func (s *Server) register(op Op, class class, route routeClass, h Handler) {
 		panic(fmt.Sprintf("wire: op %q already registered", op))
 	}
 	s.handlers[op] = entry{class: class, route: route, h: h}
-	if route == routeLifecycle {
-		s.hasLifecycle = true
-	}
 }
 
 // OnActivity installs a callback invoked immediately before each admitted handler.
@@ -197,7 +205,7 @@ func (s *Server) Serve(
 	ctx context.Context,
 	listener net.Listener,
 	ready func() error,
-	admit, admitLifecycle func() (func(), error),
+	admit, admitProtected func() (func(), error),
 ) error {
 	if listener == nil {
 		return errors.New("wire: listener is required")
@@ -205,8 +213,8 @@ func (s *Server) Serve(
 	if admit == nil {
 		return errors.New("wire: admission callback is required")
 	}
-	if admitLifecycle == nil {
-		return errors.New("wire: lifecycle admission callback is required")
+	if admitProtected == nil {
+		return errors.New("wire: protected admission callback is required")
 	}
 	if ready == nil {
 		return errors.New("wire: readiness callback is required")
@@ -216,15 +224,53 @@ func (s *Server) Serve(
 		return err
 	}
 	s.startWorkers(workers)
-
-	if err := ready(); err != nil {
-		_ = s.CloseIntake()
-		s.stopWorkers()
-		return fmt.Errorf("wire: publish readiness: %w", err)
+	if s.readiness == nil {
+		if err := ready(); err != nil {
+			_ = s.CloseIntake()
+			s.stopWorkers()
+			return fmt.Errorf("wire: publish readiness: %w", err)
+		}
+		s.publishReady()
 	}
-
 	acceptDone := make(chan error, 1)
-	go func() { acceptDone <- s.accept(ctx, admit, admitLifecycle) }()
+	go func() { acceptDone <- s.accept(ctx, admit, admitProtected) }()
+	if s.readiness != nil {
+		readinessCtx, cancelReadiness := s.installReadinessContext(ctx)
+		defer s.clearReadinessContext(cancelReadiness)
+		readinessDone := make(chan error, 1)
+		go func() { readinessDone <- s.runReadiness(readinessCtx, ready) }()
+		select {
+		case readinessErr := <-readinessDone:
+			if readinessErr == nil {
+				s.publishReady()
+				break
+			}
+			_ = s.CloseIntake()
+			acceptErr := <-acceptDone
+			s.closeSessions()
+			s.sessionWG.Wait()
+			s.stopWorkers()
+			return errors.Join(
+				fmt.Errorf("wire: publish readiness: %w", readinessErr),
+				wrapAcceptError(acceptErr),
+			)
+		case acceptErr := <-acceptDone:
+			cancelReadiness()
+			readinessErr := <-readinessDone
+			s.closeSessions()
+			s.sessionWG.Wait()
+			s.stopWorkers()
+			return errors.Join(wrapAcceptError(acceptErr), readinessErr)
+		case <-ctx.Done():
+			_ = s.CloseIntake()
+			acceptErr := <-acceptDone
+			readinessErr := <-readinessDone
+			s.closeSessions()
+			s.sessionWG.Wait()
+			s.stopWorkers()
+			return errors.Join(wrapAcceptError(acceptErr), readinessErr)
+		}
+	}
 	var acceptErr error
 	select {
 	case <-ctx.Done():
@@ -248,13 +294,13 @@ func (s *Server) Serve(
 // same handshake, capacity, admission, backpressure, cancellation, and drain
 // engine as listener sessions. It takes ownership of conn and joins the session
 // synchronously. Spawned-parent identities are always ordinary, so protected
-// lifecycle operations remain unavailable.
+// observation and stop-control operations remain unavailable.
 func (s *Server) ServeSession(
 	ctx context.Context,
 	conn net.Conn,
 	identity SessionIdentity,
 	ready func() error,
-	admit, admitLifecycle func() (func(), error),
+	admit, admitProtected func() (func(), error),
 ) error {
 	if conn == nil {
 		return errors.New("wire: existing session connection is required")
@@ -262,8 +308,8 @@ func (s *Server) ServeSession(
 	if admit == nil {
 		return errors.New("wire: admission callback is required")
 	}
-	if admitLifecycle == nil {
-		return errors.New("wire: lifecycle admission callback is required")
+	if admitProtected == nil {
+		return errors.New("wire: protected admission callback is required")
 	}
 	if ready == nil {
 		return errors.New("wire: readiness callback is required")
@@ -282,6 +328,7 @@ func (s *Server) ServeSession(
 		s.stopWorkers()
 		return fmt.Errorf("wire: publish readiness: %w", err)
 	}
+	s.publishReady()
 	verifyCtx, cancelVerify := context.WithTimeout(ctx, s.peerVerificationTimeout())
 	protected := false
 	if allowProtected {
@@ -304,7 +351,7 @@ func (s *Server) ServeSession(
 	sessionErr := func() error {
 		defer releaseCapacity()
 		defer s.sessionWG.Done()
-		return s.serveConn(ctx, conn, peer, protected, admit, admitLifecycle, releaseCapacity)
+		return s.serveConn(ctx, conn, peer, protected, admit, admitProtected, releaseCapacity)
 	}()
 	s.closeSessions()
 	s.sessionWG.Wait()
@@ -316,8 +363,8 @@ func (s *Server) ServeSession(
 }
 
 func (s *Server) start(listener net.Listener) (int, error) {
-	if s.Build == "" {
-		return 0, errors.New("wire: Build is required")
+	if s.WireBuild == "" {
+		return 0, errors.New("wire: WireBuild is required")
 	}
 	if err := s.validateSessionCapacity(); err != nil {
 		return 0, err
@@ -330,6 +377,10 @@ func (s *Server) start(listener net.Listener) (int, error) {
 	if s.started {
 		s.mu.Unlock()
 		return 0, ErrServerStarted
+	}
+	if err := s.validateBootstrapRoutesLocked(); err != nil {
+		s.mu.Unlock()
+		return 0, err
 	}
 	s.started = true
 	s.listener = listener
@@ -350,10 +401,23 @@ func (s *Server) start(listener net.Listener) (int, error) {
 	}
 	s.queue = make(chan job, backlog)
 	s.slots = make(chan struct{}, workers+backlog)
-	s.ordinarySessionSlots = make(chan struct{}, s.maxSessions()-s.ReservedProtectedSessions)
-	s.protectedSessionSlots = make(chan struct{}, s.ReservedProtectedSessions)
+	s.ordinarySessionSlots = make(chan struct{}, s.maxSessions()-s.reservedProtectedSessions)
+	s.protectedSessionSlots = make(chan struct{}, s.reservedProtectedSessions)
+	if s.hasObservations {
+		s.observationSlots = make(chan struct{}, 1)
+	}
 	s.mu.Unlock()
 	return workers, nil
+}
+
+func (s *Server) validateBootstrapRoutesLocked() error {
+	for op := range s.bootstrapRoutes {
+		registered, exists := s.handlers[op]
+		if !exists || registered.route != routeBusiness {
+			return fmt.Errorf("wire: bootstrap route %q is not a registered business route", op)
+		}
+	}
+	return nil
 }
 
 func (s *Server) startWorkers(workers int) {
@@ -376,12 +440,16 @@ func wrapAcceptError(err error) error {
 }
 
 // CloseIntake prevents new connections and new ordinary requests. Accepted
-// sessions stay alive so admitted work and lifecycle acknowledgements can settle.
+// sessions stay alive so admitted work and protected control can settle.
 func (s *Server) CloseIntake() error {
 	s.mu.Lock()
 	s.draining = true
 	listener := s.listener
+	cancelReadiness := s.readinessCancel
 	s.mu.Unlock()
+	if cancelReadiness != nil {
+		cancelReadiness()
+	}
 	if listener == nil {
 		return nil
 	}
@@ -390,7 +458,7 @@ func (s *Server) CloseIntake() error {
 	return err
 }
 
-func (s *Server) accept(ctx context.Context, admit, admitLifecycle func() (func(), error)) error {
+func (s *Server) accept(ctx context.Context, admit, admitProtected func() (func(), error)) error {
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
@@ -427,7 +495,7 @@ func (s *Server) accept(ctx context.Context, admit, admitLifecycle func() (func(
 				releaseCapacity()
 				s.sessionWG.Done()
 			}()
-			if err := s.serveConn(ctx, conn, peer, protected, admit, admitLifecycle, releaseCapacity); err != nil && !isDisconnect(err) {
+			if err := s.serveConn(ctx, conn, peer, protected, admit, admitProtected, releaseCapacity); err != nil && !isDisconnect(err) {
 				s.Log.Debug("wire: session ended", "err", err)
 			}
 		}(conn, peer, protected, capacity)
@@ -439,7 +507,7 @@ func (s *Server) serveConn(
 	conn net.Conn,
 	peer Peer,
 	protected bool,
-	admit, admitLifecycle func() (func(), error),
+	admit, admitProtected func() (func(), error),
 	releaseCapacity func(),
 ) error {
 	defer conn.Close()
@@ -468,11 +536,10 @@ func (s *Server) serveConn(
 		cancel:         cancel,
 		peer:           peer,
 		protected:      protected,
-		build:          identity.Build,
-		lifecycleBuild: identity.LifecycleBuild,
+		wireBuild:      identity.WireBuild,
 		generation:     generation,
 		admit:          admit,
-		admitLifecycle: admitLifecycle,
+		admitProtected: admitProtected,
 		outbound:       make(chan sessionOutbound, s.outboundQueue()),
 		eventCredits:   newCreditWindow(),
 		requestsDone:   make(chan struct{}),
@@ -490,39 +557,37 @@ func (s *Server) serveConn(
 	return err
 }
 
-func (s *Server) serverHandshake(codec *Codec) (BuildIdentity, []byte, error) {
+func (s *Server) serverHandshake(codec *Codec) (handshakeIdentity, []byte, error) {
 	frame, err := codec.ReadFrame()
 	if err != nil {
-		return BuildIdentity{}, nil, fmt.Errorf("%w: %w", ErrHandshake, err)
+		return handshakeIdentity{}, nil, fmt.Errorf("%w: %w", ErrHandshake, err)
 	}
 	if frame.Kind != FrameHello || frame.ID != 0 || frame.Sequence != 0 || frame.Flags != FlagEnd || frame.Op != "" || frame.Tenant != "" {
-		return BuildIdentity{}, nil, fmt.Errorf("%w: invalid hello frame", ErrHandshake)
+		return handshakeIdentity{}, nil, fmt.Errorf("%w: invalid hello frame", ErrHandshake)
 	}
-	var identity BuildIdentity
+	var identity handshakeIdentity
 	if err := decodeStrict(frame.Payload, &identity); err != nil {
-		return BuildIdentity{}, nil, fmt.Errorf("%w: identity: %w", ErrHandshake, err)
+		return handshakeIdentity{}, nil, fmt.Errorf("%w: identity: %w", ErrHandshake, err)
 	}
 	if identity.Protocol != ProtocolVersion {
-		return BuildIdentity{}, nil, fmt.Errorf("%w: identity got %d", ErrProtocolVersion, identity.Protocol)
+		return handshakeIdentity{}, nil, fmt.Errorf("%w: identity got %d", ErrProtocolVersion, identity.Protocol)
 	}
-	if identity.Build == "" {
-		return BuildIdentity{}, nil, fmt.Errorf("%w: empty build", ErrHandshake)
+	if identity.WireBuild == "" {
+		return handshakeIdentity{}, nil, fmt.Errorf("%w: empty wire build", ErrHandshake)
 	}
 	if len(identity.Session) != 0 {
-		return BuildIdentity{}, nil, fmt.Errorf("%w: client supplied a session generation", ErrHandshake)
+		return handshakeIdentity{}, nil, fmt.Errorf("%w: client supplied a session generation", ErrHandshake)
 	}
 	generation := make([]byte, sessionGenerationBytes)
 	if _, err := rand.Read(generation); err != nil {
-		return BuildIdentity{}, nil, fmt.Errorf("%w: generate session: %w", ErrHandshake, err)
+		return handshakeIdentity{}, nil, fmt.Errorf("%w: generate session: %w", ErrHandshake, err)
 	}
-	payload, err := json.Marshal(BuildIdentity{
-		Protocol: ProtocolVersion, Build: s.Build, LifecycleBuild: s.LifecycleBuild, Session: generation,
-	})
+	payload, err := json.Marshal(handshakeIdentity{Protocol: ProtocolVersion, WireBuild: s.WireBuild, Session: generation})
 	if err != nil {
-		return BuildIdentity{}, nil, err
+		return handshakeIdentity{}, nil, err
 	}
 	if err := codec.WriteFrame(Frame{Kind: FrameHelloAck, Flags: FlagEnd, Payload: payload}); err != nil {
-		return BuildIdentity{}, nil, fmt.Errorf("%w: acknowledge: %w", ErrHandshake, err)
+		return handshakeIdentity{}, nil, fmt.Errorf("%w: acknowledge: %w", ErrHandshake, err)
 	}
 	return identity, generation, nil
 }
@@ -577,10 +642,13 @@ func (s *Server) requestContext(parent context.Context, frame Frame) (context.Co
 	if frame.DeadlineUnixMilli > 0 {
 		deadline = time.UnixMilli(frame.DeadlineUnixMilli)
 	}
-	if server, _, ok := s.Ladder.Deadlines(frame.Op); ok {
-		candidate := time.Now().Add(server)
-		if deadline.IsZero() || candidate.Before(deadline) {
-			deadline = candidate
+	if frame.Op != stopControlOp {
+		server, _, ok := s.Ladder.Deadlines(frame.Op)
+		if ok {
+			candidate := time.Now().Add(server)
+			if deadline.IsZero() || candidate.Before(deadline) {
+				deadline = candidate
+			}
 		}
 	}
 	if !deadline.IsZero() {
@@ -600,6 +668,12 @@ func (s *Server) isDraining() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.draining
+}
+
+func (s *Server) publishReady() {
+	s.mu.Lock()
+	s.readyPublished = true
+	s.mu.Unlock()
 }
 
 func (s *Server) addSession(sess *session) {
@@ -630,10 +704,10 @@ func (s *Server) verifyPeer(ctx context.Context, peer Peer) (bool, error) {
 	if err := s.verifyOrdinaryPeer(ctx, peer); err != nil {
 		return false, err
 	}
-	if s.ProtectedSessionClassifier == nil {
+	if s.protectedSessionClassifier == nil {
 		return false, nil
 	}
-	return s.ProtectedSessionClassifier.Classify(ctx, peer)
+	return s.protectedSessionClassifier.Classify(ctx, peer)
 }
 
 func (s *Server) verifyOrdinaryPeer(ctx context.Context, peer Peer) error {
@@ -709,25 +783,28 @@ func (s *Server) validateSessionCapacity() error {
 	switch {
 	case s.PeerVerificationTimeout < 0:
 		return errors.New("wire: peer verification timeout must not be negative")
-	case s.ReservedProtectedSessions < 0:
+	case s.reservedProtectedSessions < 0:
 		return errors.New("wire: reserved protected sessions must not be negative")
-	case s.ReservedProtectedSessions > maximum:
-		return fmt.Errorf("wire: reserved protected sessions %d exceed maximum sessions %d", s.ReservedProtectedSessions, maximum)
-	case s.ReservedProtectedSessions != 0 && s.ProtectedSessionClassifier == nil:
+	case s.reservedProtectedSessions > maximum:
+		return fmt.Errorf("wire: reserved protected sessions %d exceed maximum sessions %d", s.reservedProtectedSessions, maximum)
+	case s.reservedProtectedSessions != 0 && s.protectedSessionClassifier == nil:
 		return errors.New("wire: protected session classifier is required when capacity is reserved")
-	case s.hasLifecycle && s.ProtectedSessionClassifier == nil:
-		return errors.New("wire: lifecycle handlers require a protected session classifier")
-	case s.hasLifecycle && s.LifecycleBuild == "":
-		return errors.New("wire: lifecycle handlers require LifecycleBuild")
-	case s.hasLifecycle && s.ReservedProtectedSessions == 0:
-		return errors.New("wire: lifecycle handlers require reserved protected capacity")
-	case s.ProtectedSessionClassifier != nil:
-		if err := s.ProtectedSessionClassifier.Validate(); err != nil {
+	case s.protectedSessionClassifier != nil:
+		if err := s.protectedSessionClassifier.Validate(); err != nil {
 			return fmt.Errorf("wire: protected session classifier: %w", err)
 		}
 		return nil
 	default:
 		return nil
+	}
+}
+
+func (s *Server) acquireObservation() (func(), bool) {
+	select {
+	case s.observationSlots <- struct{}{}:
+		return func() { <-s.observationSlots }, true
+	default:
+		return nil, false
 	}
 }
 

@@ -79,20 +79,20 @@ public enum SessionTransportError: Error, Equatable, Sendable {
     case disconnected
 }
 
-struct SessionBuildIdentity: Codable, Sendable {
+struct SessionWireIdentity: Codable, Sendable {
     let protocolVersion: UInt16
-    let build: String
+    let wireBuild: String
     let session: Data?
 
-    init(protocolVersion: UInt16, build: String, session: Data? = nil) {
+    init(protocolVersion: UInt16, wireBuild: String, session: Data? = nil) {
         self.protocolVersion = protocolVersion
-        self.build = build
+        self.wireBuild = wireBuild
         self.session = session
     }
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol"
-        case build
+        case wireBuild = "wire_build"
         case session
     }
 }

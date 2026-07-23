@@ -26,6 +26,7 @@ var (
 	fileStoreMetaBucket         = []byte("meta")
 	fileStoreRecordsBucket      = []byte("records")
 	fileStoreClaimsBucket       = []byte("claims")
+	fileStoreStopConsumedBucket = []byte("stop-consumed")
 	fileStoreReceiptsBucket     = []byte("receipts")
 	fileStoreReceiptIndexBucket = []byte("receipt-records")
 	fileStoreSequencesBucket    = []byte("sequences")
@@ -109,29 +110,24 @@ func (s *FileStore) open(ctx context.Context) (*bolt.DB, error) {
 }
 
 func initializeFileStore(tx *bolt.Tx) error {
-	for _, name := range [][]byte{
+	buckets := [][]byte{
 		fileStoreMetaBucket, fileStoreRecordsBucket, fileStoreClaimsBucket,
+		fileStoreStopConsumedBucket,
 		fileStoreReceiptsBucket, fileStoreReceiptIndexBucket,
 		fileStoreSequencesBucket, fileStoreFloorsBucket,
-	} {
-		if _, err := tx.CreateBucketIfNotExists(name); err != nil {
-			return fmt.Errorf("proc: create keyed store bucket %q: %w", name, err)
-		}
 	}
 	meta := tx.Bucket(fileStoreMetaBucket)
-	schema := meta.Get(fileStoreSchemaKey)
-	if schema == nil {
-		for _, bucketName := range [][]byte{
-			fileStoreMetaBucket, fileStoreRecordsBucket, fileStoreClaimsBucket,
-			fileStoreReceiptsBucket, fileStoreReceiptIndexBucket,
-			fileStoreSequencesBucket, fileStoreFloorsBucket,
-		} {
-			bucket := tx.Bucket(bucketName)
-			key, _ := bucket.Cursor().First()
-			if key != nil {
-				return fmt.Errorf("%w: uninitialized keyed store is not empty", ErrRecordSchema)
+	if meta == nil {
+		key, _ := tx.Cursor().First()
+		if key != nil {
+			return fmt.Errorf("%w: uninitialized keyed store is not empty", ErrRecordSchema)
+		}
+		for _, name := range buckets {
+			if _, err := tx.CreateBucket(name); err != nil {
+				return fmt.Errorf("proc: create keyed store bucket %q: %w", name, err)
 			}
 		}
+		meta = tx.Bucket(fileStoreMetaBucket)
 		if err := meta.Put(fileStoreSchemaKey, uint64Bytes(recordSchemaVersion)); err != nil {
 			return err
 		}
@@ -146,6 +142,22 @@ func initializeFileStore(tx *bolt.Tx) error {
 		}
 		return meta.Put(fileStoreOutstandingKey, uint64Bytes(0))
 	}
+	expected := make(map[string]struct{}, len(buckets))
+	for _, name := range buckets {
+		expected[string(name)] = struct{}{}
+		if tx.Bucket(name) == nil {
+			return fmt.Errorf("%w: keyed store bucket %q is missing", ErrRecordSchema, name)
+		}
+	}
+	if err := tx.ForEach(func(name []byte, _ *bolt.Bucket) error {
+		if _, ok := expected[string(name)]; !ok {
+			return fmt.Errorf("%w: unknown keyed store bucket %q", ErrRecordSchema, name)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	schema := meta.Get(fileStoreSchemaKey)
 	if len(schema) != 8 || binary.BigEndian.Uint64(schema) != recordSchemaVersion {
 		return fmt.Errorf("%w: keyed store schema is not %d", ErrRecordSchema, recordSchemaVersion)
 	}
@@ -361,12 +373,72 @@ func (s *FileStore) Remove(ctx context.Context, victims []Record) error {
 			if err := records.Delete(key); err != nil {
 				return err
 			}
+			if err := tx.Bucket(fileStoreStopConsumedBucket).Delete(key); err != nil {
+				return err
+			}
 			if err := updateOutstanding(tx, -1); err != nil {
 				return err
 			}
 		}
 		return nil
 	})
+}
+
+// ConsumeStopControl atomically marks and returns the one exact unexpired
+// authority for identity, role, and target runtime generation. The process
+// record remains durable until synchronous untracking or recovery reaping.
+func (s *FileStore) ConsumeStopControl(
+	ctx context.Context,
+	identity Identity,
+	role, targetProcessGeneration string,
+	now time.Time,
+) (Record, bool, error) {
+	if identity.PID <= 0 || identity.StartTime == "" || identity.Boot == "" ||
+		role == "" || targetProcessGeneration == "" {
+		return Record{}, false, errors.New("proc: stop authority lookup is incomplete")
+	}
+	db, err := s.open(ctx)
+	if err != nil {
+		return Record{}, false, err
+	}
+	defer db.Close()
+	authority := Record{
+		RecoveryClass: RecoveryStopControl,
+		PID:           identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
+	}
+	var consumed Record
+	err = db.Update(func(tx *bolt.Tx) error {
+		records := tx.Bucket(fileStoreRecordsBucket)
+		consumedRecords := tx.Bucket(fileStoreStopConsumedBucket)
+		key := []byte(recordKey(authority))
+		if consumedRecords.Get(key) != nil {
+			return nil
+		}
+		value := records.Get(key)
+		if value == nil {
+			return nil
+		}
+		var stored Record
+		if err := decodeStored(value, &stored); err != nil {
+			return err
+		}
+		if stored.RecoveryClass != RecoveryStopControl || stored.PID != identity.PID ||
+			stored.StartTime != identity.StartTime || stored.Boot != identity.Boot ||
+			stored.Comm != identity.Comm || stored.Executable != identity.Executable ||
+			stored.AuditToken != identity.AuditToken || stored.Role != role ||
+			stored.TargetProcessGeneration != targetProcessGeneration {
+			return nil
+		}
+		if now.UnixMilli() >= stored.ExpiresUnixMilli {
+			return nil
+		}
+		if err := consumedRecords.Put(key, []byte{1}); err != nil {
+			return err
+		}
+		consumed = stored
+		return nil
+	})
+	return consumed, consumed.RecoveryClass == RecoveryStopControl, err
 }
 
 // BeginReap durably fences graceful untracking of rec.
@@ -491,6 +563,9 @@ func (s *FileStore) CommitReap(
 			return err
 		}
 		if err := tx.Bucket(fileStoreClaimsBucket).Delete(recordKeyBytes); err != nil {
+			return err
+		}
+		if err := tx.Bucket(fileStoreStopConsumedBucket).Delete(recordKeyBytes); err != nil {
 			return err
 		}
 		return tx.Bucket(fileStoreRecordsBucket).Delete(recordKeyBytes)
@@ -757,4 +832,7 @@ func (s *FileStore) ReapReceiptFloor(ctx context.Context, class RecoveryClass) (
 	return floor, err
 }
 
-var _ Store = (*FileStore)(nil)
+var (
+	_ Store            = (*FileStore)(nil)
+	_ StopControlStore = (*FileStore)(nil)
+)

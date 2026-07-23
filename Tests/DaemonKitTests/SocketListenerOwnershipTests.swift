@@ -43,13 +43,13 @@ extension SocketTransportTests {
                 let path = directory.appendingPathComponent("owner.sock").path
                 let handlerGate = ListenerOwnershipGate()
                 let drainGate = ListenerOwnershipGate()
-                let old = SocketServer(path: path, build: "old", trust: .sameEffectiveUser) { _ in
+                let old = SocketServer(path: path, wireBuild: "old", trust: .sameEffectiveUser) { _ in
                     await handlerGate.wait()
                     return .terminal(SocketTerminal())
                 }
                 try await old.start()
                 cleanup.add { await old.stop() }
-                let client = try await SocketClient(path: path, build: "old", trust: .sameEffectiveUser)
+                let client = try await SocketClient(path: path, wireBuild: "old", trust: .sameEffectiveUser)
                 cleanup.add { client.abort() }
                 let call = Task { try await client.call(operation: "hold") }
                 await handlerGate.waitUntilEntered()
@@ -58,7 +58,7 @@ extension SocketTransportTests {
                 let stopping = Task { await old.stop() }
                 await drainGate.waitUntilEntered()
 
-                let contender = SocketServer(path: path, build: "new", trust: .sameEffectiveUser) { _ in
+                let contender = SocketServer(path: path, wireBuild: "new", trust: .sameEffectiveUser) { _ in
                     .terminal(SocketTerminal())
                 }
                 await #expect(throws: SocketServerError.self) {
@@ -73,7 +73,7 @@ extension SocketTransportTests {
                 old.stopDrainHook = nil
                 #expect(!FileManager.default.fileExists(atPath: path))
 
-                let replacement = SocketServer(path: path, build: "new", trust: .sameEffectiveUser) { _ in
+                let replacement = SocketServer(path: path, wireBuild: "new", trust: .sameEffectiveUser) { _ in
                     .terminal(SocketTerminal())
                 }
                 try await replacement.start()

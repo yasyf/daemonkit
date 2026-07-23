@@ -202,7 +202,7 @@ extension SocketTransportTests {
             await #expect(throws: SessionTransportError.self) {
                 _ = try await SocketClient(
                     path: "/tmp/never-connect.sock",
-                    build: "invalid",
+                    wireBuild: "invalid",
                     configuration: .init(maximumFrameBytes: 0),
                     trust: .sameEffectiveUser
                 )
@@ -210,14 +210,14 @@ extension SocketTransportTests {
             await #expect(throws: SessionTransportError.self) {
                 _ = try await SocketClient(
                     path: "/tmp/never-connect.sock",
-                    build: "invalid",
+                    wireBuild: "invalid",
                     configuration: .init(handshakeTimeout: .infinity),
                     trust: .sameEffectiveUser
                 )
             }
             let server = SocketServer(
                 path: "/tmp/never-bind.sock",
-                build: "invalid",
+                wireBuild: "invalid",
                 configuration: .init(maximumActiveRequests: 0, maximumSessions: 0, writeTimeout: .nan),
                 trust: .sameEffectiveUser
             ) { _ in .terminal(SocketTerminal()) }
@@ -230,7 +230,7 @@ extension SocketTransportTests {
                 let directory = try shortSocketDir()
                 cleanup.add { try? FileManager.default.removeItem(at: directory) }
                 let path = directory.appendingPathComponent("expired.sock").path
-                let server = SocketServer(path: path, build: "expired", trust: .sameEffectiveUser) { _ in
+                let server = SocketServer(path: path, wireBuild: "expired", trust: .sameEffectiveUser) { _ in
                     do {
                         try await Task.sleep(for: .seconds(5))
                     } catch {}
@@ -238,7 +238,7 @@ extension SocketTransportTests {
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try await SocketClient(path: path, build: "expired", trust: .sameEffectiveUser)
+                let client = try await SocketClient(path: path, wireBuild: "expired", trust: .sameEffectiveUser)
                 cleanup.add { await client.close() }
                 let terminal = try await client.call(
                     operation: "expired",
@@ -255,12 +255,12 @@ extension SocketTransportTests {
                 let directory = try shortSocketDir()
                 cleanup.add { try? FileManager.default.removeItem(at: directory) }
                 let path = directory.appendingPathComponent("strict.sock").path
-                let server = SocketServer(path: path, build: "strict", trust: .sameEffectiveUser) { request in
+                let server = SocketServer(path: path, wireBuild: "strict", trust: .sameEffectiveUser) { request in
                     .terminal(SocketTerminal(payload: request.payload))
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try await SocketClient(path: path, build: "strict", trust: .sameEffectiveUser)
+                let client = try await SocketClient(path: path, wireBuild: "strict", trust: .sameEffectiveUser)
                 cleanup.add { await client.close() }
                 let payload = Data(#"{"strict":true}"#.utf8)
                 let response = try await client.call(operation: "echo", payload: payload)
@@ -273,7 +273,7 @@ extension SocketTransportTests {
             defer { try? FileManager.default.removeItem(at: directory) }
             let path = directory.appendingPathComponent("start.sock").path
             let gate = AsyncGate()
-            let server = SocketServer(path: path, build: "start", trust: .sameEffectiveUser) { _ in
+            let server = SocketServer(path: path, wireBuild: "start", trust: .sameEffectiveUser) { _ in
                 .terminal(SocketTerminal())
             }
             server.startCommitHook = { await gate.wait() }
@@ -291,7 +291,7 @@ extension SocketTransportTests {
                 let directory = try shortSocketDir()
                 cleanup.add { try? FileManager.default.removeItem(at: directory) }
                 let path = directory.appendingPathComponent("stop.sock").path
-                let server = SocketServer(path: path, build: "stop", trust: .sameEffectiveUser) { _ in
+                let server = SocketServer(path: path, wireBuild: "stop", trust: .sameEffectiveUser) { _ in
                     .terminal(SocketTerminal())
                 }
                 try await server.start()
@@ -329,7 +329,7 @@ extension SocketTransportTests {
                 let path = directory.appendingPathComponent("open-cancel.sock").path
                 let handlerGate = AsyncGate()
                 let cancellationObserved = CompletionProbe()
-                let server = SocketServer(path: path, build: "open-cancel", trust: .sameEffectiveUser) { request in
+                let server = SocketServer(path: path, wireBuild: "open-cancel", trust: .sameEffectiveUser) { request in
                     if request.operation == "cancel-me" {
                         await handlerGate.wait()
                         if Task.isCancelled {
@@ -340,7 +340,7 @@ extension SocketTransportTests {
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try await SocketClient(path: path, build: "open-cancel", trust: .sameEffectiveUser)
+                let client = try await SocketClient(path: path, wireBuild: "open-cancel", trust: .sameEffectiveUser)
                 cleanup.add { await client.close() }
                 let gate = AsyncGate()
                 client.openCommitHook = { await gate.wait() }
@@ -366,7 +366,7 @@ extension SocketTransportTests {
                 let path = directory.appendingPathComponent("response-cancel.sock").path
                 let handlerGate = AsyncGate()
                 let cancellationObserved = CompletionProbe()
-                let server = SocketServer(path: path, build: "response-cancel", trust: .sameEffectiveUser) { request in
+                let server = SocketServer(path: path, wireBuild: "response-cancel", trust: .sameEffectiveUser) { request in
                     if request.operation == "wait" {
                         await handlerGate.wait()
                         if Task.isCancelled {
@@ -377,7 +377,7 @@ extension SocketTransportTests {
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try await SocketClient(path: path, build: "response-cancel", trust: .sameEffectiveUser)
+                let client = try await SocketClient(path: path, wireBuild: "response-cancel", trust: .sameEffectiveUser)
                 cleanup.add { await client.close() }
                 let call = try await client.open(operation: "wait")
                 await handlerGate.waitUntilEntered()
@@ -396,7 +396,7 @@ extension SocketTransportTests {
                 let directory = try shortSocketDir()
                 cleanup.add { try? FileManager.default.removeItem(at: directory) }
                 let path = directory.appendingPathComponent("terminal-settlement.sock").path
-                let server = SocketServer(path: path, build: "terminal-settlement", trust: .sameEffectiveUser) { request in
+                let server = SocketServer(path: path, wireBuild: "terminal-settlement", trust: .sameEffectiveUser) { request in
                     if request.operation == "terminal" {
                         return .terminal(SocketTerminal())
                     }
@@ -406,7 +406,7 @@ extension SocketTransportTests {
                 cleanup.add { await server.stop() }
                 let client = try await SocketClient(
                     path: path,
-                    build: "terminal-settlement",
+                    wireBuild: "terminal-settlement",
                     trust: .sameEffectiveUser
                 )
                 cleanup.add { await client.close() }
@@ -430,7 +430,7 @@ extension SocketTransportTests {
                 let path = directory.appendingPathComponent("send-settlement.sock").path
                 let handlerGate = AsyncGate()
                 let streamChunkObserved = CompletionProbe()
-                let server = SocketServer(path: path, build: "send-settlement", trust: .sameEffectiveUser) { request in
+                let server = SocketServer(path: path, wireBuild: "send-settlement", trust: .sameEffectiveUser) { request in
                     if request.operation == "upload" {
                         Task {
                             do {
@@ -449,7 +449,7 @@ extension SocketTransportTests {
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try await SocketClient(path: path, build: "send-settlement", trust: .sameEffectiveUser)
+                let client = try await SocketClient(path: path, wireBuild: "send-settlement", trust: .sameEffectiveUser)
                 cleanup.add { await client.close() }
                 let sendGate = AsyncGate()
                 let drainWaiting = CompletionProbe()
@@ -492,7 +492,7 @@ extension SocketTransportTests {
                 let path = directory.appendingPathComponent("stream-commit-cancel.sock").path
                 let server = SocketServer(
                     path: path,
-                    build: "stream-commit-cancel",
+                    wireBuild: "stream-commit-cancel",
                     trust: .sameEffectiveUser
                 ) { request in
                     if request.operation == "upload" {
@@ -515,7 +515,7 @@ extension SocketTransportTests {
                 cleanup.add { await server.stop() }
                 let client = try await SocketClient(
                     path: path,
-                    build: "stream-commit-cancel",
+                    wireBuild: "stream-commit-cancel",
                     trust: .sameEffectiveUser
                 )
                 cleanup.add { await client.close() }
@@ -541,12 +541,12 @@ extension SocketTransportTests {
                 let directory = try shortSocketDir()
                 cleanup.add { try? FileManager.default.removeItem(at: directory) }
                 let path = directory.appendingPathComponent("close-settlement.sock").path
-                let server = SocketServer(path: path, build: "close-settlement", trust: .sameEffectiveUser) { _ in
+                let server = SocketServer(path: path, wireBuild: "close-settlement", trust: .sameEffectiveUser) { _ in
                     .terminal(SocketTerminal())
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try await SocketClient(path: path, build: "close-settlement", trust: .sameEffectiveUser)
+                let client = try await SocketClient(path: path, wireBuild: "close-settlement", trust: .sameEffectiveUser)
                 cleanup.add { await client.close() }
                 let settling = AsyncGate()
                 let coAwaiting = AsyncGate()
@@ -580,7 +580,7 @@ extension SocketTransportTests {
                 cleanup.add { try? FileManager.default.removeItem(at: directory) }
                 let path = directory.appendingPathComponent("stream-cancel.sock").path
                 let chunks = SingleChunkSource()
-                let server = SocketServer(path: path, build: "stream-cancel", trust: .sameEffectiveUser) { request in
+                let server = SocketServer(path: path, wireBuild: "stream-cancel", trust: .sameEffectiveUser) { request in
                     if request.operation == "stream" {
                         return .stream(SocketResponseStream(
                             nextChunk: { await chunks.next() },
@@ -592,7 +592,7 @@ extension SocketTransportTests {
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try await SocketClient(path: path, build: "stream-cancel", trust: .sameEffectiveUser)
+                let client = try await SocketClient(path: path, wireBuild: "stream-cancel", trust: .sameEffectiveUser)
                 cleanup.add { await client.close() }
                 let delivering = AsyncGate()
                 client.receiveStreamOfferHook = { await delivering.wait() }
@@ -613,7 +613,7 @@ extension SocketTransportTests {
                 cleanup.add { try? FileManager.default.removeItem(at: directory) }
                 let path = directory.appendingPathComponent("duplex-cancel.sock").path
                 let chunks = SingleChunkSource()
-                let server = SocketServer(path: path, build: "duplex-cancel", trust: .sameEffectiveUser) { request in
+                let server = SocketServer(path: path, wireBuild: "duplex-cancel", trust: .sameEffectiveUser) { request in
                     if request.operation == "stream" {
                         return .stream(SocketResponseStream(
                             nextChunk: { await chunks.next() },
@@ -625,7 +625,7 @@ extension SocketTransportTests {
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try await SocketClient(path: path, build: "duplex-cancel", trust: .sameEffectiveUser)
+                let client = try await SocketClient(path: path, wireBuild: "duplex-cancel", trust: .sameEffectiveUser)
                 cleanup.add { await client.close() }
                 let sending = AsyncGate()
                 let delivering = AsyncGate()
@@ -658,7 +658,7 @@ extension SocketTransportTests {
                 cleanup.add { try? FileManager.default.removeItem(at: directory) }
                 let path = directory.appendingPathComponent("timeout-race.sock").path
                 let handlerGate = AsyncGate()
-                let server = SocketServer(path: path, build: "timeout-race", trust: .sameEffectiveUser) { request in
+                let server = SocketServer(path: path, wireBuild: "timeout-race", trust: .sameEffectiveUser) { request in
                     if request.operation == "wait" {
                         await handlerGate.wait()
                     }
@@ -668,7 +668,7 @@ extension SocketTransportTests {
                 cleanup.add { await server.stop() }
                 let client = try await SocketClient(
                     path: path,
-                    build: "timeout-race",
+                    wireBuild: "timeout-race",
                     configuration: .init(cancellationSettlementTimeout: 0.001),
                     trust: .sameEffectiveUser
                 )
@@ -717,7 +717,7 @@ extension SocketTransportTests {
                 let handlerGate = AsyncGate()
                 let server = SocketServer(
                     path: path,
-                    build: "credit-settlement",
+                    wireBuild: "credit-settlement",
                     configuration: .init(streamQueueDepth: 1),
                     trust: .sameEffectiveUser
                 ) { request in
@@ -729,7 +729,7 @@ extension SocketTransportTests {
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try await SocketClient(path: path, build: "credit-settlement", trust: .sameEffectiveUser)
+                let client = try await SocketClient(path: path, wireBuild: "credit-settlement", trust: .sameEffectiveUser)
                 cleanup.add { await client.close() }
                 let admissions = InvocationProbe()
                 client.requestSendAdmissionHook = { await admissions.record() }
@@ -936,7 +936,7 @@ extension SocketTransportTests {
             let connecting = Task {
                 try await SocketClient(
                     path: path,
-                    build: "handshake",
+                    wireBuild: "handshake",
                     configuration: .init(handshakeTimeout: 5),
                     trust: .sameEffectiveUser
                 )
@@ -971,7 +971,7 @@ extension SocketTransportTests {
                 let path = directory.appendingPathComponent("drop-client.sock").path
                 let handlerGate = AsyncGate()
                 let capture = SocketSessionCapture()
-                let server = SocketServer(path: path, build: "drop-client", trust: .sameEffectiveUser) { request in
+                let server = SocketServer(path: path, wireBuild: "drop-client", trust: .sameEffectiveUser) { request in
                     await capture.record(request.session)
                     await handlerGate.wait()
                     return .terminal(SocketTerminal())
@@ -980,7 +980,7 @@ extension SocketTransportTests {
                 cleanup.add { await server.stop() }
                 var client: SocketClient? = try await SocketClient(
                     path: path,
-                    build: "drop-client",
+                    wireBuild: "drop-client",
                     configuration: .init(cancellationSettlementTimeout: 3600),
                     trust: .sameEffectiveUser
                 )

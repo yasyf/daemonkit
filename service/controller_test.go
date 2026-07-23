@@ -132,9 +132,10 @@ func (s *controllerStoreStub) record(event string) {
 }
 
 type controllerReceiptsStub struct {
-	events *[]string
-	calls  int
-	err    error
+	events  *[]string
+	calls   int
+	classes []proc.RecoveryClass
+	err     error
 }
 
 func (r *controllerReceiptsStub) RecoverReapReceipts(
@@ -142,12 +143,13 @@ func (r *controllerReceiptsStub) RecoverReapReceipts(
 	class proc.RecoveryClass,
 	_ func(context.Context, proc.ReapReceipt) error,
 ) (proc.ReapReceiptFloor, error) {
-	if class != proc.RecoveryService {
+	if class != proc.RecoveryService && class != proc.RecoveryStopControl {
 		return proc.ReapReceiptFloor{}, fmt.Errorf("receipt class = %q", class)
 	}
 	r.calls++
+	r.classes = append(r.classes, class)
 	if r.events != nil {
-		*r.events = append(*r.events, "recover-receipts")
+		*r.events = append(*r.events, fmt.Sprintf("recover-receipts:%d", class))
 	}
 	return proc.ReapReceiptFloor{RecoveryClass: class}, r.err
 }
@@ -235,6 +237,65 @@ func TestControllerConfigRequiresExactDistinctPathsAndCapacity(t *testing.T) {
 	}
 }
 
+func TestControllerStatusReportsAbsentWithoutRuntimeConnection(t *testing.T) {
+	runtime := &controllerRuntimeStub{run: launchctlStub(func(args []string) (string, error) {
+		if !reflect.DeepEqual(args, []string{"print", serviceTarget("com.example.absent")}) {
+			t.Fatalf("launchctl args = %v", args)
+		}
+		return "not found", launchctlExit(launchctlNotLoadedExit)
+	})}
+	controller := &Controller{
+		runtime:   runtime,
+		state:     controllerState{Desired: map[string]Agent{}, Applied: map[string]Agent{}},
+		closeDone: make(chan struct{}),
+	}
+	status, err := controller.Status(t.Context(), "com.example.absent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != (Status{Label: "com.example.absent"}) {
+		t.Fatalf("Status = %#v", status)
+	}
+}
+
+func TestControllerStatusRequiresExactDesiredAppliedLoadedState(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	agent := controllerAgent(t, "com.example.exact")
+	plist, err := agent.Plist()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := agent.PlistPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, plist, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &controllerRuntimeStub{run: launchctlStub(func([]string) (string, error) {
+		return "loaded", nil
+	})}
+	controller := &Controller{
+		runtime: runtime,
+		state: controllerState{
+			Desired: map[string]Agent{agent.Label: agent},
+			Applied: map[string]Agent{agent.Label: agent},
+		},
+		closeDone: make(chan struct{}),
+	}
+	status, err := controller.Status(t.Context(), agent.Label)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Status{Label: agent.Label, Desired: true, Applied: true, Loaded: true, Exact: true}
+	if status != want {
+		t.Fatalf("Status = %#v, want %#v", status, want)
+	}
+}
+
 func TestControllerRecoveryConvergesBeforeAcknowledgingReceipts(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	agent := controllerAgent(t, "com.example.recover")
@@ -250,14 +311,18 @@ func TestControllerRecoveryConvergesBeforeAcknowledgingReceipts(t *testing.T) {
 		Applied: map[string]Agent{},
 	}, run, &events)
 	_ = controller
-	if receipts.calls != 1 {
-		t.Fatalf("receipt recovery calls = %d, want 1", receipts.calls)
+	if receipts.calls != 2 {
+		t.Fatalf("receipt recovery calls = %d, want 2", receipts.calls)
 	}
 	if got := store.state.Applied[agent.Label]; !reflect.DeepEqual(got, agent) {
 		t.Fatalf("applied agent = %#v, want %#v", got, agent)
 	}
-	wantLast := []string{"set-applied:" + agent.Label, "recover-receipts"}
-	if len(events) < len(wantLast) || !reflect.DeepEqual(events[len(events)-2:], wantLast) {
+	wantLast := []string{
+		"set-applied:" + agent.Label,
+		fmt.Sprintf("recover-receipts:%d", proc.RecoveryService),
+		fmt.Sprintf("recover-receipts:%d", proc.RecoveryStopControl),
+	}
+	if len(events) < len(wantLast) || !reflect.DeepEqual(events[len(events)-len(wantLast):], wantLast) {
 		t.Fatalf("events = %v, want suffix %v", events, wantLast)
 	}
 }
@@ -315,12 +380,16 @@ func TestControllerRecoveryVerifiesExactAgentWithoutRelaunch(t *testing.T) {
 		Applied: map[string]Agent{agent.Label: agent},
 	}, run, &events)
 	_ = controller
-	want := []string{"recover", "load", "run:print " + serviceTarget(agent.Label), "recover-receipts"}
+	want := []string{
+		"recover", "load", "run:print " + serviceTarget(agent.Label),
+		fmt.Sprintf("recover-receipts:%d", proc.RecoveryService),
+		fmt.Sprintf("recover-receipts:%d", proc.RecoveryStopControl),
+	}
 	if !reflect.DeepEqual(events, want) {
 		t.Fatalf("recovery events = %v, want %v", events, want)
 	}
-	if receipts.calls != 1 {
-		t.Fatalf("receipt recovery calls = %d, want 1", receipts.calls)
+	if receipts.calls != 2 {
+		t.Fatalf("receipt recovery calls = %d, want 2", receipts.calls)
 	}
 	if got := store.state.Applied[agent.Label]; !reflect.DeepEqual(got, agent) {
 		t.Fatalf("applied agent changed: %#v", got)

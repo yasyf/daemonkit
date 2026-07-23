@@ -70,25 +70,27 @@ func (e *runtimeEvents) wait(t *testing.T, event string) {
 type runtimeAdmission struct {
 	events *runtimeEvents
 
-	mu        sync.Mutex
-	draining  bool
-	inflight  int
-	settled   chan struct{}
-	settleErr error
+	mu           sync.Mutex
+	draining     bool
+	inflight     int
+	settled      chan struct{}
+	settleErr    error
+	closeEntered chan struct{}
+	closeRelease <-chan struct{}
 }
 
 func (a *runtimeAdmission) Admit() (func(), error) {
 	return a.admit(false)
 }
 
-func (a *runtimeAdmission) AdmitLifecycle() (func(), error) {
+func (a *runtimeAdmission) AdmitProtected() (func(), error) {
 	return a.admit(true)
 }
 
-func (a *runtimeAdmission) admit(lifecycle bool) (func(), error) {
+func (a *runtimeAdmission) admit(protected bool) (func(), error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.draining && !lifecycle {
+	if a.draining && !protected {
 		return nil, errors.New("draining")
 	}
 	a.inflight++
@@ -108,6 +110,12 @@ func (a *runtimeAdmission) admit(lifecycle bool) (func(), error) {
 
 func (a *runtimeAdmission) Close() {
 	a.events.add("admission-close")
+	if a.closeEntered != nil {
+		close(a.closeEntered)
+	}
+	if a.closeRelease != nil {
+		<-a.closeRelease
+	}
 	a.mu.Lock()
 	a.draining = true
 	a.mu.Unlock()
@@ -227,7 +235,7 @@ func (c *runtimeCloser) Close() error {
 	return c.err
 }
 
-func runtimeTestConfig(t *testing.T, peer Peer) (RuntimeConfig, *runtimeEvents, *runtimeServer, *runtimeAdmission, *runtimeWorkers) {
+func runtimeTestConfig(t *testing.T, _ any) (RuntimeConfig, *runtimeEvents, *runtimeServer, *runtimeAdmission, *runtimeWorkers) {
 	t.Helper()
 	dir, err := os.MkdirTemp("", "dkr-")
 	if err != nil {
@@ -239,17 +247,14 @@ func runtimeTestConfig(t *testing.T, peer Peer) (RuntimeConfig, *runtimeEvents, 
 	admission := &runtimeAdmission{events: events}
 	workers := &runtimeWorkers{events: events}
 	return RuntimeConfig{
-		Socket:    filepath.Join(dir, "s"),
-		Build:     "v2.0.0",
-		Protocol:  2,
-		Peer:      peer,
-		Contract:  RequestDaemon,
-		WaitMode:  SocketRelease,
-		Admission: admission,
-		Server:    server,
-		Workers:   workers,
-		State:     &runtimeCloser{events: events, event: "state-close"},
-		Resources: &runtimeCloser{events: events, event: "resources-close"},
+		Socket:          filepath.Join(dir, "s"),
+		RuntimeBuild:    "v2.0.0",
+		RuntimeProtocol: 2,
+		Admission:       admission,
+		Server:          server,
+		Workers:         workers,
+		State:           &runtimeCloser{events: events, event: "state-close"},
+		Resources:       &runtimeCloser{events: events, event: "resources-close"},
 		Activate: func(Activation) error {
 			events.add("activate")
 			return nil
@@ -258,8 +263,10 @@ func runtimeTestConfig(t *testing.T, peer Peer) (RuntimeConfig, *runtimeEvents, 
 	}, events, server, admission, workers
 }
 
-func absentRuntimePeer() Peer {
-	return &fakePeer{health: []healthResult{{err: ErrNoPeer}}}
+func absentRuntimePeer() any { return nil }
+
+func newTestRuntime(cfg RuntimeConfig) (*Runtime, error) {
+	return newRuntime(cfg)
 }
 
 func startRuntime(ctx context.Context, t *testing.T, runtime *Runtime, server *runtimeServer) <-chan error {
@@ -313,7 +320,7 @@ func waitRuntime(t *testing.T, done <-chan error) error {
 
 func TestRuntimeShutdownOrderAndDoubleRunClose(t *testing.T) {
 	cfg, events, server, _, _ := runtimeTestConfig(t, absentRuntimePeer())
-	runtime, err := NewRuntime(cfg)
+	runtime, err := newTestRuntime(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +359,7 @@ func TestRuntimeHealthUsesExactIdentityAndDrainState(t *testing.T) {
 	cfg, _, _, admission, _ := runtimeTestConfig(t, absentRuntimePeer())
 	cfg.Busy = func() bool { return true }
 	cfg.HealthState = func() State { return StateDegraded }
-	runtime, err := NewRuntime(cfg)
+	runtime, err := newTestRuntime(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -361,8 +368,8 @@ func TestRuntimeHealthUsesExactIdentityAndDrainState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if health.Build != cfg.Build || health.Protocol != cfg.Protocol {
-		t.Fatalf("identity = {%q %d}, want {%q %d}", health.Build, health.Protocol, cfg.Build, cfg.Protocol)
+	if health.RuntimeBuild != cfg.RuntimeBuild || health.RuntimeProtocol != cfg.RuntimeProtocol {
+		t.Fatalf("identity = {%q %d}, want {%q %d}", health.RuntimeBuild, health.RuntimeProtocol, cfg.RuntimeBuild, cfg.RuntimeProtocol)
 	}
 	if health.State != StateDegraded || !health.Busy || health.Draining {
 		t.Fatalf("health = %+v", health)
@@ -377,13 +384,48 @@ func TestRuntimeHealthUsesExactIdentityAndDrainState(t *testing.T) {
 	}
 }
 
+func TestRuntimeHealthReportsDrainingBeforeAdmissionCloseCompletes(t *testing.T) {
+	cfg, _, server, admission, _ := runtimeTestConfig(t, absentRuntimePeer())
+	closeEntered := make(chan struct{})
+	closeRelease := make(chan struct{})
+	admission.closeEntered = closeEntered
+	admission.closeRelease = closeRelease
+	runtime, err := newTestRuntime(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := startRuntime(context.Background(), t, runtime, server)
+	if err := runtime.WaitReady(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-closeEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("admission close did not start")
+	}
+	health, err := runtime.Health(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !health.Draining || health.Ready {
+		t.Fatalf("health during admission close = %+v, want draining and not ready", health)
+	}
+	close(closeRelease)
+	if err := waitRuntime(t, runDone); err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+}
+
 func TestRuntimeSettlesAdmissionBeforeClosingWorkers(t *testing.T) {
 	cfg, events, server, admission, _ := runtimeTestConfig(t, absentRuntimePeer())
 	doneRequest, err := admission.Admit()
 	if err != nil {
 		t.Fatal(err)
 	}
-	runtime, err := NewRuntime(cfg)
+	runtime, err := newTestRuntime(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,59 +448,27 @@ func TestRuntimeSettlesAdmissionBeforeClosingWorkers(t *testing.T) {
 	}
 }
 
-func TestRuntimeTakeoverVersionOrdering(t *testing.T) {
-	tests := []struct {
-		name        string
-		peerVersion string
-		serve       bool
-	}{
-		{name: "same exits", peerVersion: "v2.0.0"},
-		{name: "newer exits", peerVersion: "v3.0.0"},
-		{name: "older hands off", peerVersion: "v1.0.0", serve: true},
+func TestRuntimeLiveIncumbentPreventsActivation(t *testing.T) {
+	cfg, events, server, _, _ := runtimeTestConfig(t, nil)
+	listener, err := net.Listen("unix", cfg.Socket)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			peer := &fakePeer{health: []healthResult{{h: Health{
-				Build: tt.peerVersion, Protocol: 2, PID: 222,
-			}}}}
-			if tt.serve {
-				peer.health = append(peer.health, healthResult{err: ErrNoPeer})
-			}
-			cfg, events, server, _, _ := runtimeTestConfig(t, peer)
-			if tt.serve {
-				cfg.Contract = ResourceOwner
-				cfg.Handoff = func(context.Context) error { return nil }
-			}
-			runtime, err := NewRuntime(cfg)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !tt.serve {
-				if err := runtime.Run(context.Background()); err != nil {
-					t.Fatalf("Run = %v", err)
-				}
-				select {
-				case <-server.started:
-					t.Fatal("same-or-newer peer must prevent serving")
-				default:
-				}
-				if events.index("activate") >= 0 {
-					t.Fatalf("same-or-newer peer activated shared state: %v", events.snapshot())
-				}
-				return
-			}
-			runDone := startRuntime(context.Background(), t, runtime, server)
-			if err := runtime.Close(context.Background()); err != nil {
-				t.Fatalf("Close = %v", err)
-			}
-			if err := waitRuntime(t, runDone); err != nil {
-				t.Fatalf("Run = %v", err)
-			}
-			_, handoffs := peer.counts()
-			if handoffs != 1 {
-				t.Fatalf("handoffs = %d, want 1", handoffs)
-			}
-		})
+	defer listener.Close()
+	runtime, err := newTestRuntime(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-server.started:
+		t.Fatal("live incumbent allowed serving")
+	default:
+	}
+	if events.index("activate") >= 0 {
+		t.Fatalf("live incumbent allowed activation: %v", events.snapshot())
 	}
 }
 
@@ -489,7 +499,7 @@ func TestRuntimeActivatesAfterListenerOwnershipBeforeServing(t *testing.T) {
 		events.add("activate")
 		return nil
 	}
-	runtime, err := NewRuntime(cfg)
+	runtime, err := newTestRuntime(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -506,7 +516,7 @@ func TestRuntimeActivatesAfterListenerOwnershipBeforeServing(t *testing.T) {
 }
 
 func TestRuntimeWaitReadyUsesExactPublicationWithoutPolling(t *testing.T) {
-	cfg, events, server, _, _ := runtimeTestConfig(t, absentRuntimePeer())
+	cfg, events, server, admission, _ := runtimeTestConfig(t, absentRuntimePeer())
 	releaseReady := make(chan struct{})
 	server.readyGate = releaseReady
 	var healthCalls atomic.Int32
@@ -514,7 +524,7 @@ func TestRuntimeWaitReadyUsesExactPublicationWithoutPolling(t *testing.T) {
 		healthCalls.Add(1)
 		return StateHealthy
 	}
-	runtime, err := NewRuntime(cfg)
+	runtime, err := newTestRuntime(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -539,6 +549,21 @@ func TestRuntimeWaitReadyUsesExactPublicationWithoutPolling(t *testing.T) {
 	if got := healthCalls.Load(); got != 2 {
 		t.Fatalf("health calls after readiness = %d, want publish + verify", got)
 	}
+	health, err := runtime.Health(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !health.Ready || health.ProcessGeneration == "" {
+		t.Fatalf("published health = %+v, want ready canonical process generation", health)
+	}
+	admission.Close()
+	health, err = runtime.Health(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if health.Ready || !health.Draining {
+		t.Fatalf("draining health = %+v, want not ready", health)
+	}
 	if err := runtime.Close(context.Background()); err != nil {
 		t.Fatalf("Close = %v", err)
 	}
@@ -550,7 +575,7 @@ func TestRuntimeWaitReadyUsesExactPublicationWithoutPolling(t *testing.T) {
 func TestRuntimeReadinessErrorStopsAndReplaysJoinedTerminal(t *testing.T) {
 	cfg, events, _, _, _ := runtimeTestConfig(t, absentRuntimePeer())
 	cfg.HealthState = func() State { return StateFailed }
-	runtime, err := NewRuntime(cfg)
+	runtime, err := newTestRuntime(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -575,7 +600,7 @@ func TestRuntimeWaitReplaysServeTerminal(t *testing.T) {
 	boom := errors.New("serve terminal")
 	cfg, _, server, _, _ := runtimeTestConfig(t, absentRuntimePeer())
 	server.serveErr = boom
-	runtime, err := NewRuntime(cfg)
+	runtime, err := newTestRuntime(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -615,7 +640,7 @@ func TestRuntimeSeparatesActivationStartupFromResourceLifetime(t *testing.T) {
 		}
 		return nil
 	})
-	runtime, err := NewRuntime(cfg)
+	runtime, err := newTestRuntime(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -683,7 +708,7 @@ func TestRuntimeOwnsManagedProcessThroughServingAndPostDrainShutdown(t *testing.
 		events.add("activate")
 		return startErr
 	}
-	runtime, err := NewRuntime(cfg)
+	runtime, err := newTestRuntime(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -745,7 +770,7 @@ func TestRuntimeActivationFailureNeverServesAndClosesOwnedState(t *testing.T) {
 		events.add("resources-close")
 		return nil
 	})
-	runtime, err := NewRuntime(cfg)
+	runtime, err := newTestRuntime(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -776,7 +801,7 @@ func TestRuntimeActivationPanicNeverServesAndClosesOwnedState(t *testing.T) {
 		events.add("activate")
 		panic("activation exploded")
 	}
-	runtime, err := NewRuntime(cfg)
+	runtime, err := newTestRuntime(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -845,7 +870,7 @@ func TestRuntimeInterruptionsCancelAndJoinActivationBeforeCleanup(t *testing.T) 
 			defer cancelParent()
 			signals := make(chan os.Signal, 1)
 			cfg.Signals = signals
-			runtime, err := NewRuntime(cfg)
+			runtime, err := newTestRuntime(cfg)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -880,84 +905,10 @@ func TestRuntimeInterruptionsCancelAndJoinActivationBeforeCleanup(t *testing.T) 
 	}
 }
 
-func TestRuntimeRejectsProtocolMismatch(t *testing.T) {
-	peer := &fakePeer{health: []healthResult{{h: Health{Build: "v1.0.0", Protocol: 1, PID: 222}}}}
-	cfg, events, _, _, _ := runtimeTestConfig(t, peer)
-	runtime, err := NewRuntime(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = runtime.Run(context.Background())
-	if !errors.Is(err, ErrProtocolMismatch) {
-		t.Fatalf("Run = %v, want ErrProtocolMismatch", err)
-	}
-	want := []string{"workers-close", "workers-cancel", "workers-wait", "state-close", "resources-close"}
-	if got := events.snapshot(); !reflect.DeepEqual(got, want) {
-		t.Fatalf("events = %v, want %v", got, want)
-	}
-}
-
-func TestRuntimeDrainsBusyResourceOwner(t *testing.T) {
-	peer := &fakePeer{health: []healthResult{{h: Health{
-		Build: "v1.0.0", Protocol: 2, PID: 222, Busy: true,
-	}}, {err: ErrNoPeer}}}
-	cfg, _, server, _, _ := runtimeTestConfig(t, peer)
-	cfg.Contract = ResourceOwner
-	cfg.Handoff = func(context.Context) error { return nil }
-	runtime, err := NewRuntime(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	runDone := startRuntime(context.Background(), t, runtime, server)
-	if err := runtime.Close(context.Background()); err != nil {
-		t.Fatalf("Close = %v", err)
-	}
-	if err := waitRuntime(t, runDone); err != nil {
-		t.Fatalf("Run = %v", err)
-	}
-	if shutdowns, handoffs := peer.counts(); shutdowns != 0 || handoffs != 1 {
-		t.Fatalf("calls: shutdowns=%d handoffs=%d, want 0/1", shutdowns, handoffs)
-	}
-}
-
-func TestRuntimeResourceHandoffOrder(t *testing.T) {
-	cfg, events, server, admission, _ := runtimeTestConfig(t, absentRuntimePeer())
-	cfg.Contract = ResourceOwner
-	cfg.Handoff = func(context.Context) error {
-		events.add("handoff")
-		return nil
-	}
-	runtime, err := NewRuntime(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	runDone := startRuntime(context.Background(), t, runtime, server)
-	if err := runtime.Handoff(context.Background()); err != nil {
-		t.Fatalf("Handoff = %v", err)
-	}
-	if err := waitRuntime(t, runDone); err != nil {
-		t.Fatalf("Run = %v", err)
-	}
-	if !admission.Draining() {
-		t.Fatal("handoff did not close admission")
-	}
-	for before, after := range map[string]string{
-		"admission-settle": "workers-close",
-		"workers-wait":     "handoff",
-		"handoff":          "serve-exit",
-		"serve-exit":       "state-close",
-		"state-close":      "resources-close",
-	} {
-		if events.index(before) < 0 || events.index(before) >= events.index(after) {
-			t.Fatalf("%s must precede %s: %v", before, after, events.snapshot())
-		}
-	}
-}
-
 func TestRuntimeContextAndSignalShutdown(t *testing.T) {
 	t.Run("context", func(t *testing.T) {
 		cfg, _, server, _, _ := runtimeTestConfig(t, absentRuntimePeer())
-		runtime, err := NewRuntime(cfg)
+		runtime, err := newTestRuntime(cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -972,7 +923,7 @@ func TestRuntimeContextAndSignalShutdown(t *testing.T) {
 		cfg, _, server, _, _ := runtimeTestConfig(t, absentRuntimePeer())
 		signals := make(chan os.Signal, 1)
 		cfg.Signals = signals
-		runtime, err := NewRuntime(cfg)
+		runtime, err := newTestRuntime(cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -990,7 +941,7 @@ func TestRuntimeWaitsForWorkerSettlementPastDeadline(t *testing.T) {
 	workers.waitGate = release
 	workers.waitContext = true
 	cfg.ShutdownTimeout = 25 * time.Millisecond
-	runtime, err := NewRuntime(cfg)
+	runtime, err := newTestRuntime(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1029,13 +980,17 @@ func TestRuntimeWaitsForWorkerSettlementPastDeadline(t *testing.T) {
 }
 
 func TestRuntimeCloseUnstartedWaitsForWorkerSettlementPastDeadline(t *testing.T) {
-	peer := &fakePeer{health: []healthResult{{h: Health{Build: "v1.0.0", Protocol: 1, PID: 222}}}}
-	cfg, events, _, _, workers := runtimeTestConfig(t, peer)
+	cfg, events, _, _, workers := runtimeTestConfig(t, nil)
+	listener, err := net.Listen("unix", cfg.Socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
 	release := make(chan struct{})
 	workers.waitGate = release
 	workers.waitContext = true
 	cfg.ShutdownTimeout = 25 * time.Millisecond
-	runtime, err := NewRuntime(cfg)
+	runtime, err := newTestRuntime(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1053,10 +1008,8 @@ func TestRuntimeCloseUnstartedWaitsForWorkerSettlementPastDeadline(t *testing.T)
 	}
 	close(release)
 	err = waitRuntime(t, runDone)
-	for _, want := range []error{ErrProtocolMismatch, context.DeadlineExceeded} {
-		if !errors.Is(err, want) {
-			t.Fatalf("Run = %v, missing %v", err, want)
-		}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run = %v, missing deadline", err)
 	}
 	got := events.snapshot()
 	cancels := 0
@@ -1082,7 +1035,7 @@ func TestRuntimePropagatesFailuresAndClosesResourcesLast(t *testing.T) {
 	server.serveErr = serveFailure
 	cfg.State = &runtimeCloser{events: events, event: "state-close", err: stateFailure}
 	cfg.Resources = &runtimeCloser{events: events, event: "resources-close", err: resourceFailure}
-	runtime, err := NewRuntime(cfg)
+	runtime, err := newTestRuntime(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1102,7 +1055,6 @@ func TestRuntimeCrashOrderContinuesCleanup(t *testing.T) {
 	tests := []struct {
 		name    string
 		prepare func(RuntimeConfig, *runtimeServer, *runtimeAdmission, *runtimeWorkers, *runtimeEvents, error) RuntimeConfig
-		handoff bool
 	}{
 		{
 			name: "close intake",
@@ -1126,15 +1078,6 @@ func TestRuntimeCrashOrderContinuesCleanup(t *testing.T) {
 			},
 		},
 		{
-			name: "handoff",
-			prepare: func(cfg RuntimeConfig, _ *runtimeServer, _ *runtimeAdmission, _ *runtimeWorkers, _ *runtimeEvents, boom error) RuntimeConfig {
-				cfg.Contract = ResourceOwner
-				cfg.Handoff = func(context.Context) error { return boom }
-				return cfg
-			},
-			handoff: true,
-		},
-		{
 			name: "close state",
 			prepare: func(cfg RuntimeConfig, _ *runtimeServer, _ *runtimeAdmission, _ *runtimeWorkers, events *runtimeEvents, boom error) RuntimeConfig {
 				cfg.State = &runtimeCloser{events: events, event: "state-close", err: boom}
@@ -1154,16 +1097,12 @@ func TestRuntimeCrashOrderContinuesCleanup(t *testing.T) {
 			boom := errors.New(tt.name + " failed")
 			cfg, events, server, admission, workers := runtimeTestConfig(t, absentRuntimePeer())
 			cfg = tt.prepare(cfg, server, admission, workers, events, boom)
-			runtime, err := NewRuntime(cfg)
+			runtime, err := newTestRuntime(cfg)
 			if err != nil {
 				t.Fatal(err)
 			}
 			runDone := startRuntime(context.Background(), t, runtime, server)
-			if tt.handoff {
-				if err := runtime.Handoff(context.Background()); err != nil {
-					t.Fatal(err)
-				}
-			} else if err := runtime.Shutdown(context.Background()); err != nil {
+			if err := runtime.Shutdown(context.Background()); err != nil {
 				t.Fatal(err)
 			}
 			err = waitRuntime(t, runDone)
@@ -1188,23 +1127,10 @@ func TestRuntimeCrashOrderContinuesCleanup(t *testing.T) {
 	}
 }
 
-func TestRuntimeConfigRequiresExactHandoffContract(t *testing.T) {
-	cfg, _, _, _, _ := runtimeTestConfig(t, absentRuntimePeer())
-	cfg.Handoff = func(context.Context) error { return nil }
-	if _, err := NewRuntime(cfg); err == nil {
-		t.Fatal("request runtime accepted a handoff callback")
-	}
-	cfg.Contract = ResourceOwner
-	cfg.Handoff = nil
-	if _, err := NewRuntime(cfg); err == nil {
-		t.Fatal("resource-owner runtime accepted no handoff callback")
-	}
-}
-
 func TestRuntimeConfigRequiresActivation(t *testing.T) {
 	cfg, _, _, _, _ := runtimeTestConfig(t, absentRuntimePeer())
 	cfg.Activate = nil
-	if _, err := NewRuntime(cfg); err == nil {
+	if _, err := newTestRuntime(cfg); err == nil {
 		t.Fatal("runtime accepted no activation callback")
 	}
 }

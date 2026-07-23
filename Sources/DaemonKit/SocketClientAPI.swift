@@ -34,9 +34,9 @@ extension SocketClient {
         core.events
     }
 
-    /// Server build identity established by the mandatory handshake.
-    public var peerBuild: String {
-        core.peerBuild
+    /// Server wireBuild identity established by the mandatory handshake.
+    public var peerWireBuild: String {
+        core.peerWireBuild
     }
 
     /// Opens a request. Set endInput false when request chunks will follow.

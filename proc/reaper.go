@@ -48,7 +48,8 @@ type Record struct {
 	Boot string `json:"boot"`
 	// Comm is the child's initial OS-reported (truncated) process name.
 	Comm string `json:"comm"`
-	// Executable is the exact kernel-resolved path bound to AuditToken.
+	// Executable is the exact kernel-resolved path. On Darwin it is bound to
+	// AuditToken; other platforms bind it with Boot and StartTime.
 	Executable string `json:"executable,omitempty"`
 	// AuditToken is Darwin's stable (pid, pidversion) kill authority for a
 	// protected peer. Spawned disposable workers use the zero value.
@@ -61,6 +62,14 @@ type Record struct {
 	// SessionID is the dedicated session created with a process-group leader.
 	// It remains the group's durable kernel identity after the leader exits.
 	SessionID int `json:"session_id,omitempty"`
+	// Role, RuntimeBuild, RuntimeProtocol, TargetProcessGeneration, Intent, and ExpiresUnixMilli are
+	// present only for one-shot stop-control process receipts.
+	Role                    string `json:"role,omitempty"`
+	RuntimeBuild            string `json:"runtime_build,omitempty"`
+	RuntimeProtocol         int    `json:"runtime_protocol,omitempty"`
+	TargetProcessGeneration string `json:"target_process_generation,omitempty"`
+	Intent                  string `json:"intent,omitempty"`
+	ExpiresUnixMilli        int64  `json:"expires_unix_milli,omitempty"`
 }
 
 // Validate rejects an incomplete durable process identity.
@@ -80,6 +89,16 @@ func (r Record) Validate() error {
 		}
 	} else if r.SessionID != 0 {
 		return fmt.Errorf("%w: non-group record has a session id", ErrInvalidRecord)
+	}
+	if r.RecoveryClass == RecoveryStopControl {
+		if r.Role == "" || r.RuntimeBuild == "" || r.RuntimeProtocol <= 0 || r.TargetProcessGeneration == "" ||
+			(r.Intent != "upgrade" && r.Intent != "restart" && r.Intent != "uninstall") ||
+			r.ExpiresUnixMilli <= 0 || r.ProcessGroup {
+			return fmt.Errorf("%w: incomplete stop-control authority", ErrInvalidRecord)
+		}
+	} else if r.Role != "" || r.RuntimeBuild != "" || r.RuntimeProtocol != 0 || r.TargetProcessGeneration != "" ||
+		r.Intent != "" || r.ExpiresUnixMilli != 0 {
+		return fmt.Errorf("%w: non-stop record carries stop authority", ErrInvalidRecord)
 	}
 	return nil
 }
@@ -101,8 +120,6 @@ func validateRecordIdentity(r Record) error {
 		if r.Executable == "" {
 			return fmt.Errorf("%w: audit-token record requires executable", ErrInvalidRecord)
 		}
-	} else if r.Executable != "" {
-		return fmt.Errorf("%w: executable requires audit-token authority", ErrInvalidRecord)
 	}
 	return nil
 }
@@ -219,6 +236,10 @@ func (r *Reaper) TrackIdentity(ctx context.Context, identity Identity, class Rec
 		Comm: identity.Comm, Generation: r.Generation, Executable: identity.Executable,
 		AuditToken: identity.AuditToken,
 	}
+	return r.trackIdentityRecord(ctx, rec)
+}
+
+func (r *Reaper) trackIdentityRecord(ctx context.Context, rec Record) (Record, error) {
 	if err := rec.Validate(); err != nil {
 		return Record{}, err
 	}
@@ -261,6 +282,35 @@ func (r *Reaper) TrackIdentity(ctx context.Context, identity Identity, class Rec
 		return Record{}, fmt.Errorf("record authenticated process %d: %w", rec.PID, err)
 	}
 	return rec, nil
+}
+
+// TrackStopControl durably authorizes one exact already-running child to issue
+// one bounded stop request against one target runtime generation.
+func (r *Reaper) TrackStopControl(
+	ctx context.Context,
+	identity Identity,
+	role, build string,
+	protocol int,
+	targetProcessGeneration string,
+	intent string,
+	expires time.Time,
+) (Record, error) {
+	record := Record{
+		RecoveryClass: RecoveryStopControl,
+		PID:           identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
+		Comm: identity.Comm, Generation: r.Generation, Executable: identity.Executable,
+		AuditToken: identity.AuditToken, Role: role, RuntimeBuild: build, RuntimeProtocol: protocol,
+		TargetProcessGeneration: targetProcessGeneration, Intent: intent, ExpiresUnixMilli: expires.UnixMilli(),
+	}
+	if err := record.Validate(); err != nil {
+		return Record{}, err
+	}
+	return r.trackIdentityRecord(ctx, record)
+}
+
+// StopControlStore atomically consumes one exact one-shot stop authority.
+type StopControlStore interface {
+	ConsumeStopControl(context.Context, Identity, string, string, time.Time) (Record, bool, error)
 }
 
 // TrackGroup records a child whose PID leads its own process group and session.
@@ -356,6 +406,42 @@ func (r *Reaper) TerminateWithin(ctx context.Context, rec Record, grace time.Dur
 	clone := *r
 	clone.Grace = grace
 	return clone.Terminate(ctx, rec)
+}
+
+// TerminateIdentityWithin applies the exact TERM/KILL ladder to a live process
+// identity without requiring its one-shot authorization record to remain in
+// the store. It is intended for the controller that directly spawned and must
+// synchronously reap that process.
+func (r *Reaper) TerminateIdentityWithin(ctx context.Context, identity Identity, grace time.Duration) error {
+	if grace <= 0 {
+		return errors.New("proc: termination grace must be positive")
+	}
+	record := Record{
+		RecoveryClass: RecoveryTask,
+		PID:           identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
+		Comm: identity.Comm, Generation: r.Generation, Executable: identity.Executable,
+		AuditToken: identity.AuditToken,
+	}
+	if identity.AuditToken.IsZero() {
+		record.Executable = ""
+	}
+	if err := record.Validate(); err != nil {
+		return err
+	}
+	boot, err := r.prb().bootID()
+	if err != nil {
+		return fmt.Errorf("load current boot identity: %w", err)
+	}
+	clone := *r
+	clone.Grace = grace
+	settled, err := clone.terminateOne(ctx, record, boot)
+	if err != nil {
+		return err
+	}
+	if !settled {
+		return errors.New("proc: process remained live")
+	}
+	return nil
 }
 
 func (r *Reaper) terminateOne(ctx context.Context, rec Record, boot string) (bool, error) {

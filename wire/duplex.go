@@ -21,7 +21,7 @@ type SessionIdentity struct {
 
 // SpawnedParentSessionIdentity binds the current process's live parent to an
 // ordinary same-user session identity. Spawned identities never authorize
-// protected lifecycle traffic.
+// protected service traffic.
 func SpawnedParentSessionIdentity() (SessionIdentity, error) {
 	pid := os.Getppid()
 	identity, err := proc.Probe(pid)

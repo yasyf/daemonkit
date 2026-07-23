@@ -233,7 +233,7 @@ func TestEmbeddedRuntimeIsNil(t *testing.T) {
 	}
 }
 
-func TestEmbeddedProcessRejectsSecondStartAndPrestartLifecycle(t *testing.T) {
+func TestEmbeddedProcessRejectsSecondStartAndPrestartOperations(t *testing.T) {
 	process := &EmbeddedProcess{}
 	if err := process.Ready(context.Background()); !errors.Is(err, ErrEmbeddedProcessNotStarted) {
 		t.Fatalf("Ready before Start = %v", err)

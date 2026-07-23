@@ -62,6 +62,56 @@ func TestFileStoreSchemaIsExactEpochOne(t *testing.T) {
 	}
 }
 
+func TestFileStoreRejectsIncompleteOldEpochOneWithoutMutation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "recovery.db")
+	db, err := bolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldBuckets := [][]byte{
+		fileStoreMetaBucket, fileStoreRecordsBucket, fileStoreClaimsBucket,
+		fileStoreReceiptsBucket, fileStoreReceiptIndexBucket,
+		fileStoreSequencesBucket, fileStoreFloorsBucket,
+	}
+	if err := db.Update(func(tx *bolt.Tx) error {
+		for _, name := range oldBuckets {
+			if _, err := tx.CreateBucket(name); err != nil {
+				return err
+			}
+		}
+		meta := tx.Bucket(fileStoreMetaBucket)
+		if err := meta.Put(fileStoreSchemaKey, uint64Bytes(recordSchemaVersion)); err != nil {
+			return err
+		}
+		if err := meta.Put(fileStoreLedgerKey, make([]byte, len(ReceiptLedgerID{}))); err != nil {
+			return err
+		}
+		return meta.Put(fileStoreOutstandingKey, uint64Bytes(0))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store := &FileStore{Path: path}
+	if _, err := store.Load(t.Context()); !errors.Is(err, ErrRecordSchema) {
+		t.Fatalf("old epoch-one load = %v, want ErrRecordSchema", err)
+	}
+	db, err = bolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.View(func(tx *bolt.Tx) error {
+		if tx.Bucket(fileStoreStopConsumedBucket) != nil {
+			t.Fatal("failed schema open mutated the old layout")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func storeRecord(class RecoveryClass, pid int) Record {
 	return Record{
 		RecoveryClass: class,
@@ -151,6 +201,226 @@ func TestFileStoreAddIsExactIdempotent(t *testing.T) {
 	}
 	if len(records) != 1 || records[0] != record {
 		t.Fatalf("records after conflicting add = %+v", records)
+	}
+}
+
+func stopControlStoreRecord(pid int, expires time.Time) (Identity, Record) {
+	identity := Identity{
+		PID: pid, StartTime: "start", Boot: "boot", Comm: "stop-child",
+		Executable: "/Applications/Fixed.app/Contents/MacOS/Fixed",
+		AuditToken: auditTokenForPID(pid, 17),
+	}
+	return identity, Record{
+		RecoveryClass: RecoveryStopControl,
+		PID:           identity.PID, StartTime: identity.StartTime, Boot: identity.Boot, Comm: identity.Comm,
+		Executable: identity.Executable, AuditToken: identity.AuditToken,
+		Generation: "controller-generation", Role: "com.example.stop", RuntimeBuild: "v2.0.0", RuntimeProtocol: 1,
+		TargetProcessGeneration: "runtime-generation", Intent: "upgrade", ExpiresUnixMilli: expires.UnixMilli(),
+	}
+}
+
+func TestFileStoreStopControlConsumesExactlyOnceConcurrently(t *testing.T) {
+	store := &FileStore{Path: filepath.Join(t.TempDir(), "recovery.db")}
+	identity, record := stopControlStoreRecord(142, time.Now().Add(time.Minute))
+	if err := store.Add(t.Context(), record); err != nil {
+		t.Fatal(err)
+	}
+	type outcome struct {
+		record Record
+		ok     bool
+		err    error
+	}
+	start := make(chan struct{})
+	results := make(chan outcome, 2)
+	for range 2 {
+		go func() {
+			<-start
+			got, ok, err := store.ConsumeStopControl(
+				context.Background(), identity, record.Role, record.TargetProcessGeneration, time.Now(),
+			)
+			results <- outcome{record: got, ok: ok, err: err}
+		}()
+	}
+	close(start)
+	consumed := 0
+	for range 2 {
+		result := <-results
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.ok {
+			consumed++
+			if result.record != record {
+				t.Fatalf("consumed record = %+v, want %+v", result.record, record)
+			}
+		}
+	}
+	if consumed != 1 {
+		t.Fatalf("successful consumes = %d, want 1", consumed)
+	}
+	if _, ok, err := store.ConsumeStopControl(
+		t.Context(), identity, record.Role, record.TargetProcessGeneration, time.Now(),
+	); err != nil || ok {
+		t.Fatalf("replay = ok %v err %v, want false nil", ok, err)
+	}
+	records, err := store.Load(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0] != record {
+		t.Fatalf("post-consume recovery records = %+v, want exact helper retained", records)
+	}
+	if err := store.Remove(t.Context(), []Record{record}); err != nil {
+		t.Fatal(err)
+	}
+	records, err = store.Load(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("records after settled untrack = %+v", records)
+	}
+}
+
+func TestFileStoreStopControlConsumedMarkerSurvivesReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "recovery.db")
+	store := &FileStore{Path: path}
+	identity, record := stopControlStoreRecord(145, time.Now().Add(time.Minute))
+	if err := store.Add(t.Context(), record); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok, err := store.ConsumeStopControl(
+		t.Context(), identity, record.Role, record.TargetProcessGeneration, time.Now(),
+	); err != nil || !ok || got != record {
+		t.Fatalf("initial consume = %+v, %v, %v", got, ok, err)
+	}
+	reopened := &FileStore{Path: path}
+	if got, ok, err := reopened.ConsumeStopControl(
+		t.Context(), identity, record.Role, record.TargetProcessGeneration, time.Now(),
+	); err != nil || ok || got != (Record{}) {
+		t.Fatalf("reopen replay = %+v, %v, %v; want zero, false, nil", got, ok, err)
+	}
+	records, err := reopened.Load(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0] != record {
+		t.Fatalf("reopen recovery records = %+v, want consumed helper retained", records)
+	}
+}
+
+func TestFileStoreStopControlRejectsNearMatchesWithoutConsuming(t *testing.T) {
+	store := &FileStore{Path: filepath.Join(t.TempDir(), "recovery.db")}
+	identity, record := stopControlStoreRecord(143, time.Now().Add(time.Minute))
+	if err := store.Add(t.Context(), record); err != nil {
+		t.Fatal(err)
+	}
+	wrongPID := identity
+	wrongPID.PID++
+	wrongPID.AuditToken = auditTokenForPID(wrongPID.PID, 17)
+	wrongStart := identity
+	wrongStart.StartTime = "other-start"
+	wrongBoot := identity
+	wrongBoot.Boot = "other-boot"
+	wrongComm := identity
+	wrongComm.Comm = "other-child"
+	wrongExecutable := identity
+	wrongExecutable.Executable = "/Applications/Other.app/Contents/MacOS/Other"
+	wrongAudit := identity
+	wrongAudit.AuditToken = auditTokenForPID(identity.PID, 18)
+	for _, test := range []struct {
+		name     string
+		identity Identity
+		role     string
+		target   string
+	}{
+		{name: "pid", identity: wrongPID, role: record.Role, target: record.TargetProcessGeneration},
+		{name: "start", identity: wrongStart, role: record.Role, target: record.TargetProcessGeneration},
+		{name: "boot", identity: wrongBoot, role: record.Role, target: record.TargetProcessGeneration},
+		{name: "comm", identity: wrongComm, role: record.Role, target: record.TargetProcessGeneration},
+		{name: "executable", identity: wrongExecutable, role: record.Role, target: record.TargetProcessGeneration},
+		{name: "audit", identity: wrongAudit, role: record.Role, target: record.TargetProcessGeneration},
+		{name: "role", identity: identity, role: "com.example.other", target: record.TargetProcessGeneration},
+		{name: "target", identity: identity, role: record.Role, target: "other-runtime"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got, ok, err := store.ConsumeStopControl(
+				t.Context(), test.identity, test.role, test.target, time.Now(),
+			); err != nil || ok || got != (Record{}) {
+				t.Fatalf("near match = %+v, %v, %v; want zero, false, nil", got, ok, err)
+			}
+		})
+	}
+	got, ok, err := store.ConsumeStopControl(
+		t.Context(), identity, record.Role, record.TargetProcessGeneration, time.Now(),
+	)
+	if err != nil || !ok || got != record {
+		t.Fatalf("exact consume = %+v, %v, %v; want record, true, nil", got, ok, err)
+	}
+}
+
+func TestFileStoreConsumedStopControlRecoversThroughReceiptAcknowledgement(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "recovery.db")
+	store := &FileStore{Path: path}
+	identity, record := stopControlStoreRecord(146, time.Now().Add(time.Minute))
+	if err := store.Add(t.Context(), record); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := store.ConsumeStopControl(
+		t.Context(), identity, record.Role, record.TargetProcessGeneration, time.Now(),
+	); err != nil || !ok {
+		t.Fatalf("consume = %v, %v", ok, err)
+	}
+	if err := store.BeginReap(t.Context(), record, "reaper-generation"); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := store.CommitReap(t.Context(), record, "reaper-generation", ReapTerminated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened := &FileStore{Path: path}
+	reaper := &Reaper{Store: reopened, Generation: "successor-generation"}
+	var settled []ReapReceipt
+	floor, err := reaper.RecoverReapReceipts(
+		t.Context(), RecoveryStopControl,
+		func(_ context.Context, got ReapReceipt) error {
+			settled = append(settled, got)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(settled) != 1 || settled[0] != receipt || floor.Sequence != receipt.Sequence {
+		t.Fatalf("recovery = receipts %+v floor %+v; want receipt %+v", settled, floor, receipt)
+	}
+	page, err := reaper.ReapReceipts(t.Context(), RecoveryStopControl, ReapReceiptCursor{}, ReapReceiptPageLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Receipts) != 0 || page.Floor.Sequence != receipt.Sequence {
+		t.Fatalf("post-ack page = %+v", page)
+	}
+}
+
+func TestFileStoreStopControlExpiryIsExactAndRetainedForRecovery(t *testing.T) {
+	store := &FileStore{Path: filepath.Join(t.TempDir(), "recovery.db")}
+	expires := time.UnixMilli(time.Now().Add(time.Minute).UnixMilli())
+	identity, record := stopControlStoreRecord(144, expires)
+	if err := store.Add(t.Context(), record); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok, err := store.ConsumeStopControl(
+		t.Context(), identity, record.Role, record.TargetProcessGeneration, expires,
+	); err != nil || ok || got != (Record{}) {
+		t.Fatalf("consume at expiry = %+v, %v, %v; want zero, false, nil", got, ok, err)
+	}
+	records, err := store.Load(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0] != record {
+		t.Fatalf("expired recovery records = %+v, want retained authority", records)
 	}
 }
 

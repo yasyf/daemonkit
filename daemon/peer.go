@@ -1,12 +1,9 @@
-// Package daemon is the consumer-agnostic lifecycle shell for a detached
-// daemon: the successor-initiated takeover ladder, the ensure gate, the skew
-// watch, an idle-exit timer, and a foreign-key-preserving state file.
-// Consumers adapt a running peer through the exact-protocol Peer interface.
+// Package daemon is the consumer-agnostic process runtime for a detached
+// daemon: exclusive listener ownership, readiness, ordered shutdown, skew
+// observation, idle exit, and embedded-process coordination.
 package daemon
 
-import "context"
-
-// State is a peer's coarse health verdict. A temporary secure-hardware outage is
+// State is a runtime's coarse health verdict. A temporary secure-hardware outage is
 // StateDegraded, never a crash loop.
 type State string
 
@@ -20,31 +17,22 @@ const (
 	StateFailed State = "failed"
 )
 
-// Health is a peer's lifecycle snapshot. Build orders takeover and Protocol is
-// the exact compatibility contract.
+// Health is one runtime generation's process and service snapshot.
 type Health struct {
-	// Build is the peer's build identity, classified by the version package.
-	Build string
-	// Protocol is the peer's exact lifecycle protocol version.
-	Protocol int
+	// RuntimeBuild is the product runtime build identity.
+	RuntimeBuild string
+	// RuntimeProtocol is the product runtime's exact protocol version.
+	RuntimeProtocol int
+	// ProcessGeneration is daemonkit's canonical identity for this process execution.
+	ProcessGeneration string
 	// PID is the peer's process id, the revalidation anchor for any signal.
 	PID int
 	// State is the coarse health verdict.
 	State State
 	// Draining reports whether the peer is shedding work ahead of exit.
 	Draining bool
-	// Busy reports whether the peer is mid-operation; a busy ResourceOwner is
-	// never killed for being older.
+	// Busy reports product work outside the runtime's admission and worker lanes.
 	Busy bool
-}
-
-// Peer is a running daemon as its successor or a client sees it. Every method
-// blocks on I/O and takes ctx first.
-type Peer interface {
-	// Health returns the peer's current snapshot.
-	Health(ctx context.Context) (Health, error)
-	// Shutdown asks the peer to exit.
-	Shutdown(ctx context.Context) error
-	// Handoff asks the peer to release its socket for a successor.
-	Handoff(ctx context.Context) error
+	// Ready reports whether all runtime serving prerequisites were published.
+	Ready bool
 }

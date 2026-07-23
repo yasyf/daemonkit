@@ -25,7 +25,7 @@ func (f identityAcceptorFunc) Accept(ctx context.Context, peer wire.Peer) (Accep
 	return f(ctx, peer)
 }
 
-func TestFixedClassifierDeniesOrdinaryAndAllowsSameOrNewerDaemon(t *testing.T) {
+func TestFixedClassifierDeniesOrdinaryAndAllowsProtectedExecutable(t *testing.T) {
 	classifier := FixedClassifier{Executable: "/opt/example/bin/daemon"}
 	ordinary, err := classifier.Classify(t.Context(), wire.Peer{
 		PID: 42, UID: os.Geteuid(), StartTime: "start", Boot: "boot",
@@ -40,11 +40,6 @@ func TestFixedClassifierDeniesOrdinaryAndAllowsSameOrNewerDaemon(t *testing.T) {
 	})
 	if err != nil || !protected {
 		t.Fatalf("daemon classification = %t, %v", protected, err)
-	}
-	if !classifier.AuthorizeLifecycleBuild("v1.2.0", "v1.2.0") ||
-		!classifier.AuthorizeLifecycleBuild("v1.2.0", "v1.3.0") ||
-		classifier.AuthorizeLifecycleBuild("v1.2.0", "v1.1.0") {
-		t.Fatal("same/newer protected build relationship is not exact")
 	}
 }
 

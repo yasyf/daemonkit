@@ -589,6 +589,78 @@ func TestReapRetainedAuthenticatedAppRecordUsesAuditTokenAuthority(t *testing.T)
 	}
 }
 
+func TestTerminateIdentityRejectsNearMatchesWithoutSignal(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		identity Identity
+		prober   *fakeProber
+	}{
+		{
+			name:     "boot",
+			identity: Identity{PID: 4242, StartTime: liveInfo().startTime, Boot: "prior-boot", Comm: liveInfo().comm},
+			prober:   &fakeProber{info: liveInfo()},
+		},
+		{
+			name:     "start",
+			identity: Identity{PID: 4242, StartTime: "prior-start", Boot: testBoot, Comm: liveInfo().comm},
+			prober:   &fakeProber{info: liveInfo()},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			signals := &recSignaler{}
+			reaper := &Reaper{Generation: "controller", prober: test.prober, signaler: signals, clock: newFakeClock()}
+			if err := reaper.TerminateIdentityWithin(t.Context(), test.identity, time.Millisecond); err != nil {
+				t.Fatal(err)
+			}
+			if calls := signals.calls(); len(calls) != 0 {
+				t.Fatalf("signals = %v, want none", calls)
+			}
+		})
+	}
+
+	const pid = 4242
+	for _, test := range []struct {
+		name     string
+		identity Identity
+		path     string
+	}{
+		{
+			name: "audit pid",
+			identity: Identity{
+				PID: pid + 1, StartTime: liveInfo().startTime, Boot: testBoot, Comm: liveInfo().comm,
+				Executable: "/Applications/Fixed.app/Contents/MacOS/Fixed", AuditToken: auditTokenForPID(pid, 17),
+			},
+			path: "/Applications/Fixed.app/Contents/MacOS/Fixed",
+		},
+		{
+			name: "executable path",
+			identity: Identity{
+				PID: pid, StartTime: liveInfo().startTime, Boot: testBoot, Comm: liveInfo().comm,
+				Executable: "/Applications/Fixed.app/Contents/MacOS/Fixed", AuditToken: auditTokenForPID(pid, 17),
+			},
+			path: "/Applications/Other.app/Contents/MacOS/Other",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var signals []syscall.Signal
+			reaper := &Reaper{
+				Generation: "controller", prober: &fakeProber{info: liveInfo()}, clock: newFakeClock(),
+				auditPath: func(AuditToken) (string, error) { return test.path, nil },
+				auditSignal: func(_ AuditToken, signal syscall.Signal) (bool, error) {
+					signals = append(signals, signal)
+					return false, nil
+				},
+			}
+			if err := reaper.TerminateIdentityWithin(t.Context(), test.identity, time.Millisecond); err == nil {
+				t.Fatal("TerminateIdentityWithin accepted a near-match identity")
+			}
+			if len(signals) != 0 {
+				t.Fatalf("signals = %v, want none", signals)
+			}
+		})
+	}
+}
+
 func matchingGroupRecord(pid int, gen string) Record {
 	rec := matchingRecord(pid, gen)
 	rec.ProcessGroup = true

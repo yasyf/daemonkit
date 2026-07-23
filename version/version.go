@@ -1,5 +1,5 @@
-// Package version classifies and compares release and development build
-// versions for same-or-newer daemon takeover.
+// Package version classifies and compares release and development builds for
+// launcher-owned runtime settlement and release ordering.
 package version
 
 import (

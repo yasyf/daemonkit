@@ -215,7 +215,7 @@ extension SocketTransportTests {
             await #expect(throws: PeerTrust.TrustError.self) {
                 _ = try await SocketClient(
                     path: path,
-                    build: "server-test",
+                    wireBuild: "server-test",
                     trust: PeerTrust(requirement: fixtureRequirement())
                 )
             }
@@ -268,12 +268,12 @@ extension SocketTransportTests {
                 let directory = try shortSocketDir()
                 cleanup.add { try? FileManager.default.removeItem(at: directory) }
                 let path = directory.appendingPathComponent("s.sock").path
-                let server = SocketServer(path: path, build: "server-test", trust: .sameEffectiveUser) { request in
+                let server = SocketServer(path: path, wireBuild: "server-test", trust: .sameEffectiveUser) { request in
                     .terminal(SocketTerminal(payload: request.payload))
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try await SocketClient(path: path, build: "server-test", trust: .sameEffectiveUser)
+                let client = try await SocketClient(path: path, wireBuild: "server-test", trust: .sameEffectiveUser)
                 cleanup.add { await client.close() }
                 let result = try await client.call(operation: "echo", payload: Data(#""hi""#.utf8))
                 #expect(result.payload == Data(#""hi""#.utf8))
@@ -287,7 +287,7 @@ extension SocketTransportTests {
                 let path = directory.appendingPathComponent("s.sock").path
                 let server = try SocketServer(
                     path: path,
-                    build: "server-test",
+                    wireBuild: "server-test",
                     trust: PeerTrust(requirement: fixtureRequirement())
                 ) { _ in
                     Issue.record("handler must not run for a rejected peer")
@@ -296,7 +296,7 @@ extension SocketTransportTests {
                 try await server.start()
                 cleanup.add { await server.stop() }
                 await #expect(throws: (any Error).self) {
-                    _ = try await SocketClient(path: path, build: "server-test", trust: .sameEffectiveUser)
+                    _ = try await SocketClient(path: path, wireBuild: "server-test", trust: .sameEffectiveUser)
                 }
             }
         }

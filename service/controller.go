@@ -73,11 +73,13 @@ type serviceReceiptRecovery interface {
 // Controller owns one exact durable LaunchAgent set and every launchctl worker
 // used to converge it.
 type Controller struct {
-	config    ControllerConfig
-	runtime   controllerRuntime
-	receipts  serviceReceiptRecovery
-	store     controllerStateStore
-	retryWait func(context.Context, time.Duration) error
+	config     ControllerConfig
+	runtime    controllerRuntime
+	receipts   serviceReceiptRecovery
+	store      controllerStateStore
+	retryWait  func(context.Context, time.Duration) error
+	stopReaper *proc.Reaper
+	stopTiming stopControlTiming
 
 	opMu  sync.Mutex
 	state controllerState
@@ -90,6 +92,16 @@ type Controller struct {
 	closeOnce sync.Once
 	closeDone chan struct{}
 	closeErr  error
+}
+
+// Status is the controller-owned launch service state. Product runtime health
+// remains the authority for application readiness.
+type Status struct {
+	Label   string
+	Desired bool
+	Applied bool
+	Loaded  bool
+	Exact   bool
 }
 
 // NewController opens the durable controller, settles prior workers, restores
@@ -117,7 +129,12 @@ func NewController(ctx context.Context, config ControllerConfig) (*Controller, e
 		_ = store.Close()
 		return nil, err
 	}
-	return newControllerWithRuntime(ctx, config, runtime, reaper, store)
+	controller, err := newControllerWithRuntime(ctx, config, runtime, reaper, store)
+	if err != nil {
+		return nil, err
+	}
+	controller.stopReaper = reaper
+	return controller, nil
 }
 
 func newControllerWithRuntime(
@@ -167,6 +184,13 @@ func newControllerWithRuntime(
 	); err != nil {
 		return nil, fmt.Errorf("service: acknowledge recovered service workers: %w", err)
 	}
+	if _, err := receipts.RecoverReapReceipts(
+		ctx,
+		proc.RecoveryStopControl,
+		func(context.Context, proc.ReapReceipt) error { return nil },
+	); err != nil {
+		return nil, fmt.Errorf("service: acknowledge recovered stop controls: %w", err)
+	}
 	return controller, nil
 }
 
@@ -194,6 +218,46 @@ func (c *Controller) Converge(ctx context.Context, agents []Agent) error {
 		c.state = controllerState{Desired: copyAgents(desired), Applied: copyAgents(prior.Applied)}
 	}
 	return c.reconcile(opCtx, copyAgents(c.state.Applied), c.state.Desired)
+}
+
+// Status reports durable desired/applied state and current launchd ownership
+// without opening a protected runtime connection.
+func (c *Controller) Status(ctx context.Context, label string) (Status, error) {
+	if err := validateLabel(label); err != nil {
+		return Status{}, err
+	}
+	c.opMu.Lock()
+	defer c.opMu.Unlock()
+	opCtx, finish, err := c.admit(ctx)
+	if err != nil {
+		return Status{}, err
+	}
+	defer finish()
+
+	desired, isDesired := c.state.Desired[label]
+	applied, isApplied := c.state.Applied[label]
+	status := Status{Label: label, Desired: isDesired, Applied: isApplied}
+	_, printErr := c.launchctl(opCtx, "print", serviceTarget(label))
+	switch launchctlExitCode(printErr) {
+	case launchctlNotLoadedExit:
+		return status, nil
+	case -1:
+		if printErr != nil {
+			return Status{}, fmt.Errorf("service: inspect agent %q: %w", label, printErr)
+		}
+	default:
+		return Status{}, fmt.Errorf("service: inspect agent %q: %w", label, printErr)
+	}
+	status.Loaded = true
+	if !isDesired || !isApplied || !reflect.DeepEqual(desired, applied) {
+		return status, nil
+	}
+	exact, err := c.verify(opCtx, desired)
+	if err != nil {
+		return Status{}, fmt.Errorf("service: verify agent %q: %w", label, err)
+	}
+	status.Exact = exact
+	return status, nil
 }
 
 // Close rejects new convergence, waits for admitted service workers, cancels

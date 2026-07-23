@@ -1,8 +1,6 @@
 package daemon
 
 import (
-	"errors"
-	"syscall"
 	"time"
 
 	"github.com/yasyf/daemonkit/proc"
@@ -42,48 +40,4 @@ func proberOrSys(p prober) prober {
 		return sysProber{}
 	}
 	return p
-}
-
-// signaler delivers a signal to a process. Production wraps kill(2); tests
-// substitute a fake to observe the ladder and inject ESRCH.
-type signaler interface {
-	signal(pid int, sig syscall.Signal) error
-}
-
-type sysSignaler struct{}
-
-func (sysSignaler) signal(pid int, sig syscall.Signal) error { return syscall.Kill(pid, sig) }
-
-func signalerOrSys(s signaler) signaler {
-	if s == nil {
-		return sysSignaler{}
-	}
-	return s
-}
-
-// processWaiter reaps an exited child when the incumbent is owned by this
-// process. Non-children remain observable only through their probed identity.
-type processWaiter interface {
-	wait(pid int) (bool, error)
-}
-
-type sysProcessWaiter struct{}
-
-func (sysProcessWaiter) wait(pid int) (bool, error) {
-	var status syscall.WaitStatus
-	waited, err := syscall.Wait4(pid, &status, syscall.WNOHANG, nil)
-	if errors.Is(err, syscall.ECHILD) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return waited == pid, nil
-}
-
-func processWaiterOrSys(w processWaiter) processWaiter {
-	if w == nil {
-		return sysProcessWaiter{}
-	}
-	return w
 }
