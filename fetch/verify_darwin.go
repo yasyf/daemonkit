@@ -4,6 +4,7 @@ package fetch
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -21,6 +22,13 @@ func (codesignVerifier) Verify(ctx context.Context, appPath, requirement string)
 	cmd := exec.CommandContext(ctx, "codesign", "--verify", "-R="+requirement, appPath)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return fmt.Errorf("%w: codesign --verify %q: %w: %s", ErrUntrusted, appPath, err, strings.TrimSpace(string(out)))
+		}
 		return fmt.Errorf("codesign --verify %q: %w: %s", appPath, err, strings.TrimSpace(string(out)))
 	}
 	return nil

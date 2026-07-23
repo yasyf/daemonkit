@@ -2,6 +2,7 @@ package fetch
 
 import (
 	"archive/zip"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -32,9 +33,9 @@ func extractEntry(entry *zip.File, dest string) error {
 		return fmt.Errorf("%w: %q", ErrUnsafeArchive, entry.Name)
 	}
 	if entry.FileInfo().IsDir() {
-		return os.MkdirAll(target, 0o750)
+		return mkdirAllNoSymlink(dest, target, 0o750)
 	}
-	if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
+	if err := mkdirAllNoSymlink(dest, filepath.Dir(target), 0o750); err != nil {
 		return fmt.Errorf("fetch: mkdir %q: %w", filepath.Dir(target), err)
 	}
 	if entry.Mode()&os.ModeSymlink != 0 {
@@ -49,7 +50,7 @@ func extractFile(entry *zip.File, target string) error {
 		return fmt.Errorf("fetch: open entry %q: %w", entry.Name, err)
 	}
 	defer rc.Close()
-	out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, entry.Mode().Perm())
+	out, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, entry.Mode().Perm())
 	if err != nil {
 		return fmt.Errorf("fetch: create %q: %w", target, err)
 	}
@@ -75,10 +76,10 @@ func extractSymlink(entry *zip.File, target, dest string) error {
 		return fmt.Errorf("fetch: read link %q: %w", entry.Name, err)
 	}
 	dst := string(link)
-	resolved := dst
-	if !filepath.IsAbs(dst) {
-		resolved = filepath.Join(filepath.Dir(target), dst)
+	if filepath.IsAbs(dst) {
+		return fmt.Errorf("%w: absolute symlink %q -> %q", ErrUnsafeArchive, entry.Name, dst)
 	}
+	resolved := filepath.Join(filepath.Dir(target), dst)
 	if !within(dest, resolved) {
 		return fmt.Errorf("%w: symlink %q -> %q", ErrUnsafeArchive, entry.Name, dst)
 	}
@@ -94,4 +95,32 @@ func within(dir, target string) bool {
 		return false
 	}
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func mkdirAllNoSymlink(root, target string, perm os.FileMode) error {
+	rel, err := filepath.Rel(root, target)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("%w: directory %q escapes archive root", ErrUnsafeArchive, target)
+	}
+	current := root
+	if rel == "." {
+		return nil
+	}
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if errors.Is(err, os.ErrNotExist) {
+			if err := os.Mkdir(current, perm); err != nil {
+				return err
+			}
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: archive directory %q is not a real directory", ErrUnsafeArchive, current)
+		}
+	}
+	return nil
 }

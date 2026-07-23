@@ -6,6 +6,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-07-23
+
+### Changed
+
+- `fetch.Release` requires the exact signed bundle marketing version, asset
+  URL, and embedded SHA-256. The mutable checksum-side lookup and DR-only reuse
+  contract are removed.
+- `bundle.ShortVersion` reads both XML and binary property lists.
+
+### Fixed
+
+- Signed app installs serialize through a never-unlinked per-app lock, stage
+  durably on the target filesystem, and publish real canonical `.app`
+  directories with exclusive rename or atomic exchange.
+- Strict v1 prepared/final receipts bind release and codesign policy to the
+  canonical directory identity. Generation-fenced recovery completes an exact
+  prepared transaction without an absence window and never reuses conflicting,
+  corrupt, symlinked, or unattributed state.
+
 ## [0.7.0] - 2026-07-23
 
 ### Changed
@@ -159,7 +178,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/yasyf/daemonkit/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/yasyf/daemonkit/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/yasyf/daemonkit/compare/v0.5.0...v0.6.1
 [0.5.0]: https://github.com/yasyf/daemonkit/compare/v0.4.2...v0.5.0

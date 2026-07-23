@@ -62,6 +62,7 @@ One row per package; the Status column is each surface's live state.
 | `version` | Release/dev version taxonomy, newest-wins skew | Landed |
 | `paths` | The `~/<app>` state layout: daemon socket, HTTP handshake file, per-subject artifacts, start lock, sqlite database, daemon log, turn-snapshot scratch dirs | Landed |
 | `bundle` | Info.plist reads, stable `.app` path conventions | Landed |
+| `fetch` | Exact release identity, signed `.app` verification, atomic real-directory publication, and strict v1 crash recovery | Landed |
 | `wire` | Exact-v1 persistent session transport, bounded multiplexing and delivery, peer credentials | Landed |
 | `wire/lifeproto` | The exact-v1 frozen lifecycle envelope (health, shutdown, hello, handoff) — Go and Swift bindings generated from one schema, pinned byte-identical by a shared golden fixture | Landed |
 | `trust` | Codesign peer verification (audit-token designated requirements) | Landed |
@@ -72,7 +73,11 @@ One row per package; the Status column is each surface's live state.
 
 The LaunchAgents `service` writes use no socket activation — the daemon binds and flocks its own socket (`proc`); launchd only keeps the process alive. Every `Agent` and `AppKeepAlive` selects `RestartAlways`, `RestartOnFailure`, or `NoRestart`; the policy is rendered directly into the launchd plist. On the Swift side, `DaemonKit` reconciles `SMAppService` login items (opening the Login Items settings pane when the item needs approval), watches snapshot directories, and rides the signed `.app` bundle for a stable bundle + TCC identity.
 
-Status: v0.3.2 is the hard-cut release line consumed by FuseKit and the manually
+`fetch` installs only a consumer-owned fixed signed app into that consumer's
+daemonkit-managed path. FuseKit's holder runtime is embedded in the consumer
+app; daemonkit and FuseKit do not ship or fetch a separate generic holder.
+
+Status: v0.7.1 is the hard-cut release line consumed by FuseKit and the manually
 migrated fleet. Protocol and durable-state epochs begin at 1 with exact equality;
 the API stabilizes at v1.0.0.
 
