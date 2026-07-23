@@ -37,6 +37,39 @@ func TestCaskTemplateUsesAuthoritativeAssetURL(t *testing.T) {
 	}
 }
 
+func TestCaskTemplateUsesMeaningfulUserApplicationPath(t *testing.T) {
+	rendered, err := renderCaskTemplate("--stop-and-uninstall-service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const installedApp = `#{Dir.home}/Applications/Example Helper.app`
+	if !strings.Contains(rendered, `app "Example Helper.app", target: "`+installedApp+`"`) {
+		t.Fatal("cask does not install the product helper at its stable user application path")
+	}
+	if got := strings.Count(rendered, installedApp); got != 4 {
+		t.Fatalf("stable user application path appears %d times, want app plus every lifecycle hook", got)
+	}
+	if strings.Contains(rendered, "#{appdir}") {
+		t.Fatal("cask still relies on Homebrew's system application directory")
+	}
+	for _, required := range []string{
+		"Do not use this template for FuseKit consumer runtimes",
+		"embeds holder.Runtime",
+		"$HOME/Applications/<MeaningfulProduct>.app",
+		"its CLI reconciles that app",
+		"There is no generic FuseKit application or cask",
+	} {
+		if !strings.Contains(rendered, required) {
+			t.Fatalf("cask omits consumer-runtime contract %q", required)
+		}
+	}
+	for _, retired := range []string{"fusekit-holder", "FuseKitHolder.app"} {
+		if strings.Contains(rendered, retired) {
+			t.Fatalf("cask still cites retired holder artifact %q", retired)
+		}
+	}
+}
+
 func TestCaskTemplateGenerationFailsWithoutExactStopHook(t *testing.T) {
 	if _, err := renderCaskTemplate(""); !errors.Is(err, errMissingStopHook) {
 		t.Fatalf("render without stop hook = %v, want %v", err, errMissingStopHook)

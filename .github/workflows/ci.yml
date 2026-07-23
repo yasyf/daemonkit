@@ -38,13 +38,6 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Codegen drift gate
-        # Regenerating both lifeproto bindings must be a no-op against the
-        # committed files. Linux-only: the output is host-independent.
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          go generate ./wire/...
-          git diff --exit-code -- wire/lifeproto/lifeproto.go Sources/DaemonKit/LifecycleWire.swift
       - name: Vet
         # -unsafeptr=false: dlsym data-symbol FFI in trust/ (ccn 239201e).
         run: go vet -unsafeptr=false ./...

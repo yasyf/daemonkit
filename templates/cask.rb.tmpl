@@ -1,9 +1,14 @@
-# Homebrew cask for a daemonkit signed helper app (__APP_NAME__.app).
+# Homebrew cask for a product that deliberately publishes its signed helper app
+# (__APP_NAME__.app) through Homebrew.
+#
+# Do not use this template for FuseKit consumer runtimes. Each FuseKit consumer
+# embeds holder.Runtime in its own fixed, same-release signed app at
+# $HOME/Applications/<MeaningfulProduct>.app, and its CLI reconciles that app.
+# There is no generic FuseKit application or cask.
 #
 # The app is Developer ID signed, notarized, and stapled, so Gatekeeper
 # validates it offline; the postflight strips Homebrew's download quarantine so
-# the first launch is silent. Generalized from cc-pool's cc-pool-status.rb.tmpl
-# and fusekit's fusekit-holder.rb.tmpl.
+# the first launch is silent.
 #
 #   brew install --cask __GH_OWNER__/tap/__CASK_TOKEN__
 #
@@ -26,14 +31,15 @@ cask "__CASK_TOKEN__" do
   # notarization ticket and keeps a stable, bundle-keyed TCC/Keychain identity
   # across upgrades (a bare Mach-O can't staple and gets path-keyed TCC). The
   # installed app is LSUIElement (no Dock icon) and registers its
-  # SMAppService/LaunchAgent supervisor on launch.
-  app "__APP_NAME__.app"
+  # SMAppService/LaunchAgent supervisor on launch. Keep the product helper out
+  # of the system-wide /Applications directory.
+  app "__APP_NAME__.app", target: "#{Dir.home}/Applications/__APP_NAME__.app"
 
   preflight do
     # An existing installation must settle and unregister through the product's
     # identity-verified daemonkit stop path before Homebrew replaces its bundle.
     # A present app with a missing or failing hook is a hard failure.
-    installed_app = "#{appdir}/__APP_NAME__.app"
+    installed_app = "#{Dir.home}/Applications/__APP_NAME__.app"
     if Dir.exist?(installed_app)
       system_command "#{installed_app}/Contents/MacOS/__BINARY_NAME__",
                      args: ["__STOP_UNINSTALL_ARG__"],
@@ -42,14 +48,15 @@ cask "__CASK_TOKEN__" do
   end
 
   postflight do
+    installed_app = "#{Dir.home}/Applications/__APP_NAME__.app"
     # Strip Homebrew's download quarantine so first launch is silent
     # (notarized + stapled).
     system_command "/usr/bin/xattr",
-                   args: ["-dr", "com.apple.quarantine", "#{appdir}/__APP_NAME__.app"],
+                   args: ["-dr", "com.apple.quarantine", installed_app],
                    must_succeed: false
     # Relaunch in the background (-g: no focus steal). Launching runs the app's
     # LoginItem.reconcile(), which (re)registers the supervisor.
-    system_command "/usr/bin/open", args: ["-g", "#{appdir}/__APP_NAME__.app"], must_succeed: false
+    system_command "/usr/bin/open", args: ["-g", installed_app], must_succeed: false
   end
 
   uninstall_preflight do
@@ -57,7 +64,8 @@ cask "__CASK_TOKEN__" do
     # live KeepAlive/SMAppService registration just triggers an instant relaunch.
     # The required product hook invokes AppKeepAlive.Stop (or the product's
     # equally exact stable-bundle service API), proves absence, then unregisters.
-    system_command "#{appdir}/__APP_NAME__.app/Contents/MacOS/__BINARY_NAME__",
+    installed_app = "#{Dir.home}/Applications/__APP_NAME__.app"
+    system_command "#{installed_app}/Contents/MacOS/__BINARY_NAME__",
                    args: ["__STOP_UNINSTALL_ARG__"],
                    must_succeed: true
   end

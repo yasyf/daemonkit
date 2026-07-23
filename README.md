@@ -66,7 +66,7 @@ One row per package; the Status column is each surface's live state.
 | `version` | Release/dev version taxonomy, newest-wins skew | Landed |
 | `paths` | The `~/<app>` state layout: daemon socket, HTTP handshake file, per-subject artifacts, start lock, sqlite database, daemon log, turn-snapshot scratch dirs | Landed |
 | `bundle` | Info.plist reads, stable `.app` path conventions | Landed |
-| `fetch` | Exact release identity, signed `.app` verification, atomic real-directory publication, and strict v1 crash recovery | Landed |
+| `deployment` | Exact release identity, signed `.app` verification, atomic real-directory publication, and strict schema-1 crash recovery under `.daemonkit-deployment/<AppName>` | Landed |
 | `wire` | Exact-v1 persistent business transport, typed product observations, receipt-authenticated stop control, and the sole composed daemon runtime constructor | Landed |
 | `trust` | Codesign peer verification (audit-token designated requirements) | Landed |
 | `daemon` | Opaque process runtime, readiness, ordered shutdown, skew observation, embedded processes, and idle exit | Landed |
@@ -76,9 +76,12 @@ One row per package; the Status column is each surface's live state.
 
 The LaunchAgents `service` writes use no socket activation — the daemon binds and flocks its own socket (`proc`); launchd only keeps the process alive. Every `Agent` and `AppKeepAlive` selects `RestartAlways`, `RestartOnFailure`, or `NoRestart`; the policy is rendered directly into the launchd plist. On the Swift side, `DaemonKit` reconciles `SMAppService` login items (opening the Login Items settings pane when the item needs approval), watches snapshot directories, and rides the signed `.app` bundle for a stable bundle + TCC identity.
 
-`fetch` installs only a consumer-owned fixed signed app into that consumer's
-daemonkit-managed path. FuseKit's holder runtime is embedded in the consumer
-app; daemonkit and FuseKit do not ship or fetch a separate generic holder.
+`daemonkit/deployment` installs only a consumer-owned fixed, same-release signed
+app. The consumer supplies its exact deployment policy and build digest; there
+is no legacy-state reader. For a FuseKit consumer, its CLI reconciles
+`$HOME/Applications/<MeaningfulProduct>.app`, whose meaningful product name
+might be `CCNotesHelper.app`, and that app embeds `holder.Runtime`. Daemonkit and
+FuseKit publish no generic holder application or FuseKit cask.
 
 Status: v0.8.0 is the hard-cut release line consumed by FuseKit and the manually
 migrated fleet. Protocol and durable-state epochs begin at 1 with exact equality;

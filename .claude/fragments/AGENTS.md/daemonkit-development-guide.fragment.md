@@ -7,8 +7,8 @@ Daemons that spawn detached, trust by codesign, and drain on upgrade.
 ```
 daemonkit/
 ├── doc.go            # module godoc; the Go packages land beside it at the root
-│                     #   (proc/, service/, version/, paths/, bundle/,
-│                     #   wire/, trust/, daemon/, drain/, supervise/)
+│                     #   (proc/, service/, deployment/, version/, paths/,
+│                     #   bundle/, wire/, trust/, daemon/, drain/, supervise/)
 ├── Package.swift     # SPM manifest — stays at the repo root (SPM requires it)
 ├── Sources/DaemonKit/       # the Swift half: socket serving, peer trust,
 │                            #   launchd registration, snapshot watching
