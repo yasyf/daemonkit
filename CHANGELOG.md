@@ -6,6 +6,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-23
+
+### Changed
+
+- Durable daemon state now uses exact v1 identities and schema fingerprints.
+  Drain journals, generation owners, strike accounting, process-reaping
+  ledgers, service-controller state, fetch receipts, and fetch transactions
+  reject missing, legacy, foreign, incomplete, or extended representations.
+- `daemon.ExactStateFile` requires a caller-owned codec, identity, and
+  fingerprint. Missing-state initialization is explicit; daemonkit no longer
+  preserves unknown JSON while mutating state it owns.
+- Swift `SnapshotWatcher` requires a caller-owned `SnapshotSchema` and
+  `SnapshotCodec`, and reports exact identity, v1, and fingerprint skew before
+  invoking the caller's payload decoder.
+
+### Removed
+
+- Permissive `daemon.StateFile`, its untyped mutation callback, and the Swift
+  watcher's version-only schema check.
+- Readers for pre-v1 or structurally incomplete daemonkit-owned state. Runtime
+  state is rebuilt or migrated manually at the fleet hard cut.
+
 ## [0.8.1] - 2026-07-23
 
 ### Fixed
@@ -218,7 +240,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/yasyf/daemonkit/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/yasyf/daemonkit/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/yasyf/daemonkit/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/yasyf/daemonkit/compare/v0.7.0...v0.7.1
