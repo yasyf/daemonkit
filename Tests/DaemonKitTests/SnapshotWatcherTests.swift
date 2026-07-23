@@ -4,10 +4,19 @@ import Foundation
 import Testing
 
 private let snapshotFingerprint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-private let snapshotSchema = try! SnapshotSchema(
-    identity: "test.snapshot.v1",
-    fingerprint: snapshotFingerprint
-)
+
+private func makeSnapshotSchema() -> SnapshotSchema {
+    do {
+        return try SnapshotSchema(
+            identity: "test.snapshot.v1",
+            fingerprint: snapshotFingerprint
+        )
+    } catch {
+        fatalError("invalid test snapshot schema: \(error)")
+    }
+}
+
+private let snapshotSchema = makeSnapshotSchema()
 
 private func snapshotCodec<S: Decodable & Sendable>(_: S.Type) -> SnapshotCodec<S> {
     SnapshotCodec(schema: snapshotSchema) { data, decoder in
@@ -131,7 +140,11 @@ struct SnapshotWatcherTests {
         let decoder = SnapshotWatcher<Dated>.makeDecoder()
 
         let fractionalState = SnapshotWatcher<Dated>.decodedState(
-            from: Data(#"{"identity":"test.snapshot.v1","schema_version":1,"fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","updated_at":"2026-07-17T12:00:00.500Z"}"#.utf8),
+            from: Data((
+                #"{"identity":"test.snapshot.v1","schema_version":1,"# +
+                    #""fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","# +
+                    #""updated_at":"2026-07-17T12:00:00.500Z"}"#
+            ).utf8),
             codec: snapshotCodec(Dated.self),
             decoder: decoder
         )
@@ -145,7 +158,11 @@ struct SnapshotWatcherTests {
         #expect(fractional.updatedAt == expectedFractional)
 
         let plainState = SnapshotWatcher<Dated>.decodedState(
-            from: Data(#"{"identity":"test.snapshot.v1","schema_version":1,"fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","updated_at":"2026-07-17T12:00:00Z"}"#.utf8),
+            from: Data((
+                #"{"identity":"test.snapshot.v1","schema_version":1,"# +
+                    #""fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","# +
+                    #""updated_at":"2026-07-17T12:00:00Z"}"#
+            ).utf8),
             codec: snapshotCodec(Dated.self),
             decoder: decoder
         )
