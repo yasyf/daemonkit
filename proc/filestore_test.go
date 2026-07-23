@@ -3,6 +3,7 @@ package proc
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -40,15 +41,21 @@ func TestFileStoreSchemaIsExactEpochOne(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var schema []byte
+	var identity, schema, fingerprint []byte
 	if err := db.View(func(tx *bolt.Tx) error {
-		schema = append([]byte(nil), tx.Bucket(fileStoreMetaBucket).Get(fileStoreSchemaKey)...)
+		meta := tx.Bucket(fileStoreMetaBucket)
+		identity = append([]byte(nil), meta.Get(fileStoreIdentityKey)...)
+		schema = append([]byte(nil), meta.Get(fileStoreSchemaKey)...)
+		fingerprint = append([]byte(nil), meta.Get(fileStoreFingerprintKey)...)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if len(schema) != 8 || binary.BigEndian.Uint64(schema) != 1 {
 		t.Fatalf("schema = %x, want epoch 1", schema)
+	}
+	if string(identity) != string(fileStoreIdentity) || string(fingerprint) != string(fileStoreFingerprint) {
+		t.Fatalf("identity/fingerprint = %q/%q, want %q/%q", identity, fingerprint, fileStoreIdentity, fileStoreFingerprint)
 	}
 	if err := db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(fileStoreMetaBucket).Put(fileStoreSchemaKey, uint64Bytes(2))
@@ -60,6 +67,84 @@ func TestFileStoreSchemaIsExactEpochOne(t *testing.T) {
 	}
 	if _, err := store.Load(t.Context()); !errors.Is(err, ErrRecordSchema) {
 		t.Fatalf("foreign schema load = %v, want ErrRecordSchema", err)
+	}
+}
+
+func TestFileStoreRejectsForeignMetadata(t *testing.T) {
+	tests := map[string]func(*bolt.Bucket) error{
+		"identity": func(meta *bolt.Bucket) error {
+			return meta.Put(fileStoreIdentityKey, []byte("foreign"))
+		},
+		"fingerprint": func(meta *bolt.Bucket) error {
+			return meta.Put(fileStoreFingerprintKey, []byte("foreign"))
+		},
+		"missing identity": func(meta *bolt.Bucket) error {
+			return meta.Delete(fileStoreIdentityKey)
+		},
+		"unknown key": func(meta *bolt.Bucket) error {
+			return meta.Put([]byte("future"), []byte("1"))
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "recovery.db")
+			store := &FileStore{Path: path}
+			if err := store.Add(t.Context(), storeRecord(RecoveryTask, 42)); err != nil {
+				t.Fatal(err)
+			}
+			db, err := bolt.Open(path, 0o600, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Update(func(tx *bolt.Tx) error {
+				return mutate(tx.Bucket(fileStoreMetaBucket))
+			}); err != nil {
+				_ = db.Close()
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.Load(t.Context()); !errors.Is(err, ErrRecordSchema) {
+				t.Fatalf("Load error = %v, want ErrRecordSchema", err)
+			}
+		})
+	}
+}
+
+func TestFileStoreRejectsMissingRecordField(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "recovery.db")
+	store := &FileStore{Path: path}
+	record := storeRecord(RecoveryTask, 42)
+	if err := store.Add(t.Context(), record); err != nil {
+		t.Fatal(err)
+	}
+	db, err := bolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(fileStoreRecordsBucket)
+		key := []byte(recordKey(record))
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(bucket.Get(key), &fields); err != nil {
+			return err
+		}
+		delete(fields, "executable")
+		payload, err := json.Marshal(fields)
+		if err != nil {
+			return err
+		}
+		return bucket.Put(key, payload)
+	}); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Load(t.Context()); !errors.Is(err, ErrRecordSchema) {
+		t.Fatalf("Load error = %v, want ErrRecordSchema", err)
 	}
 }
 

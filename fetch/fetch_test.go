@@ -158,6 +158,9 @@ func TestFetchPublishesExactRealBundle(t *testing.T) {
 	if current.Version != "1.2.3" || current.URL != cfg.Release.URL || current.SHA256 != cfg.Release.SHA256.String() {
 		t.Fatalf("receipt = %#v, want exact release", current)
 	}
+	if current.Identity != receiptIdentity || current.Schema != 1 || current.Fingerprint != receiptFingerprint {
+		t.Fatalf("receipt identity = %q/%d/%q", current.Identity, current.Schema, current.Fingerprint)
+	}
 }
 
 func TestFetchRejectsChecksumMismatch(t *testing.T) {
@@ -415,6 +418,9 @@ func TestFetchRejectsPreparedTransactionForDifferentAppName(t *testing.T) {
 	tx, err := readTransaction(pathsFor(cfg).transaction)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if tx.Identity != transactionIdentity || tx.Schema != 1 || tx.Fingerprint != transactionFingerprint {
+		t.Fatalf("transaction identity = %q/%d/%q", tx.Identity, tx.Schema, tx.Fingerprint)
 	}
 	tx.Next.AppName = "Other"
 	if err := writeJSONDurable(pathsFor(cfg).transaction, tx); err != nil {

@@ -55,6 +55,9 @@ func (p *fakeProber) probe(pid int) (proc.Identity, error) {
 }
 
 func (p *fakeProber) boot() (string, error) {
+	if p.bootID == "" && p.bootErr == nil {
+		return "test-boot", nil
+	}
 	return p.bootID, p.bootErr
 }
 

@@ -3,6 +3,18 @@ import Darwin
 import Foundation
 import Testing
 
+private let snapshotFingerprint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+private let snapshotSchema = try! SnapshotSchema(
+    identity: "test.snapshot.v1",
+    fingerprint: snapshotFingerprint
+)
+
+private func snapshotCodec<S: Decodable & Sendable>(_: S.Type) -> SnapshotCodec<S> {
+    SnapshotCodec(schema: snapshotSchema) { data, decoder in
+        try decoder.decode(S.self, from: data)
+    }
+}
+
 private struct Snap: Decodable, Sendable, Equatable {
     let schemaVersion: Int
     let value: Int
@@ -54,10 +66,10 @@ private func waitUntil(_ seconds: Double = 3, _ condition: @Sendable () -> Bool)
 @Suite(.timeLimit(.minutes(1)))
 struct SnapshotWatcherTests {
     @Test func decodesLoadedSnapshot() {
-        let data = Data(#"{"schema_version":1,"value":42}"#.utf8)
+        let data = Data(#"{"identity":"test.snapshot.v1","schema_version":1,"fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","value":42}"#.utf8)
         let state = SnapshotWatcher<Snap>.decodedState(
             from: data,
-            expectedSchemaVersion: 1,
+            codec: snapshotCodec(Snap.self),
             decoder: SnapshotWatcher<Snap>.makeDecoder()
         )
         guard case let .loaded(snap) = state else {
@@ -67,29 +79,32 @@ struct SnapshotWatcherTests {
         #expect(snap == Snap(schemaVersion: 1, value: 42))
     }
 
-    @Test func versionSkewSurfacesExpectedAndFound() {
-        let data = Data(#"{"schema_version":2,"value":42}"#.utf8)
+    @Test func schemaSkewSurfacesExpectedAndFound() {
+        let data = Data(#"{"identity":"test.snapshot.v1","schema_version":2,"fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","value":42}"#.utf8)
         let state = SnapshotWatcher<Snap>.decodedState(
             from: data,
-            expectedSchemaVersion: 1,
+            codec: snapshotCodec(Snap.self),
             decoder: SnapshotWatcher<Snap>.makeDecoder()
         )
-        guard case let .versionSkew(expected, found) = state else {
-            Issue.record("expected .versionSkew, got \(state)")
+        guard case let .schemaSkew(expected, foundIdentity, foundVersion, foundFingerprint) = state else {
+            Issue.record("expected .schemaSkew, got \(state)")
             return
         }
-        #expect(expected == 1)
-        #expect(found == 2)
+        #expect(expected == snapshotSchema)
+        #expect(foundIdentity == snapshotSchema.identity)
+        #expect(foundVersion == 2)
+        #expect(foundFingerprint == snapshotSchema.fingerprint)
     }
 
     @Test(arguments: [
         #"not json at all"#,
         #"{"schema_version":1}"#,
+        #"{"identity":"test.snapshot.v1","schema_version":1,"fingerprint":"short","value":42}"#,
     ])
     func malformedSnapshotSurfacesMalformed(json: String) {
         let state = SnapshotWatcher<Snap>.decodedState(
             from: Data(json.utf8),
-            expectedSchemaVersion: 1,
+            codec: snapshotCodec(Snap.self),
             decoder: SnapshotWatcher<Snap>.makeDecoder()
         )
         guard case .malformed = state else {
@@ -102,7 +117,7 @@ struct SnapshotWatcherTests {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("dk-missing-\(UUID()).json")
         let watcher = SnapshotWatcher<Snap>(
             fileURL: url,
-            expectedSchemaVersion: 1,
+            codec: snapshotCodec(Snap.self),
             callbackQueue: .global(),
             onChange: { _ in }
         )
@@ -116,8 +131,8 @@ struct SnapshotWatcherTests {
         let decoder = SnapshotWatcher<Dated>.makeDecoder()
 
         let fractionalState = SnapshotWatcher<Dated>.decodedState(
-            from: Data(#"{"schema_version":1,"updated_at":"2026-07-17T12:00:00.500Z"}"#.utf8),
-            expectedSchemaVersion: 1,
+            from: Data(#"{"identity":"test.snapshot.v1","schema_version":1,"fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","updated_at":"2026-07-17T12:00:00.500Z"}"#.utf8),
+            codec: snapshotCodec(Dated.self),
             decoder: decoder
         )
         let fractionalFormatter = ISO8601DateFormatter()
@@ -130,8 +145,8 @@ struct SnapshotWatcherTests {
         #expect(fractional.updatedAt == expectedFractional)
 
         let plainState = SnapshotWatcher<Dated>.decodedState(
-            from: Data(#"{"schema_version":1,"updated_at":"2026-07-17T12:00:00Z"}"#.utf8),
-            expectedSchemaVersion: 1,
+            from: Data(#"{"identity":"test.snapshot.v1","schema_version":1,"fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","updated_at":"2026-07-17T12:00:00Z"}"#.utf8),
+            codec: snapshotCodec(Dated.self),
             decoder: decoder
         )
         let plainFormatter = ISO8601DateFormatter()
@@ -149,12 +164,12 @@ struct SnapshotWatcherTests {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let file = dir.appendingPathComponent("snap.json")
-        try Data(#"{"schema_version":1,"value":1}"#.utf8).write(to: file)
+        try Data(#"{"identity":"test.snapshot.v1","schema_version":1,"fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","value":1}"#.utf8).write(to: file)
 
         let box = StateBox<Snap>()
         let watcher = SnapshotWatcher<Snap>(
             fileURL: file,
-            expectedSchemaVersion: 1,
+            codec: snapshotCodec(Snap.self),
             debounce: 0.05,
             callbackQueue: .global(),
             onChange: { box.append($0) }
@@ -170,7 +185,7 @@ struct SnapshotWatcherTests {
         #expect(first.value == 1)
 
         let tmp = dir.appendingPathComponent(".tmp-\(UUID())")
-        try Data(#"{"schema_version":1,"value":2}"#.utf8).write(to: tmp)
+        try Data(#"{"identity":"test.snapshot.v1","schema_version":1,"fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","value":2}"#.utf8).write(to: tmp)
         #expect(rename(tmp.path, file.path) == 0)
 
         try await waitUntil { box.count >= 2 }
@@ -187,7 +202,7 @@ struct SnapshotWatcherTests {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let file = dir.appendingPathComponent("snapshot.json")
-        try Data(#"{"schema_version":1,"value":1}"#.utf8).write(to: file)
+        try Data(#"{"identity":"test.snapshot.v1","schema_version":1,"fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","value":1}"#.utf8).write(to: file)
 
         func probeFD() -> Int32 {
             let probe = open(dir.path, O_EVTONLY)
@@ -201,7 +216,7 @@ struct SnapshotWatcherTests {
         for _ in 0 ..< 64 {
             let watcher = SnapshotWatcher<Snap>(
                 fileURL: file,
-                expectedSchemaVersion: 1,
+                codec: snapshotCodec(Snap.self),
                 callbackQueue: .global(),
                 onChange: { _ in }
             )

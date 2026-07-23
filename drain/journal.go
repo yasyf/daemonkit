@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -41,12 +40,6 @@ const (
 	RowYielded RowState = "yielded"
 )
 
-const seqKey = "~seq"
-
-const transitionKey = "~transition"
-
-const completeKey = "~complete"
-
 // Row is one journal row; Seq is the monotonic transition seq CAS updates key on.
 type Row struct {
 	Key   Key      `json:"key"`
@@ -56,7 +49,7 @@ type Row struct {
 
 // Journal is a flock-guarded JSON ownership journal, one row per resource key.
 type Journal struct {
-	file      daemon.StateFile
+	file      daemon.ExactStateFile[journalState]
 	lock      string
 	genDir    string
 	inc       string
@@ -65,7 +58,7 @@ type Journal struct {
 
 // NewJournal opens the canonical journal at path.
 func NewJournal(path string) Journal {
-	return Journal{file: daemon.StateFile{Path: path}, lock: path + ".lock"}
+	return Journal{file: journalStateFile(path), lock: path + ".lock"}
 }
 
 func (j Journal) withLock(ctx context.Context, fn func() error) error {
@@ -115,19 +108,12 @@ func (j Journal) Rows(ctx context.Context) (map[Key]Row, error) {
 }
 
 func (j Journal) rowsUnlocked() (map[Key]Row, error) {
-	state, err := readState(j.file.Path)
+	state, err := j.file.Read()
 	if err != nil {
 		return nil, err
 	}
-	rows := make(map[Key]Row, len(state))
-	for k, raw := range state {
-		if isJournalMetadata(k) {
-			continue
-		}
-		row, err := decodeRow(raw)
-		if err != nil {
-			return nil, fmt.Errorf("row %q: %w", k, err)
-		}
+	rows := make(map[Key]Row, len(state.Rows))
+	for k, row := range state.Rows {
 		rows[Key(k)] = row
 	}
 	return rows, nil
@@ -137,20 +123,13 @@ func (j Journal) rowsUnlocked() (map[Key]Row, error) {
 func (j Journal) apply(ctx context.Context, rows ...Row) (int, error) {
 	applied := 0
 	err := j.withLock(ctx, func() error {
-		return j.file.UpdateUnlocked(func(state map[string]json.RawMessage) error {
+		return j.file.UpdateUnlocked(func(state *journalState) error {
 			for _, r := range rows {
-				stored, err := decodeRow(state[string(r.Key)])
-				if err != nil {
-					return fmt.Errorf("row %q: %w", r.Key, err)
-				}
+				stored := state.Rows[string(r.Key)]
 				if r.Seq <= stored.Seq {
 					continue
 				}
-				b, err := json.Marshal(r)
-				if err != nil {
-					return err
-				}
-				state[string(r.Key)] = b
+				state.Rows[string(r.Key)] = r
 				applied++
 			}
 			return nil
@@ -166,25 +145,14 @@ func (j Journal) apply(ctx context.Context, rows ...Row) (int, error) {
 func (j Journal) Bump(ctx context.Context, key Key, state RowState) (Row, error) {
 	var out Row
 	err := j.withLock(ctx, func() error {
-		return j.file.UpdateUnlocked(func(st map[string]json.RawMessage) error {
-			stored, err := decodeRow(st[string(key)])
-			if err != nil {
-				return fmt.Errorf("row %q: %w", key, err)
-			}
-			high, err := decodeSeq(st[seqKey])
-			if err != nil {
-				return err
-			}
-			next, ok := advanceSeq(stored.Seq, high)
+		return j.file.UpdateUnlocked(func(st *journalState) error {
+			stored := st.Rows[string(key)]
+			next, ok := advanceSeq(stored.Seq, st.Sequence)
 			if !ok {
 				return fmt.Errorf("%w: key %q", ErrSeqExhausted, key)
 			}
 			out = Row{Key: key, Seq: next, State: state}
-			b, err := json.Marshal(out)
-			if err != nil {
-				return err
-			}
-			st[string(key)] = b
+			st.Rows[string(key)] = out
 			return nil
 		})
 	})
@@ -196,28 +164,17 @@ func (j Journal) Bump(ctx context.Context, key Key, state RowState) (Row, error)
 
 func (j Journal) adopt(ctx context.Context, rows []Row) error {
 	return j.withLock(ctx, func() error {
-		return j.file.UpdateUnlocked(func(st map[string]json.RawMessage) error {
-			high, err := decodeSeq(st[seqKey])
-			if err != nil {
-				return err
-			}
+		return j.file.UpdateUnlocked(func(st *journalState) error {
 			for _, r := range rows {
-				stored, err := decodeRow(st[string(r.Key)])
-				if err != nil {
-					return fmt.Errorf("row %q: %w", r.Key, err)
-				}
+				stored := st.Rows[string(r.Key)]
 				if stored.Seq > r.Seq {
 					continue
 				}
-				next, ok := advanceSeq(r.Seq, stored.Seq, high)
+				next, ok := advanceSeq(r.Seq, stored.Seq, st.Sequence)
 				if !ok {
 					return fmt.Errorf("%w: key %q", ErrSeqExhausted, r.Key)
 				}
-				b, err := json.Marshal(Row{Key: r.Key, Seq: next, State: RowPending})
-				if err != nil {
-					return err
-				}
-				st[string(r.Key)] = b
+				st.Rows[string(r.Key)] = Row{Key: r.Key, Seq: next, State: RowPending}
 			}
 			return nil
 		})
@@ -228,17 +185,10 @@ func (j Journal) adopt(ctx context.Context, rows []Row) error {
 // canonical→generation snapshot; must not be exported.
 func (j Journal) claimSnapshot(ctx context.Context, rows []Row, claim func() error) error {
 	return j.withLock(ctx, func() error {
-		return j.file.UpdateUnlocked(func(state map[string]json.RawMessage) error {
-			stored := make(map[Key]Row, len(state))
-			for k, raw := range state {
-				if isJournalMetadata(k) {
-					continue
-				}
-				r, err := decodeRow(raw)
-				if err != nil {
-					return fmt.Errorf("row %q: %w", k, err)
-				}
-				stored[Key(k)] = r
+		return j.file.UpdateUnlocked(func(state *journalState) error {
+			stored := make(map[Key]Row, len(state.Rows))
+			for k, row := range state.Rows {
+				stored[Key(k)] = row
 			}
 			if len(stored) > 0 {
 				if len(stored) != len(rows) {
@@ -257,11 +207,7 @@ func (j Journal) claimSnapshot(ctx context.Context, rows []Row, claim func() err
 				return nil
 			}
 			for _, r := range rows {
-				b, err := json.Marshal(r)
-				if err != nil {
-					return err
-				}
-				state[string(r.Key)] = b
+				state.Rows[string(r.Key)] = r
 			}
 			return nil
 		})
@@ -273,36 +219,22 @@ func (j Journal) claimSnapshot(ctx context.Context, rows []Row, claim func() err
 // seqs so a later Bump never re-issues one.
 func (j Journal) Truncate(ctx context.Context, scope map[Key]Row) error {
 	return j.withLock(ctx, func() error {
-		return j.file.UpdateUnlocked(func(state map[string]json.RawMessage) error {
-			high, err := decodeSeq(state[seqKey])
-			if err != nil {
-				return err
-			}
+		return j.file.UpdateUnlocked(func(state *journalState) error {
+			high := state.Sequence
 			for key, want := range scope {
-				stored, err := decodeRow(state[string(key)])
-				if err != nil {
-					return fmt.Errorf("row %q: %w", key, err)
-				}
+				stored := state.Rows[string(key)]
 				if stored != want {
 					continue
 				}
 				if stored.Seq > high {
 					high = stored.Seq
 				}
-				delete(state, string(key))
+				delete(state.Rows, string(key))
 			}
-			b, err := json.Marshal(high)
-			if err != nil {
-				return err
-			}
-			state[seqKey] = b
+			state.Sequence = high
 			return nil
 		})
 	})
-}
-
-func isJournalMetadata(key string) bool {
-	return key == seqKey || key == transitionKey || key == completeKey
 }
 
 func (j Journal) markComplete(ctx context.Context) error {
@@ -310,12 +242,8 @@ func (j Journal) markComplete(ctx context.Context) error {
 		return errors.New("complete marker requires an incarnation-bound journal")
 	}
 	return j.withLock(ctx, func() error {
-		return j.file.UpdateUnlocked(func(state map[string]json.RawMessage) error {
-			b, err := json.Marshal(j.inc)
-			if err != nil {
-				return err
-			}
-			state[completeKey] = b
+		return j.file.UpdateUnlocked(func(state *journalState) error {
+			state.Complete = j.inc
 			return nil
 		})
 	})
@@ -324,19 +252,11 @@ func (j Journal) markComplete(ctx context.Context) error {
 func (j Journal) isComplete(ctx context.Context) (bool, error) {
 	var complete bool
 	err := j.withLock(ctx, func() error {
-		state, err := readState(j.file.Path)
+		state, err := j.file.Read()
 		if err != nil {
 			return err
 		}
-		raw := state[completeKey]
-		if len(raw) == 0 {
-			return nil
-		}
-		var tok string
-		if err := json.Unmarshal(raw, &tok); err != nil {
-			return fmt.Errorf("parse complete marker: %w", err)
-		}
-		complete = j.inc != "" && tok == j.inc
+		complete = j.inc != "" && state.Complete == j.inc
 		return nil
 	})
 	if err != nil {
@@ -352,20 +272,13 @@ func (j Journal) terminalize(ctx context.Context, row Row) error {
 }
 
 func (j Journal) terminalizeUnlocked(row Row) error {
-	return j.file.UpdateUnlocked(func(state map[string]json.RawMessage) error {
-		stored, err := decodeRow(state[string(row.Key)])
-		if err != nil {
-			return fmt.Errorf("row %q: %w", row.Key, err)
-		}
+	return j.file.UpdateUnlocked(func(state *journalState) error {
+		stored := state.Rows[string(row.Key)]
 		if stored != row {
 			return fmt.Errorf("terminalize row %q: stored %+v does not match expected %+v", row.Key, stored, row)
 		}
 		out := Row{Key: row.Key, Seq: nextSeq(row.Seq), State: RowYielded}
-		b, err := json.Marshal(out)
-		if err != nil {
-			return err
-		}
-		state[string(row.Key)] = b
+		state.Rows[string(row.Key)] = out
 		return nil
 	})
 }
@@ -388,46 +301,6 @@ func advanceSeq(floors ...uint64) (uint64, bool) {
 		return 0, false
 	}
 	return next, true
-}
-
-func decodeSeq(raw json.RawMessage) (uint64, error) {
-	if len(raw) == 0 {
-		return 0, nil
-	}
-	var high uint64
-	if err := json.Unmarshal(raw, &high); err != nil {
-		return 0, fmt.Errorf("parse seq high-water: %w", err)
-	}
-	return high, nil
-}
-
-func decodeRow(raw json.RawMessage) (Row, error) {
-	if len(raw) == 0 {
-		return Row{}, nil
-	}
-	var r Row
-	if err := json.Unmarshal(raw, &r); err != nil {
-		return Row{}, err
-	}
-	return r, nil
-}
-
-func readState(path string) (map[string]json.RawMessage, error) {
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return map[string]json.RawMessage{}, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("read journal %s: %w", path, err)
-	}
-	if len(data) == 0 {
-		return map[string]json.RawMessage{}, nil
-	}
-	var state map[string]json.RawMessage
-	if err := json.Unmarshal(data, &state); err != nil {
-		return nil, fmt.Errorf("parse journal %s: %w", path, err)
-	}
-	return state, nil
 }
 
 func withFileLock(ctx context.Context, path string, fn func() error) error {
@@ -477,7 +350,7 @@ type ownerRecord struct {
 	PID       int    `json:"pid"`
 	StartTime string `json:"start_time"`
 	Comm      string `json:"comm"`
-	Boot      string `json:"boot,omitempty"`
+	Boot      string `json:"boot"`
 }
 
 type transitionRecord struct {
@@ -499,44 +372,20 @@ type ownerFile struct {
 	Inc string `json:"inc"`
 }
 
-func decodeTransition(raw json.RawMessage) (transitionRecord, bool, error) {
-	if len(raw) == 0 {
-		return transitionRecord{}, false, nil
-	}
-	var rec transitionRecord
-	if err := json.Unmarshal(raw, &rec); err != nil {
-		return transitionRecord{}, false, fmt.Errorf("parse active transition: %w", err)
-	}
-	if rec.Generation == "" || rec.Owner.PID <= 0 || rec.Owner.StartTime == "" {
-		return transitionRecord{}, false, errors.New("active transition: incomplete record")
-	}
-	if rec.Step < 0 || rec.Step > StepSpawn {
-		return transitionRecord{}, false, fmt.Errorf("active transition: invalid step %d", rec.Step)
-	}
-	return rec, true, nil
-}
-
 func (j Journal) claimTransition(ctx context.Context, generation string, owner proc.Identity) (Step, error) {
 	want := transitionRecord{Generation: generation, Owner: newOwnerRecord(owner)}
 	var phase Step
 	err := j.withLock(ctx, func() error {
-		return j.file.UpdateUnlocked(func(state map[string]json.RawMessage) error {
-			current, ok, err := decodeTransition(state[transitionKey])
-			if err != nil {
-				return err
-			}
-			if ok {
+		return j.file.UpdateUnlocked(func(state *journalState) error {
+			if state.Transition != nil {
+				current := *state.Transition
 				if current.Generation != want.Generation || current.Owner != want.Owner {
 					return ErrDrainInProgress
 				}
 				phase = current.Step
 				return nil
 			}
-			b, err := json.Marshal(want)
-			if err != nil {
-				return err
-			}
-			state[transitionKey] = b
+			state.Transition = &want
 			return nil
 		})
 	})
@@ -546,14 +395,11 @@ func (j Journal) claimTransition(ctx context.Context, generation string, owner p
 func (j Journal) advanceTransition(ctx context.Context, generation string, owner proc.Identity, step Step) error {
 	wantOwner := newOwnerRecord(owner)
 	return j.withLock(ctx, func() error {
-		return j.file.UpdateUnlocked(func(state map[string]json.RawMessage) error {
-			current, ok, err := decodeTransition(state[transitionKey])
-			if err != nil {
-				return err
-			}
-			if !ok || current.Generation != generation || current.Owner != wantOwner {
+		return j.file.UpdateUnlocked(func(state *journalState) error {
+			if state.Transition == nil || state.Transition.Generation != generation || state.Transition.Owner != wantOwner {
 				return ErrDrainInProgress
 			}
+			current := *state.Transition
 			if current.Step >= step {
 				return nil
 			}
@@ -561,11 +407,7 @@ func (j Journal) advanceTransition(ctx context.Context, generation string, owner
 				return fmt.Errorf("active transition: advance from step %d to %d", current.Step, step)
 			}
 			current.Step = step
-			b, err := json.Marshal(current)
-			if err != nil {
-				return err
-			}
-			state[transitionKey] = b
+			state.Transition = &current
 			return nil
 		})
 	})
@@ -575,12 +417,15 @@ func (j Journal) activeTransition(ctx context.Context) (transitionRecord, bool, 
 	var rec transitionRecord
 	var ok bool
 	err := j.withLock(ctx, func() error {
-		state, err := readState(j.file.Path)
+		state, err := j.file.Read()
 		if err != nil {
 			return err
 		}
-		rec, ok, err = decodeTransition(state[transitionKey])
-		return err
+		if state.Transition != nil {
+			rec = *state.Transition
+			ok = true
+		}
+		return nil
 	})
 	return rec, ok, err
 }
@@ -588,18 +433,15 @@ func (j Journal) activeTransition(ctx context.Context) (transitionRecord, bool, 
 func (j Journal) releaseTransition(ctx context.Context, generation string, owner proc.Identity) error {
 	wantOwner := newOwnerRecord(owner)
 	return j.withLock(ctx, func() error {
-		return j.file.UpdateUnlocked(func(state map[string]json.RawMessage) error {
-			current, ok, err := decodeTransition(state[transitionKey])
-			if err != nil {
-				return err
-			}
-			if !ok || current.Generation != generation {
+		return j.file.UpdateUnlocked(func(state *journalState) error {
+			if state.Transition == nil || state.Transition.Generation != generation {
 				return nil
 			}
+			current := *state.Transition
 			if current.Owner != wantOwner {
 				return fmt.Errorf("active transition %s owner %+v does not match %+v", generation, current.Owner.identity(), owner)
 			}
-			delete(state, transitionKey)
+			state.Transition = nil
 			return nil
 		})
 	})
@@ -638,8 +480,9 @@ func (g Generation) Dir() string { return g.dir }
 func (g Generation) Name() string { return filepath.Base(g.dir) }
 
 func (g Generation) journal() Journal {
+	path := filepath.Join(g.dir, "journal.json")
 	return Journal{
-		file:      daemon.StateFile{Path: filepath.Join(g.dir, "journal.json")},
+		file:      journalStateFile(path),
 		lock:      g.rootLock(),
 		genDir:    g.dir,
 		inc:       g.inc,
@@ -654,11 +497,11 @@ func (g Generation) rootLock() string {
 func (g Generation) ownerPath() string { return filepath.Join(g.dir, "owner.json") }
 
 func (g Generation) writeOwnerUnlocked(id proc.Identity, inc string) error {
-	b, err := json.Marshal(ownerFile{ownerRecord: newOwnerRecord(id), Inc: inc})
-	if err != nil {
-		return err
+	file := ownerStateFile(g.ownerPath())
+	if _, err := file.Read(); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read owner %s before write: %w", g.ownerPath(), err)
 	}
-	if err := daemon.WriteFileDurable(g.ownerPath(), b, 0o600); err != nil {
+	if err := file.ReplaceUnlocked(ownerFile{ownerRecord: newOwnerRecord(id), Inc: inc}); err != nil {
 		return fmt.Errorf("write owner %s: %w", g.ownerPath(), err)
 	}
 	return nil
@@ -682,29 +525,18 @@ func (g Generation) claimOwner(ctx context.Context, id proc.Identity) (Generatio
 				return fmt.Errorf("%w: generation %s is owned by %+v", ErrStaleJournal, g.Name(), rec.identity())
 			}
 			inc := rec.Inc
-			if inc == "" {
-				inc, err = mintInc()
-				if err != nil {
-					return err
-				}
-				if err := g.clearStaleMarker(); err != nil {
-					return err
-				}
-			}
 			bound = Generation{dir: g.dir, inc: inc}
 			return g.writeOwnerUnlocked(id, inc)
 		}
 		if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
-		state, err := readState(filepath.Join(g.dir, "journal.json"))
+		state, err := journalStateFile(filepath.Join(g.dir, "journal.json")).Read()
 		if err != nil {
 			return err
 		}
-		for key := range state {
-			if !isJournalMetadata(key) {
-				return ErrStaleJournal
-			}
+		if len(state.Rows) != 0 {
+			return ErrStaleJournal
 		}
 		inc, err := mintInc()
 		if err != nil {
@@ -724,15 +556,16 @@ func (g Generation) claimOwner(ctx context.Context, id proc.Identity) (Generatio
 
 func (g Generation) clearStaleMarker() error {
 	path := filepath.Join(g.dir, "journal.json")
-	state, err := readState(path)
+	file := journalStateFile(path)
+	state, err := file.Read()
 	if err != nil {
 		return err
 	}
-	if len(state[completeKey]) == 0 {
+	if state.Complete == "" {
 		return nil
 	}
-	return daemon.StateFile{Path: path}.UpdateUnlocked(func(st map[string]json.RawMessage) error {
-		delete(st, completeKey)
+	return file.UpdateUnlocked(func(st *journalState) error {
+		st.Complete = ""
 		return nil
 	})
 }
@@ -763,16 +596,9 @@ func (g Generation) ReadOwner() (proc.Identity, error) {
 }
 
 func readOwnerFile(path string) (ownerFile, error) {
-	data, err := os.ReadFile(path)
+	rec, err := ownerStateFile(path).Read()
 	if err != nil {
 		return ownerFile{}, fmt.Errorf("read owner %s: %w", path, err)
-	}
-	var rec ownerFile
-	if err := json.Unmarshal(data, &rec); err != nil {
-		return ownerFile{}, fmt.Errorf("parse owner %s: %w", path, err)
-	}
-	if rec.PID <= 0 || rec.StartTime == "" {
-		return ownerFile{}, fmt.Errorf("owner %s: incomplete identity", path)
 	}
 	return rec, nil
 }

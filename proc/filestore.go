@@ -31,9 +31,13 @@ var (
 	fileStoreReceiptIndexBucket = []byte("receipt-records")
 	fileStoreSequencesBucket    = []byte("sequences")
 	fileStoreFloorsBucket       = []byte("floors")
+	fileStoreIdentityKey        = []byte("identity")
 	fileStoreSchemaKey          = []byte("schema")
+	fileStoreFingerprintKey     = []byte("fingerprint")
 	fileStoreLedgerKey          = []byte("ledger")
 	fileStoreOutstandingKey     = []byte("outstanding")
+	fileStoreIdentity           = []byte("daemonkit.proc.file-store.v1")
+	fileStoreFingerprint        = []byte("461e806ff27ab0417cdea0e81ea6060b321d1b7653e33baa1831436fea6bf06e")
 )
 
 // ErrReceiptBacklog means durable unacknowledged recovery liabilities reached
@@ -130,7 +134,13 @@ func initializeFileStore(tx *bolt.Tx) error {
 			}
 		}
 		meta = tx.Bucket(fileStoreMetaBucket)
+		if err := meta.Put(fileStoreIdentityKey, fileStoreIdentity); err != nil {
+			return err
+		}
 		if err := meta.Put(fileStoreSchemaKey, uint64Bytes(recordSchemaVersion)); err != nil {
+			return err
+		}
+		if err := meta.Put(fileStoreFingerprintKey, fileStoreFingerprint); err != nil {
 			return err
 		}
 		var ledger ReceiptLedgerID
@@ -162,6 +172,23 @@ func initializeFileStore(tx *bolt.Tx) error {
 	schema := meta.Get(fileStoreSchemaKey)
 	if len(schema) != 8 || binary.BigEndian.Uint64(schema) != recordSchemaVersion {
 		return fmt.Errorf("%w: keyed store schema is not %d", ErrRecordSchema, recordSchemaVersion)
+	}
+	expectedMetadata := map[string]struct{}{
+		string(fileStoreIdentityKey): {}, string(fileStoreSchemaKey): {},
+		string(fileStoreFingerprintKey): {}, string(fileStoreLedgerKey): {},
+		string(fileStoreOutstandingKey): {},
+	}
+	if err := meta.ForEach(func(key, _ []byte) error {
+		if _, ok := expectedMetadata[string(key)]; !ok {
+			return fmt.Errorf("%w: unknown keyed store metadata %q", ErrRecordSchema, key)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if !bytes.Equal(meta.Get(fileStoreIdentityKey), fileStoreIdentity) ||
+		!bytes.Equal(meta.Get(fileStoreFingerprintKey), fileStoreFingerprint) {
+		return fmt.Errorf("%w: keyed store identity or fingerprint mismatch", ErrRecordSchema)
 	}
 	if len(meta.Get(fileStoreLedgerKey)) != len(ReceiptLedgerID{}) || len(meta.Get(fileStoreOutstandingKey)) != 8 {
 		return fmt.Errorf("%w: keyed store metadata is incomplete", ErrRecordSchema)
@@ -239,6 +266,9 @@ func decodeStored[T any](data []byte, value *T) error {
 	if data == nil {
 		return os.ErrNotExist
 	}
+	if err := validateStoredFieldSet(data, value); err != nil {
+		return fmt.Errorf("%w: stored value field set: %w", ErrRecordSchema, err)
+	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(value); err != nil {
@@ -247,6 +277,51 @@ func decodeStored[T any](data []byte, value *T) error {
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return fmt.Errorf("%w: trailing keyed store value", ErrRecordSchema)
+	}
+	return nil
+}
+
+var recordJSONFields = []string{
+	"recovery_class", "pid", "start_time", "boot", "comm", "executable", "audit_token",
+	"generation", "process_group", "session_id", "role", "runtime_build", "runtime_protocol",
+	"target_process_generation", "intent", "stop_authority_state", "expires_unix_milli",
+}
+
+func validateStoredFieldSet(data []byte, value any) error {
+	switch value.(type) {
+	case *Record:
+		return exactJSONObject(data, recordJSONFields, nil)
+	case *reapClaim:
+		return exactJSONObject(data, []string{"record", "reaper_generation"}, map[string][]string{
+			"record": recordJSONFields,
+		})
+	case *ReapReceipt:
+		return exactJSONObject(data, []string{
+			"ledger_id", "sequence", "record", "reaper_generation", "outcome", "digest",
+		}, map[string][]string{"record": recordJSONFields})
+	default:
+		return fmt.Errorf("unsupported durable value type %T", value)
+	}
+}
+
+func exactJSONObject(data []byte, fields []string, nested map[string][]string) error {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(data, &object); err != nil {
+		return err
+	}
+	if len(object) != len(fields) {
+		return errors.New("field count mismatch")
+	}
+	for _, field := range fields {
+		raw, ok := object[field]
+		if !ok {
+			return fmt.Errorf("field %q is missing", field)
+		}
+		if nestedFields := nested[field]; nestedFields != nil {
+			if err := exactJSONObject(raw, nestedFields, nil); err != nil {
+				return fmt.Errorf("field %q: %w", field, err)
+			}
+		}
 	}
 	return nil
 }

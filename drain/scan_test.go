@@ -17,7 +17,7 @@ const (
 )
 
 func deadOwner() proc.Identity {
-	return proc.Identity{PID: deadPID, StartTime: deadStart, Comm: "old-daemon"}
+	return proc.Identity{PID: deadPID, StartTime: deadStart, Comm: "old-daemon", Boot: "test-boot"}
 }
 
 func newScanEnv(t *testing.T, prb prober, rows ...Row) (ScanConfig, Generation) {
@@ -118,7 +118,7 @@ func TestScanAlivePeerUntouched(t *testing.T) {
 }
 
 func TestScanReusedPIDIsDead(t *testing.T) {
-	reused := proc.Identity{PID: deadPID, StartTime: "999.000", Comm: "newcomer"}
+	reused := proc.Identity{PID: deadPID, StartTime: "999.000", Comm: "newcomer", Boot: "test-boot"}
 	prb := &fakeProber{results: map[int]proberResult{deadPID: {id: reused}}}
 	cfg, g := newScanEnv(t, prb, Row{Key: "k1", Seq: 1, State: RowPending})
 	if err := ScanPeers(context.Background(), cfg); err != nil {
@@ -197,8 +197,8 @@ func TestAdoptDeadRefusedWhileDraining(t *testing.T) {
 }
 
 func TestScanRetainsGenerationWhenTransitionOwnerMismatches(t *testing.T) {
-	owner1 := proc.Identity{PID: 3131, StartTime: "111.222", Comm: "live"}
-	owner2 := proc.Identity{PID: 4242, StartTime: "333.444", Comm: "dead"}
+	owner1 := proc.Identity{PID: 3131, StartTime: "111.222", Comm: "live", Boot: "test-boot"}
+	owner2 := proc.Identity{PID: 4242, StartTime: "333.444", Comm: "dead", Boot: "test-boot"}
 	prb := &fakeProber{results: map[int]proberResult{
 		owner1.PID: {id: owner1},
 		owner2.PID: {err: proc.ErrNoProcess},
@@ -387,7 +387,7 @@ func TestScanBreakerSpacesFailingPeer(t *testing.T) {
 }
 
 func TestAdoptDeadRefusesChangedOwnerIdentity(t *testing.T) {
-	reuser := proc.Identity{PID: 5353, StartTime: "555.666", Comm: "new-daemon"}
+	reuser := proc.Identity{PID: 5353, StartTime: "555.666", Comm: "new-daemon", Boot: "test-boot"}
 	prb := &fakeProber{results: map[int]proberResult{
 		deadPID:    {err: proc.ErrNoProcess},
 		reuser.PID: {err: proc.ErrNoProcess},

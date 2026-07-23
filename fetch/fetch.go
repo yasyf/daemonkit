@@ -26,11 +26,15 @@ import (
 )
 
 const (
-	receiptSchema  = 1
-	lockDeadline   = 30 * time.Second
-	settleDeadline = 30 * time.Second
-	statePrepared  = "prepared"
-	stateFinal     = "final"
+	receiptSchema          = 1
+	receiptIdentity        = "daemonkit.fetch.receipt.v1"
+	receiptFingerprint     = "81f5f8d912f1950853fa64264eca1c8467cd7a6eae3578658d6894961193da87"
+	transactionIdentity    = "daemonkit.fetch.transaction.v1"
+	transactionFingerprint = "8c2d042e88de06ef72196d52986a9e986765ea8b43c5352771691d1786becf2d"
+	lockDeadline           = 30 * time.Second
+	settleDeadline         = 30 * time.Second
+	statePrepared          = "prepared"
+	stateFinal             = "final"
 )
 
 var (
@@ -115,7 +119,9 @@ type Fetcher struct {
 type namespaceOperation func(*os.File, string, *os.File, string) error
 
 type receipt struct {
+	Identity              string `json:"identity"`
 	Schema                int    `json:"schema"`
+	Fingerprint           string `json:"fingerprint"`
 	State                 string `json:"state"`
 	Version               string `json:"version"`
 	URL                   string `json:"url"`
@@ -126,11 +132,13 @@ type receipt struct {
 }
 
 type transaction struct {
-	Schema    int     `json:"schema"`
-	Stage     string  `json:"stage"`
-	Candidate fileID  `json:"candidate"`
-	Previous  *fileID `json:"previous"`
-	Next      receipt `json:"next"`
+	Identity    string  `json:"identity"`
+	Schema      int     `json:"schema"`
+	Fingerprint string  `json:"fingerprint"`
+	Stage       string  `json:"stage"`
+	Candidate   fileID  `json:"candidate"`
+	Previous    *fileID `json:"previous"`
+	Next        receipt `json:"next"`
 }
 
 type installPaths struct {
@@ -241,20 +249,23 @@ func pathsFor(cfg Config) installPaths {
 
 func newReceipt(cfg Config, dr string) receipt {
 	return receipt{
-		Schema: receiptSchema, State: stateFinal, Version: cfg.Release.Version, URL: cfg.Release.URL,
+		Identity: receiptIdentity, Schema: receiptSchema, Fingerprint: receiptFingerprint,
+		State: stateFinal, Version: cfg.Release.Version, URL: cfg.Release.URL,
 		SHA256: cfg.Release.SHA256.String(), AppName: cfg.AppName, DesignatedRequirement: dr,
 	}
 }
 
 func (r receipt) matches(want receipt) bool {
-	return r.Schema == receiptSchema && r.State == stateFinal &&
+	return r.Identity == receiptIdentity && r.Schema == receiptSchema && r.Fingerprint == receiptFingerprint &&
+		r.State == stateFinal &&
 		r.Version == want.Version && r.URL == want.URL && r.SHA256 == want.SHA256 &&
 		r.AppName == want.AppName && r.DesignatedRequirement == want.DesignatedRequirement
 }
 
 func (r receipt) validate(expectedState string) error {
-	if r.Schema != receiptSchema || r.State != expectedState {
-		return fmt.Errorf("%w: receipt schema or state", ErrInstallState)
+	if r.Identity != receiptIdentity || r.Schema != receiptSchema || r.Fingerprint != receiptFingerprint ||
+		r.State != expectedState {
+		return fmt.Errorf("%w: receipt identity, schema, fingerprint, or state", ErrInstallState)
 	}
 	if r.Version == "" || strings.TrimSpace(r.Version) != r.Version {
 		return fmt.Errorf("%w: receipt version", ErrInstallState)
@@ -419,7 +430,8 @@ func (f *Fetcher) install(
 		previous = &previousID
 	}
 	tx := transaction{
-		Schema: receiptSchema, Stage: filepath.Base(stage), Candidate: id, Previous: previous, Next: want,
+		Identity: transactionIdentity, Schema: receiptSchema, Fingerprint: transactionFingerprint,
+		Stage: filepath.Base(stage), Candidate: id, Previous: previous, Next: want,
 	}
 	if f.beforePrepared != nil {
 		if err := f.beforePrepared(); err != nil {
@@ -637,7 +649,8 @@ func readTransaction(path string) (transaction, error) {
 		return transaction{}, err
 	}
 	var tx transaction
-	if err := decodeStrict(data, &tx); err != nil || tx.Schema != receiptSchema ||
+	if err := decodeStrict(data, &tx); err != nil || tx.Identity != transactionIdentity ||
+		tx.Schema != receiptSchema || tx.Fingerprint != transactionFingerprint ||
 		tx.Next.Canonical != tx.Candidate || filepath.Base(tx.Stage) != tx.Stage || !strings.HasPrefix(tx.Stage, ".stage-") {
 		return transaction{}, fmt.Errorf("%w: decode transaction", ErrInstallState)
 	}
@@ -697,6 +710,9 @@ func syncVerifiedDirectory(path string) error {
 }
 
 func decodeStrict(data []byte, value any) error {
+	if err := validateJSONFieldSet(data, value); err != nil {
+		return err
+	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(value); err != nil {
@@ -704,6 +720,73 @@ func decodeStrict(data []byte, value any) error {
 	}
 	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return errors.New("trailing JSON data")
+	}
+	return nil
+}
+
+var receiptJSONFields = []string{
+	"identity", "schema", "fingerprint", "state", "version", "url", "sha256", "app_name",
+	"designated_requirement", "canonical",
+}
+
+func validateJSONFieldSet(data []byte, value any) error {
+	object, err := exactObject(data, nil)
+	if err != nil {
+		return err
+	}
+	switch value.(type) {
+	case *receipt:
+		if err := exactFields(object, receiptJSONFields); err != nil {
+			return err
+		}
+		_, err = exactObject(object["canonical"], []string{"device", "inode"})
+		return err
+	case *transaction:
+		if err := exactFields(object, []string{
+			"identity", "schema", "fingerprint", "stage", "candidate", "previous", "next",
+		}); err != nil {
+			return err
+		}
+		if _, err := exactObject(object["candidate"], []string{"device", "inode"}); err != nil {
+			return err
+		}
+		if !bytes.Equal(object["previous"], []byte("null")) {
+			if _, err := exactObject(object["previous"], []string{"device", "inode"}); err != nil {
+				return err
+			}
+		}
+		next, err := exactObject(object["next"], receiptJSONFields)
+		if err != nil {
+			return err
+		}
+		_, err = exactObject(next["canonical"], []string{"device", "inode"})
+		return err
+	default:
+		return fmt.Errorf("fetch: unsupported durable JSON type %T", value)
+	}
+}
+
+func exactObject(data []byte, fields []string) (map[string]json.RawMessage, error) {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(data, &object); err != nil {
+		return nil, err
+	}
+	if fields != nil {
+		if err := exactFields(object, fields); err != nil {
+			return nil, err
+		}
+	}
+	return object, nil
+}
+
+func exactFields(object map[string]json.RawMessage, fields []string) error {
+	if len(object) != len(fields) {
+		return errors.New("JSON field count mismatch")
+	}
+	for _, field := range fields {
+		if _, ok := object[field]; !ok {
+			return fmt.Errorf("JSON field %q is missing", field)
+		}
 	}
 	return nil
 }

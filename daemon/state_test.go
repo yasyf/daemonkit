@@ -2,9 +2,10 @@ package daemon
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -13,70 +14,181 @@ import (
 	"github.com/yasyf/daemonkit/proc"
 )
 
-func TestStateFilePreservesForeignKeys(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.json")
-	const foreign = `{"z": 1, "a": "x<y>&z"}`
-	if err := os.WriteFile(path, []byte(`{"foreign":`+foreign+`,"pid":1}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	sf := StateFile{Path: path}
+const testStateFingerprint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
-	err := sf.Update(context.Background(), func(state map[string]json.RawMessage) error {
-		state["pid"] = json.RawMessage("2")
+type testState struct {
+	Value int `json:"value"`
+}
+
+func testStateFile(path string) ExactStateFile[testState] {
+	return ExactStateFile[testState]{
+		Path: path,
+		Codec: ExactStateCodec[testState]{
+			Identity: "daemonkit.test.state.v1", Fingerprint: testStateFingerprint,
+			New: func() (testState, error) { return testState{}, nil },
+			Encode: func(state testState) (json.RawMessage, error) {
+				return json.Marshal(state)
+			},
+			Decode: func(raw json.RawMessage) (testState, error) {
+				var fields map[string]json.RawMessage
+				if err := json.Unmarshal(raw, &fields); err != nil {
+					return testState{}, err
+				}
+				if len(fields) != 1 || fields["value"] == nil {
+					return testState{}, errors.New("test payload field set is not exact")
+				}
+				decoder := json.NewDecoder(bytes.NewReader(raw))
+				decoder.DisallowUnknownFields()
+				var state testState
+				if err := decoder.Decode(&state); err != nil {
+					return testState{}, err
+				}
+				if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+					return testState{}, errors.New("test payload has trailing JSON")
+				}
+				return state, nil
+			},
+		},
+	}
+}
+
+func TestExactStateFileCreatesExactEnvelope(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sub", "state.json")
+	file := testStateFile(path)
+	if err := file.Update(t.Context(), func(state *testState) error {
+		state.Value = 42
 		return nil
-	})
-	if err != nil {
+	}); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
-
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(data, []byte(foreign)) {
-		t.Errorf("foreign value drifted; file = %s, want a verbatim %s", data, foreign)
+	want := `{"identity":"daemonkit.test.state.v1","schema":1,"fingerprint":"` + testStateFingerprint + `","payload":{"value":42}}`
+	if string(data) != want {
+		t.Fatalf("state = %s, want %s", data, want)
 	}
-	var got map[string]json.RawMessage
-	if err := json.Unmarshal(data, &got); err != nil {
-		t.Fatalf("re-read state: %v", err)
-	}
-	if string(got["pid"]) != "2" {
-		t.Errorf("pid = %s, want 2", got["pid"])
+	state, err := file.Read()
+	if err != nil || state.Value != 42 {
+		t.Fatalf("Read = %+v, %v; want value 42", state, err)
 	}
 }
 
-func TestStateFileRejectsInvalidValue(t *testing.T) {
+func TestExactStateFileRejectsForeignOrDamagedState(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
-	sf := StateFile{Path: path}
-	err := sf.Update(context.Background(), func(state map[string]json.RawMessage) error {
-		state["pid"] = json.RawMessage("not-json")
+	file := testStateFile(path)
+	tests := map[string]string{
+		"empty":         "",
+		"null":          "null",
+		"legacy map":    `{"value":1}`,
+		"foreign":       `{"identity":"foreign","schema":1,"fingerprint":"` + testStateFingerprint + `","payload":{"value":1}}`,
+		"unknown":       `{"identity":"daemonkit.test.state.v1","schema":1,"fingerprint":"` + testStateFingerprint + `","payload":{"value":1},"future":true}`,
+		"payload null":  `{"identity":"daemonkit.test.state.v1","schema":1,"fingerprint":"` + testStateFingerprint + `","payload":null}`,
+		"payload drift": `{"identity":"daemonkit.test.state.v1","schema":1,"fingerprint":"` + testStateFingerprint + `","payload":{"value":1,"future":true}}`,
+	}
+	for name, data := range tests {
+		t.Run(name, func(t *testing.T) {
+			if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := file.Read(); err == nil {
+				t.Fatal("Read accepted foreign or damaged state")
+			}
+		})
+	}
+}
+
+func TestExactStateFileRejectsInvalidCodecPayload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	file := testStateFile(path)
+	file.Codec.Encode = func(testState) (json.RawMessage, error) {
+		return json.RawMessage("not-json"), nil
+	}
+	err := file.Update(t.Context(), func(*testState) error { return nil })
+	if err == nil {
+		t.Fatal("Update accepted invalid codec payload")
+	}
+	if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("state file written despite invalid payload: %v", statErr)
+	}
+}
+
+func TestExactStateFileUpdateLockBusy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	held, err := (proc.FileLockSpec{
+		Path: path + ".lock", Mode: proc.FileLockExclusive, Deadline: time.Second,
+	}).TryAcquire()
+	if err != nil {
+		t.Fatalf("pre-hold lock: %v", err)
+	}
+	defer held.Close()
+	err = testStateFile(path).Update(t.Context(), func(*testState) error {
+		t.Fatal("mutate ran while lock was held")
+		return nil
+	})
+	if !errors.Is(err, proc.ErrLockBusy) {
+		t.Fatalf("Update err = %v, want proc.ErrLockBusy", err)
+	}
+}
+
+func TestExactStateFileUpdateUnlocked(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	held, err := (proc.FileLockSpec{
+		Path: path + ".lock", Mode: proc.FileLockExclusive, Deadline: time.Second,
+	}).TryAcquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	file := testStateFile(path)
+	if err := file.UpdateUnlocked(func(state *testState) error {
+		state.Value = 7
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := file.Read()
+	if err != nil || state.Value != 7 {
+		t.Fatalf("Read = %+v, %v; want value 7", state, err)
+	}
+}
+
+func TestExactStateFileReadErrorPropagates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err := testStateFile(path).Update(t.Context(), func(*testState) error {
+		t.Error("mutate ran on failed read")
 		return nil
 	})
 	if err == nil {
-		t.Fatal("Update accepted invalid JSON value; want an error")
+		t.Fatal("Update succeeded on unreadable state")
 	}
-	if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
-		t.Errorf("state file written despite invalid value: stat err = %v", statErr)
+	if info, statErr := os.Stat(path); statErr != nil || !info.IsDir() {
+		t.Fatalf("state path clobbered: %v", statErr)
 	}
 }
 
-func TestStateFileCreatesMissing(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "sub", "state.json")
-	sf := StateFile{Path: path}
+func TestExactStateFileMutateErrorAborts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	boom := errors.New("bad mutation")
+	err := testStateFile(path).Update(t.Context(), func(*testState) error { return boom })
+	if !errors.Is(err, boom) {
+		t.Fatalf("Update err = %v, want %v", err, boom)
+	}
+	if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("state file written despite mutate error: %v", statErr)
+	}
+}
 
-	err := sf.Update(context.Background(), func(state map[string]json.RawMessage) error {
-		state["pid"] = json.RawMessage("42")
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("Update: %v", err)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != `{"pid":42}` {
-		t.Errorf("state = %s, want {\"pid\":42}", data)
+func TestExactStateFileRejectsInvalidConfiguration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	file := testStateFile(path)
+	file.Codec.Fingerprint = "ABC"
+	if _, err := file.Read(); err == nil {
+		t.Fatal("Read accepted invalid schema fingerprint")
 	}
 }
 
@@ -91,13 +203,8 @@ func TestWriteFileDurableSyncsCreatedDirectoryParents(t *testing.T) {
 		t.Fatalf("writeFileDurable: %v", err)
 	}
 	want := []string{filepath.Dir(root), root, filepath.Join(root, "drain"), filepath.Join(root, "drain", "g1")}
-	if len(synced) != len(want) {
+	if fmt.Sprint(synced) != fmt.Sprint(want) {
 		t.Fatalf("synced directories = %v, want %v", synced, want)
-	}
-	for i := range want {
-		if synced[i] != want[i] {
-			t.Errorf("synced[%d] = %q, want %q", i, synced[i], want[i])
-		}
 	}
 }
 
@@ -125,92 +232,5 @@ func TestMkdirAllDurableRetriesFailedParentSync(t *testing.T) {
 	}
 	if len(synced) == 0 || synced[0] != root {
 		t.Fatalf("retry synced directories = %v, want %q first", synced, root)
-	}
-}
-
-func TestStateFileUpdateLockBusy(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.json")
-	held, err := (proc.FileLockSpec{
-		Path:     path + ".lock",
-		Mode:     proc.FileLockExclusive,
-		Deadline: time.Second,
-	}).TryAcquire()
-	if err != nil {
-		t.Fatalf("pre-hold lock: %v", err)
-	}
-	defer held.Close()
-
-	sf := StateFile{Path: path}
-	err = sf.Update(context.Background(), func(map[string]json.RawMessage) error {
-		t.Fatal("mutate ran while the lock was held")
-		return nil
-	})
-	if !errors.Is(err, proc.ErrLockBusy) {
-		t.Fatalf("Update err = %v, want proc.ErrLockBusy", err)
-	}
-	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-		t.Error("state file written despite a busy lock")
-	}
-}
-
-func TestStateFileUpdateUnlocked(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.json")
-	held, err := (proc.FileLockSpec{
-		Path:     path + ".lock",
-		Mode:     proc.FileLockExclusive,
-		Deadline: time.Second,
-	}).TryAcquire()
-	if err != nil {
-		t.Fatalf("hold lock: %v", err)
-	}
-	defer held.Close()
-
-	sf := StateFile{Path: path}
-	err = sf.UpdateUnlocked(func(state map[string]json.RawMessage) error {
-		state["v"] = json.RawMessage(`"1.2.3"`)
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("UpdateUnlocked while holding the lock: %v", err)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != `{"v":"1.2.3"}` {
-		t.Errorf("state = %s, want {\"v\":\"1.2.3\"}", data)
-	}
-}
-
-func TestStateFileReadErrorPropagates(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.json")
-	if err := os.MkdirAll(path, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	sf := StateFile{Path: path}
-	err := sf.Update(context.Background(), func(map[string]json.RawMessage) error {
-		t.Error("mutate ran on a failed read")
-		return nil
-	})
-	if err == nil {
-		t.Fatal("Update succeeded on an unreadable state file, want error")
-	}
-	fi, statErr := os.Stat(path)
-	if statErr != nil || !fi.IsDir() {
-		t.Errorf("state path clobbered after a read error: %v", statErr)
-	}
-}
-
-func TestStateFileMutateErrorAborts(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.json")
-	boom := errors.New("bad mutation")
-	sf := StateFile{Path: path}
-
-	err := sf.Update(context.Background(), func(map[string]json.RawMessage) error { return boom })
-	if !errors.Is(err, boom) {
-		t.Fatalf("Update err = %v, want the mutate error", err)
-	}
-	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-		t.Error("state file written despite a mutate error")
 	}
 }

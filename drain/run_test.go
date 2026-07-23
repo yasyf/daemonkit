@@ -454,6 +454,25 @@ func TestStrikeStorePersistsAcrossRestart(t *testing.T) {
 	}
 }
 
+func TestStrikeStoreRejectsLegacyState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "strikes.json")
+	legacy := []byte(`{"strikes":{"times":[],"level":0,"parked_until":"0001-01-01T00:00:00Z"}}`)
+	if err := os.WriteFile(path, legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := StrikeStore{Path: path}
+	if _, _, err := store.Gate(t.Context(), time.Now()); err == nil {
+		t.Fatal("Gate accepted legacy strike state")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != string(legacy) {
+		t.Fatalf("legacy strike state was mutated: %s", data)
+	}
+}
+
 func TestStrikeGateRefusesWhileParkedWithoutRecording(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "strikes.json")
 	ctx := context.Background()

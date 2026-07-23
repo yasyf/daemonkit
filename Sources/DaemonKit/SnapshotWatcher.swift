@@ -19,8 +19,50 @@ public enum SnapshotState<S: Sendable>: Sendable {
     case missing
     /// The file exists but could not be read or decoded.
     case malformed(SnapshotDecodeError)
-    /// The file's `schema_version` does not match the expected version.
-    case versionSkew(expected: Int, found: Int)
+    /// The file's exact schema identity does not match the caller's codec.
+    case schemaSkew(
+        expected: SnapshotSchema,
+        foundIdentity: String,
+        foundVersion: Int,
+        foundFingerprint: String
+    )
+}
+
+/// SnapshotSchema is one caller-owned exact v1 snapshot identity.
+public struct SnapshotSchema: Equatable, Sendable {
+    public let identity: String
+    public let version = 1
+    public let fingerprint: String
+
+    public init(identity: String, fingerprint: String) throws {
+        guard !identity.isEmpty else { throw SnapshotSchemaError.invalidIdentity }
+        let hex = CharacterSet(charactersIn: "0123456789abcdef")
+        guard fingerprint.count == 64,
+              fingerprint.unicodeScalars.allSatisfy(hex.contains)
+        else { throw SnapshotSchemaError.invalidFingerprint }
+        self.identity = identity
+        self.fingerprint = fingerprint
+    }
+}
+
+/// SnapshotSchemaError rejects an incomplete caller-owned schema.
+public enum SnapshotSchemaError: Error, Sendable {
+    case invalidIdentity
+    case invalidFingerprint
+}
+
+/// SnapshotCodec supplies both exact schema identity and caller-owned decoding.
+public struct SnapshotCodec<S: Sendable>: Sendable {
+    public let schema: SnapshotSchema
+    let decode: @Sendable (Data, JSONDecoder) throws -> S
+
+    public init(
+        schema: SnapshotSchema,
+        decode: @escaping @Sendable (Data, JSONDecoder) throws -> S
+    ) {
+        self.schema = schema
+        self.decode = decode
+    }
 }
 
 /// Errors thrown while starting a ``SnapshotWatcher``.
@@ -33,10 +75,10 @@ public enum SnapshotWatcherError: Error, Sendable {
 /// each change. The watch is on the **parent directory**: consumers publish
 /// via atomic rename-into-place, which replaces the inode and silently kills
 /// a file-level (`vnode`) watch.
-public final class SnapshotWatcher<S: Decodable & Sendable>: @unchecked Sendable {
+public final class SnapshotWatcher<S: Sendable>: @unchecked Sendable {
     private let fileURL: URL
     private let directoryURL: URL
-    private let expectedSchemaVersion: Int
+    private let codec: SnapshotCodec<S>
     private let debounce: TimeInterval
     private let callbackQueue: DispatchQueue
     private let onChange: @Sendable (SnapshotState<S>) -> Void
@@ -48,14 +90,14 @@ public final class SnapshotWatcher<S: Decodable & Sendable>: @unchecked Sendable
 
     public init(
         fileURL: URL,
-        expectedSchemaVersion: Int,
+        codec: SnapshotCodec<S>,
         debounce: TimeInterval = 0.2,
         callbackQueue: DispatchQueue,
         onChange: @escaping @Sendable (SnapshotState<S>) -> Void
     ) {
         self.fileURL = fileURL
         directoryURL = fileURL.deletingLastPathComponent()
-        self.expectedSchemaVersion = expectedSchemaVersion
+        self.codec = codec
         self.debounce = debounce
         self.callbackQueue = callbackQueue
         self.onChange = onChange
@@ -113,12 +155,12 @@ public final class SnapshotWatcher<S: Decodable & Sendable>: @unchecked Sendable
         } catch {
             return .malformed(SnapshotDecodeError(error))
         }
-        return Self.decodedState(from: data, expectedSchemaVersion: expectedSchemaVersion, decoder: decoder)
+        return Self.decodedState(from: data, codec: codec, decoder: decoder)
     }
 
     static func decodedState(
         from data: Data,
-        expectedSchemaVersion: Int,
+        codec: SnapshotCodec<S>,
         decoder: JSONDecoder
     ) -> SnapshotState<S> {
         let probe: SnapshotSchemaProbe
@@ -127,11 +169,22 @@ public final class SnapshotWatcher<S: Decodable & Sendable>: @unchecked Sendable
         } catch {
             return .malformed(SnapshotDecodeError(error))
         }
-        guard probe.schemaVersion == expectedSchemaVersion else {
-            return .versionSkew(expected: expectedSchemaVersion, found: probe.schemaVersion)
+        let found: SnapshotSchema
+        do {
+            found = try SnapshotSchema(identity: probe.identity, fingerprint: probe.fingerprint)
+        } catch {
+            return .malformed(SnapshotDecodeError(error))
+        }
+        guard found == codec.schema, probe.schemaVersion == codec.schema.version else {
+            return .schemaSkew(
+                expected: codec.schema,
+                foundIdentity: probe.identity,
+                foundVersion: probe.schemaVersion,
+                foundFingerprint: probe.fingerprint
+            )
         }
         do {
-            return try .loaded(decoder.decode(S.self, from: data))
+            return try .loaded(codec.decode(data, decoder))
         } catch {
             return .malformed(SnapshotDecodeError(error))
         }
@@ -155,9 +208,13 @@ public final class SnapshotWatcher<S: Decodable & Sendable>: @unchecked Sendable
 }
 
 private struct SnapshotSchemaProbe: Decodable {
+    let identity: String
     let schemaVersion: Int
+    let fingerprint: String
     enum CodingKeys: String, CodingKey {
+        case identity
         case schemaVersion = "schema_version"
+        case fingerprint
     }
 }
 

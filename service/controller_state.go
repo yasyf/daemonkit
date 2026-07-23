@@ -23,10 +23,14 @@ const (
 )
 
 var (
-	controllerMetaBucket    = []byte("meta")
-	controllerDesiredBucket = []byte("desired")
-	controllerAppliedBucket = []byte("applied")
-	controllerSchemaKey     = []byte("schema")
+	controllerMetaBucket     = []byte("meta")
+	controllerDesiredBucket  = []byte("desired")
+	controllerAppliedBucket  = []byte("applied")
+	controllerIdentityKey    = []byte("identity")
+	controllerSchemaKey      = []byte("schema")
+	controllerFingerprintKey = []byte("fingerprint")
+	controllerIdentity       = []byte("daemonkit.service.controller-store.v1")
+	controllerFingerprint    = []byte("af0fa2541218dfe83f92f1b7fadccace367989a56b50da16e30d983694d5edd2")
 )
 
 type controllerState struct {
@@ -144,7 +148,13 @@ func initializeControllerState(tx *bolt.Tx) error {
 		}
 		var encoded [8]byte
 		binary.BigEndian.PutUint64(encoded[:], controllerStateSchema)
-		return meta.Put(controllerSchemaKey, encoded[:])
+		if err := meta.Put(controllerIdentityKey, controllerIdentity); err != nil {
+			return err
+		}
+		if err := meta.Put(controllerSchemaKey, encoded[:]); err != nil {
+			return err
+		}
+		return meta.Put(controllerFingerprintKey, controllerFingerprint)
 	}
 	for name := range expected {
 		if !present[name] {
@@ -155,12 +165,17 @@ func initializeControllerState(tx *bolt.Tx) error {
 		return errors.New("service: unsupported controller state schema")
 	}
 	if err := meta.ForEach(func(key, _ []byte) error {
-		if !bytes.Equal(key, controllerSchemaKey) {
+		if !bytes.Equal(key, controllerIdentityKey) && !bytes.Equal(key, controllerSchemaKey) &&
+			!bytes.Equal(key, controllerFingerprintKey) {
 			return fmt.Errorf("service: unknown controller metadata key %q", key)
 		}
 		return nil
 	}); err != nil {
 		return err
+	}
+	if !bytes.Equal(meta.Get(controllerIdentityKey), controllerIdentity) ||
+		!bytes.Equal(meta.Get(controllerFingerprintKey), controllerFingerprint) {
+		return errors.New("service: controller state identity or fingerprint mismatch")
 	}
 	return nil
 }
@@ -309,6 +324,23 @@ func encodeControllerAgent(agent Agent) ([]byte, error) {
 }
 
 func decodeControllerAgent(payload []byte) (Agent, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		return Agent{}, fmt.Errorf("decode stored agent: %w", err)
+	}
+	expected := []string{
+		"Label", "Program", "Args", "LogPath", "Env", "AssociatedBundleIdentifiers",
+		"RestartPolicy", "StartInterval", "WatchPaths", "StartCalendarInterval",
+		"ProcessType", "LimitLoadToSessionType",
+	}
+	if len(fields) != len(expected) {
+		return Agent{}, errors.New("stored agent field set is not exact")
+	}
+	for _, field := range expected {
+		if _, ok := fields[field]; !ok {
+			return Agent{}, fmt.Errorf("stored agent field %q is missing", field)
+		}
+	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	var agent Agent

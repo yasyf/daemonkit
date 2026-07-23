@@ -62,10 +62,10 @@ type Record struct {
 	Comm string `json:"comm"`
 	// Executable is the exact kernel-resolved path. On Darwin it is bound to
 	// AuditToken; other platforms bind it with Boot and StartTime.
-	Executable string `json:"executable,omitempty"`
+	Executable string `json:"executable"`
 	// AuditToken is Darwin's stable (pid, pidversion) kill authority for a
 	// protected peer. Spawned disposable workers use the zero value.
-	AuditToken AuditToken `json:"audit_token,omitzero"`
+	AuditToken AuditToken `json:"audit_token"`
 	// Generation tags the daemon instance that spawned the child.
 	Generation string `json:"generation"`
 	// ProcessGroup means PID is also the process-group id and signals target the
@@ -73,17 +73,17 @@ type Record struct {
 	ProcessGroup bool `json:"process_group"`
 	// SessionID is the dedicated session created with a process-group leader.
 	// It remains the group's durable kernel identity after the leader exits.
-	SessionID int `json:"session_id,omitempty"`
+	SessionID int `json:"session_id"`
 	// Role, RuntimeBuild, RuntimeProtocol, TargetProcessGeneration, Intent,
 	// StopAuthorityState, and ExpiresUnixMilli are present only for one-shot
 	// stop-control process receipts.
-	Role                    string             `json:"role,omitempty"`
-	RuntimeBuild            string             `json:"runtime_build,omitempty"`
-	RuntimeProtocol         int                `json:"runtime_protocol,omitempty"`
-	TargetProcessGeneration string             `json:"target_process_generation,omitempty"`
-	Intent                  string             `json:"intent,omitempty"`
-	StopAuthorityState      StopAuthorityState `json:"stop_authority_state,omitempty"`
-	ExpiresUnixMilli        int64              `json:"expires_unix_milli,omitempty"`
+	Role                    string             `json:"role"`
+	RuntimeBuild            string             `json:"runtime_build"`
+	RuntimeProtocol         int                `json:"runtime_protocol"`
+	TargetProcessGeneration string             `json:"target_process_generation"`
+	Intent                  string             `json:"intent"`
+	StopAuthorityState      StopAuthorityState `json:"stop_authority_state"`
+	ExpiresUnixMilli        int64              `json:"expires_unix_milli"`
 }
 
 // Validate rejects an incomplete durable process identity.

@@ -51,7 +51,7 @@ func newTransitionEnv(t *testing.T, seed ...Row) (*transitionEnv, TransitionConf
 		CloseIntake:       func(context.Context) error { e.record("close-intake"); return nil },
 		Canonical:         e.canonical,
 		Generation:        e.gen,
-		Self:              proc.Identity{PID: 4242, StartTime: "111.222", Comm: "old"},
+		Self:              proc.Identity{PID: 4242, StartTime: "111.222", Comm: "old", Boot: "test-boot"},
 		BindDrainListener: func(context.Context) error { e.record("bind"); return nil },
 		ReleaseLock:       func() error { e.record("release-lock"); return nil },
 		SpawnSuccessor: func(ctx context.Context) error {
@@ -220,7 +220,7 @@ func TestTransitionSnapshotRefusesStaleGenerationJournal(t *testing.T) {
 
 func TestTransitionSnapshotRefusesDisjointForeignGenerationJournal(t *testing.T) {
 	e, cfg := newTransitionEnv(t, seedRows()...)
-	foreign := proc.Identity{PID: 999, StartTime: "333.444", Comm: "foreign"}
+	foreign := proc.Identity{PID: 999, StartTime: "333.444", Comm: "foreign", Boot: "test-boot"}
 	foreignGen := seedOwner(t, e.gen, foreign)
 	mustApply(t, foreignGen.journal(), Row{Key: "foreign", Seq: 1, State: RowPending})
 
@@ -249,14 +249,12 @@ func TestSnapshotFailureBeforeRowsIsRetryable(t *testing.T) {
 		if owner, err := e.gen.ReadOwner(); err != nil || owner != cfg.Self {
 			t.Errorf("generation owner = %+v, %v; want %+v before rows", owner, err, cfg.Self)
 		}
-		state, err := readState(e.gen.journal().Path())
+		state, err := e.gen.journal().file.Read()
 		if err != nil {
 			t.Fatalf("read generation journal: %v", err)
 		}
-		for key := range state {
-			if !isJournalMetadata(key) {
-				t.Errorf("generation row %s became durable before the claim completed", key)
-			}
+		for key := range state.Rows {
+			t.Errorf("generation row %s became durable before the claim completed", key)
 		}
 		return errCrash
 	}
@@ -281,7 +279,7 @@ func TestSnapshotFailureBeforeRowsIsRetryable(t *testing.T) {
 
 func TestTransitionJoinsInFlightAdoption(t *testing.T) {
 	e, cfg := newTransitionEnv(t, seedRows()...)
-	peerOwner := proc.Identity{PID: 999, StartTime: "1.2", Comm: "peer"}
+	peerOwner := proc.Identity{PID: 999, StartTime: "1.2", Comm: "peer", Boot: "test-boot"}
 	peer := seedOwner(t, newGen(t, e.dotdir, "g0"), peerOwner)
 	mustApply(t, peer.journal(), Row{Key: "k3", Seq: 5, State: RowPending})
 	scanCfg := ScanConfig{
@@ -429,7 +427,7 @@ func TestTransitionConcurrentDifferentGenerationsSingleOwner(t *testing.T) {
 		CloseIntake:       func(context.Context) error { return nil },
 		Canonical:         e.canonical,
 		Generation:        g2,
-		Self:              proc.Identity{PID: 7777, StartTime: "222.333", Comm: "other"},
+		Self:              proc.Identity{PID: 7777, StartTime: "222.333", Comm: "other", Boot: "test-boot"},
 		BindDrainListener: func(context.Context) error { return nil },
 		ReleaseLock:       func() error { return nil },
 		SpawnSuccessor:    func(context.Context) error { return nil },
@@ -779,7 +777,7 @@ func TestTransitionRestartFencesPreviousGeneration(t *testing.T) {
 	}
 
 	g2 := newGen(t, e.dotdir, "g2")
-	self2 := proc.Identity{PID: 7777, StartTime: "222.333", Comm: "new"}
+	self2 := proc.Identity{PID: 7777, StartTime: "222.333", Comm: "new", Boot: "test-boot"}
 	cfg2 := TransitionConfig{
 		Intake:            &Intake{},
 		CloseIntake:       func(context.Context) error { return nil },
@@ -927,8 +925,11 @@ func TestStaleCompleteMarkerDoesNotShortCircuitReusedName(t *testing.T) {
 	if err := os.MkdirAll(e.gen.Dir(), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	residue := []byte(`{"~complete":"deadbeefdeadbeefdeadbeefdeadbeef"}`)
-	if err := os.WriteFile(filepath.Join(e.gen.Dir(), "journal.json"), residue, 0o600); err != nil {
+	file := journalStateFile(filepath.Join(e.gen.Dir(), "journal.json"))
+	if err := file.UpdateUnlocked(func(state *journalState) error {
+		state.Complete = "deadbeefdeadbeefdeadbeefdeadbeef"
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := Transition(context.Background(), cfg); err != nil {

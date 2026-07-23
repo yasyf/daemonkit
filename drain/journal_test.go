@@ -2,6 +2,7 @@ package drain
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
 	"os"
@@ -72,21 +73,55 @@ func TestJournalApplyCountsPerRow(t *testing.T) {
 	}
 }
 
-func TestJournalPreservesForeignRowBytes(t *testing.T) {
+func TestJournalRejectsForeignStateWithoutMutation(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "journal.json")
-	foreign := `{"key":"a","seq":7,"state":"pending","x": [1,  2]}`
-	if err := os.WriteFile(path, []byte(`{"a":`+foreign+`}`), 0o600); err != nil {
+	foreign := []byte(`{"a":{"key":"a","seq":7,"state":"pending"}}`)
+	if err := os.WriteFile(path, foreign, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	j := NewJournal(path)
-	mustApply(t, j, Row{Key: "b", Seq: 1, State: RowPending})
-
+	if _, err := j.apply(t.Context(), Row{Key: "b", Seq: 1, State: RowPending}); err == nil {
+		t.Fatal("apply accepted a foreign journal format")
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), foreign) {
-		t.Errorf("foreign row bytes not preserved verbatim:\n%s", data)
+	if string(data) != string(foreign) {
+		t.Errorf("foreign journal was mutated: %s", data)
+	}
+}
+
+func TestJournalWritesIdentityAndRejectsPayloadDrift(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "journal.json")
+	j := NewJournal(path)
+	if _, err := j.Bump(t.Context(), "a", RowPending); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope struct {
+		Identity    string          `json:"identity"`
+		Schema      uint64          `json:"schema"`
+		Fingerprint string          `json:"fingerprint"`
+		Payload     json.RawMessage `json:"payload"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Identity != journalStateIdentity || envelope.Schema != 1 ||
+		envelope.Fingerprint != journalStateFingerprint {
+		t.Fatalf("journal identity = %q/%d/%q", envelope.Identity, envelope.Schema, envelope.Fingerprint)
+	}
+	drifted := `{"identity":"` + journalStateIdentity + `","schema":1,"fingerprint":"` + journalStateFingerprint +
+		`","payload":{"rows":{"a":{"key":"a","seq":1,"state":"pending","future":true}},"sequence":0,"transition":null,"complete":""}}`
+	if err := os.WriteFile(path, []byte(drifted), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Rows(t.Context()); err == nil {
+		t.Fatal("Rows accepted a drifted exact payload")
 	}
 }
 
@@ -215,7 +250,7 @@ func TestResolveOwner(t *testing.T) {
 
 func TestGenerationOwnerRoundTrip(t *testing.T) {
 	g := newGen(t, t.TempDir(), "g1")
-	id := proc.Identity{PID: 4242, StartTime: "111.222", Comm: "daemon"}
+	id := proc.Identity{PID: 4242, StartTime: "111.222", Comm: "daemon", Boot: "test-boot"}
 	seedOwner(t, g, id)
 	got, err := g.ReadOwner()
 	if err != nil {
@@ -275,8 +310,8 @@ func TestNewGenerationRejectsUnsafeNames(t *testing.T) {
 func TestStaleBoundHandleCannotWriteReusedGeneration(t *testing.T) {
 	ctx := context.Background()
 	g := newGen(t, t.TempDir(), "g1")
-	id1 := proc.Identity{PID: 4242, StartTime: "111.222", Comm: "one"}
-	id2 := proc.Identity{PID: 7777, StartTime: "333.444", Comm: "two"}
+	id1 := proc.Identity{PID: 4242, StartTime: "111.222", Comm: "one", Boot: "test-boot"}
+	id2 := proc.Identity{PID: 7777, StartTime: "333.444", Comm: "two", Boot: "test-boot"}
 	bound1, err := g.claimOwner(ctx, id1)
 	if err != nil {
 		t.Fatalf("claimOwner incarnation 1: %v", err)

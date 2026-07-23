@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -168,6 +169,24 @@ func TestControllerStoreRejectsUnknownSchemaSurfaces(t *testing.T) {
 				return tx.Bucket(controllerMetaBucket).Put(controllerSchemaKey, schema[:])
 			},
 		},
+		{
+			name: "foreign identity", want: "identity",
+			mutate: func(tx *bolt.Tx) error {
+				return tx.Bucket(controllerMetaBucket).Put(controllerIdentityKey, []byte("foreign"))
+			},
+		},
+		{
+			name: "foreign fingerprint", want: "fingerprint",
+			mutate: func(tx *bolt.Tx) error {
+				return tx.Bucket(controllerMetaBucket).Put(controllerFingerprintKey, []byte("foreign"))
+			},
+		},
+		{
+			name: "missing identity", want: "identity",
+			mutate: func(tx *bolt.Tx) error {
+				return tx.Bucket(controllerMetaBucket).Delete(controllerIdentityKey)
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -234,8 +253,55 @@ func TestControllerStoreRejectsUnknownAgentFieldsAndLegacyJSON(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer store.Close()
-		if _, err := store.Load(context.Background()); err == nil || !strings.Contains(err.Error(), "unknown field") {
+		if _, err := store.Load(context.Background()); err == nil || !strings.Contains(err.Error(), "field set") {
 			t.Fatalf("Load() error = %v, want strict field rejection", err)
+		}
+	})
+
+	t.Run("missing agent field", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "services.db")
+		store, err := openControllerStore(context.Background(), path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		agent := controllerAgent(t, "com.example.missing")
+		if _, err := store.ReplaceDesired(context.Background(), map[string]Agent{agent.Label: agent}); err != nil {
+			_ = store.Close()
+			t.Fatal(err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		db, err := bolt.Open(path, 0o600, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Update(func(tx *bolt.Tx) error {
+			bucket := tx.Bucket(controllerDesiredBucket)
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(bucket.Get([]byte(agent.Label)), &fields); err != nil {
+				return err
+			}
+			delete(fields, "Program")
+			payload, err := json.Marshal(fields)
+			if err != nil {
+				return err
+			}
+			return bucket.Put([]byte(agent.Label), payload)
+		}); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		store, err = openControllerStore(context.Background(), path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		if _, err := store.Load(context.Background()); err == nil || !strings.Contains(err.Error(), "field set") {
+			t.Fatalf("Load() error = %v, want missing field rejection", err)
 		}
 	})
 

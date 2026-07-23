@@ -2,14 +2,12 @@ package drain
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
 	"time"
 
-	"github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/proc"
 )
 
@@ -87,22 +85,14 @@ func (s StrikeStore) Parked(ctx context.Context, now time.Time) (bool, time.Time
 // spawns only behind a recorded strike; a crash between the strike and its
 // launch costs one unconsumed strike, which the park ladder must tolerate.
 func (s StrikeStore) Gate(ctx context.Context, now time.Time) (allowed bool, until time.Time, err error) {
-	file := daemon.StateFile{Path: s.Path}
+	file := strikeStateFile(s.Path)
 	err = withFileLock(ctx, s.Path+".lock", func() error {
-		st, err := s.load()
-		if err != nil {
-			return err
-		}
-		if now.Before(st.ParkedUntil) {
-			until = st.ParkedUntil
-			return nil
-		}
-		allowed = true
-		return file.UpdateUnlocked(func(state map[string]json.RawMessage) error {
-			st, err := decodeStrikes(state["strikes"])
-			if err != nil {
-				return err
+		return file.UpdateUnlocked(func(st *strikeState) error {
+			if now.Before(st.ParkedUntil) {
+				until = st.ParkedUntil
+				return nil
 			}
+			allowed = true
 			strikes := proc.Strikes{Limit: s.limit(), Window: s.window()}
 			strikes.Load(st.Times)
 			if strikes.Strike(now) {
@@ -115,11 +105,6 @@ func (s StrikeStore) Gate(ctx context.Context, now time.Time) (allowed bool, unt
 				until = st.ParkedUntil
 			}
 			st.Times = strikes.Times()
-			b, err := json.Marshal(st)
-			if err != nil {
-				return err
-			}
-			state["strikes"] = b
 			return nil
 		})
 	})
@@ -145,22 +130,11 @@ func (s StrikeStore) SpawnGate() func(ctx context.Context) error {
 }
 
 func (s StrikeStore) load() (strikeState, error) {
-	state, err := readState(s.Path)
+	state, err := strikeStateFile(s.Path).Read()
 	if err != nil {
 		return strikeState{}, err
 	}
-	return decodeStrikes(state["strikes"])
-}
-
-func decodeStrikes(raw json.RawMessage) (strikeState, error) {
-	if len(raw) == 0 {
-		return strikeState{}, nil
-	}
-	var st strikeState
-	if err := json.Unmarshal(raw, &st); err != nil {
-		return strikeState{}, fmt.Errorf("parse strike state: %w", err)
-	}
-	return st, nil
+	return state, nil
 }
 
 // Breakers applies per-id failure backoff on a proc.Backoff; not safe for concurrent use.
