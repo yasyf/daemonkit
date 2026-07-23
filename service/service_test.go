@@ -61,6 +61,7 @@ func TestAgentPlistRequiresCanonicalIdentityAndPaths(t *testing.T) {
 		want string
 	}{
 		{name: "label", edit: func(agent *Agent) { agent.Label = "../worker" }, want: "not canonical"},
+		{name: "empty program", edit: func(agent *Agent) { agent.Program = "" }, want: "program path"},
 		{name: "program", edit: func(agent *Agent) { agent.Program = "usr/bin/true" }, want: "program path"},
 		{name: "log", edit: func(agent *Agent) { agent.LogPath = "worker.log" }, want: "log path"},
 		{name: "restart", edit: func(agent *Agent) { agent.RestartPolicy = 0 }, want: "restart policy is required"},

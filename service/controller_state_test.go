@@ -391,6 +391,76 @@ func TestControllerStoreRejectsUnknownAgentFieldsAndLegacyJSON(t *testing.T) {
 	})
 }
 
+func TestControllerStoreRejectsPersistedUnsafeProgram(t *testing.T) {
+	executable := filepath.Join(t.TempDir(), "executable")
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "executable-link")
+	if err := os.Symlink(executable, link); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name    string
+		program string
+	}{
+		{name: "empty", program: ""},
+		{name: "relative", program: "usr/bin/true"},
+		{name: "symlink", program: link},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "services.db")
+			store, err := openControllerStore(context.Background(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			agent := controllerAgent(t, "com.example.persisted-unsafe")
+			if _, err := store.ReplaceDesired(context.Background(), map[string]Agent{agent.Label: agent}); err != nil {
+				_ = store.Close()
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			db, err := bolt.Open(path, 0o600, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Update(func(tx *bolt.Tx) error {
+				bucket := tx.Bucket(controllerDesiredBucket)
+				var fields map[string]json.RawMessage
+				if err := json.Unmarshal(bucket.Get([]byte(agent.Label)), &fields); err != nil {
+					return err
+				}
+				payload, err := json.Marshal(test.program)
+				if err != nil {
+					return err
+				}
+				fields["Program"] = payload
+				payload, err = json.Marshal(fields)
+				if err != nil {
+					return err
+				}
+				return bucket.Put([]byte(agent.Label), payload)
+			}); err != nil {
+				_ = db.Close()
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			store, err = openControllerStore(context.Background(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			if _, err := store.Load(context.Background()); err == nil {
+				t.Fatal("Load accepted persisted unsafe program")
+			}
+		})
+	}
+}
+
 func TestControllerStoreRejectsUnsafeModeAndInvalidKeys(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "services.db")
 	store, err := openControllerStore(context.Background(), path)
