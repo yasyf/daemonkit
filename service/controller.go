@@ -230,7 +230,13 @@ func (c *Controller) Converge(ctx context.Context, agents []Agent) error {
 		if err != nil {
 			return err
 		}
-		c.state = controllerState{Desired: copyAgents(desired), Applied: copyAgents(prior.Applied)}
+		c.state = controllerState{
+			Desired:           copyAgents(desired),
+			Applied:           copyAgents(prior.Applied),
+			Replacement:       copyReplacement(prior.Replacement),
+			ReplacementCommit: copyReplacementCommit(prior.ReplacementCommit),
+			ReplacementAck:    copyReplacementCommit(prior.ReplacementAck),
+		}
 	}
 	return c.reconcile(opCtx, copyAgents(c.state.Applied), c.state.Desired)
 }
