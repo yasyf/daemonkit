@@ -6,6 +6,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- New `fetch` package: downloads a signed macOS `.app` bundle from a GitHub
+  release, verifies its SHA-256 against the release checksums and the unpacked
+  bundle against a pinned codesign designated requirement (`codesign --verify
+  -R`), and installs it into a caller-managed directory. It preserves the
+  asset's build-time signature and never re-signs. Idempotent: an installed
+  bundle that still satisfies the requirement is reused without re-downloading.
+
 ## [0.5.0] - 2026-07-22
 
 ### Added
