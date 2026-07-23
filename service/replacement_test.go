@@ -65,6 +65,32 @@ func newReplacementController(
 	return controller, store, launchd
 }
 
+func openDurableReplacementController(
+	t *testing.T,
+	config ControllerConfig,
+	launchd *replacementLaunchd,
+) *Controller {
+	t.Helper()
+	store, err := openControllerStore(t.Context(), config.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &controllerRuntimeStub{run: launchd.run}
+	receipts := &controllerReceiptsStub{}
+	controller, err := newControllerWithRuntime(t.Context(), config, runtime, receipts, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return controller
+}
+
+func closeReplacementController(t *testing.T, controller *Controller) {
+	t.Helper()
+	if err := controller.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func replacementPlan(t *testing.T, agents ...Agent) Plan {
 	t.Helper()
 	plan, err := NewPlan(agents)
@@ -155,20 +181,29 @@ func TestReplacementFenceOwnsQuiesceApplyAndCommit(t *testing.T) {
 	if status == nil || status.Phase != ReplacementRunningOwned || !plansEqual(status.Current, next) || len(status.Proofs) != 1 {
 		t.Fatalf("replacement status = %#v", status)
 	}
-	if err := controller.CommitReplacement(t.Context(), "replace-1", binding, prior); !errors.Is(err, ErrReplacementMismatch) {
+	if _, err := controller.CommitReplacement(t.Context(), "replace-1", binding, prior); !errors.Is(err, ErrReplacementMismatch) {
 		t.Fatalf("CommitReplacement stale plan = %v", err)
 	}
 	if store.state.Replacement == nil {
 		t.Fatal("mismatched commit cleared fence")
 	}
-	if err := controller.CommitReplacement(t.Context(), "replace-1", binding, next); err != nil {
+	commit, err := controller.CommitReplacement(t.Context(), "replace-1", binding, next)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if status, err := controller.ReplacementStatus(t.Context()); err != nil || status != nil {
 		t.Fatalf("committed status = %#v, %v", status, err)
 	}
+	if err := controller.Converge(t.Context(), next.Agents()); !errors.Is(err, ErrReplacementCommitPending) {
+		t.Fatalf("Converge before acknowledgement = %v", err)
+	}
+	if err := controller.AcknowledgeReplacementCommit(
+		t.Context(), commit.OperationID(), commit.Binding(), commit.Prior(), commit.Next(),
+	); err != nil {
+		t.Fatal(err)
+	}
 	if err := controller.Converge(t.Context(), next.Agents()); err != nil {
-		t.Fatalf("Converge after commit = %v", err)
+		t.Fatalf("Converge after acknowledgement = %v", err)
 	}
 }
 
@@ -208,7 +243,7 @@ func TestReplacementRollbackRequiresFreshRequiesceProof(t *testing.T) {
 		!plansEqual(status.Current, prior) || len(status.Proofs) != 2 {
 		t.Fatalf("restored status = %#v, %v", status, err)
 	}
-	if err := controller.CommitReplacement(t.Context(), "replace-rollback", binding, prior); err != nil {
+	if _, err := controller.CommitReplacement(t.Context(), "replace-rollback", binding, prior); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -316,7 +351,7 @@ func TestReplacementFenceSurvivesStoreReopen(t *testing.T) {
 		OperationID: "replace-reopen", Phase: ReplacementUnloaded, Epoch: 1,
 		Binding: replacementBinding("replace-reopen"), Prior: plan, Current: plan,
 	}
-	if _, err := store.SetReplacement(t.Context(), map[string]Agent{}, replacement); err != nil {
+	if _, err := store.SetReplacement(t.Context(), map[string]Agent{}, replacement, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
@@ -334,6 +369,131 @@ func TestReplacementFenceSurvivesStoreReopen(t *testing.T) {
 	if state.Replacement == nil || state.Replacement.OperationID != replacement.OperationID ||
 		state.Replacement.Phase != ReplacementUnloaded || !plansEqual(state.Replacement.Prior, plan) {
 		t.Fatalf("reopened fence = %#v", state.Replacement)
+	}
+}
+
+func TestProveQuiescedIsExactAndIdempotentAfterControllerReopen(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	directory := t.TempDir()
+	config := ControllerConfig{
+		StatePath:   filepath.Join(directory, "services.db"),
+		ProcessPath: filepath.Join(directory, "processes.db"), WorkerLimit: 1,
+	}
+	launchd := &replacementLaunchd{loaded: make(map[string]bool)}
+	agent := controllerAgent(t, "com.example.proof-reopen")
+	plan := replacementPlan(t, agent)
+	binding := replacementBinding("proof-reopen")
+	controller := openDurableReplacementController(t, config, launchd)
+	if err := controller.Converge(t.Context(), plan.Agents()); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := controller.Quiesce(t.Context(), "proof-reopen", binding, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proveReplacement(t, controller, receipt)
+	closeReplacementController(t, controller)
+
+	controller = openDurableReplacementController(t, config, launchd)
+	replayed, err := controller.Quiesce(t.Context(), "proof-reopen", binding, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observations := 0
+	now := time.Unix(1_700_000_100, 0)
+	controller.replacementNow = func() time.Time { return now }
+	controller.replacementWait = func(ctx context.Context, duration time.Duration) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		now = now.Add(duration)
+		return nil
+	}
+	controller.replacementProcesses = func(string) ([]proc.Identity, error) {
+		observations++
+		return nil, nil
+	}
+	if err := controller.ProveQuiesced(t.Context(), replayed, mustProgramPaths(t, replayed.Plan)); err != nil {
+		t.Fatal(err)
+	}
+	status, err := controller.ReplacementStatus(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observations < 2 || status == nil || status.Phase != ReplacementQuiesced || len(status.Proofs) != 1 ||
+		status.Proofs[0].Epoch != replayed.Epoch || !slices.Equal(status.Proofs[0].ProgramPaths, mustProgramPaths(t, plan)) {
+		t.Fatalf("replayed proof observations/status = %d %#v", observations, status)
+	}
+	closeReplacementController(t, controller)
+}
+
+func TestReplacementCommitSurvivesReopenAndBlocksUntilExactAcknowledgement(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	directory := t.TempDir()
+	config := ControllerConfig{
+		StatePath:   filepath.Join(directory, "services.db"),
+		ProcessPath: filepath.Join(directory, "processes.db"), WorkerLimit: 1,
+	}
+	launchd := &replacementLaunchd{loaded: make(map[string]bool)}
+	prior := replacementPlan(t, controllerAgent(t, "com.example.commit-prior"))
+	next := replacementPlan(t, controllerAgent(t, "com.example.commit-next"))
+	binding := replacementBinding("commit-reopen")
+	controller := openDurableReplacementController(t, config, launchd)
+	if err := controller.Converge(t.Context(), prior.Agents()); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := controller.Quiesce(t.Context(), "commit-reopen", binding, prior)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proveReplacement(t, controller, receipt)
+	if err := controller.ApplyReplacement(t.Context(), "commit-reopen", binding, next); err != nil {
+		t.Fatal(err)
+	}
+	commit, err := controller.CommitReplacement(t.Context(), "commit-reopen", binding, next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeReplacementController(t, controller)
+
+	controller = openDurableReplacementController(t, config, launchd)
+	completion, err := controller.ReplacementCompletion(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completion == nil || completion.OperationID() != commit.OperationID() || completion.Binding() != binding ||
+		!plansEqual(completion.Prior(), prior) || !plansEqual(completion.Next(), next) {
+		t.Fatalf("reopened completion = %#v", completion)
+	}
+	if err := controller.Converge(t.Context(), next.Agents()); !errors.Is(err, ErrReplacementCommitPending) {
+		t.Fatalf("Converge with pending commit = %v", err)
+	}
+	if _, err := controller.Quiesce(t.Context(), "other", binding, next); !errors.Is(err, ErrReplacementCommitPending) {
+		t.Fatalf("Quiesce with pending commit = %v", err)
+	}
+	if _, err := controller.CommitReplacement(t.Context(), "commit-reopen", binding, next); err != nil {
+		t.Fatalf("repeat exact commit = %v", err)
+	}
+	if err := controller.AcknowledgeReplacementCommit(
+		t.Context(), commit.OperationID(), commit.Binding(), next, next,
+	); !errors.Is(err, ErrReplacementMismatch) {
+		t.Fatalf("mismatched acknowledgement = %v", err)
+	}
+	if err := controller.AcknowledgeReplacementCommit(
+		t.Context(), commit.OperationID(), commit.Binding(), commit.Prior(), commit.Next(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	closeReplacementController(t, controller)
+
+	controller = openDurableReplacementController(t, config, launchd)
+	defer closeReplacementController(t, controller)
+	completion, err = controller.ReplacementCompletion(t.Context())
+	if err != nil || completion != nil {
+		t.Fatalf("completion after acknowledgement = %#v, %v", completion, err)
+	}
+	if err := controller.Converge(t.Context(), next.Agents()); err != nil {
+		t.Fatalf("Converge after acknowledgement = %v", err)
 	}
 }
 
@@ -385,7 +545,7 @@ func TestCommitReplacementRejectsDriftBeforeClearingFence(t *testing.T) {
 		t.Fatal(err)
 	}
 	launchd.loaded[serviceTarget(agent.Label)] = false
-	if err := controller.CommitReplacement(t.Context(), "replace-drift", binding, plan); !errors.Is(err, ErrReplacementMismatch) {
+	if _, err := controller.CommitReplacement(t.Context(), "replace-drift", binding, plan); !errors.Is(err, ErrReplacementMismatch) {
 		t.Fatalf("commit drift = %v, want ErrReplacementMismatch", err)
 	}
 	if store.state.Replacement == nil {
@@ -394,7 +554,7 @@ func TestCommitReplacementRejectsDriftBeforeClearingFence(t *testing.T) {
 	if err := controller.install(t.Context(), agent); err != nil {
 		t.Fatal(err)
 	}
-	if err := controller.CommitReplacement(t.Context(), "replace-drift", binding, plan); err != nil {
+	if _, err := controller.CommitReplacement(t.Context(), "replace-drift", binding, plan); err != nil {
 		t.Fatal(err)
 	}
 	if store.state.Replacement != nil || !launchd.loaded[serviceTarget(agent.Label)] {

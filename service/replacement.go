@@ -27,6 +27,8 @@ var (
 	ErrReplacementMismatch = errors.New("service: replacement fence mismatch")
 	// ErrNotQuiesced means launchd or an exact executable remains live.
 	ErrNotQuiesced = errors.New("service: replacement is not quiesced")
+	// ErrReplacementCommitPending means a committed replacement awaits exact deployment acknowledgement.
+	ErrReplacementCommitPending = errors.New("service: replacement commit acknowledgement is pending")
 )
 
 // PlanDigest is the immutable digest of one canonical service plan.
@@ -160,6 +162,57 @@ type replacementState struct {
 	Proofs      []replacementProof
 }
 
+type replacementCommit struct {
+	OperationID string
+	Binding     ReplacementBinding
+	Prior       Plan
+	Next        Plan
+}
+
+// ReplacementCommit is the immutable durable acknowledgement boundary for one replacement.
+type ReplacementCommit struct {
+	operationID string
+	binding     ReplacementBinding
+	prior       Plan
+	next        Plan
+}
+
+// OperationID returns the exact deployment operation identifier.
+func (c ReplacementCommit) OperationID() string { return c.operationID }
+
+// Binding returns the exact consumer build and policy binding.
+func (c ReplacementCommit) Binding() ReplacementBinding { return c.binding }
+
+// Prior returns the immutable plan that preceded the replacement.
+func (c ReplacementCommit) Prior() Plan { return copyPlan(c.prior) }
+
+// Next returns the immutable committed plan.
+func (c ReplacementCommit) Next() Plan { return copyPlan(c.next) }
+
+func copyPlan(plan Plan) Plan {
+	return Plan{agents: copyAgents(plan.agents), digest: plan.digest, valid: plan.valid}
+}
+
+func copyReplacementCommit(commit *replacementCommit) *replacementCommit {
+	if commit == nil {
+		return nil
+	}
+	return &replacementCommit{
+		OperationID: commit.OperationID, Binding: commit.Binding,
+		Prior: copyPlan(commit.Prior), Next: copyPlan(commit.Next),
+	}
+}
+
+func publicReplacementCommit(commit *replacementCommit) *ReplacementCommit {
+	if commit == nil {
+		return nil
+	}
+	return &ReplacementCommit{
+		operationID: commit.OperationID, binding: commit.Binding,
+		prior: copyPlan(commit.Prior), next: copyPlan(commit.Next),
+	}
+}
+
 func copyReplacement(replacement *replacementState) *replacementState {
 	if replacement == nil {
 		return nil
@@ -254,6 +307,21 @@ func (c *Controller) ReplacementStatus(ctx context.Context) (*ReplacementStatus,
 	return statusFromReplacement(c.state.Replacement), nil
 }
 
+// ReplacementCompletion returns the exact committed replacement awaiting acknowledgement.
+func (c *Controller) ReplacementCompletion(ctx context.Context) (*ReplacementCommit, error) {
+	c.opMu.Lock()
+	defer c.opMu.Unlock()
+	opCtx, finish, err := c.admit(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
+	if err := opCtx.Err(); err != nil {
+		return nil, err
+	}
+	return publicReplacementCommit(c.state.ReplacementCommit), nil
+}
+
 // Quiesce durably fences the expected plan, suppresses RestartAlways, and unloads it.
 func (c *Controller) Quiesce(
 	ctx context.Context,
@@ -277,6 +345,9 @@ func (c *Controller) Quiesce(
 		return QuiesceReceipt{}, err
 	}
 	defer finish()
+	if c.state.ReplacementCommit != nil {
+		return QuiesceReceipt{}, ErrReplacementCommitPending
+	}
 	if existing := c.state.Replacement; existing != nil {
 		if existing.OperationID != operationID || existing.Binding != binding || !plansEqual(existing.Prior, expected) ||
 			(existing.Phase != ReplacementUnloaded && existing.Phase != ReplacementQuiesced) {
@@ -301,7 +372,7 @@ func (c *Controller) Quiesce(
 		OperationID: operationID, Phase: ReplacementUnloaded, Epoch: 1,
 		Binding: binding, Prior: expected, Current: expected,
 	}
-	if err := c.transitionReplacement(opCtx, map[string]Agent{}, replacement); err != nil {
+	if err := c.transitionReplacement(opCtx, map[string]Agent{}, replacement, nil); err != nil {
 		return QuiesceReceipt{}, err
 	}
 	if err := c.reconcile(opCtx, copyAgents(c.state.Applied), c.state.Desired); err != nil {
@@ -319,9 +390,14 @@ func (c *Controller) ProveQuiesced(ctx context.Context, receipt QuiesceReceipt, 
 		return err
 	}
 	defer finish()
-	replacement, err := c.matchReceipt(receipt, ReplacementUnloaded)
-	if err != nil {
-		return err
+	replacement := c.state.Replacement
+	if replacement == nil || replacement.OperationID != receipt.OperationID ||
+		replacement.Binding != receipt.Binding || replacement.Epoch != receipt.Epoch ||
+		!plansEqual(replacement.Current, receipt.Plan) {
+		return ErrReplacementMismatch
+	}
+	if replacement.Phase != ReplacementUnloaded && replacement.Phase != ReplacementQuiesced {
+		return ErrReplacementMismatch
 	}
 	expectedPaths, err := replacement.Current.programPaths()
 	if err != nil {
@@ -333,6 +409,16 @@ func (c *Controller) ProveQuiesced(ctx context.Context, receipt QuiesceReceipt, 
 	}
 	if !slices.Equal(paths, expectedPaths) {
 		return fmt.Errorf("%w: program paths %q differ from fenced plan %q", ErrReplacementMismatch, paths, expectedPaths)
+	}
+	if replacement.Phase == ReplacementQuiesced {
+		if len(replacement.Proofs) == 0 {
+			return ErrReplacementMismatch
+		}
+		proof := replacement.Proofs[len(replacement.Proofs)-1]
+		if proof.Epoch != receipt.Epoch || proof.PlanDigest != receipt.Plan.digest ||
+			!slices.Equal(proof.ProgramPaths, paths) {
+			return ErrReplacementMismatch
+		}
 	}
 	quietSince := time.Time{}
 	for {
@@ -367,11 +453,16 @@ func (c *Controller) ProveQuiesced(ctx context.Context, receipt QuiesceReceipt, 
 	}
 	updated := copyReplacement(replacement)
 	updated.Phase = ReplacementQuiesced
-	updated.Proofs = append(updated.Proofs, replacementProof{
+	proof := replacementProof{
 		Epoch: updated.Epoch, PlanDigest: updated.Current.digest,
 		ProgramPaths: paths, ProvedAt: c.replacementNow().UTC(),
-	})
-	return c.transitionReplacement(opCtx, map[string]Agent{}, updated)
+	}
+	if len(updated.Proofs) != 0 && updated.Proofs[len(updated.Proofs)-1].Epoch == updated.Epoch {
+		updated.Proofs[len(updated.Proofs)-1] = proof
+	} else {
+		updated.Proofs = append(updated.Proofs, proof)
+	}
+	return c.transitionReplacement(opCtx, map[string]Agent{}, updated, nil)
 }
 
 // ApplyReplacement starts next while retaining deployment ownership of the fence.
@@ -443,7 +534,7 @@ func (c *Controller) resumeReplacementLocked(ctx context.Context, replacement *r
 	updated := copyReplacement(replacement)
 	updated.Current = next
 	updated.Phase = ReplacementRunningOwned
-	if err := c.transitionReplacement(ctx, next.agents, updated); err != nil {
+	if err := c.transitionReplacement(ctx, next.agents, updated, nil); err != nil {
 		return err
 	}
 	return c.reconcile(ctx, copyAgents(c.state.Applied), c.state.Desired)
@@ -476,7 +567,7 @@ func (c *Controller) Requiesce(
 		updated := copyReplacement(replacement)
 		updated.Phase = ReplacementUnloaded
 		updated.Epoch++
-		if err := c.transitionReplacement(opCtx, map[string]Agent{}, updated); err != nil {
+		if err := c.transitionReplacement(opCtx, map[string]Agent{}, updated, nil); err != nil {
 			return QuiesceReceipt{}, err
 		}
 	} else if replacement.Phase != ReplacementUnloaded {
@@ -488,20 +579,81 @@ func (c *Controller) Requiesce(
 	return receiptFromReplacement(c.state.Replacement), nil
 }
 
-// CommitReplacement clears the fence only for the exact durable deployment plan.
+// CommitReplacement replaces the active fence with one durable exact completion receipt.
 func (c *Controller) CommitReplacement(
 	ctx context.Context,
 	operationID string,
 	binding ReplacementBinding,
 	expected Plan,
+) (ReplacementCommit, error) {
+	if err := validateReplacementOperationID(operationID); err != nil {
+		return ReplacementCommit{}, err
+	}
+	if err := expected.validate(); err != nil {
+		return ReplacementCommit{}, err
+	}
+	if err := binding.validate(); err != nil {
+		return ReplacementCommit{}, err
+	}
+	c.opMu.Lock()
+	defer c.opMu.Unlock()
+	opCtx, finish, err := c.admit(ctx)
+	if err != nil {
+		return ReplacementCommit{}, err
+	}
+	defer finish()
+	if completion := c.state.ReplacementCommit; completion != nil {
+		if completion.OperationID != operationID || completion.Binding != binding ||
+			!plansEqual(completion.Next, expected) {
+			return ReplacementCommit{}, ErrReplacementCommitPending
+		}
+		if !reflect.DeepEqual(c.state.Desired, expected.agents) || !reflect.DeepEqual(c.state.Applied, expected.agents) {
+			return ReplacementCommit{}, ErrReplacementMismatch
+		}
+		if err := c.requireExactPlanLoaded(opCtx, expected); err != nil {
+			return ReplacementCommit{}, fmt.Errorf("%w: committed plan is not exact and loaded: %w", ErrReplacementMismatch, err)
+		}
+		return *publicReplacementCommit(completion), nil
+	}
+	replacement := c.state.Replacement
+	if replacement == nil || replacement.OperationID != operationID || replacement.Binding != binding ||
+		replacement.Phase != ReplacementRunningOwned || !plansEqual(replacement.Current, expected) {
+		return ReplacementCommit{}, ErrReplacementMismatch
+	}
+	if !reflect.DeepEqual(c.state.Desired, expected.agents) || !reflect.DeepEqual(c.state.Applied, expected.agents) {
+		return ReplacementCommit{}, fmt.Errorf("%w: committed service state differs from deployment receipt", ErrReplacementMismatch)
+	}
+	if err := c.requireExactPlanLoaded(opCtx, expected); err != nil {
+		return ReplacementCommit{}, fmt.Errorf("%w: committed plan is not exact and loaded: %w", ErrReplacementMismatch, err)
+	}
+	completion := &replacementCommit{
+		OperationID: operationID, Binding: binding,
+		Prior: copyPlan(replacement.Prior), Next: copyPlan(expected),
+	}
+	if err := c.transitionReplacement(opCtx, expected.agents, nil, completion); err != nil {
+		return ReplacementCommit{}, err
+	}
+	return *publicReplacementCommit(c.state.ReplacementCommit), nil
+}
+
+// AcknowledgeReplacementCommit clears only the exact durable completion after deployment cleanup.
+func (c *Controller) AcknowledgeReplacementCommit(
+	ctx context.Context,
+	operationID string,
+	binding ReplacementBinding,
+	prior Plan,
+	next Plan,
 ) error {
 	if err := validateReplacementOperationID(operationID); err != nil {
 		return err
 	}
-	if err := expected.validate(); err != nil {
+	if err := binding.validate(); err != nil {
 		return err
 	}
-	if err := binding.validate(); err != nil {
+	if err := prior.validate(); err != nil {
+		return err
+	}
+	if err := next.validate(); err != nil {
 		return err
 	}
 	c.opMu.Lock()
@@ -511,37 +663,32 @@ func (c *Controller) CommitReplacement(
 		return err
 	}
 	defer finish()
-	replacement := c.state.Replacement
-	if replacement == nil || replacement.OperationID != operationID || replacement.Binding != binding ||
-		replacement.Phase != ReplacementRunningOwned || !plansEqual(replacement.Current, expected) {
+	commit := c.state.ReplacementCommit
+	if c.state.Replacement != nil || commit == nil || commit.OperationID != operationID ||
+		commit.Binding != binding || !plansEqual(commit.Prior, prior) || !plansEqual(commit.Next, next) {
 		return ErrReplacementMismatch
 	}
-	if !reflect.DeepEqual(c.state.Desired, expected.agents) || !reflect.DeepEqual(c.state.Applied, expected.agents) {
-		return fmt.Errorf("%w: committed service state differs from deployment receipt", ErrReplacementMismatch)
+	if !reflect.DeepEqual(c.state.Desired, next.agents) || !reflect.DeepEqual(c.state.Applied, next.agents) {
+		return ErrReplacementMismatch
 	}
-	if err := c.requireExactPlanLoaded(opCtx, expected); err != nil {
-		return fmt.Errorf("%w: committed plan is not exact and loaded: %w", ErrReplacementMismatch, err)
+	if err := c.requireExactPlanLoaded(opCtx, next); err != nil {
+		return fmt.Errorf("%w: acknowledged plan is not exact and loaded: %w", ErrReplacementMismatch, err)
 	}
-	return c.transitionReplacement(opCtx, expected.agents, nil)
+	return c.transitionReplacement(opCtx, next.agents, nil, nil)
 }
 
-func (c *Controller) transitionReplacement(ctx context.Context, desired map[string]Agent, replacement *replacementState) error {
-	state, err := c.store.SetReplacement(ctx, desired, replacement)
+func (c *Controller) transitionReplacement(
+	ctx context.Context,
+	desired map[string]Agent,
+	replacement *replacementState,
+	commit *replacementCommit,
+) error {
+	state, err := c.store.SetReplacement(ctx, desired, replacement, commit)
 	if err != nil {
 		return err
 	}
 	c.state = state
 	return nil
-}
-
-func (c *Controller) matchReceipt(receipt QuiesceReceipt, phase ReplacementPhase) (*replacementState, error) {
-	replacement := c.state.Replacement
-	if replacement == nil || replacement.OperationID != receipt.OperationID ||
-		replacement.Binding != receipt.Binding || replacement.Epoch != receipt.Epoch || replacement.Phase != phase ||
-		!plansEqual(replacement.Current, receipt.Plan) {
-		return nil, ErrReplacementMismatch
-	}
-	return replacement, nil
 }
 
 func (c *Controller) requireReplacementUnloaded(ctx context.Context, plan Plan) error {
