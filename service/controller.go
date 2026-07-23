@@ -81,6 +81,12 @@ type Controller struct {
 	stopReaper *proc.Reaper
 	stopTiming stopControlTiming
 
+	replacementProcesses func(string) ([]proc.Identity, error)
+	replacementNow       func() time.Time
+	replacementWait      func(context.Context, time.Duration) error
+
+	// Lock order is opMu, then store/launchctl/process inventory. Product stop,
+	// readiness, and deployment callbacks run only between controller calls.
 	opMu  sync.Mutex
 	state controllerState
 
@@ -152,8 +158,11 @@ func newControllerWithRuntime(
 	}
 	controller := &Controller{
 		config: config, runtime: runtime, receipts: receipts, store: store,
-		retryWait: waitServiceRetry,
-		closeDone: make(chan struct{}),
+		retryWait:            waitServiceRetry,
+		replacementProcesses: proc.ExecutableIdentities,
+		replacementNow:       time.Now,
+		replacementWait:      defaultReplacementWait,
+		closeDone:            make(chan struct{}),
 	}
 	defer func() {
 		if err == nil {
@@ -199,10 +208,6 @@ func newControllerWithRuntime(
 // succeeds. Repeating the same set verifies its plist and launchd registration,
 // repairing drift without reloading an already exact agent.
 func (c *Controller) Converge(ctx context.Context, agents []Agent) error {
-	desired, err := desiredAgents(agents)
-	if err != nil {
-		return err
-	}
 	c.opMu.Lock()
 	defer c.opMu.Unlock()
 	opCtx, finish, err := c.admit(ctx)
@@ -210,6 +215,13 @@ func (c *Controller) Converge(ctx context.Context, agents []Agent) error {
 		return err
 	}
 	defer finish()
+	if c.state.Replacement != nil {
+		return ErrQuiesced
+	}
+	desired, err := desiredAgents(agents)
+	if err != nil {
+		return err
+	}
 	if !reflect.DeepEqual(c.state.Desired, desired) {
 		prior, err := c.store.ReplaceDesired(opCtx, desired)
 		if err != nil {

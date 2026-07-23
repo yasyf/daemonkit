@@ -82,8 +82,8 @@ type controllerStoreStub struct {
 func (s *controllerStoreStub) Load(context.Context) (controllerState, error) {
 	s.record("load")
 	return controllerState{
-		Desired: copyAgents(s.state.Desired),
-		Applied: copyAgents(s.state.Applied),
+		Desired: copyAgents(s.state.Desired), Applied: copyAgents(s.state.Applied),
+		Replacement: copyReplacement(s.state.Replacement),
 	}, nil
 }
 
@@ -93,14 +93,32 @@ func (s *controllerStoreStub) ReplaceDesired(
 ) (controllerState, error) {
 	s.record("replace-desired")
 	prior := controllerState{
-		Desired: copyAgents(s.state.Desired),
-		Applied: copyAgents(s.state.Applied),
+		Desired:     copyAgents(s.state.Desired),
+		Applied:     copyAgents(s.state.Applied),
+		Replacement: copyReplacement(s.state.Replacement),
 	}
 	if s.replaceErr != nil {
 		return controllerState{}, s.replaceErr
 	}
 	s.state.Desired = copyAgents(desired)
 	return prior, nil
+}
+
+func (s *controllerStoreStub) SetReplacement(
+	_ context.Context,
+	desired map[string]Agent,
+	replacement *replacementState,
+) (controllerState, error) {
+	s.record("set-replacement")
+	if s.replaceErr != nil {
+		return controllerState{}, s.replaceErr
+	}
+	s.state.Desired = copyAgents(desired)
+	s.state.Replacement = copyReplacement(replacement)
+	return controllerState{
+		Desired: copyAgents(s.state.Desired), Applied: copyAgents(s.state.Applied),
+		Replacement: copyReplacement(s.state.Replacement),
+	}, nil
 }
 
 func (s *controllerStoreStub) SetApplied(_ context.Context, label string, agent *Agent) error {
