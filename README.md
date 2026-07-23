@@ -21,7 +21,7 @@ go: added github.com/yasyf/daemonkit v<version>
 Add the package to your dependencies and link the `DaemonKit` library product into your app or helper target:
 
 ```swift
-.package(url: "https://github.com/yasyf/daemonkit", exact: "0.8.0"),
+.package(url: "https://github.com/yasyf/daemonkit", exact: "0.10.0"),
 ```
 
 </details>
@@ -66,7 +66,7 @@ One row per package; the Status column is each surface's live state.
 | `version` | Release/dev version taxonomy, newest-wins skew | Landed |
 | `paths` | The `~/<app>` state layout: daemon socket, HTTP handshake file, per-subject artifacts, start lock, sqlite database, daemon log, turn-snapshot scratch dirs | Landed |
 | `bundle` | Info.plist reads, stable `.app` path conventions | Landed |
-| `fetch` | Exact release identity, signed `.app` verification, atomic real-directory publication, and strict v1 crash recovery | Landed |
+| `deployment` | Exact signed-application publication, service-plan fencing, durable recovery, deactivation, and status | Landed |
 | `wire` | Exact-v1 persistent business transport, typed product observations, receipt-authenticated stop control, and the sole composed daemon runtime constructor | Landed |
 | `trust` | Codesign peer verification (audit-token designated requirements) | Landed |
 | `daemon` | Opaque process runtime, readiness, ordered shutdown, skew observation, embedded processes, and idle exit | Landed |
@@ -76,12 +76,16 @@ One row per package; the Status column is each surface's live state.
 
 The LaunchAgents `service` writes use no socket activation — the daemon binds and flocks its own socket (`proc`); launchd only keeps the process alive. Every `Agent` and `AppKeepAlive` selects `RestartAlways`, `RestartOnFailure`, or `NoRestart`; the policy is rendered directly into the launchd plist. On the Swift side, `DaemonKit` reconciles `SMAppService` login items (opening the Login Items settings pane when the item needs approval), watches snapshot directories, and rides the signed `.app` bundle for a stable bundle + TCC identity.
 
-`fetch` installs only a consumer-owned fixed signed app into that consumer's
-daemonkit-managed path. FuseKit's holder runtime is embedded in the consumer
-app; daemonkit and FuseKit do not ship or fetch a separate generic holder.
+`deployment.Controller` is the only public signed-application publication
+workflow. A product supplies a complete `deployment.Config` to `Deploy`;
+`Deactivate` durably retires its exact service plan and runtime, `Recover`
+settles an interrupted transaction, and `Status` observes state without
+advancing recovery. The canonical product path is
+`$HOME/Applications/<Product>.app`; exact v1 receipts, transactions, service
+state, and locks live under
+`$HOME/Applications/.daemonkit-deployment/<Product>`.
 
-Status: v0.8.0 is the hard-cut release line consumed by FuseKit and the manually
-migrated fleet. Protocol and durable-state epochs begin at 1 with exact equality;
-the API stabilizes at v1.0.0.
+Status: v0.10.0 is the hard-cut release line. Protocol and durable-state epochs
+begin at 1 with exact equality; the API stabilizes at v1.0.0.
 
 Licensed under [PolyForm-Noncommercial-1.0.0](LICENSE).
