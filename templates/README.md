@@ -1,11 +1,17 @@
 # Templates
 
 Render-time sources for a daemonkit signed helper app: an XcodeGen project, its
-entitlements, the per-build version generator, and the Homebrew cask. Nothing
-here is consumed at Go build time — repo-bootstrap's daemonkit layer substitutes
-the `__PLACEHOLDER__` tokens once at scaffold time, and the release workflow
-fills the per-release values (`__VERSION__`, `__ASSET_URL__`, `__SHA_APP__`) in
-the cask.
+entitlements, the per-build version generator, and an optional product-owned
+Homebrew cask. Nothing here is consumed at Go build time — repo-bootstrap's
+daemonkit layer substitutes the `__PLACEHOLDER__` tokens once at scaffold time,
+and the release workflow fills the per-release values (`__VERSION__`,
+`__ASSET_URL__`, `__SHA_APP__`) in the cask.
+
+The cask template is not for FuseKit consumer runtimes. Each FuseKit consumer
+embeds `holder.Runtime` in its own fixed, same-release signed app at
+`$HOME/Applications/<MeaningfulProduct>.app`—for example,
+`$HOME/Applications/CCNotesHelper.app`—and its CLI reconciles that app. There is
+no generic FuseKit application or cask.
 
 ## What's here
 
@@ -17,7 +23,7 @@ the cask.
 | `entitlements/app.entitlements.tmpl` | `<App>.entitlements` | Non-sandboxed host app. The App Group is its only entitlement — the profile-authorized claim that makes the first group-container access a silent TCC grant. |
 | `entitlements/widget.entitlements.tmpl` | `<App>Widget.entitlements` | Sandboxed WidgetKit appex (macOS requires it): App Group plus a home-relative read-only temporary exception into the app's dotdir. |
 | `entitlements/appex-shared.entitlements.tmpl` | rendered on demand | File-Provider-style shared-container appex: App Group plus a home-relative read-write exception, resolved against the real home (`getpwuid`, not the container's `NSHomeDirectory`). Not wired into the default project. |
-| `cask.rb.tmpl` | the tap's cask | Full `.app` bundle using the release workflow's authoritative `__ASSET_URL__`, never a reconstructed release path or bare `binary`. Only a bundle staples and keeps bundle-keyed TCC identity. `__STOP_UNINSTALL_ARG__` is mandatory and must dispatch to the product's identity-verified `AppKeepAlive.Stop` plus service removal path (or an equally exact stable-bundle service API). Upgrade preflight and uninstall both require that hook to succeed; process-name discovery or killing is forbidden. Postflight strips quarantine and relaunches the settled app. |
+| `cask.rb.tmpl` | the product's optional tap cask | For products that deliberately publish their signed helper through Homebrew; never for a FuseKit consumer runtime. Installs the full `.app` bundle at `$HOME/Applications/<MeaningfulProduct>.app` using the release workflow's authoritative `__ASSET_URL__`, never a reconstructed release path or bare `binary`. Only a bundle staples and keeps bundle-keyed TCC identity. `__STOP_UNINSTALL_ARG__` is mandatory and must dispatch to the product's identity-verified `AppKeepAlive.Stop` plus service removal path (or an equally exact stable-bundle service API). Upgrade preflight and uninstall both require that hook to succeed; process-name discovery or killing is forbidden. Postflight strips quarantine and relaunches the settled app. |
 
 ## Render order
 
