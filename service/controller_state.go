@@ -225,7 +225,7 @@ func (s *boltControllerStore) ReplaceDesired(
 		if label != agent.Label {
 			return controllerState{}, fmt.Errorf("service: desired state key %q does not match agent label %q", label, agent.Label)
 		}
-		payload, err := encodeControllerAgent(agent)
+		payload, err := encodeLiveControllerAgent(agent)
 		if err != nil {
 			return controllerState{}, err
 		}
@@ -344,7 +344,7 @@ func encodeControllerAgents(agents map[string]Agent) (map[string][]byte, error) 
 		if label != agent.Label {
 			return nil, fmt.Errorf("service: state key %q does not match agent label %q", label, agent.Label)
 		}
-		payload, err := encodeControllerAgent(agent)
+		payload, err := encodeLiveControllerAgent(agent)
 		if err != nil {
 			return nil, err
 		}
@@ -391,7 +391,7 @@ func (s *boltControllerStore) SetApplied(
 		if label != agent.Label {
 			return fmt.Errorf("service: applied state key %q does not match agent label %q", label, agent.Label)
 		}
-		payload, err := encodeControllerAgent(*agent)
+		payload, err := encodeLiveControllerAgent(*agent)
 		if err != nil {
 			return err
 		}
@@ -432,7 +432,7 @@ func loadControllerStateTx(tx *bolt.Tx) (controllerState, error) {
 func loadControllerAgents(bucket *bolt.Bucket) (map[string]Agent, error) {
 	agents := make(map[string]Agent)
 	err := bucket.ForEach(func(key, payload []byte) error {
-		agent, err := decodeControllerAgent(payload)
+		agent, err := decodeLiveControllerAgent(payload)
 		if err != nil {
 			return fmt.Errorf("agent %q: %w", key, err)
 		}
@@ -871,9 +871,6 @@ func encodeControllerAgent(agent Agent) ([]byte, error) {
 	if _, err := agent.Plist(); err != nil {
 		return nil, fmt.Errorf("service: validate stored agent %q: %w", agent.Label, err)
 	}
-	if err := validateProgramTree(agent); err != nil {
-		return nil, fmt.Errorf("service: validate stored agent %q: %w", agent.Label, err)
-	}
 	agent.AssociatedBundleIdentifiers, _ = canonicalAssociatedBundleIdentifiers(
 		agent.AssociatedBundleIdentifiers,
 	)
@@ -882,6 +879,13 @@ func encodeControllerAgent(agent Agent) ([]byte, error) {
 		return nil, fmt.Errorf("service: encode stored agent %q: %w", agent.Label, err)
 	}
 	return payload, nil
+}
+
+func encodeLiveControllerAgent(agent Agent) ([]byte, error) {
+	if err := validateProgramTree(agent); err != nil {
+		return nil, fmt.Errorf("service: validate live stored agent %q: %w", agent.Label, err)
+	}
+	return encodeControllerAgent(agent)
 }
 
 func decodeControllerAgent(payload []byte) (Agent, error) {
@@ -914,14 +918,22 @@ func decodeControllerAgent(payload []byte) (Agent, error) {
 	if _, err := agent.Plist(); err != nil {
 		return Agent{}, fmt.Errorf("validate stored agent: %w", err)
 	}
-	if err := validateProgramTree(agent); err != nil {
-		return Agent{}, fmt.Errorf("validate stored agent: %w", err)
-	}
 	agent.Args = append([]string(nil), agent.Args...)
 	agent.Env = cloneStrings(agent.Env)
 	agent.AssociatedBundleIdentifiers, _ = canonicalAssociatedBundleIdentifiers(
 		agent.AssociatedBundleIdentifiers,
 	)
+	return agent, nil
+}
+
+func decodeLiveControllerAgent(payload []byte) (Agent, error) {
+	agent, err := decodeControllerAgent(payload)
+	if err != nil {
+		return Agent{}, err
+	}
+	if err := validateProgramTree(agent); err != nil {
+		return Agent{}, fmt.Errorf("validate live stored agent: %w", err)
+	}
 	return agent, nil
 }
 
