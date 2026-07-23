@@ -1,6 +1,6 @@
-# Caller for yasyf/homebrew-tap's reusable release-app.yml, rendered by
-# repo-bootstrap's daemonkit layer. Proven shape: the daemonkit-release-rehearsal
-# runs (rc + stable) went green with exactly this wiring.
+# Caller for yasyf/homebrew-tap's artifact-only release-app.yml, rendered by
+# repo-bootstrap's daemonkit layer. The reusable workflow stages a verified
+# artifact; this caller alone owns the draft and final GitHub Release.
 name: release
 
 on:
@@ -30,13 +30,9 @@ jobs:
 
   release:
     needs: version
-    # The reusable release job attaches the built .app to the GitHub release; a
-    # caller on a default-read repo must grant contents: write here — a called
-    # workflow can never exceed the caller's token permissions, and the run
-    # dies at startup_failure without it.
     permissions:
-      contents: write
-    uses: yasyf/homebrew-tap/.github/workflows/release-app.yml@f45550932b0c8a42eb04e9ab0e5de8f82ad78b6a
+      contents: read
+    uses: yasyf/homebrew-tap/.github/workflows/release-app.yml@83ee384b1d4fe25a8e4aa7258bb76d55e1593735
     with:
       app_name: __APP_NAME__
       asset_name: __CASK_TOKEN__
@@ -62,14 +58,20 @@ jobs:
       MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
       MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
 
-  cask:
+  publish:
     needs: [version, release]
-    if: needs.version.outputs.stable == 'true' && needs.release.outputs.changed == 'true'
+    if: needs.release.outputs.changed == 'true'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
     steps:
       - uses: actions/checkout@v7
+
+      - name: Download the verified application artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.release.outputs.artifact_name }}
+          path: dist
 
       - name: Assert the verified application artifact contract
         shell: bash
@@ -87,8 +89,37 @@ jobs:
             || { echo "::error::release-app returned an empty asset URL"; exit 1; }
           [[ "$ASSET_SHA256" =~ ^[0-9a-f]{64}$ ]] \
             || { echo "::error::release-app returned an invalid SHA-256"; exit 1; }
+          [ -f "dist/$ASSET_FILENAME" ] && [ -f "dist/$ASSET_FILENAME.sha256" ] \
+            || { echo "::error::staged application artifact is incomplete"; exit 1; }
+          count="$(find dist -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          [ "$count" -eq 2 ] \
+            || { echo "::error::staged application artifact has $count files, want 2"; exit 1; }
+          (cd dist && shasum -a 256 -c "$ASSET_FILENAME.sha256")
+          actual="$(shasum -a 256 "dist/$ASSET_FILENAME" | awk '{print $1}')"
+          [ "$actual" = "$ASSET_SHA256" ] \
+            || { echo "::error::staged application SHA changed after verification"; exit 1; }
+
+      - name: Record the exact release asset manifest
+        shell: bash
+        env:
+          ASSET_FILENAME: ${{ needs.release.outputs.asset_filename }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "dist/$ASSET_FILENAME" "dist/$ASSET_FILENAME.sha256" \
+            > "$RUNNER_TEMP/app-release-assets"
+
+      - name: Stage and verify the complete draft release
+        id: draft
+        uses: yasyf/homebrew-tap/.github/actions/stage-draft-release@54e3e194bda69896894a82c17fcdb2822beefab5
+        with:
+          token: ${{ github.token }}
+          tag: ${{ github.ref_name }}
+          manifest: ${{ runner.temp }}/app-release-assets
+          title: ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
 
       - name: Guard cask registry name and version
+        if: needs.version.outputs.stable == 'true'
         shell: bash
         env:
           CASK_TOKEN: __CASK_TOKEN__
@@ -136,6 +167,7 @@ jobs:
           fi
 
       - name: Require a full-application cask template
+        if: needs.version.outputs.stable == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -147,7 +179,8 @@ jobs:
           fi
 
       - name: Render the cask
-        uses: yasyf/homebrew-tap/.github/actions/render-formula@f45550932b0c8a42eb04e9ab0e5de8f82ad78b6a
+        if: needs.version.outputs.stable == 'true'
+        uses: yasyf/homebrew-tap/.github/actions/render-formula@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9
         with:
           template: templates/cask.rb.tmpl
           output: Casks/__CASK_TOKEN__.rb
@@ -156,9 +189,67 @@ jobs:
             __ASSET_URL__=${{ needs.release.outputs.asset_url }}
             __SHA_APP__=${{ needs.release.outputs.sha256 }}
 
+      - name: Test the rendered cask locally
+        if: needs.version.outputs.stable == 'true'
+        shell: bash
+        env:
+          ASSET_SHA256: ${{ needs.release.outputs.sha256 }}
+          ASSET_URL: ${{ needs.release.outputs.asset_url }}
+          VERSION: ${{ needs.version.outputs.marketing }}
+        run: |
+          set -euo pipefail
+          cask=tap-staging/Casks/__CASK_TOKEN__.rb
+          ruby -c "$cask"
+          grep -Fq "version \"$VERSION\"" "$cask"
+          grep -Fq "sha256 \"$ASSET_SHA256\"" "$cask"
+          grep -Fq "url \"$ASSET_URL\"" "$cask"
+          grep -Eq '^[[:space:]]*app[[:space:]]+' "$cask"
+
+      - name: Publish the verified release
+        uses: yasyf/homebrew-tap/.github/actions/publish-draft-release@54e3e194bda69896894a82c17fcdb2822beefab5
+        with:
+          token: ${{ github.token }}
+          release-id: ${{ steps.draft.outputs['release-id'] }}
+          tag: ${{ github.ref_name }}
+          manifest: ${{ runner.temp }}/app-release-assets
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make-latest: ${{ needs.version.outputs.stable == 'true' }}
+
+      - name: Verify the public release asset
+        shell: bash
+        env:
+          ASSET_FILENAME: ${{ needs.release.outputs.asset_filename }}
+          ASSET_SHA256: ${{ needs.release.outputs.sha256 }}
+          ASSET_URL: ${{ needs.release.outputs.asset_url }}
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 4 --output "$RUNNER_TEMP/$ASSET_FILENAME" "$ASSET_URL"
+          actual="$(shasum -a 256 "$RUNNER_TEMP/$ASSET_FILENAME" | awk '{print $1}')"
+          [ "$actual" = "$ASSET_SHA256" ] \
+            || { echo "::error::public release asset SHA differs from the verified artifact"; exit 1; }
+
       - name: Publish the cask to the tap
-        uses: yasyf/homebrew-tap/.github/actions/publish@f45550932b0c8a42eb04e9ab0e5de8f82ad78b6a
+        if: needs.version.outputs.stable == 'true'
+        uses: yasyf/homebrew-tap/.github/actions/publish@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           dir: tap-staging
           message: "__CASK_TOKEN__ ${{ github.ref_name }}"
+
+      - name: Verify the published cask and asset
+        if: needs.version.outputs.stable == 'true'
+        shell: bash
+        env:
+          ASSET_SHA256: ${{ needs.release.outputs.sha256 }}
+          ASSET_URL: ${{ needs.release.outputs.asset_url }}
+        run: |
+          set -euo pipefail
+          published="$RUNNER_TEMP/published-cask.rb"
+          curl --fail --location --retry 4 \
+            --output "$published" \
+            "https://raw.githubusercontent.com/yasyf/homebrew-tap/main/Casks/__CASK_TOKEN__.rb"
+          cmp tap-staging/Casks/__CASK_TOKEN__.rb "$published"
+          curl --fail --location --retry 4 --output "$RUNNER_TEMP/public-app.zip" "$ASSET_URL"
+          actual="$(shasum -a 256 "$RUNNER_TEMP/public-app.zip" | awk '{print $1}')"
+          [ "$actual" = "$ASSET_SHA256" ] \
+            || { echo "::error::published cask asset is not publicly retrievable and exact"; exit 1; }
