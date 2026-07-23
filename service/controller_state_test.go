@@ -142,6 +142,81 @@ func TestControllerStoreRejectsConcurrentOwner(t *testing.T) {
 	}
 }
 
+func TestControllerStoreRejectsEveryPreexistingSchemaLessLayout(t *testing.T) {
+	tests := []struct {
+		name    string
+		buckets [][]byte
+		want    string
+	}{
+		{
+			name: "expected buckets without metadata",
+			buckets: [][]byte{
+				controllerDesiredBucket, controllerAppliedBucket, controllerReplacementBucket,
+			},
+			want: "schema-less",
+		},
+		{
+			name: "empty expected metadata and buckets",
+			buckets: [][]byte{
+				controllerMetaBucket, controllerDesiredBucket, controllerAppliedBucket, controllerReplacementBucket,
+			},
+			want: "schema-less",
+		},
+		{name: "unknown bucket", buckets: [][]byte{[]byte("legacy")}, want: "unknown"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "services.db")
+			db, err := bolt.Open(path, 0o600, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Update(func(tx *bolt.Tx) error {
+				for _, bucket := range test.buckets {
+					if _, err := tx.CreateBucket(bucket); err != nil {
+						return err
+					}
+				}
+				return nil
+			}); err != nil {
+				_ = db.Close()
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := openControllerStore(context.Background(), path); err == nil ||
+				!strings.Contains(err.Error(), test.want) {
+				t.Fatalf("openControllerStore() error = %v, want %s rejection", err, test.want)
+			}
+		})
+	}
+}
+
+func TestControllerStoreInitializesOnlyTrulyEmptyBoltFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "services.db")
+	db, err := bolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := openControllerStore(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Desired) != 0 || len(state.Applied) != 0 ||
+		state.Replacement != nil || state.ReplacementCommit != nil {
+		t.Fatalf("fresh state = %#v", state)
+	}
+}
+
 func TestControllerStoreRejectsUnknownSchemaSurfaces(t *testing.T) {
 	tests := []struct {
 		name   string

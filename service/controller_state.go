@@ -143,11 +143,8 @@ func initializeControllerState(tx *bolt.Tx) error {
 		schema = meta.Get(controllerSchemaKey)
 	}
 	if schema == nil {
-		for name := range present {
-			key, _ := tx.Bucket([]byte(name)).Cursor().First()
-			if key != nil {
-				return fmt.Errorf("service: uninitialized controller bucket %q is not empty", name)
-			}
+		if len(present) != 0 {
+			return errors.New("service: preexisting schema-less controller state is not supported")
 		}
 		var err error
 		meta, err = tx.CreateBucketIfNotExists(controllerMetaBucket)
