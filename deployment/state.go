@@ -173,7 +173,7 @@ func (receipt activationReceiptWire) validate() error {
 		return err
 	}
 	if _, err := restorePlan(receipt.Plan); err != nil {
-		return fmt.Errorf("%w: %v", ErrInstallState, err)
+		return fmt.Errorf("%w: %w", ErrInstallState, err)
 	}
 	if receipt.Phase == activationPrepared && receipt.Readiness != nil {
 		return ErrInstallState

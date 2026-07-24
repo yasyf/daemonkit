@@ -326,13 +326,6 @@ func writeJSONDurable(path string, value any) error {
 	return writeExactJSON(path, value)
 }
 
-func removeDurable(path string) error {
-	if err := os.Remove(path); err != nil {
-		return err
-	}
-	return daemon.SyncDir(filepath.Dir(path))
-}
-
 var runtimeExecutable = service.CanonicalExecutable
 
 // RuntimeStopControlStore returns the app-scoped process authority store.

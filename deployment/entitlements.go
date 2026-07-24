@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strconv"
 	"time"
 
 	"howett.net/plist"
@@ -70,7 +71,7 @@ func canonicalEntitlementValue(value any) (any, error) {
 		if reflected.Uint() > math.MaxInt64 {
 			return map[string]any{"unsigned": fmt.Sprintf("%d", reflected.Uint())}, nil
 		}
-		return map[string]any{"integer": int64(reflected.Uint())}, nil
+		return map[string]any{"integer": json.Number(strconv.FormatUint(reflected.Uint(), 10))}, nil
 	case reflect.Float32, reflect.Float64:
 		if math.IsInf(reflected.Float(), 0) || math.IsNaN(reflected.Float()) {
 			return nil, errors.New("deployment: entitlement contains non-finite real")

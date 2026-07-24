@@ -282,7 +282,7 @@ func validateInstalledSpec(spec InstalledSpec) error {
 		return fmt.Errorf("%w: version is required as an exact string", ErrInvalidConfig)
 	}
 	if err := spec.Identity.Validate(); err != nil {
-		return fmt.Errorf("%w: code identity: %v", ErrInvalidConfig, err)
+		return fmt.Errorf("%w: code identity: %w", ErrInvalidConfig, err)
 	}
 	return nil
 }
@@ -581,7 +581,7 @@ func (c *Controller) deactivateLocked(
 		return DeactivationReceipt{}, fmt.Errorf("%w: deactivation config differs from activation", ErrInstallConflict)
 	}
 	if err := verifyGenerationIdentity(expected.Generation().Path(), activation.Generation.FileID); err != nil {
-		return DeactivationReceipt{}, fmt.Errorf("%w: canonical app generation changed: %v", ErrInstallConflict, err)
+		return DeactivationReceipt{}, fmt.Errorf("%w: canonical app generation changed: %w", ErrInstallConflict, err)
 	}
 	tombstone, err := readDeactivation(paths.deactivation)
 	if errors.Is(err, os.ErrNotExist) {
@@ -774,14 +774,6 @@ func (receipt activationReceiptWire) public() (ActivationReceipt, error) {
 		}
 	}
 	return result, nil
-}
-
-func mustPublicActivation(receipt activationReceiptWire) ActivationReceipt {
-	public, err := receipt.public()
-	if err != nil {
-		panic(err)
-	}
-	return public
 }
 
 func (receipt deactivationReceiptWire) public() (DeactivationReceipt, error) {

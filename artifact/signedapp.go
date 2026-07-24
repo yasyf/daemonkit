@@ -11,7 +11,7 @@ import (
 	dkversion "github.com/yasyf/daemonkit/version"
 )
 
-func (s Store) resolveSignedApp(ctx context.Context, desc *Descriptor, version string, o options) (string, error) {
+func (s Store) resolveSignedApp(_ context.Context, desc *Descriptor, version string, _ options) (string, error) {
 	exec := desc.App.Exec
 	if exec == "" {
 		exec = filepath.Join("Contents", "MacOS", desc.App.AppName)
