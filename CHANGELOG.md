@@ -6,9 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-07-23
+
 ### Added
 
-- `deployment.ApplyInstalledCandidate` owns exact local candidate copying,
+- `daemon.PublicationSlot.Acquire` atomically admits a ready publication,
+  pins its resource graph for the caller's operation, and makes release part of
+  runtime drain settlement. Unpinned publication loads are removed.
+- `deployment.NewCandidatePlan` binds exact service policy to an existing local
+  packaged app and persists only relative program paths. `ApplyInstalledCandidate`
+  owns exact local candidate copying,
   attestation, first install, atomic upgrade, activation, rollback, and durable
   replay without exposing a staging path or downloading an artifact.
 - `deployment.DeactivateCurrentInstalled` derives prior generation, build,

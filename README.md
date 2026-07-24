@@ -95,7 +95,10 @@ no single-role or compatibility initializer.
 exact local signed `.app` resource. `ApplyInstalledCandidate` copies it into a
 private controller-owned stage, verifies its bundle digest, version, signature,
 identity, and file generation, then owns first install or atomic upgrade through
-activation and rollback. `DeactivateCurrentInstalled` derives prior build,
+activation and rollback. Its opaque `CandidatePlan` is validated against the
+packaged app, persisted with relative program paths, and rebound and revalidated
+only after the exact candidate occupies the canonical path.
+`DeactivateCurrentInstalled` derives prior build,
 policy, plan, and generation only from sealed state. `UninstallCurrentInstalled`
 owns quiescence and crash-recoverable namespace removal. Consumers never write a
 candidate path, swap the installed app, inspect private JSON, or remove the
