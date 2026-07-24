@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-07-23
+
+### Fixed
+
+- `proc.ClaimSpawnedSessionIdentity` now duplicates the inherited session
+  descriptor before inspection and leaves the original descriptor and flags
+  untouched unless the exact ownership proof succeeds.
+- Spawned-session ownership is bound to the direct manager parent through
+  kernel AF_UNIX peer credentials, independently captured process identity,
+  and the exact v1 bootstrap, receipt, acknowledgement, and nonce exchange.
+  Reparented sessions, foreign peers, malformed acknowledgements, and partial
+  proofs fail without transferring or damaging descriptor ownership.
+
 ## [0.15.0] - 2026-07-23
 
 ### Added
@@ -397,7 +410,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/yasyf/daemonkit/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/yasyf/daemonkit/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/yasyf/daemonkit/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/yasyf/daemonkit/compare/v0.12.0...v0.13.0
