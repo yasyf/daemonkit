@@ -38,6 +38,17 @@ type ControllerConfig struct {
 	StatePath   string
 	ProcessPath string
 	WorkerLimit int
+	// UnsupportedSchema governs the durable worker/process-record store at
+	// ProcessPath when it is not the exact current schema. The zero value fails
+	// closed; ArchiveUnsupportedSchema renames the wedged store aside and starts
+	// fresh, trading best-effort recovery receipts for liveness. It never governs
+	// the controller state store at StatePath, whose desired agent set must not
+	// be silently discarded.
+	UnsupportedSchema proc.UnsupportedSchemaPolicy
+}
+
+func (c ControllerConfig) processStore() *proc.FileStore {
+	return &proc.FileStore{Path: c.ProcessPath, UnsupportedSchema: c.UnsupportedSchema}
 }
 
 func (c ControllerConfig) validate() error {
@@ -129,7 +140,7 @@ func NewController(ctx context.Context, config ControllerConfig) (*Controller, e
 		return nil, fmt.Errorf("service: derive process generation: %w", err)
 	}
 	reaper := &proc.Reaper{
-		Store:      &proc.FileStore{Path: config.ProcessPath},
+		Store:      config.processStore(),
 		Generation: generation,
 	}
 	runtime, err := newControllerWorkerRuntime(config.WorkerLimit, reaper)
