@@ -22,6 +22,8 @@ var (
 	ErrCancelSettlement = errors.New("wire: canceled call did not settle")
 	// ErrClientAbort means the local owner intentionally tore down the session.
 	ErrClientAbort = errors.New("wire: client aborted session")
+	// ErrClientClosing means the local owner began graceful session closure.
+	ErrClientClosing = errors.New("wire: client closing session")
 )
 
 const defaultCancelSettlementTimeout = 5 * time.Second
@@ -136,9 +138,10 @@ type Client struct {
 
 	lifecycleValidator func([]byte) (bool, error)
 
-	mu      sync.Mutex
-	pending map[uint64]*ClientCall
-	err     error
+	mu          sync.Mutex
+	pending     map[uint64]*ClientCall
+	pendingDone chan struct{}
+	err         error
 
 	writerMu     sync.RWMutex
 	writerClosed bool
@@ -148,6 +151,7 @@ type Client struct {
 	closeErr                error
 	failOnce                sync.Once
 	closing                 atomic.Bool
+	goAwayStarted           atomic.Bool
 	goAwayOnce              sync.Once
 	goAway                  chan struct{}
 	streamCap               int
@@ -273,11 +277,13 @@ func newClientWithLifecycleValidator(
 		lifecycle:               newLatestStream[[]byte](),
 		lifecycleValidator:      validator,
 		pending:                 make(map[uint64]*ClientCall),
+		pendingDone:             make(chan struct{}),
 		goAway:                  make(chan struct{}),
 		streamCap:               streamCap,
 		streamWindow:            streamWindow,
 		cancelSettlementTimeout: durationOr(config.CancelSettlementTimeout, defaultCancelSettlementTimeout),
 	}
+	close(c.pendingDone)
 	if err := codec.WriteFrame(Frame{Kind: FrameWindow, Sequence: eventWindow}); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("wire: grant event window: %w", err)
@@ -387,9 +393,6 @@ func (c *Client) open(
 	if err := validateOperation(op); err != nil {
 		return nil, &OpenError{Outcome: PreSendFailure, Err: err}
 	}
-	if err := c.sessionErr(); err != nil {
-		return nil, &OpenError{Outcome: PreSendFailure, Err: err}
-	}
 	id := c.nextID.Add(1)
 	call := &ClientCall{
 		client:         c,
@@ -403,9 +406,9 @@ func (c *Client) open(
 		sendEnded:      endInput,
 		receiveEnded:   false,
 	}
-	c.mu.Lock()
-	c.pending[id] = call
-	c.mu.Unlock()
+	if err := c.addPending(call); err != nil {
+		return nil, &OpenError{Outcome: PreSendFailure, Err: err}
+	}
 	callCtx, cancel := c.callContext(ctx, op)
 	deadline, _ := callCtx.Deadline()
 	flags := FrameFlags(0)
@@ -600,6 +603,9 @@ func (c *ClientCall) cancel(parent context.Context) {
 			_, err := c.client.sendFrame(ctx, Frame{Kind: FrameCancel, Flags: FlagEnd, ID: c.id})
 			cancel()
 			if err != nil {
+				if errors.Is(err, ErrClientClosing) {
+					return
+				}
 				c.client.fail(fmt.Errorf("wire: cancel request: %w", err))
 				return
 			}
@@ -626,6 +632,9 @@ func (c *ClientCall) deliverChunks() {
 			select {
 			case c.chunks <- chunk:
 				if _, err := c.client.sendFrame(c.client.ctx, Frame{Kind: FrameWindow, ID: c.id, Sequence: 1}); err != nil {
+					if errors.Is(err, ErrClientClosing) {
+						return
+					}
 					c.client.fail(fmt.Errorf("wire: return response credit: %w", err))
 					return
 				}
@@ -658,6 +667,9 @@ func (c *Client) deliverEvents() {
 			select {
 			case c.eventOut <- event:
 				if _, err := c.sendFrame(c.ctx, Frame{Kind: FrameWindow, Sequence: 1}); err != nil {
+					if errors.Is(err, ErrClientClosing) {
+						return
+					}
 					c.fail(fmt.Errorf("wire: return event credit: %w", err))
 					return
 				}
@@ -691,10 +703,17 @@ func (c *Client) Abort(cause error) error {
 
 func (c *Client) close(parent context.Context) error {
 	c.closeOnce.Do(func() {
+		c.mu.Lock()
+		c.closing.Store(true)
+		pendingDone := c.pendingDone
+		c.mu.Unlock()
+		<-pendingDone
+		c.writerMu.Lock()
+		c.goAwayStarted.Store(true)
+		c.writerMu.Unlock()
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), c.codec.WriteTimeout)
 		defer cancel()
-		c.closing.Store(true)
-		if _, err := c.sendFrame(ctx, Frame{Kind: FrameGoAway, Flags: FlagEnd}); err != nil {
+		if _, err := c.sendFrameState(ctx, Frame{Kind: FrameGoAway, Flags: FlagEnd}, true); err != nil {
 			c.closeErr = fmt.Errorf("wire: send go-away: %w", err)
 		} else {
 			select {
@@ -894,7 +913,9 @@ func (c *Client) receiveResponse(frame Frame) error {
 	if err := decodeStrict(frame.Payload, &response); err != nil {
 		return fmt.Errorf("%w: decode response: %w", ErrInvalidFrame, err)
 	}
-	call := c.removePending(frame.ID)
+	c.mu.Lock()
+	call := c.pending[frame.ID]
+	c.mu.Unlock()
 	var ackErr error
 	if response.Ack {
 		_, ackErr = c.sendFrame(c.ctx, Frame{
@@ -915,6 +936,7 @@ func (c *Client) receiveResponse(frame Frame) error {
 		outcome = Rejected
 	}
 	call.finish(callResult{result: Result{Outcome: outcome, Response: response}})
+	c.removePending(frame.ID)
 	return ackErr
 }
 
@@ -982,11 +1004,19 @@ func (c *Client) receiveWindow(frame Frame) error {
 }
 
 func (c *Client) sendFrame(ctx context.Context, frame Frame) (frameSendState, error) {
+	return c.sendFrameState(ctx, frame, false)
+}
+
+func (c *Client) sendFrameState(ctx context.Context, frame Frame, duringClose bool) (frameSendState, error) {
 	done := make(chan frameSendResult, 1)
 	c.writerMu.RLock()
 	if c.writerClosed {
 		c.writerMu.RUnlock()
 		return frameNotSent, c.sessionErr()
+	}
+	if c.goAwayStarted.Load() && !duringClose {
+		c.writerMu.RUnlock()
+		return frameNotSent, ErrClientClosing
 	}
 	select {
 	case c.outbound <- outboundFrame{frame: frame, ctx: ctx, done: done}:
@@ -1008,6 +1038,9 @@ func (c *Client) fail(err error) {
 		c.err = err
 		pending := c.pending
 		c.pending = make(map[uint64]*ClientCall)
+		if len(pending) > 0 {
+			close(c.pendingDone)
+		}
 		c.mu.Unlock()
 		c.cancel()
 		_ = c.conn.Close()
@@ -1046,8 +1079,34 @@ func (c *Client) removePending(id uint64) *ClientCall {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	call := c.pending[id]
-	delete(c.pending, id)
+	if call != nil {
+		delete(c.pending, id)
+		if len(c.pending) == 0 {
+			close(c.pendingDone)
+		}
+	}
 	return call
+}
+
+func (c *Client) addPending(call *ClientCall) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closing.Load() {
+		return ErrClientClosing
+	}
+	if c.err != nil {
+		return c.err
+	}
+	select {
+	case <-c.ctx.Done():
+		return net.ErrClosed
+	default:
+	}
+	if len(c.pending) == 0 {
+		c.pendingDone = make(chan struct{})
+	}
+	c.pending[call.id] = call
+	return nil
 }
 
 func (c *Client) sessionErr() error {
