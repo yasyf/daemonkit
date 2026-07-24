@@ -50,6 +50,11 @@ linters:
       # G104 duplicates errcheck, which owns unhandled-error reporting.
       - linters: [gosec]
         text: "G104"
+      # A resolved artifact must carry the executable bit; extracted archive
+      # members stay 0600 and only the entrypoint is chmod'd executable.
+      - linters: [gosec]
+        text: "G302"
+        path: ^artifact/
       # Test fixtures read/write their own temp paths and don't wrap errors.
       - path: _test\.go$
         linters: [gosec, errorlint]
