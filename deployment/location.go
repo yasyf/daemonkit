@@ -65,7 +65,7 @@ func (l stateLocation) validateLexical() error {
 	return nil
 }
 
-func (l stateLocation) stopControlStore() (proc.StopControlStore, error) {
+func (l stateLocation) stopControlStore() (*proc.FileStore, error) {
 	if err := l.validate(); err != nil {
 		return nil, err
 	}
@@ -76,9 +76,9 @@ func (l stateLocation) stopControlStore() (proc.StopControlStore, error) {
 var runtimeExecutable = service.CanonicalExecutable
 
 // RuntimeStopControlStore derives the containing fixed app from the running
-// direct-child executable and returns the same opaque authority store used by
-// its deployment-owned service controller.
-func RuntimeStopControlStore() (proc.StopControlStore, error) {
+// direct-child executable and returns the exact file-backed authority store
+// used by its deployment-owned service controller.
+func RuntimeStopControlStore() (*proc.FileStore, error) {
 	executable, err := runtimeExecutable()
 	if err != nil {
 		return nil, fmt.Errorf("deployment: resolve runtime executable: %w", err)

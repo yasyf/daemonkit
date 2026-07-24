@@ -82,8 +82,8 @@ func TestBrokerHandoffRequiresDedicatedRoleAndExactRuntimeIdentity(t *testing.T)
 		ExpectedUID: os.Geteuid(),
 		Roles: map[trust.PeerRole]trust.Requirement{
 			"stop":      {TeamID: "SXKCTF23Q2", SigningIdentifier: "com.yasyf.daemonkit.stop"},
-			"lifecycle": {TeamID: "SXKCTF23Q2", SigningIdentifier: "com.yasyf.daemonkit.lifecycle"},
-			"handoff":   {TeamID: "SXKCTF23Q2", SigningIdentifier: "com.yasyf.daemonkit.handoff"},
+			"lifecycle": {TeamID: "SXKCTF23Q2", SigningIdentifier: "com.yasyf.daemonkit.broker"},
+			"handoff":   {TeamID: "SXKCTF23Q2", SigningIdentifier: "com.yasyf.daemonkit.broker"},
 		},
 		StopRoles:      []trust.PeerRole{"stop"},
 		ReceiptRoles:   []trust.PeerRole{"lifecycle"},

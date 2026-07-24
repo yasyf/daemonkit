@@ -1,6 +1,9 @@
 package trust
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func TestTrustPolicyStopAuthorityHasExactlyOneRole(t *testing.T) {
 	config := trustPolicyConfig()
@@ -14,21 +17,25 @@ func TestTrustPolicyStopAuthorityHasExactlyOneRole(t *testing.T) {
 	}
 }
 
-func TestTrustPolicyLifecycleAuthorityHasAtMostTwoDistinctRoles(t *testing.T) {
+func TestTrustPolicyLifecycleAuthorityAllowsSevenDistinctRoles(t *testing.T) {
 	config := trustPolicyConfig()
 	policy, err := NewTrustPolicy(config)
 	if err != nil || !policy.AllowsReceipt("lifecycle") || !policy.AllowsReadiness("lifecycle") {
 		t.Fatalf("shared lifecycle role = %v", err)
 	}
-	config.Roles["lifecycle-2"] = trustPolicyRequirement("com.yasyf.daemonkit.lifecycle-2")
-	config.ReadinessRoles = []PeerRole{"lifecycle-2"}
-	if _, err := NewTrustPolicy(config); err != nil {
-		t.Fatalf("two lifecycle roles: %v", err)
+	for index := 2; index <= 7; index++ {
+		role := PeerRole(fmt.Sprintf("lifecycle-%d", index))
+		config.Roles[role] = config.Roles["lifecycle"]
+		config.ReadinessRoles = append(config.ReadinessRoles, role)
 	}
-	config.Roles["lifecycle-3"] = trustPolicyRequirement("com.yasyf.daemonkit.lifecycle-3")
-	config.ReadinessRoles = []PeerRole{"lifecycle-2", "lifecycle-3"}
-	if _, err := NewTrustPolicy(config); err == nil {
-		t.Fatal("three lifecycle roles succeeded")
+	policy, err = NewTrustPolicy(config)
+	if err != nil {
+		t.Fatalf("seven lifecycle roles: %v", err)
+	}
+	for _, role := range config.ReadinessRoles {
+		if !policy.AllowsReadiness(role) {
+			t.Fatalf("readiness role %q lost authority", role)
+		}
 	}
 }
 

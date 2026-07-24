@@ -263,9 +263,6 @@ func NewTrustPolicy(config TrustPolicyConfig) (TrustPolicy, error) {
 	for role := range policy.readinessRoles {
 		lifecycleRoles[role] = struct{}{}
 	}
-	if len(lifecycleRoles) > 2 {
-		return TrustPolicy{}, errors.New("trust: lifecycle roles exceed the fixed capacity of two")
-	}
 	for role := range policy.stopRoles {
 		if _, exists := lifecycleRoles[role]; exists {
 			return TrustPolicy{}, fmt.Errorf("trust: role %q overlaps stop and lifecycle authority", role)

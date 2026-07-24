@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lifecycle session performs only receipt and readiness preflight; a separate
   persistent handoff session sends only `daemon.broker-handoff.v1`, pinned to
   the exact ready-runtime receipt.
+- `deployment.RuntimeStopControlStore` returns the exact `*proc.FileStore`
+  consumed by holders, without an interface assertion.
+- Trust policies allow any exact, disjoint lifecycle role topology that fits
+  the server's configured session capacity; the lifecycle-specific two-role
+  ceiling is removed.
 
 ### Removed
 

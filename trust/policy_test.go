@@ -317,18 +317,12 @@ func TestTrustPolicyAllowsDisabledHandoff(t *testing.T) {
 	}
 }
 
-func TestTrustPolicyRejectsCrossBucketOverlapAndLifecycleOverflow(t *testing.T) {
+func TestTrustPolicyRejectsCrossBucketOverlap(t *testing.T) {
 	for name, mutate := range map[string]func(*TrustPolicyConfig){
 		"stop lifecycle": func(c *TrustPolicyConfig) { c.StopRoles = []PeerRole{"lifecycle"} },
 		"stop handoff":   func(c *TrustPolicyConfig) { c.StopRoles = []PeerRole{"broker"} },
 		"lifecycle handoff": func(c *TrustPolicyConfig) {
 			c.HandoffRoles = []PeerRole{"lifecycle"}
-		},
-		"lifecycle overflow": func(c *TrustPolicyConfig) {
-			c.Roles["lifecycle-2"] = trustPolicyRequirement("com.yasyf.daemonkit.lifecycle-2")
-			c.Roles["lifecycle-3"] = trustPolicyRequirement("com.yasyf.daemonkit.lifecycle-3")
-			c.ReceiptRoles = []PeerRole{"lifecycle", "lifecycle-2"}
-			c.ReadinessRoles = []PeerRole{"lifecycle-3"}
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

@@ -5,8 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-
-	"github.com/yasyf/daemonkit/proc"
 )
 
 func runtimeAppFixture(t *testing.T) (string, stateLocation) {
@@ -35,8 +33,8 @@ func TestRuntimeStopControlStoreDerivesExactAppWithoutCreatingState(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	fileStore, ok := store.(*proc.FileStore)
-	if !ok || fileStore.Path != deploymentPathsForLocation(location).serviceProcess {
+	_ = store
+	if store.Path != deploymentPathsForLocation(location).serviceProcess {
 		t.Fatalf("store = %#v", store)
 	}
 	if _, err := os.Lstat(filepath.Join(location.Dir, ".daemonkit-deployment")); !errors.Is(err, os.ErrNotExist) {
