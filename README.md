@@ -21,7 +21,7 @@ go: added github.com/yasyf/daemonkit v<version>
 Add the package to your dependencies and link the `DaemonKit` library product into your app or helper target:
 
 ```swift
-.package(url: "https://github.com/yasyf/daemonkit", exact: "0.14.0"),
+.package(url: "https://github.com/yasyf/daemonkit", exact: "0.15.0"),
 ```
 
 </details>
@@ -55,6 +55,15 @@ and exact process identity to settle before it starts the replacement.
 
 A unix socket's permission bits say which UID connected, not which binary. On macOS, daemonkit's trust check resolves the peer's audit token to its code signature and pins team + signing identifier — same-team-but-different-tool is rejected, and a configured requirement with no verifier fails closed.
 
+### Own a typed Swift service generation
+
+`StaticSessionServiceRuntime<Request, Response>` binds one exact Unix socket,
+checks the peer's effective UID and role before admission, publishes Ready only
+after the typed route exists, and drains every accepted request before unlinking
+the listener. Products provide their codec, operation, tenant, handler, and
+resource limits; daemonkit owns lifecycle controls, framing, backpressure,
+cancellation, settlement, and authenticated successor following.
+
 ## The packages
 
 One row per package; the Status column is each surface's live state.
@@ -72,7 +81,7 @@ One row per package; the Status column is each surface's live state.
 | `daemon` | Opaque process runtime, readiness, ordered shutdown, skew observation, embedded processes, and idle exit | Landed |
 | `drain` | Drain-on-upgrade: journals, fences, dead-peer adoption | Landed |
 | `supervise` | Bounded disposable workers and managed long-lived process handles with pre-exec durable identity, readiness gating, cancellation settlement, and cross-generation orphan recovery | Landed |
-| `Sources/DaemonKit` | Swift: generation-aware service clients, signed-process App Group resolution, socket serving, peer trust (same-UID floor + designated-requirement pinning), `SMAppService` login items, snapshot watching | Landed |
+| `Sources/DaemonKit` | Swift: typed static service runtimes, generation-aware service clients, signed-process App Group resolution, peer trust (same-UID floor + designated-requirement pinning), `SMAppService` login items, snapshot watching | Landed |
 
 The LaunchAgents `service` writes use no socket activation — the daemon binds and flocks its own socket (`proc`); launchd only keeps the process alive. Every `Agent` and `AppKeepAlive` selects `RestartAlways`, `RestartOnFailure`, or `NoRestart`; the policy is rendered directly into the launchd plist. On the Swift side, `DaemonKit` reconciles `SMAppService` login items (opening the Login Items settings pane when the item needs approval), watches snapshot directories, and rides the signed `.app` bundle for a stable bundle + TCC identity.
 
@@ -91,7 +100,7 @@ advancing recovery. The canonical product path is
 state, and locks live under
 `$HOME/Applications/.daemonkit-deployment/<Product>`.
 
-Status: v0.14.0 is the hard-cut release line. Protocol and durable-state epochs
+Status: v0.15.0 is the hard-cut release line. Protocol and durable-state epochs
 begin at 1 with exact equality; the API stabilizes at v1.0.0.
 
 Licensed under [PolyForm-Noncommercial-1.0.0](LICENSE).

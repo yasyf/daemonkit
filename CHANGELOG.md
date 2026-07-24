@@ -6,6 +6,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-07-23
+
+### Added
+
+- Swift `StaticSessionServiceRuntime<Request, Response>` owns one typed,
+  same-EUID service generation from listener acquisition through Ready,
+  draining, request settlement, unlink, and retained terminal result.
+- `SessionServiceHandler`, `SessionServiceCodec`, and
+  `SessionServiceConfiguration` make the product route and every transport
+  bound explicit while keeping raw socket requests and responses internal.
+- The Swift service runtime owns receipt and readiness control operations;
+  `ServiceSocketClient` follows an authenticated successor without product
+  code implementing lifecycle framing or retry policy.
+
+### Changed
+
+- Protected runtime controls are exact unary calls with an empty tenant and
+  are rejected before product dispatch when their framing is incomplete.
+- Trust is evaluated against the peer's effective UID before a session can
+  reserve capacity or send application bytes.
+- Shutdown has one deadline-independent settlement task. A caller deadline can
+  expire, but a later shutdown joins the same drain and reaping work.
+
+### Removed
+
+- Swift consumers no longer construct public raw `SocketServer`,
+  `SocketRequest`, or `SocketResponse` service loops. There is no compatibility
+  wrapper for the deleted public server surface.
+
 ## [0.14.0] - 2026-07-23
 
 ### Changed
@@ -350,7 +379,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/yasyf/daemonkit/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/yasyf/daemonkit/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/yasyf/daemonkit/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/yasyf/daemonkit/compare/v0.10.0...v0.12.0
