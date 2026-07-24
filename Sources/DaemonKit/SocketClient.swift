@@ -539,7 +539,7 @@ extension SocketClientCore {
             }
             let code = SocketResponseCode(rawValue: rawCode)
             switch code {
-            case .sessionCapacity, .peerUntrusted, .buildMismatch:
+            case .sessionCapacity, .peerUntrusted, .permissionDenied, .buildMismatch:
                 throw SocketHandshakeRejectionError(code: code, reason: reason)
             default:
                 throw SessionTransportError.handshake("invalid rejection code \(rawCode.debugDescription)")

@@ -9,6 +9,7 @@ final class ServerSession: @unchecked Sendable {
     private let handler: @Sendable (SocketRequest) async -> SocketResponse
     private let runtimeLifecycle: RuntimeLifecycleController?
     private let controlOperations: Set<String>
+    private let sessionPolicy: SocketServer.SessionPolicy?
     private let shutdownDescriptor: @Sendable () -> Void
     private let codec: SessionFrameCodec
     private let readQueue: DispatchQueue
@@ -31,6 +32,7 @@ final class ServerSession: @unchecked Sendable {
         configuration: SocketServer.Configuration,
         runtimeLifecycle: RuntimeLifecycleController?,
         controlOperations: Set<String>,
+        sessionPolicy: SocketServer.SessionPolicy?,
         handler: @escaping @Sendable (SocketRequest) async -> SocketResponse
     ) {
         self.descriptor = descriptor
@@ -40,6 +42,7 @@ final class ServerSession: @unchecked Sendable {
         self.configuration = configuration
         self.runtimeLifecycle = runtimeLifecycle
         self.controlOperations = controlOperations
+        self.sessionPolicy = sessionPolicy
         self.handler = handler
         var uuid = UUID().uuid
         generation = withUnsafeBytes(of: &uuid) { Data($0) }
@@ -183,6 +186,28 @@ final class ServerSession: @unchecked Sendable {
         guard !identity.role.isEmpty else {
             throw SessionTransportError.handshake("empty role")
         }
+        if let sessionPolicy {
+            guard peer.effectiveUserID == sessionPolicy.effectiveUserID else {
+                try await rejectHandshake(
+                    code: .peerUntrusted,
+                    reason: "wire: peer effective user does not match service owner"
+                )
+                throw SocketHandshakeRejectionError(
+                    code: .peerUntrusted,
+                    reason: "wire: peer effective user does not match service owner"
+                )
+            }
+            guard identity.role == sessionPolicy.role else {
+                try await rejectHandshake(
+                    code: .permissionDenied,
+                    reason: "wire: peer role does not match service role"
+                )
+                throw SocketHandshakeRejectionError(
+                    code: .permissionDenied,
+                    reason: "wire: peer role does not match service role"
+                )
+            }
+        }
         guard identity.wireBuild == serverWireBuild else {
             let payload = try SessionHandshakeCodec.encodeRejection(
                 wireBuild: serverWireBuild,
@@ -195,6 +220,15 @@ final class ServerSession: @unchecked Sendable {
         let payload = try SessionHandshakeCodec.encodeSuccess(wireBuild: serverWireBuild, session: generation)
         try await write(SessionFrame(kind: .helloAck, flags: .end, payload: payload))
         return identity
+    }
+
+    private func rejectHandshake(code: SocketResponseCode, reason: String) async throws {
+        let payload = try SessionHandshakeCodec.encodeRejection(
+            wireBuild: serverWireBuild,
+            code: code,
+            reason: reason
+        )
+        try await write(SessionFrame(kind: .helloAck, flags: .end, payload: payload))
     }
 
     private func read(timeout: TimeInterval = 0) async throws -> SessionFrame {
@@ -217,6 +251,22 @@ final class ServerSession: @unchecked Sendable {
                 id: frame.id,
                 code: .permissionDenied,
                 reason: "wire: Swift sessions cannot authorize protected daemonkit operations"
+            )
+            return
+        }
+        if let sessionPolicy, frame.operation != sessionPolicy.operation {
+            try await sendRejected(
+                id: frame.id,
+                code: .permissionDenied,
+                reason: "wire: operation does not match service operation"
+            )
+            return
+        }
+        if let sessionPolicy, frame.tenant != sessionPolicy.tenant {
+            try await sendRejected(
+                id: frame.id,
+                code: .permissionDenied,
+                reason: "wire: tenant does not match service tenant"
             )
             return
         }

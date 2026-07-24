@@ -29,6 +29,7 @@ final class DaemonRuntime: @unchecked Sendable {
         wireBuild: String,
         identity: RuntimeIdentity,
         configuration: SocketServer.Configuration = .init(),
+        sessionPolicy: SocketServer.SessionPolicy? = nil,
         handler: RuntimeHandlerSpec
     ) throws {
         let controller = try RuntimeLifecycleController(
@@ -42,6 +43,7 @@ final class DaemonRuntime: @unchecked Sendable {
             wireBuild: wireBuild,
             configuration: configuration,
             runtimeLifecycle: controller,
+            sessionPolicy: sessionPolicy,
             handler: handler.operation
         )
     }
@@ -105,8 +107,13 @@ final class DaemonRuntime: @unchecked Sendable {
             return true
         }
         guard shouldStop else { return }
-        try await controller.closeIntake(deadline: deadline)
-        try await server.stopRuntime(deadline: deadline)
-        controller.finishShutdown()
+        do {
+            try await controller.closeIntake(deadline: deadline)
+            try await server.stopRuntime(deadline: deadline)
+            controller.finishShutdown()
+        } catch {
+            lock.withLock { shutDown = false }
+            throw error
+        }
     }
 }

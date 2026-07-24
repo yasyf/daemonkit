@@ -4,6 +4,13 @@ import os
 
 /// A unix-domain persistent v1 session server.
 final class SocketServer: @unchecked Sendable {
+    struct SessionPolicy: Sendable {
+        let effectiveUserID: uid_t
+        let role: String
+        let operation: String
+        let tenant: String
+    }
+
     struct Configuration: Sendable {
         var maximumFrameBytes: Int
         var maximumActiveRequests: Int
@@ -131,6 +138,7 @@ final class SocketServer: @unchecked Sendable {
     private let configuration: Configuration
     private let runtimeLifecycle: RuntimeLifecycleController?
     private let controlOperations: Set<String>
+    private let sessionPolicy: SessionPolicy?
     private let handler: @Sendable (SocketRequest) async -> SocketResponse
     private let acceptQueue = DispatchQueue(label: "com.yasyf.daemonkit.SocketServer.accept")
     private let controlQueue = DispatchQueue(label: "com.yasyf.daemonkit.SocketServer.control")
@@ -154,6 +162,7 @@ final class SocketServer: @unchecked Sendable {
         path: String,
         wireBuild: String,
         configuration: Configuration = .init(),
+        sessionPolicy: SessionPolicy? = nil,
         handler: @escaping @Sendable (SocketRequest) async -> SocketResponse
     ) {
         self.path = path
@@ -161,6 +170,7 @@ final class SocketServer: @unchecked Sendable {
         self.configuration = configuration
         runtimeLifecycle = nil
         controlOperations = []
+        self.sessionPolicy = sessionPolicy
         self.handler = handler
     }
 
@@ -170,6 +180,7 @@ final class SocketServer: @unchecked Sendable {
         configuration: Configuration = .init(),
         runtimeLifecycle: RuntimeLifecycleController,
         controlOperations: Set<String> = [],
+        sessionPolicy: SessionPolicy? = nil,
         handler: @escaping @Sendable (SocketRequest) async -> SocketResponse
     ) {
         self.path = path
@@ -177,6 +188,7 @@ final class SocketServer: @unchecked Sendable {
         self.configuration = configuration
         self.runtimeLifecycle = runtimeLifecycle
         self.controlOperations = controlOperations
+        self.sessionPolicy = sessionPolicy
         self.handler = handler
     }
 }
@@ -578,6 +590,7 @@ extension SocketServer {
                 configuration: configuration,
                 runtimeLifecycle: runtimeLifecycle,
                 controlOperations: controlOperations,
+                sessionPolicy: sessionPolicy,
                 handler: handler
             )
             insert(session, descriptor: descriptor)

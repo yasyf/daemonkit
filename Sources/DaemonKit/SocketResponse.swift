@@ -15,6 +15,8 @@ public struct SocketResponseCode: RawRepresentable, Equatable, Hashable, Sendabl
     public static let sessionCapacity = SocketResponseCode(rawValue: "session_capacity")
     public static let peerUntrusted = SocketResponseCode(rawValue: "peer_untrusted")
     public static let permissionDenied = SocketResponseCode(rawValue: "permission_denied")
+    public static let invalidRequest = SocketResponseCode(rawValue: "invalid_request")
+    public static let requestTooLarge = SocketResponseCode(rawValue: "request_too_large")
     public static let handoffPendingCapacity = SocketResponseCode(rawValue: "handoff_pending_capacity")
     public static let handoffReplay = SocketResponseCode(rawValue: "handoff_replay")
     public static let handoffSessionExhausted = SocketResponseCode(rawValue: "handoff_session_exhausted")
