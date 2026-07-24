@@ -503,7 +503,7 @@ extension SocketClientCore {
         beginAbort(error: error)
     }
 
-    private static func handshake(
+    static func handshake(
         codec: SessionFrameCodec,
         wireBuild: String,
         role: String,
@@ -514,19 +514,35 @@ extension SocketClientCore {
             wireBuild: wireBuild,
             role: role
         ))
-        try codec.write(SessionFrame(kind: .hello, flags: .end, payload: payload))
-        let response = try codec.read(timeout: timeout)
+        let writeFailure: Error?
+        do {
+            try codec.write(SessionFrame(kind: .hello, flags: .end, payload: payload))
+            writeFailure = nil
+        } catch let error as SessionTransportError where error.isPeerEndWriteFailure {
+            writeFailure = error
+        }
+        let response: SessionFrame
+        do {
+            response = try codec.read(timeout: timeout)
+        } catch {
+            throw writeFailure ?? error
+        }
         guard response.kind == .helloAck, response.flags == .end, response.id == 0,
               response.sequence == 0, response.operation.isEmpty, response.tenant.isEmpty
         else {
-            throw SessionTransportError.handshake("invalid acknowledgment")
+            throw writeFailure ?? SessionTransportError.handshake("invalid acknowledgment")
         }
-        let acknowledgment = try SessionHandshakeCodec.decodeAck(response.payload)
+        let acknowledgment: SessionHandshakeAck
+        do {
+            acknowledgment = try SessionHandshakeCodec.decodeAck(response.payload)
+        } catch {
+            throw writeFailure ?? error
+        }
         guard acknowledgment.protocolVersion == daemonKitSessionProtocolVersion else {
-            throw SessionTransportError.unsupportedProtocolVersion(acknowledgment.protocolVersion)
+            throw writeFailure ?? SessionTransportError.unsupportedProtocolVersion(acknowledgment.protocolVersion)
         }
         guard !acknowledgment.wireBuild.isEmpty else {
-            throw SessionTransportError.handshake("empty server wireBuild")
+            throw writeFailure ?? SessionTransportError.handshake("empty server wireBuild")
         }
         guard acknowledgment.wireBuild == wireBuild else {
             throw SocketWireBuildMismatchError(server: acknowledgment.wireBuild, client: wireBuild)
@@ -535,18 +551,20 @@ extension SocketClientCore {
             guard let rawCode = acknowledgment.code, !rawCode.isEmpty,
                   let reason = acknowledgment.reason, !reason.isEmpty
             else {
-                throw SessionTransportError.handshake("invalid rejection")
+                throw writeFailure ?? SessionTransportError.handshake("invalid rejection")
             }
             let code = SocketResponseCode(rawValue: rawCode)
             switch code {
             case .sessionCapacity, .peerUntrusted, .permissionDenied, .buildMismatch:
                 throw SocketHandshakeRejectionError(code: code, reason: reason)
             default:
-                throw SessionTransportError.handshake("invalid rejection code \(rawCode.debugDescription)")
+                throw writeFailure ?? SessionTransportError.handshake(
+                    "invalid rejection code \(rawCode.debugDescription)"
+                )
             }
         }
         guard let session = acknowledgment.session else {
-            throw SessionTransportError.handshake("missing session generation")
+            throw writeFailure ?? SessionTransportError.handshake("missing session generation")
         }
         return SessionWireIdentity(
             protocolVersion: acknowledgment.protocolVersion,

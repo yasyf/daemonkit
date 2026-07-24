@@ -905,6 +905,115 @@ extension SocketTransportTests.ServiceSocketClientTests {
         }
     }
 
+    @Test func bufferedAcknowledgmentWinsPeerCloseDuringHelloWrite() throws {
+        var descriptors: [Int32] = [-1, -1]
+        try #require(socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0)
+        defer {
+            Darwin.close(descriptors[0])
+            if descriptors[1] >= 0 {
+                Darwin.close(descriptors[1])
+            }
+        }
+        let server = SessionFrameCodec(descriptor: descriptors[1])
+        try server.write(SessionFrame(
+            kind: .helloAck,
+            flags: .end,
+            payload: SessionHandshakeCodec.encodeRejection(
+                wireBuild: "service.v1",
+                code: .sessionCapacity,
+                reason: "wire: session capacity exhausted"
+            )
+        ))
+        Darwin.close(descriptors[1])
+        descriptors[1] = -1
+        var probe: UInt8 = 0
+        let sent = withUnsafeBytes(of: &probe) {
+            Darwin.send(descriptors[0], $0.baseAddress, $0.count, MSG_NOSIGNAL)
+        }
+        try #require(sent == -1)
+        try #require(errno == EPIPE)
+
+        let client = SessionFrameCodec(descriptor: descriptors[0])
+        #expect(throws: SocketWireBuildMismatchError(server: "service.v1", client: "other.v1")) {
+            _ = try SocketClientCore.handshake(
+                codec: client,
+                wireBuild: "other.v1",
+                role: SessionPeerRole.unprotected,
+                timeout: 0.1
+            )
+        }
+    }
+
+    @Test func invalidBufferedAcknowledgmentDoesNotHideHelloWriteFailure() throws {
+        var descriptors: [Int32] = [-1, -1]
+        try #require(socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0)
+        defer {
+            Darwin.close(descriptors[0])
+            if descriptors[1] >= 0 {
+                Darwin.close(descriptors[1])
+            }
+        }
+        let server = SessionFrameCodec(descriptor: descriptors[1])
+        try server.write(SessionFrame(
+            kind: .helloAck,
+            flags: .end,
+            payload: Data(#"{"protocol":1}"#.utf8)
+        ))
+        Darwin.close(descriptors[1])
+        descriptors[1] = -1
+        var probe: UInt8 = 0
+        let sent = withUnsafeBytes(of: &probe) {
+            Darwin.send(descriptors[0], $0.baseAddress, $0.count, MSG_NOSIGNAL)
+        }
+        try #require(sent == -1)
+        try #require(errno == EPIPE)
+
+        #expect(throws: SessionTransportError.systemCall(operation: "send", errno: EPIPE)) {
+            _ = try SocketClientCore.handshake(
+                codec: SessionFrameCodec(descriptor: descriptors[0]),
+                wireBuild: "service.v1",
+                role: SessionPeerRole.unprotected,
+                timeout: 0.1
+            )
+        }
+    }
+
+    @Test func silentHandshakePeerHonorsPublicClientDeadline() async throws {
+        let directory = try shortSocketDir()
+        let path = directory.appendingPathComponent("silent.sock").path
+        var address = try #require(makeAddress(path: path))
+        let listener = socket(AF_UNIX, SOCK_STREAM, 0)
+        try #require(listener >= 0)
+        defer {
+            shutdown(listener, SHUT_RDWR)
+            Darwin.close(listener)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        try #require(withServiceAddress(&address) { Darwin.bind(listener, $0, $1) } == 0)
+        try #require(listen(listener, 1) == 0)
+        let accepted = Task {
+            try await DispatchQueue(label: "com.yasyf.daemonkit.tests.silent-peer").performIO {
+                let descriptor = accept(listener, nil, nil)
+                guard descriptor >= 0 else {
+                    throw SessionTransportError.systemCall(operation: "accept", errno: errno)
+                }
+                return descriptor
+            }
+        }
+        let started = ContinuousClock.now
+        await #expect(throws: SessionTransportError.systemCall(operation: "read", errno: EAGAIN)) {
+            _ = try await SocketClient(
+                path: path,
+                wireBuild: "service.v1",
+                role: SessionPeerRole.unprotected,
+                configuration: .init(handshakeTimeout: 0.05)
+            )
+        }
+        #expect(started.duration(to: .now) < .milliseconds(500))
+        let acceptedDescriptor = try await accepted.value
+        Darwin.close(acceptedDescriptor)
+    }
+
     @Test func handshakeCodecRejectsUnknownAndMalformedRejections() throws {
         let unknown = Data(#"{"protocol":1,"wire_build":"service.v1","rejected":true,"code":"later","reason":"no"}"#.utf8)
         let malformed = Data(#"{"protocol":1,"wire_build":"service.v1","rejected":true,"code":"peer_untrusted"}"#.utf8)
