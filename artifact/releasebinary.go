@@ -94,7 +94,7 @@ func (s Store) materializeReleaseBinary(ctx context.Context, desc *Descriptor, e
 	if err != nil {
 		return err
 	}
-	if err := place(entry.Format, tmpPath, stage, stageEntry, decompressionBudget(entry.Size)); err != nil {
+	if err := placeArtifact(ctx, entry, tmpPath, stage, stageEntry); err != nil {
 		return err
 	}
 	if !regular(stageEntry) {
@@ -123,9 +123,12 @@ func (s Store) materializeReleaseBinary(ctx context.Context, desc *Descriptor, e
 	return daemon.SyncDir(shardDir)
 }
 
-func place(format Format, src, stageDir, dst string, maxBytes int64) error {
-	if format != Raw {
-		return extract(format, src, stageDir, maxBytes)
+func placeArtifact(ctx context.Context, entry PlatformEntry, src, stageDir, dst string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if entry.Format != Raw {
+		return extract(ctx, entry.Format, src, stageDir, decompressionBudget(entry.Size))
 	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
 		return fmt.Errorf("artifact: create entry directory: %w", err)

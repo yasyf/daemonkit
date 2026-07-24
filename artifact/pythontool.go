@@ -60,6 +60,13 @@ func installPythonTool(ctx context.Context, uv, dist, version, toolDir, binDir, 
 		_ = os.RemoveAll(toolDir)
 		return fmt.Errorf("artifact: uv tool install %s did not produce its entrypoint: %w", dist, err)
 	}
+	// Fsync the env's file data before the marker, so a crash cannot leave a
+	// durable .installed pointing at a truncated env (the release path SyncDirs
+	// its stage before the rename for the same reason).
+	if err := syncTree(toolDir); err != nil {
+		_ = os.RemoveAll(toolDir)
+		return fmt.Errorf("artifact: sync tool env: %w", err)
+	}
 	if err := daemon.WriteFileDurable(marker, nil, 0o600); err != nil {
 		_ = os.RemoveAll(toolDir)
 		return fmt.Errorf("artifact: mark tool env installed: %w", err)

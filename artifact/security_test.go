@@ -1,6 +1,9 @@
 package artifact
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"net/http"
@@ -8,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -176,11 +180,61 @@ func TestResolveReleaseBinaryHungServerRespectsDeadline(t *testing.T) {
 // #6 — extraction is bounded by a decompression budget.
 func TestExtractTarGzEnforcesBudget(t *testing.T) {
 	src := writeTemp(t, tarGzBytes(t, "tool", make([]byte, 1000)))
-	if err := extractTarGz(src, t.TempDir(), 500); !errors.Is(err, ErrUnsafeArchive) {
+	if err := extractTarGz(context.Background(), src, t.TempDir(), 500); !errors.Is(err, ErrUnsafeArchive) {
 		t.Fatalf("over-budget extract = %v, want ErrUnsafeArchive", err)
 	}
-	if err := extractTarGz(src, t.TempDir(), 2000); err != nil {
+	if err := extractTarGz(context.Background(), src, t.TempDir(), 2000); err != nil {
 		t.Fatalf("within-budget extract = %v", err)
+	}
+}
+
+// F1 — a swarm of tiny entries is rejected by the entry-count bound even though
+// each writes zero bytes.
+func TestExtractTarGzEnforcesEntryCount(t *testing.T) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	for i := 0; i <= maxArchiveEntries; i++ {
+		if err := tw.WriteHeader(&tar.Header{Name: "e" + strconv.Itoa(i), Mode: 0o600, Size: 0, Typeflag: tar.TypeReg}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := errors.Join(tw.Close(), gz.Close()); err != nil {
+		t.Fatal(err)
+	}
+	src := writeTemp(t, buf.Bytes())
+	if err := extractTarGz(context.Background(), src, t.TempDir(), 1<<30); !errors.Is(err, ErrUnsafeArchive) {
+		t.Fatalf("many-entry extract = %v, want ErrUnsafeArchive", err)
+	}
+}
+
+// F1 — a member declaring a huge uncompressed size is rejected before streaming.
+func TestExtractTarGzEnforcesDeclaredSize(t *testing.T) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	// A header that claims far more than it will stream; declared-size admits it
+	// before any bytes are written.
+	if err := tw.WriteHeader(&tar.Header{Name: "big", Mode: 0o600, Size: 1 << 20, Typeflag: tar.TypeReg}); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = tw.Write(make([]byte, 1<<20))
+	if err := errors.Join(tw.Close(), gz.Close()); err != nil {
+		t.Fatal(err)
+	}
+	src := writeTemp(t, buf.Bytes())
+	if err := extractTarGz(context.Background(), src, t.TempDir(), 1000); !errors.Is(err, ErrUnsafeArchive) {
+		t.Fatalf("declared-oversize extract = %v, want ErrUnsafeArchive", err)
+	}
+}
+
+// F1 — a cancelled context stops extraction rather than running under the lock.
+func TestExtractTarGzHonorsContext(t *testing.T) {
+	src := writeTemp(t, tarGzBytes(t, "tool", []byte("hi")))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := extractTarGz(ctx, src, t.TempDir(), 1<<20); !errors.Is(err, context.Canceled) {
+		t.Fatalf("extract with cancelled ctx = %v, want context.Canceled", err)
 	}
 }
 

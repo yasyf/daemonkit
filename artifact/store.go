@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -21,10 +22,11 @@ import (
 
 const materializeLockDeadline = 5 * time.Minute
 
-// defaultDownloadClient fails fast on a server that accepts a connection but
-// stalls, so a hung host cannot hold the per-artifact lock for the whole
-// acquisition window. A slow-but-progressing transfer is still allowed, bounded
-// by the download context.
+// defaultDownloadClient bounds a stalled download so it cannot hold the
+// per-artifact lock indefinitely: a host that accepts a connection but never
+// sends response headers fails in 30s, while a host that sends headers and then
+// drips the body is bounded by the download context (materializeLockDeadline) —
+// so a slow host still holds the lock for that whole window, but never longer.
 var defaultDownloadClient = &http.Client{
 	Transport: &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
@@ -183,6 +185,31 @@ func writeCacheMeta(digestDir, name string, entry PlatformEntry) error {
 		return fmt.Errorf("artifact: encode cache meta: %w", err)
 	}
 	return daemon.WriteFileDurable(filepath.Join(digestDir, "meta.json"), append(data, '\n'), 0o600)
+}
+
+// syncTree fsyncs every file and directory under root, skipping symlinks, so a
+// materialized tree survives a crash before its completion marker or its rename
+// into place. Walking and opening through an os.Root keeps every access inside
+// root even if a component is a symlink.
+func syncTree(root string) error {
+	dir, err := os.OpenRoot(root)
+	if err != nil {
+		return fmt.Errorf("artifact: open tree root: %w", err)
+	}
+	defer dir.Close()
+	return fs.WalkDir(dir.FS(), ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.Type()&fs.ModeSymlink != 0 {
+			return nil
+		}
+		file, err := dir.Open(path)
+		if err != nil {
+			return err
+		}
+		return errors.Join(file.Sync(), file.Close())
+	})
 }
 
 func download(ctx context.Context, client *http.Client, url, token string, dst *os.File) (digest string, size int64, err error) {
