@@ -21,7 +21,7 @@ go: added github.com/yasyf/daemonkit v<version>
 Add the package to your dependencies and link the `DaemonKit` library product into your app or helper target:
 
 ```swift
-.package(url: "https://github.com/yasyf/daemonkit", exact: "0.11.0"),
+.package(url: "https://github.com/yasyf/daemonkit", exact: "0.13.0"),
 ```
 
 </details>
@@ -85,7 +85,7 @@ advancing recovery. The canonical product path is
 state, and locks live under
 `$HOME/Applications/.daemonkit-deployment/<Product>`.
 
-Status: v0.11.0 is the hard-cut release line. Protocol and durable-state epochs
+Status: v0.13.0 is the hard-cut release line. Protocol and durable-state epochs
 begin at 1 with exact equality; the API stabilizes at v1.0.0.
 
 Licensed under [PolyForm-Noncommercial-1.0.0](LICENSE).

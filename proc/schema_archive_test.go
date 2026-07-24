@@ -43,7 +43,7 @@ func storeBackups(t *testing.T, path string) []string {
 func TestFileStoreFailsClosedOnUnsupportedSchemaByDefault(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "workers.db")
 	seed := &FileStore{Path: path}
-	if err := seed.Add(t.Context(), storeRecord(RecoveryTask, 42)); err != nil {
+	if err := seed.Add(t.Context(), storeRecord(RecoveryTaskID, 42)); err != nil {
 		t.Fatal(err)
 	}
 	wedgeSchemaFingerprint(t, path)
@@ -63,7 +63,7 @@ func TestFileStoreFailsClosedOnUnsupportedSchemaByDefault(t *testing.T) {
 func TestFileStoreArchivesUnsupportedSchemaWhenOptedIn(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "workers.db")
 	seed := &FileStore{Path: path}
-	if err := seed.Add(t.Context(), storeRecord(RecoveryTask, 42)); err != nil {
+	if err := seed.Add(t.Context(), storeRecord(RecoveryTaskID, 42)); err != nil {
 		t.Fatal(err)
 	}
 	wedgeSchemaFingerprint(t, path)
@@ -79,7 +79,7 @@ func TestFileStoreArchivesUnsupportedSchemaWhenOptedIn(t *testing.T) {
 	if bak := storeBackups(t, path); len(bak) != 1 {
 		t.Fatalf("archive must leave exactly one .bak, found %v", bak)
 	}
-	if err := store.Add(t.Context(), storeRecord(RecoveryTask, 7)); err != nil {
+	if err := store.Add(t.Context(), storeRecord(RecoveryTaskID, 7)); err != nil {
 		t.Fatalf("Add to fresh store = %v", err)
 	}
 }
@@ -87,7 +87,7 @@ func TestFileStoreArchivesUnsupportedSchemaWhenOptedIn(t *testing.T) {
 func TestFileStoreArchiveIgnoresTransientOpenFailure(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "workers.db")
 	seed := &FileStore{Path: path}
-	if err := seed.Add(t.Context(), storeRecord(RecoveryTask, 42)); err != nil {
+	if err := seed.Add(t.Context(), storeRecord(RecoveryTaskID, 42)); err != nil {
 		t.Fatal(err)
 	}
 	wedgeSchemaFingerprint(t, path)
@@ -118,7 +118,7 @@ func TestFileStoreArchiveIgnoresTransientOpenFailure(t *testing.T) {
 func TestFileStoreArchiveIsSingleFlight(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "workers.db")
 	seed := &FileStore{Path: path}
-	if err := seed.Add(t.Context(), storeRecord(RecoveryTask, 42)); err != nil {
+	if err := seed.Add(t.Context(), storeRecord(RecoveryTaskID, 42)); err != nil {
 		t.Fatal(err)
 	}
 	wedgeSchemaFingerprint(t, path)

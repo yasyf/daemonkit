@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-07-23
+
+### Fixed
+
+- Swift service-client readiness fixtures use a private test operation instead
+  of impersonating protected `daemon.*` authority. Production Swift servers
+  continue to reject every `daemon.*` operation.
+- Schema-archive tests use the typed `RecoveryTaskID` introduced by the runtime
+  recovery hard cut, restoring the Go vet and lint gates.
+
 ## [0.12.0] - 2026-07-23
 
 ### Added
@@ -32,25 +42,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `proc.ArchiveUnsupportedStore` exposes the rename-aside for reuse.
   `service.ControllerConfig.UnsupportedSchema` threads the policy to the
   worker/process-record store.
-
-### Changed
-
-- Also carries the wire and runtime work landed on `main` since the 0.11.0
-  preparation: the authenticated broker socket handoff, explicit peer-role
-  session binding, typed runtime recovery and durable stop replay, sealed
-  spawned sessions, and the lifecycle/workers/trust hard cut.
-
-### Fixed
-
-- The rendered application cask guards its stop hook on the installed binary
-  being executable and removes a binary-less husk left by an aborted upgrade,
-  so `brew upgrade` no longer aborts with exit 127 when Homebrew has already
-  moved the app aside.
-
-## [0.11.0] - 2026-07-23
-
-### Added
-
 - Go `wire.ServiceClient` and Swift `ServiceSocketClient` keep one lazy,
   exact-build session across service startup and replace it across drain,
   listener turnover, and takeover. Typed `runtime_starting` and
@@ -61,11 +52,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The runtime stack hard-cuts to authenticated broker socket handoff, explicit
+  peer-role session binding, typed runtime recovery and durable stop replay,
+  sealed spawned sessions, and composed lifecycle/workers/trust ownership.
 - The application release template pins the shared staging and publication
   actions to their atomic-publication implementations.
 
 ### Fixed
 
+- The rendered application cask guards its stop hook on the installed binary
+  being executable and removes a binary-less husk left by an aborted upgrade,
+  so `brew upgrade` no longer aborts with exit 127 when Homebrew has already
+  moved the app aside.
 - Graceful wire shutdown waits for an interrupted whole-frame write to settle,
   so admission cannot close ahead of a completed response during GoAway.
 - LaunchAgent convergence enables the exact loaded job before bootstrap or
@@ -332,9 +330,9 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.12.0...HEAD
-[0.12.0]: https://github.com/yasyf/daemonkit/compare/v0.11.0...v0.12.0
-[0.11.0]: https://github.com/yasyf/daemonkit/compare/v0.10.0...v0.11.0
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/yasyf/daemonkit/compare/v0.12.0...v0.13.0
+[0.12.0]: https://github.com/yasyf/daemonkit/compare/v0.10.0...v0.12.0
 [0.10.0]: https://github.com/yasyf/daemonkit/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/yasyf/daemonkit/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/yasyf/daemonkit/compare/v0.8.0...v0.8.1
