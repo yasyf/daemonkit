@@ -635,10 +635,35 @@ extension SocketServer {
                 maximumFrameBytes: self.configuration.maximumFrameBytes,
                 writeTimeout: self.configuration.writeTimeout
             )
+            let hello = try codec.read(timeout: self.configuration.handshakeTimeout)
+            guard hello.kind == .hello, hello.flags == .end, hello.id == 0,
+                  hello.sequence == 0, hello.operation.isEmpty, hello.tenant.isEmpty
+            else {
+                throw SessionTransportError.handshake("invalid hello")
+            }
+            let identity = try SessionHandshakeCodec.decodeHello(hello.payload)
+            guard identity.protocolVersion == daemonKitSessionProtocolVersion else {
+                throw SessionTransportError.unsupportedProtocolVersion(identity.protocolVersion)
+            }
+            guard !identity.wireBuild.isEmpty else {
+                throw SessionTransportError.handshake("empty wireBuild")
+            }
+            guard !identity.role.isEmpty else {
+                throw SessionTransportError.handshake("empty role")
+            }
+            let rejection: (SocketResponseCode, String) = if code == .peerUntrusted {
+                (code, reason)
+            } else if let sessionPolicy = self.sessionPolicy, identity.role != sessionPolicy.role {
+                (.permissionDenied, "wire: peer role does not match service role")
+            } else if identity.wireBuild != self.wireBuild {
+                (.buildMismatch, "wire: client build does not match server build")
+            } else {
+                (code, reason)
+            }
             let payload = try SessionHandshakeCodec.encodeRejection(
                 wireBuild: self.wireBuild,
-                code: code,
-                reason: reason
+                code: rejection.0,
+                reason: rejection.1
             )
             try codec.write(SessionFrame(kind: .helloAck, flags: .end, payload: payload))
         }
