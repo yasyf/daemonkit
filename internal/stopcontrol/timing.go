@@ -9,9 +9,13 @@ import "time"
 // observation ceiling. Durable arming privately reserves one additional
 // AuthorityBound and never releases a child unless this full window remains.
 const (
-	IdentityBound        time.Duration = 5 * time.Second
-	AuthorityBound       time.Duration = 5 * time.Second
-	ChildSettlementBound time.Duration = 30 * time.Second
-	ParentOperationBound time.Duration = 35 * time.Second
-	PollInterval         time.Duration = 25 * time.Millisecond
+	IdentityBound          time.Duration = 5 * time.Second
+	TrackBound             time.Duration = 5 * time.Second
+	AuthorityBound         time.Duration = 5 * time.Second
+	ChildSettlementBound   time.Duration = 30 * time.Second
+	ParentSettlementMargin time.Duration = 5 * time.Second
+	ParentOperationBound                 = ChildSettlementBound + ParentSettlementMargin
+	DeferredUntrackBound   time.Duration = 5 * time.Second
+	TotalBound                           = IdentityBound + TrackBound + ParentOperationBound + DeferredUntrackBound
+	PollInterval           time.Duration = 25 * time.Millisecond
 )

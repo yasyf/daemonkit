@@ -136,6 +136,21 @@ func TestStopAuthorityFullWindowBoundaryIsStrict(t *testing.T) {
 	}
 }
 
+func TestStandardStopBudgetDerivesExactTotal(t *testing.T) {
+	budget := StandardStopBudget()
+	if budget.IdentityReport != 5*time.Second || budget.DurableTrack != 5*time.Second ||
+		budget.ChildSettlement != 30*time.Second || budget.ParentMargin != 5*time.Second ||
+		budget.DeferredUntrack != 5*time.Second {
+		t.Fatalf("standard stop budget = %+v", budget)
+	}
+	if budget.ChildOperation() != 35*time.Second {
+		t.Fatalf("child operation = %v, want 35s", budget.ChildOperation())
+	}
+	if budget.Total() != 50*time.Second {
+		t.Fatalf("total = %v, want 50s", budget.Total())
+	}
+}
+
 func TestStopControlHelperProcess(_ *testing.T) {
 	mode := os.Getenv(stopControlHelperMode)
 	if mode == "" {
@@ -213,7 +228,7 @@ func TestStopRuntimeBoundsAndReapsWedgedChildPhases(t *testing.T) {
 			if err == nil {
 				t.Fatal("StopRuntime accepted a wedged helper")
 			}
-			if elapsed := time.Since(started); elapsed > stopChildSettleBound+time.Second {
+			if elapsed := time.Since(started); elapsed > StandardStopBudget().ParentMargin+time.Second {
 				t.Fatalf("StopRuntime took %v, exceeded hard settlement bound", elapsed)
 			}
 			records, loadErr := store.Load(t.Context())
@@ -224,6 +239,117 @@ func TestStopRuntimeBoundsAndReapsWedgedChildPhases(t *testing.T) {
 				t.Fatalf("settled helper records = %+v, want none", records)
 			}
 		})
+	}
+}
+
+func TestStopRuntimeEnforcesInternalOperationBoundAndUntracks(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	executable, err = filepath.EvalSymlinks(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(stopControlHelperMode, "after-release")
+	generation, err := proc.ProcessGeneration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &proc.FileStore{Path: filepath.Join(t.TempDir(), "workers.db")}
+	controller := &Controller{
+		stopReaper: &proc.Reaper{Store: store, Generation: generation},
+		stopTiming: stopControlTiming{
+			identity: time.Second, track: time.Second, authority: time.Second,
+			child: 50 * time.Millisecond, parentMargin: time.Second, untrack: 500 * time.Millisecond,
+		},
+	}
+	started := time.Now()
+	_, err = controller.StopRuntime(context.Background(), StopControlSpec{
+		Executable: executable,
+		Args:       []string{"-test.run=^TestStopControlHelperProcess$"},
+		Role:       "com.example.stop", RuntimeBuild: "v2.0.0", RuntimeProtocol: 1,
+		TargetProcessGeneration: "runtime-generation", Intent: wire.StopIntentRestart,
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("StopRuntime error = %v, want deadline exceeded", err)
+	}
+	elapsed := time.Since(started)
+	if elapsed < 50*time.Millisecond || elapsed > 2*time.Second {
+		t.Fatalf("StopRuntime elapsed = %v, want internal bounded failure", elapsed)
+	}
+	records, loadErr := store.Load(t.Context())
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if len(records) != 0 {
+		t.Fatalf("records after internal timeout = %+v, want none", records)
+	}
+}
+
+func TestStopRuntimeCancellationSettlesAndUntracksBeforeReturn(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	executable, err = filepath.EvalSymlinks(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(stopControlHelperMode, "after-release")
+	releaseMarker := filepath.Join(t.TempDir(), "released")
+	t.Setenv(stopControlHelperReleaseMarker, releaseMarker)
+	generation, err := proc.ProcessGeneration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &proc.FileStore{Path: filepath.Join(t.TempDir(), "workers.db")}
+	controller := &Controller{stopReaper: &proc.Reaper{Store: store, Generation: generation}}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, stopErr := controller.StopRuntime(ctx, StopControlSpec{
+			Executable: executable,
+			Args:       []string{"-test.run=^TestStopControlHelperProcess$"},
+			Role:       "com.example.stop", RuntimeBuild: "v2.0.0", RuntimeProtocol: 1,
+			TargetProcessGeneration: "runtime-generation", Intent: wire.StopIntentRestart,
+		})
+		result <- stopErr
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, statErr := os.Stat(releaseMarker); statErr == nil {
+			break
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatal(statErr)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stop child was not released")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	records, err := store.Load(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("records before cancellation = %+v, want one", records)
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("StopRuntime error = %v, want canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("StopRuntime did not settle after cancellation")
+	}
+	records, err = store.Load(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("records after cancellation return = %+v, want none", records)
 	}
 }
 
@@ -246,7 +372,7 @@ func TestStopRuntimeSeparatesAuthorityExpiryFromOperationSettlement(t *testing.T
 	t.Setenv(stopControlHelperReleaseMarker, releaseMarker)
 	controller := &Controller{
 		stopReaper: &proc.Reaper{Store: store, Generation: generation},
-		stopTiming: stopControlTiming{identity: 5 * time.Second, authority: 250 * time.Millisecond, operation: 5 * time.Second},
+		stopTiming: stopControlTiming{identity: 5 * time.Second, authority: 250 * time.Millisecond},
 	}
 	result, err := controller.StopRuntime(t.Context(), StopControlSpec{
 		Executable: executable,
@@ -287,7 +413,7 @@ func TestStopRuntimeRevokesWithoutReleaseWhenFullAuthorityWindowWasConsumed(t *t
 	controller := &Controller{
 		stopReaper: &proc.Reaper{Store: store, Generation: generation},
 		stopTiming: stopControlTiming{
-			identity: 5 * time.Second, authority: 50 * time.Millisecond, operation: 5 * time.Second,
+			identity: 5 * time.Second, authority: 50 * time.Millisecond,
 			now: func() time.Time { return time.Now().Add(time.Second) },
 			afterRevoke: func() {
 				close(revoked)

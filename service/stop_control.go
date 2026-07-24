@@ -24,31 +24,71 @@ const (
 	stopControlFrameLimit   = 16 << 10
 	stopChildKillGrace      = 500 * time.Millisecond
 	stopChildTerminateBound = 3 * time.Second
-	stopChildSettleBound    = 5 * time.Second
 )
 
 type stopControlTiming struct {
-	identity    time.Duration
-	authority   time.Duration
-	operation   time.Duration
-	now         func() time.Time
-	afterRevoke func()
+	identity     time.Duration
+	track        time.Duration
+	authority    time.Duration
+	child        time.Duration
+	parentMargin time.Duration
+	untrack      time.Duration
+	now          func() time.Time
+	afterRevoke  func()
 }
 
 func (t stopControlTiming) withDefaults() stopControlTiming {
+	budget := StandardStopBudget()
 	if t.identity == 0 {
-		t.identity = stopcontract.IdentityBound
+		t.identity = budget.IdentityReport
+	}
+	if t.track == 0 {
+		t.track = budget.DurableTrack
 	}
 	if t.authority == 0 {
 		t.authority = stopcontract.AuthorityBound
 	}
-	if t.operation == 0 {
-		t.operation = stopcontract.ParentOperationBound
+	if t.child == 0 {
+		t.child = budget.ChildSettlement
+	}
+	if t.parentMargin == 0 {
+		t.parentMargin = budget.ParentMargin
+	}
+	if t.untrack == 0 {
+		t.untrack = budget.DeferredUntrack
 	}
 	if t.now == nil {
 		t.now = time.Now
 	}
 	return t
+}
+
+// StopBudget exposes the controller-owned bounds for one complete runtime stop.
+type StopBudget struct {
+	IdentityReport  time.Duration
+	DurableTrack    time.Duration
+	ChildSettlement time.Duration
+	ParentMargin    time.Duration
+	DeferredUntrack time.Duration
+}
+
+// StandardStopBudget returns the fixed runtime stop budget enforced by Controller.
+func StandardStopBudget() StopBudget {
+	return StopBudget{
+		IdentityReport:  stopcontract.IdentityBound,
+		DurableTrack:    stopcontract.TrackBound,
+		ChildSettlement: stopcontract.ChildSettlementBound,
+		ParentMargin:    stopcontract.ParentSettlementMargin,
+		DeferredUntrack: stopcontract.DeferredUntrackBound,
+	}
+}
+
+// ChildOperation returns the child settlement bound plus the parent settlement margin.
+func (b StopBudget) ChildOperation() time.Duration { return b.ChildSettlement + b.ParentMargin }
+
+// Total returns the complete sequential stop bound.
+func (b StopBudget) Total() time.Duration {
+	return b.IdentityReport + b.DurableTrack + b.ChildOperation() + b.DeferredUntrack
 }
 
 // ErrStopDeclined means the exact target remained live because an upgrade
@@ -133,11 +173,18 @@ func (c *Controller) StopRuntime(
 	var identity proc.Identity
 	var tracked *proc.Record
 	settled := false
+	var operationDeadline time.Time
 	defer func() {
 		if !settled {
 			_ = reportReader.Close()
 			_ = releaseWriter.Close()
-			cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(opCtx), stopChildSettleBound)
+			cleanupParent := context.WithoutCancel(opCtx)
+			if !operationDeadline.IsZero() {
+				var cancelDeadline context.CancelFunc
+				cleanupParent, cancelDeadline = context.WithDeadline(cleanupParent, operationDeadline)
+				defer cancelDeadline()
+			}
+			cleanupCtx, cancelCleanup := context.WithTimeout(cleanupParent, timing.parentMargin)
 			defer cancelCleanup()
 			var terminateErr error
 			if identity.PID == cmd.Process.Pid {
@@ -162,7 +209,7 @@ func (c *Controller) StopRuntime(
 			}
 		}
 		if settled && tracked != nil {
-			untrackCtx, cancelUntrack := context.WithTimeout(context.WithoutCancel(opCtx), stopChildSettleBound)
+			untrackCtx, cancelUntrack := context.WithTimeout(context.WithoutCancel(opCtx), timing.untrack)
 			defer cancelUntrack()
 			if err := c.stopReaper.Untrack(untrackCtx, *tracked); err != nil {
 				returnErr = errors.Join(returnErr, err)
@@ -183,7 +230,7 @@ func (c *Controller) StopRuntime(
 	if identity.PID != cmd.Process.Pid || identity.Executable != roleTarget {
 		return wire.StopResult{}, errors.New("service: stop child reported another process identity")
 	}
-	authorityCtx, cancelAuthority := context.WithTimeout(opCtx, timing.identity)
+	authorityCtx, cancelAuthority := context.WithTimeout(opCtx, timing.track)
 	record, err := c.stopReaper.TrackStopControl(
 		authorityCtx, identity, spec.Role, spec.RuntimeBuild, spec.RuntimeProtocol,
 		spec.TargetProcessGeneration, string(spec.Intent), timing.authority,
@@ -214,10 +261,13 @@ func (c *Controller) StopRuntime(
 	}
 	_ = releaseWriter.Close()
 
-	operationCtx, cancelOperation := context.WithTimeout(opCtx, timing.operation)
+	operationDeadline = time.Now().Add(timing.child + timing.parentMargin)
+	operationCtx, cancelOperation := context.WithDeadline(opCtx, operationDeadline)
 	defer cancelOperation()
+	childCtx, cancelChild := context.WithTimeout(operationCtx, timing.child)
+	defer cancelChild()
 	var report stopChildResult
-	if err := readStopFrame(operationCtx, reports, &report); err != nil {
+	if err := readStopFrame(childCtx, reports, &report); err != nil {
 		return wire.StopResult{}, fmt.Errorf("service: read stop result: %w", err)
 	}
 	var childWaitErr error
