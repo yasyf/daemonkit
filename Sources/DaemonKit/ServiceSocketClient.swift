@@ -321,12 +321,22 @@ public actor ServiceSocketClient {
             try checkBound(deadline, progress: progress)
             do {
                 let current = try await session(deadline: effectiveDeadline(deadline, progress: progress))
-                let receipt = try await current.1.acquireRuntimeReceipt(
-                    expectedRuntimeBuild: expectedRuntimeBuild,
-                    deadline: effectiveDeadline(deadline, progress: progress)
-                )
-                guard generation?.id == current.0.id else { throw Transition.reconnect }
-                generationReceipt = (current.0.id, receipt)
+                let receipt: RuntimeProcessReceipt
+                if let cached = generationReceipt, cached.id == current.0.id {
+                    guard cached.receipt.runtimeIdentity.runtimeBuild == expectedRuntimeBuild else {
+                        throw RuntimeReadinessValidationError.invalidResponse(
+                            "runtime receipt build mismatch"
+                        )
+                    }
+                    receipt = cached.receipt
+                } else {
+                    receipt = try await current.1.acquireRuntimeReceipt(
+                        expectedRuntimeBuild: expectedRuntimeBuild,
+                        deadline: effectiveDeadline(deadline, progress: progress)
+                    )
+                    guard generation?.id == current.0.id else { throw Transition.reconnect }
+                    generationReceipt = (current.0.id, receipt)
+                }
                 progress.pin(receipt.runtimeIdentity)
                 let request = ServiceSocketCall(
                     operation: runtimeReadinessSubscribeOperation,

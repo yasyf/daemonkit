@@ -445,6 +445,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
 
     @Test func brokerHandoffTerminalResponseCannotOutliveFixedDeadline() async throws {
         let identity = RuntimeIdentity(runtimeBuild: "app.v1", processGeneration: "boot-1")
+        let responseGate = ServiceWriteGate()
         try await withRawServicePeers(count: 1) { _, codec in
             let receipt = try nextRequest(codec)
             guard receipt.operation == runtimeReceiptOperation else {
@@ -465,12 +466,17 @@ extension SocketTransportTests.ServiceSocketClientTests {
             guard handoff.operation == brokerHandoffOperation else {
                 throw SessionTransportError.invalidFrame("expected broker handoff request")
             }
-            usleep(100_000)
+            responseGate.block()
         } operation: { path in
+            defer { responseGate.unblock() }
             let client = try ServiceSocketClient(
                 path: path,
                 wireBuild: "service.v1",
                 noProgressTimeout: 1
+            )
+            _ = try await client.acquireReadyRuntime(
+                expectedRuntimeBuild: "app.v1",
+                deadline: Date().addingTimeInterval(1)
             )
             var connected: [Int32] = [-1, -1]
             try #require(socketpair(AF_UNIX, SOCK_STREAM, 0, &connected) == 0)
