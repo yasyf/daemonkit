@@ -295,6 +295,123 @@ func (c *Controller) retireActiveApply(ctx context.Context, receipt *applyReceip
 	return errors.Join(removeTreeDurable(paths.prior), removeIfExistsDurable(paths.apply))
 }
 
+func (c *Controller) recoverApplyForDeactivation(
+	ctx context.Context,
+	config DeactivateCurrentInstalledConfig,
+	paths deploymentPaths,
+) error {
+	receipt, err := readApply(paths.apply)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	switch receipt.Phase {
+	case applyActive:
+		return c.retireActiveApply(ctx, receipt, paths)
+	case applyRolledBack:
+		return c.retireRolledBackApply(ctx, receipt, paths)
+	case applyPrepared:
+		if err := c.discardApplyCandidate(ctx, receipt, paths); err != nil {
+			return err
+		}
+		return removeIfExistsDurable(paths.apply)
+	case applyQuiesced:
+		if receipt.Prior == nil && !fileExists(paths.canonical) {
+			if err := c.discardApplyCandidate(ctx, receipt, paths); err != nil {
+				return err
+			}
+			return removeIfExistsDurable(paths.apply)
+		}
+		if receipt.Prior != nil && !fileExists(paths.prior) {
+			current, err := inspectInstalled(ctx, c.verifier, paths.canonical, receipt.Prior.Generation.Version, codeidentity.CodeIdentity{
+				TeamID: receipt.Prior.Generation.TeamID, SigningIdentifier: receipt.Prior.Generation.SigningIdentifier,
+			})
+			if err != nil || !sameGenerationBytes(current, receipt.Prior.Generation) {
+				return fmt.Errorf("%w: quiesced prior generation changed", ErrInstallConflict)
+			}
+			if err := c.discardApplyCandidate(ctx, receipt, paths); err != nil {
+				return err
+			}
+			return removeIfExistsDurable(paths.apply)
+		}
+	case applySwapped, applyRollback:
+	}
+
+	plan, err := restorePlan(receipt.Plan)
+	if err != nil {
+		return err
+	}
+	policy, err := ParseSHA256(receipt.PolicyDigest)
+	if err != nil {
+		return err
+	}
+	digest, err := ParseSHA256(receipt.Candidate.BundleDigest)
+	if err != nil {
+		return err
+	}
+	rollbackConfig := ApplyInstalledCandidateConfig{
+		Target: config.Current, CandidateVersion: receipt.Candidate.Version, CandidateBundleDigest: digest,
+		ConsumerBuild: receipt.ConsumerBuild, PolicyDigest: policy, Plan: plan,
+		RuntimeQuiesce: config.RuntimeQuiesce, Readiness: config.Readiness,
+	}
+	if receipt.Phase != applyRollback {
+		receipt.Phase = applyRollback
+		if err := writeJSONDurable(paths.apply, receipt); err != nil {
+			return err
+		}
+		if err := c.applyCheckpoint("apply:rollback"); err != nil {
+			return err
+		}
+	}
+	if err := c.rollbackApply(ctx, rollbackConfig, receipt, paths, mustInstalledCandidatePath(paths.canonical)); err != nil {
+		return err
+	}
+	return c.retireRolledBackApply(ctx, receipt, paths)
+}
+
+func (c *Controller) retireRolledBackApply(ctx context.Context, receipt *applyReceiptWire, paths deploymentPaths) error {
+	if receipt.Prior != nil {
+		activation, err := readActivation(paths.activation)
+		if err != nil || activation.OperationID != receipt.RollbackOperation || activation.Phase != activationActive {
+			return fmt.Errorf("%w: rolled-back apply lacks its exact prior activation", ErrInstallState)
+		}
+		current, err := inspectInstalled(ctx, c.verifier, paths.canonical, receipt.Prior.Generation.Version, codeidentity.CodeIdentity{
+			TeamID: receipt.Prior.Generation.TeamID, SigningIdentifier: receipt.Prior.Generation.SigningIdentifier,
+		})
+		if err != nil || !sameGenerationBytes(current, receipt.Prior.Generation) {
+			return fmt.Errorf("%w: rolled-back prior generation changed", ErrInstallConflict)
+		}
+	}
+	if err := c.discardApplyCandidate(ctx, receipt, paths); err != nil {
+		return err
+	}
+	return errors.Join(removeTreeDurable(paths.prior), removeIfExistsDurable(paths.apply))
+}
+
+func (c *Controller) discardApplyCandidate(ctx context.Context, receipt *applyReceiptWire, paths deploymentPaths) error {
+	candidatePath := mustInstalledCandidatePath(paths.canonical)
+	if !fileExists(candidatePath) {
+		return nil
+	}
+	candidate, err := inspectInstalled(ctx, c.verifier, candidatePath, receipt.Candidate.Version, codeidentity.CodeIdentity{
+		TeamID: receipt.Candidate.TeamID, SigningIdentifier: receipt.Candidate.SigningIdentifier,
+	})
+	if err != nil || !sameGenerationBytes(candidate, receipt.Candidate) {
+		return fmt.Errorf("%w: private candidate changed", ErrInstallConflict)
+	}
+	return removeTreeDurable(candidatePath)
+}
+
+func mustInstalledCandidatePath(appPath string) string {
+	path, err := installedCandidatePath(appPath)
+	if err != nil {
+		panic(err)
+	}
+	return path
+}
+
 func (c *Controller) prepareApply(
 	ctx context.Context,
 	config ApplyInstalledCandidateConfig,
@@ -330,6 +447,9 @@ func (c *Controller) prepareApply(
 	operationID, err := c.operationID()
 	if err != nil {
 		return nil, err
+	}
+	if !validOperationID(operationID) {
+		return nil, errors.New("deployment: operation ID source returned a noncanonical value")
 	}
 	receipt := &applyReceiptWire{
 		Identity: applyIdentity, Schema: activationSchema, OperationID: operationID,
@@ -419,19 +539,41 @@ func (c *Controller) rollbackApply(
 	paths deploymentPaths,
 	candidatePath string,
 ) error {
+	priorActive := false
 	if activation, err := readActivation(paths.activation); err == nil {
-		if receipt.ActivationOperation != "" && activation.OperationID != receipt.ActivationOperation {
-			return fmt.Errorf("%w: rollback activation differs from apply", ErrInstallConflict)
-		}
-		if _, err := c.deactivateCurrentLocked(ctx, DeactivateCurrentInstalledConfig{
-			Current: config.Target, RuntimeQuiesce: config.RuntimeQuiesce,
-		}, paths); err != nil {
-			return err
+		switch {
+		case sameGenerationBytes(activation.Generation, receipt.Candidate):
+			if receipt.ActivationOperation != "" && activation.OperationID != receipt.ActivationOperation {
+				return fmt.Errorf("%w: rollback activation differs from apply", ErrInstallConflict)
+			}
+			if _, err := c.deactivateCurrentLocked(ctx, DeactivateCurrentInstalledConfig{
+				Current: config.Target, RuntimeQuiesce: config.RuntimeQuiesce,
+			}, paths); err != nil {
+				return err
+			}
+		case receipt.Prior != nil && sameGenerationBytes(activation.Generation, receipt.Prior.Generation):
+			if receipt.RollbackOperation != "" && activation.OperationID != receipt.RollbackOperation {
+				return fmt.Errorf("%w: rollback prior activation differs from receipt", ErrInstallConflict)
+			}
+			receipt.RollbackOperation = activation.OperationID
+			priorActive = true
+		default:
+			return fmt.Errorf("%w: rollback found an unrelated activation", ErrInstallConflict)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if fileExists(paths.canonical) && (receipt.Prior == nil || fileExists(paths.prior)) {
+	priorRestored := false
+	if receipt.Prior != nil && !fileExists(paths.prior) && fileExists(paths.canonical) {
+		current, err := inspectInstalled(ctx, c.verifier, paths.canonical, receipt.Prior.Generation.Version, codeidentity.CodeIdentity{
+			TeamID: receipt.Prior.Generation.TeamID, SigningIdentifier: receipt.Prior.Generation.SigningIdentifier,
+		})
+		priorRestored = err == nil && sameGenerationBytes(current, receipt.Prior.Generation)
+		if !priorRestored {
+			return fmt.Errorf("%w: rollback canonical generation is not the prior app", ErrInstallConflict)
+		}
+	}
+	if !priorRestored && fileExists(paths.canonical) && (receipt.Prior == nil || fileExists(paths.prior)) {
 		if fileExists(candidatePath) {
 			return fmt.Errorf("%w: candidate occupied during rollback", ErrInstallConflict)
 		}
@@ -443,43 +585,47 @@ func (c *Controller) rollbackApply(
 		}
 	}
 	if receipt.Prior != nil {
-		if !fileExists(paths.prior) || fileExists(paths.canonical) {
-			return fmt.Errorf("%w: rollback prior generation is unavailable", ErrInstallState)
-		}
-		if err := os.Rename(paths.prior, paths.canonical); err != nil {
-			return err
-		}
-		if err := daemon.SyncDir(filepath.Dir(paths.canonical)); err != nil {
-			return err
-		}
-		if err := c.applyCheckpoint("apply:rollback_swapped"); err != nil {
-			return err
+		if !priorRestored {
+			if !fileExists(paths.prior) || fileExists(paths.canonical) {
+				return fmt.Errorf("%w: rollback prior generation is unavailable", ErrInstallState)
+			}
+			if err := os.Rename(paths.prior, paths.canonical); err != nil {
+				return err
+			}
+			if err := daemon.SyncDir(filepath.Dir(paths.canonical)); err != nil {
+				return err
+			}
+			if err := c.applyCheckpoint("apply:rollback_swapped"); err != nil {
+				return err
+			}
 		}
 		prior := receipt.Prior
 		if err := c.attestStoredGeneration(ctx, prior.Generation); err != nil {
 			return err
 		}
-		plan, err := restorePlan(prior.Plan)
-		if err != nil {
-			return err
+		if !priorActive {
+			plan, err := restorePlan(prior.Plan)
+			if err != nil {
+				return err
+			}
+			policy, err := ParseSHA256(prior.PolicyDigest)
+			if err != nil {
+				return err
+			}
+			activationConfig := ActivateInstalledConfig{
+				Expected: InstalledAttestation{stored: prior.Generation}, ConsumerBuild: prior.ConsumerBuild,
+				PolicyDigest: policy, Plan: plan, Readiness: config.Readiness,
+			}
+			validated, err := validateActivateConfig(activationConfig)
+			if err != nil {
+				return err
+			}
+			active, err := c.activateLocked(ctx, activationConfig, validated, paths)
+			if err != nil {
+				return err
+			}
+			receipt.RollbackOperation = active.OperationID()
 		}
-		policy, err := ParseSHA256(prior.PolicyDigest)
-		if err != nil {
-			return err
-		}
-		activationConfig := ActivateInstalledConfig{
-			Expected: InstalledAttestation{stored: prior.Generation}, ConsumerBuild: prior.ConsumerBuild,
-			PolicyDigest: policy, Plan: plan, Readiness: config.Readiness,
-		}
-		validated, err := validateActivateConfig(activationConfig)
-		if err != nil {
-			return err
-		}
-		active, err := c.activateLocked(ctx, activationConfig, validated, paths)
-		if err != nil {
-			return err
-		}
-		receipt.RollbackOperation = active.OperationID()
 	}
 	receipt.Phase = applyRolledBack
 	if err := writeJSONDurable(paths.apply, receipt); err != nil {

@@ -50,6 +50,7 @@ type ActivateInstalledConfig struct {
 type DeactivateCurrentInstalledConfig struct {
 	Current        CurrentInstalledSpec
 	RuntimeQuiesce func(context.Context, RuntimeStopper, DeactivateInstalledOperation) (RuntimeProof, error)
+	Readiness      func(context.Context, InstalledOperation) (ReadinessProof, error)
 }
 
 // InstalledAttestation is one exact attested app generation.
@@ -525,7 +526,7 @@ func (c *Controller) DeactivateCurrentInstalled(ctx context.Context, config Deac
 	if err := validateCurrentInstalledSpec(config.Current); err != nil {
 		return DeactivationReceipt{}, err
 	}
-	if config.RuntimeQuiesce == nil || c == nil || c.verifier == nil || c.openService == nil || c.operationID == nil {
+	if config.RuntimeQuiesce == nil || config.Readiness == nil || c == nil || c.verifier == nil || c.openService == nil || c.operationID == nil {
 		return DeactivationReceipt{}, ErrInvalidConfig
 	}
 	paths := deploymentPathsForApp(config.Current.AppPath)
@@ -537,6 +538,9 @@ func (c *Controller) DeactivateCurrentInstalled(ctx context.Context, config Deac
 		return DeactivationReceipt{}, err
 	}
 	defer lock.Close()
+	if err := c.recoverApplyForDeactivation(ctx, config, paths); err != nil {
+		return DeactivationReceipt{}, err
+	}
 	receipt, err := c.deactivateCurrentLocked(ctx, config, paths)
 	if err != nil {
 		return DeactivationReceipt{}, err
@@ -552,8 +556,9 @@ func (c *Controller) DeactivateCurrentInstalled(ctx context.Context, config Deac
 }
 
 func validateCurrentInstalledSpec(spec CurrentInstalledSpec) error {
-	if err := validateCanonicalAppPath(spec.AppPath); err != nil {
-		return err
+	if spec.AppPath == "" || !filepath.IsAbs(spec.AppPath) || filepath.Clean(spec.AppPath) != spec.AppPath ||
+		!strings.HasSuffix(filepath.Base(spec.AppPath), ".app") || filepath.Base(spec.AppPath) == ".app" {
+		return fmt.Errorf("%w: current app path must be exact", ErrInvalidConfig)
 	}
 	if _, err := spec.Identity.DRString(); err != nil {
 		return fmt.Errorf("%w: current code identity: %w", ErrInvalidConfig, err)

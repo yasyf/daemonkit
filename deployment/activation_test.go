@@ -301,7 +301,8 @@ func TestActivationStateRejectsLegacyShortOperationID(t *testing.T) {
 func TestDeactivateCurrentInstalledUsesSealedActivationAndEnforcesUpgradeOrder(t *testing.T) {
 	fixture := newActivationFixture(t)
 	deactivate := DeactivateCurrentInstalledConfig{
-		Current: CurrentInstalledSpec{AppPath: fixture.appPath, Identity: fixture.spec.Identity},
+		Current:   CurrentInstalledSpec{AppPath: fixture.appPath, Identity: fixture.spec.Identity},
+		Readiness: fixture.config.Readiness,
 		RuntimeQuiesce: func(context.Context, RuntimeStopper, DeactivateInstalledOperation) (RuntimeProof, error) {
 			return NewRuntimeProof(true, proc.OwnerGeneration{}, SHA256{8})
 		},

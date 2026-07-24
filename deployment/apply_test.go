@@ -66,6 +66,84 @@ func TestApplyInstalledCandidateUpgradeAndRollbackReactivation(t *testing.T) {
 	}
 }
 
+func TestApplyInstalledCandidateRecoversEveryRollbackCheckpoint(t *testing.T) {
+	for _, point := range []string{"apply:rollback", "apply:rollback_swapped", "apply:rolled_back"} {
+		t.Run(point, func(t *testing.T) {
+			fixture := newActivationFixture(t)
+			if _, err := fixture.controller.ActivateInstalled(t.Context(), fixture.config); err != nil {
+				t.Fatal(err)
+			}
+			config := newApplyConfig(t, fixture, "2.0.0", true)
+			config.Readiness = rollbackReadiness
+			failed := false
+			fixture.controller.failpoint = func(got string) error {
+				if got == point && !failed {
+					failed = true
+					return errors.New("simulated rollback process death")
+				}
+				return nil
+			}
+			if _, err := fixture.controller.ApplyInstalledCandidate(t.Context(), config); err == nil {
+				t.Fatal("simulated rollback process death was not returned")
+			}
+			fixture.controller.failpoint = nil
+			if _, err := fixture.controller.ApplyInstalledCandidate(t.Context(), config); err == nil {
+				t.Fatal("rolled-back apply replay unexpectedly succeeded")
+			}
+			active, err := readActivation(deploymentPathsForApp(fixture.appPath).activation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if active.Generation.Version != "1.0.0" {
+				t.Fatalf("rollback recovered version = %q", active.Generation.Version)
+			}
+		})
+	}
+}
+
+func TestDeactivateCurrentInstalledRecoversEveryPendingApplyPhase(t *testing.T) {
+	for _, point := range []string{
+		"apply:prepared", "apply:quiesced", "apply:prior_moved", "apply:candidate_moved", "apply:swapped", "apply:active",
+	} {
+		t.Run(point, func(t *testing.T) {
+			fixture := newActivationFixture(t)
+			if _, err := fixture.controller.ActivateInstalled(t.Context(), fixture.config); err != nil {
+				t.Fatal(err)
+			}
+			apply := newApplyConfig(t, fixture, "2.0.0", true)
+			failed := false
+			fixture.controller.failpoint = func(got string) error {
+				if got == point && !failed {
+					failed = true
+					return errors.New("simulated process death")
+				}
+				return nil
+			}
+			if _, err := fixture.controller.ApplyInstalledCandidate(t.Context(), apply); err == nil {
+				t.Fatal("simulated process death was not returned")
+			}
+			fixture.controller.failpoint = nil
+			deactivate := DeactivateCurrentInstalledConfig{
+				Current: apply.Target, RuntimeQuiesce: apply.RuntimeQuiesce, Readiness: apply.Readiness,
+			}
+			if _, err := fixture.controller.DeactivateCurrentInstalled(t.Context(), deactivate); err != nil {
+				t.Fatal(err)
+			}
+			paths := deploymentPathsForApp(fixture.appPath)
+			if fileExists(paths.apply) || fileExists(paths.activation) || fileExists(mustCandidatePath(t, fixture.appPath)) {
+				t.Fatal("deactivation retained apply, activation, or candidate state")
+			}
+			want := "1.0.0"
+			if point == "apply:active" {
+				want = "2.0.0"
+			}
+			if got, err := bundleVersion(fixture.appPath); err != nil || got != want {
+				t.Fatalf("inactive installed version = %q, %v; want %q", got, err, want)
+			}
+		})
+	}
+}
+
 func TestApplyInstalledCandidateRecoversEveryForwardCheckpoint(t *testing.T) {
 	for _, point := range []string{
 		"apply:prepared", "apply:quiesced", "apply:candidate_moved", "apply:swapped", "apply:active",
@@ -211,6 +289,13 @@ func newApplyConfig(t *testing.T, fixture *activationFixture, version string, pr
 			return NewReadinessProof("runtime-"+operation.Generation().Version(), proc.OwnerGeneration{2}, SHA256{6})
 		},
 	}
+}
+
+func rollbackReadiness(_ context.Context, operation InstalledOperation) (ReadinessProof, error) {
+	if operation.Generation().Version() == "2.0.0" {
+		return ReadinessProof{}, errors.New("new runtime failed readiness")
+	}
+	return NewReadinessProof("runtime-v1", proc.OwnerGeneration{1}, SHA256{3})
 }
 
 func mustCandidatePath(t *testing.T, appPath string) string {
