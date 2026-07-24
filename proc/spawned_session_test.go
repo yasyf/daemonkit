@@ -2,10 +2,14 @@ package proc
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -59,6 +63,103 @@ func TestSpawnedSessionRejectsForeignInheritedDescriptorWithoutMutation(t *testi
 	}
 	if after != flags {
 		t.Fatalf("foreign descriptor flags = %#x, want unchanged %#x", after, flags)
+	}
+}
+
+func TestSpawnedSessionRejectsForeignUnixPeerWithoutMutation(t *testing.T) {
+	peer, candidate, err := newSpawnedSessionFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	defer candidate.Close()
+	flags, err := unix.FcntlInt(candidate.Fd(), unix.F_GETFD, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := spawnedSessionProcessIdentity(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent.PID++
+	if _, err := claimSpawnedSessionIdentityForParent(t.Context(), int(candidate.Fd()), parent); !errors.Is(err, ErrSpawnedSessionIdentity) {
+		t.Fatalf("foreign peer claim = %v, want identity mismatch", err)
+	}
+	assertSpawnedSessionDescriptorUnchanged(t, candidate, flags)
+}
+
+func TestSpawnedSessionDeadlineLeavesOriginalDescriptorUnchanged(t *testing.T) {
+	peer, candidate, err := newSpawnedSessionFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	defer candidate.Close()
+	flags, err := unix.FcntlInt(candidate.Fd(), unix.F_GETFD, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := spawnedSessionProcessIdentity(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := claimSpawnedSessionIdentityForParent(ctx, int(candidate.Fd()), parent); !errors.Is(err, ErrSpawnedSessionIdentity) {
+		t.Fatalf("deadline claim = %v, want identity mismatch", err)
+	}
+	assertSpawnedSessionDescriptorUnchanged(t, candidate, flags)
+}
+
+func TestSpawnedSessionRejectsParentStartMismatchWithoutMutation(t *testing.T) {
+	peerFile, candidate, err := newSpawnedSessionFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peerFile.Close()
+	defer candidate.Close()
+	peer, err := net.FileConn(peerFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	flags, err := unix.FcntlInt(candidate.Fd(), unix.F_GETFD, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := spawnedSessionProcessIdentity(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	self := parent
+	nonzero := make([]byte, sha256.Size)
+	nonzero[0] = 1
+	bootstrap := spawnedSessionBootstrap{
+		Version: spawnedSessionBootstrapVersion, Nonce: nonzero,
+		ReceiptDigest: append([]byte(nil), nonzero...), RequestDigest: append([]byte(nil), nonzero...),
+		Signature: append([]byte(nil), nonzero...), ExpectedExecutable: self.Executable,
+		OwnerGeneration: OwnerGeneration{1}, Child: self, Parent: parent,
+	}
+	bootstrap.Parent.StartTime += "-foreign"
+	written := make(chan error, 1)
+	go func() { written <- writeSpawnedSessionObject(t.Context(), peer, bootstrap) }()
+	if _, err := claimSpawnedSessionIdentityForParent(t.Context(), int(candidate.Fd()), parent); !errors.Is(err, ErrSpawnedSessionIdentity) {
+		t.Fatalf("parent mismatch claim = %v, want identity mismatch", err)
+	}
+	if err := <-written; err != nil {
+		t.Fatal(err)
+	}
+	assertSpawnedSessionDescriptorUnchanged(t, candidate, flags)
+}
+
+func assertSpawnedSessionDescriptorUnchanged(t *testing.T, file *os.File, flags int) {
+	t.Helper()
+	after, err := unix.FcntlInt(file.Fd(), unix.F_GETFD, 0)
+	if err != nil {
+		t.Fatalf("original descriptor was closed: %v", err)
+	}
+	if after != flags {
+		t.Fatalf("original descriptor flags = %#x, want unchanged %#x", after, flags)
 	}
 }
 
@@ -154,13 +255,44 @@ func TestSpawnedSessionHelperProcess(t *testing.T) {
 		_ = os.WriteFile(os.Getenv("SPAWNED_SESSION_DIAGNOSTIC"), []byte(err.Error()), 0o600)
 		t.Fatal(err)
 	}
-	identity, err := ClaimSpawnedSessionIdentity(ctx)
-	if err != nil {
-		fail(err)
+	type claimResult struct {
+		identity SpawnedSessionIdentity
+		err      error
+	}
+	start := make(chan struct{})
+	results := make(chan claimResult, 2)
+	var claims sync.WaitGroup
+	for range 2 {
+		claims.Add(1)
+		go func() {
+			defer claims.Done()
+			<-start
+			identity, err := ClaimSpawnedSessionIdentity(ctx)
+			results <- claimResult{identity: identity, err: err}
+		}()
+	}
+	close(start)
+	claims.Wait()
+	close(results)
+	var identity SpawnedSessionIdentity
+	claimed := 0
+	for result := range results {
+		switch {
+		case result.err == nil:
+			identity = result.identity
+		case errors.Is(result.err, ErrSpawnedSessionClaimed):
+			claimed++
+		default:
+			fail(result.err)
+			return
+		}
+	}
+	if identity.state == nil || claimed != 1 {
+		fail(fmt.Errorf("concurrent claims: identity=%t claimed=%d", identity.state != nil, claimed))
 		return
 	}
-	if _, err := ClaimSpawnedSessionIdentity(ctx); !errors.Is(err, ErrSpawnedSessionClaimed) {
-		fail(errors.New("second child identity claim did not fail closed"))
+	if _, err := unix.FcntlInt(spawnedSessionFD, unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
+		fail(fmt.Errorf("inherited descriptor remained open: %v", err))
 		return
 	}
 	if err := CloseInheritedFDs(); err != nil {

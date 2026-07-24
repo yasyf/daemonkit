@@ -372,7 +372,7 @@ func claimSpawnedSessionIdentityForParent(
 	}
 	owned := &spawnedsession.OnceConn{Conn: conn}
 	fail := func(err error) (SpawnedSessionIdentity, error) {
-		return SpawnedSessionIdentity{}, errors.Join(err, owned.Close())
+		return SpawnedSessionIdentity{}, errors.Join(ErrSpawnedSessionIdentity, err, owned.Close())
 	}
 	var bootstrap spawnedSessionBootstrap
 	if err := readSpawnedSessionObject(ctx, conn, &bootstrap); err != nil {
