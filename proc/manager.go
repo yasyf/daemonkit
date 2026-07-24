@@ -83,23 +83,25 @@ type SpawnConfig struct {
 	Stdout            StdioMode
 	Stderr            StdioMode
 	RequiresPeerFence bool
+	SpawnedSession    bool
 	ExpectedSignature *SignatureDigest
 }
 
 // SpawnRequest is an immutable validated child launch request.
 type SpawnRequest struct {
-	recoveryClass RecoveryClass
-	executable    string
-	args          []string
-	dir           string
-	env           []string
-	stdin         StdioMode
-	stdout        StdioMode
-	stderr        StdioMode
-	requiresFence bool
-	signature     SignatureDigest
-	hasSignature  bool
-	digest        SpawnRequestDigest
+	recoveryClass  RecoveryClass
+	executable     string
+	args           []string
+	dir            string
+	env            []string
+	stdin          StdioMode
+	stdout         StdioMode
+	stderr         StdioMode
+	requiresFence  bool
+	spawnedSession bool
+	signature      SignatureDigest
+	hasSignature   bool
+	digest         SpawnRequestDigest
 }
 
 // NewSpawnRequest validates and deep-copies one exact launch request.
@@ -124,6 +126,10 @@ func NewSpawnRequest(config SpawnConfig) (SpawnRequest, error) {
 	if config.RequiresPeerFence && config.ExpectedSignature == nil {
 		return SpawnRequest{}, errors.New("proc: peer-fenced spawn requires an expected signature")
 	}
+	if config.SpawnedSession && (config.ExpectedSignature == nil || config.RequiresPeerFence ||
+		config.Stdin != StdioNull || config.Stdout != StdioNull) {
+		return SpawnRequest{}, errors.New("proc: spawned session requires an exact signature, null stdin/stdout, and no peer fence")
+	}
 	for _, mode := range []StdioMode{config.Stdin, config.Stdout, config.Stderr} {
 		if mode != StdioNull && mode != StdioPipe {
 			return SpawnRequest{}, errors.New("proc: every stdio mode must be explicit")
@@ -146,7 +152,7 @@ func NewSpawnRequest(config SpawnConfig) (SpawnRequest, error) {
 		recoveryClass: config.RecoveryClass, executable: config.Executable,
 		args: append([]string(nil), config.Args...), dir: config.Dir,
 		env: environment, stdin: config.Stdin, stdout: config.Stdout, stderr: config.Stderr,
-		requiresFence: config.RequiresPeerFence,
+		requiresFence: config.RequiresPeerFence, spawnedSession: config.SpawnedSession,
 	}
 	if config.ExpectedSignature != nil {
 		request.signature = *config.ExpectedSignature
@@ -168,6 +174,7 @@ func digestSpawnRequest(request SpawnRequest) SpawnRequestDigest {
 		writeSpawnDigestBytes(h, []byte{byte(mode)})
 	}
 	writeSpawnDigestBytes(h, []byte{boolByte(request.requiresFence)})
+	writeSpawnDigestBytes(h, []byte{boolByte(request.spawnedSession)})
 	writeSpawnDigestBytes(h, []byte{boolByte(request.hasSignature)})
 	if request.hasSignature {
 		writeSpawnDigestBytes(h, request.signature[:])
@@ -202,15 +209,16 @@ func boolByte(value bool) byte {
 
 // ProcessReceipt binds the prepared process instance to its expected target.
 type ProcessReceipt struct {
-	process       Identity
-	executable    string
-	signature     SignatureDigest
-	hasSignature  bool
-	requestDigest SpawnRequestDigest
-	requiresFence bool
-	generation    string
-	state         *preparedReceiptState
-	owner         *managerToken
+	process        Identity
+	executable     string
+	signature      SignatureDigest
+	hasSignature   bool
+	requestDigest  SpawnRequestDigest
+	requiresFence  bool
+	spawnedSession bool
+	generation     string
+	state          *preparedReceiptState
+	owner          *managerToken
 }
 
 type preparedReceiptState struct {
@@ -234,6 +242,9 @@ func (r ProcessReceipt) RequestDigest() SpawnRequestDigest { return r.requestDig
 
 // RequiresPeerFence reports whether direct Start is forbidden.
 func (r ProcessReceipt) RequiresPeerFence() bool { return r.requiresFence }
+
+// HasSpawnedSession reports whether the exact spawn owns a sealed session.
+func (r ProcessReceipt) HasSpawnedSession() bool { return r.spawnedSession }
 
 // OwnerGeneration returns the exact daemon generation that durably owns the child.
 func (r ProcessReceipt) OwnerGeneration() string { return r.generation }
@@ -334,19 +345,21 @@ type PreparedChild struct {
 	stdin   *os.File
 	stdout  *os.File
 	stderr  *os.File
+	session *spawnedSessionParent
 
-	mu            sync.Mutex
-	state         preparedChildState
-	observed      chan struct{}
-	done          chan struct{}
-	waitErr       error
-	terminated    bool
-	attempting    bool
-	attemptDone   chan struct{}
-	attemptErr    error
-	exit          ProcessExit
-	requiresFence bool
-	requestDigest SpawnRequestDigest
+	mu             sync.Mutex
+	state          preparedChildState
+	observed       chan struct{}
+	done           chan struct{}
+	waitErr        error
+	terminated     bool
+	attempting     bool
+	attemptDone    chan struct{}
+	attemptErr     error
+	exit           ProcessExit
+	requiresFence  bool
+	spawnedSession bool
+	requestDigest  SpawnRequestDigest
 }
 
 type preparedChildState uint8
@@ -398,13 +411,16 @@ func (m *Manager) Prepare(ctx context.Context, request SpawnRequest) (*PreparedC
 		process:    Identity{PID: record.PID, StartTime: record.StartTime, Boot: record.Boot, Comm: record.Comm, Executable: record.Executable},
 		executable: request.executable, signature: request.signature, hasSignature: request.hasSignature,
 		requestDigest: request.digest, requiresFence: request.requiresFence,
-		generation: record.Generation, state: receiptState, owner: m.token,
+		spawnedSession: request.spawnedSession,
+		generation:     record.Generation, state: receiptState, owner: m.token,
 	}
 	child := &PreparedChild{
 		manager: m, record: record, receipt: receipt, gate: pipes.gateWrite, waited: waited,
 		stdin: pipes.stdinParent, stdout: pipes.stdoutParent, stderr: pipes.stderrParent,
-		state: preparedChildPending, observed: make(chan struct{}), done: make(chan struct{}),
-		requiresFence: request.requiresFence, requestDigest: request.digest,
+		session: newSpawnedSessionParent(pipes.takeSessionParent()),
+		state:   preparedChildPending, observed: make(chan struct{}), done: make(chan struct{}),
+		requiresFence: request.requiresFence, spawnedSession: request.spawnedSession,
+		requestDigest: request.digest,
 	}
 	m.mu.Lock()
 	m.preparing--
@@ -487,7 +503,32 @@ func (c *PreparedChild) matchesReceipt(receipt ProcessReceipt) bool {
 		receipt.process == c.receipt.process && receipt.generation == c.receipt.generation &&
 		receipt.requestDigest == c.requestDigest && receipt.requiresFence == c.requiresFence &&
 		receipt.executable == c.receipt.executable && receipt.signature == c.receipt.signature &&
-		receipt.hasSignature == c.receipt.hasSignature
+		receipt.hasSignature == c.receipt.hasSignature && receipt.spawnedSession == c.spawnedSession
+}
+
+// ClaimSpawnedSession consumes the receipt-bound parent endpoint after dispatch.
+func (c *PreparedChild) ClaimSpawnedSession(
+	ctx context.Context,
+	receipt ProcessReceipt,
+) (SpawnedSessionEndpoint, error) {
+	if c == nil {
+		return SpawnedSessionEndpoint{}, ErrSpawnedSessionUnavailable
+	}
+	if err := ctx.Err(); err != nil {
+		return SpawnedSessionEndpoint{}, err
+	}
+	c.mu.Lock()
+	if c.state != preparedChildStarted || !c.spawnedSession || c.session == nil || !c.matchesReceipt(receipt) {
+		c.mu.Unlock()
+		return SpawnedSessionEndpoint{}, ErrSpawnedSessionUnavailable
+	}
+	session := c.session
+	c.mu.Unlock()
+	parent, err := spawnedCurrentIdentity()
+	if err != nil {
+		return SpawnedSessionEndpoint{}, fmt.Errorf("proc: snapshot spawned session parent: %w", err)
+	}
+	return session.claim(ctx, receipt, parent)
 }
 
 //nolint:contextcheck // Failed dispatch settles under the manager-owned termination budget.
@@ -785,7 +826,10 @@ func (m *Manager) cleanupUntracked(pipes *preparedPipes, identity Identity, wait
 	child := &untrackedChild{
 		manager: m, identity: identity, gate: pipes.gateWrite, waited: waited,
 		observed: make(chan struct{}), done: make(chan struct{}),
-		files: []*os.File{pipes.readyRead, pipes.stdinParent, pipes.stdoutParent, pipes.stderrParent},
+		files: []*os.File{
+			pipes.readyRead, pipes.stdinParent, pipes.stdoutParent, pipes.stderrParent,
+			pipes.sessionParent,
+		},
 	}
 	m.mu.Lock()
 	if transferPreparing {
@@ -918,7 +962,7 @@ func (c *PreparedChild) settle(stopped bool, settleErr error) {
 	state := c.receipt.state
 	gate := c.gate
 	c.gate = nil
-	stdin, stdout, stderr := c.stdin, c.stdout, c.stderr
+	stdin, stdout, stderr, session := c.stdin, c.stdout, c.stderr, c.session
 	c.mu.Unlock()
 	if state != nil {
 		state.mu.Lock()
@@ -932,6 +976,9 @@ func (c *PreparedChild) settle(stopped bool, settleErr error) {
 		if file != nil {
 			_ = file.Close()
 		}
+	}
+	if session != nil {
+		_ = session.close()
 	}
 	c.manager.mu.Lock()
 	delete(c.manager.children, c)
@@ -955,6 +1002,7 @@ func processExitCode(err error) int {
 type preparedPipes struct {
 	readyRead, readyWrite, gateRead, gateWrite                                    *os.File
 	stdinParent, stdinChild, stdoutParent, stdoutChild, stderrParent, stderrChild *os.File
+	sessionParent, sessionChild                                                   *os.File
 }
 
 func prepareCommand(request SpawnRequest) (*exec.Cmd, *preparedPipes, error) {
@@ -979,12 +1027,21 @@ func prepareCommand(request SpawnRequest) (*exec.Cmd, *preparedPipes, error) {
 		p.closeAll()
 		return nil, nil, err
 	}
+	if request.spawnedSession {
+		if p.sessionParent, p.sessionChild, err = newSpawnedSessionFiles(); err != nil {
+			p.closeAll()
+			return nil, nil, err
+		}
+	}
 	args := append([]string{"-c", childWrapper, "daemonkit-child", request.executable}, request.args...)
 	cmd := exec.Command("/bin/sh", args...)
 	cmd.Dir = request.dir
 	cmd.Env = append([]string{"PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LANG=C"}, request.env...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = p.stdinChild, p.stdoutChild, p.stderrChild
 	cmd.ExtraFiles = []*os.File{p.readyWrite, p.gateRead}
+	if p.sessionChild != nil {
+		cmd.ExtraFiles = append(cmd.ExtraFiles, p.sessionChild)
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	return cmd, p, nil
 }
@@ -1026,7 +1083,9 @@ func awaitPrepared(ctx context.Context, ready *os.File) error {
 }
 
 func (p *preparedPipes) closeChildEnds() {
-	for _, file := range []*os.File{p.readyWrite, p.gateRead, p.stdinChild, p.stdoutChild, p.stderrChild} {
+	for _, file := range []*os.File{
+		p.readyWrite, p.gateRead, p.stdinChild, p.stdoutChild, p.stderrChild, p.sessionChild,
+	} {
 		if file != nil {
 			_ = file.Close()
 		}
@@ -1034,10 +1093,19 @@ func (p *preparedPipes) closeChildEnds() {
 }
 
 func (p *preparedPipes) closeParentEnds() {
-	for _, file := range []*os.File{p.readyRead, p.gateWrite, p.stdinParent, p.stdoutParent, p.stderrParent} {
+	for _, file := range []*os.File{
+		p.readyRead, p.gateWrite, p.stdinParent, p.stdoutParent, p.stderrParent, p.sessionParent,
+	} {
 		if file != nil {
 			_ = file.Close()
 		}
 	}
 }
+
+func (p *preparedPipes) takeSessionParent() *os.File {
+	file := p.sessionParent
+	p.sessionParent = nil
+	return file
+}
+
 func (p *preparedPipes) closeAll() { p.closeChildEnds(); p.closeParentEnds() }

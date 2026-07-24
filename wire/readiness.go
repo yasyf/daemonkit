@@ -69,6 +69,12 @@ func (s *Server) authorizePreReady(
 	entry entry,
 	_ Request,
 ) error {
+	if s.staticOrdinary {
+		if entry.route != routeBusiness {
+			return ErrPermissionDenied
+		}
+		return nil
+	}
 	lifecycle := s.lifecycle
 	if lifecycle == nil {
 		return ErrNotReady

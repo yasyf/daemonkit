@@ -1,6 +1,7 @@
 package proc
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -17,12 +18,17 @@ func CloseInheritedFDs() error {
 	if runtime.GOOS == "linux" {
 		dir = "/proc/self/fd"
 	}
-	entries, err := os.ReadDir(dir)
+	directory, err := os.Open(dir)
 	if err != nil {
 		return fmt.Errorf("list open fds: %w", err)
 	}
-	for _, e := range entries {
-		fd, err := strconv.Atoi(e.Name())
+	names, readErr := directory.Readdirnames(-1)
+	closeErr := directory.Close()
+	if readErr != nil || closeErr != nil {
+		return fmt.Errorf("list open fds: %w", errors.Join(readErr, closeErr))
+	}
+	for _, name := range names {
+		fd, err := strconv.Atoi(name)
 		if err != nil || fd < 3 {
 			continue
 		}
