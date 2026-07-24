@@ -48,6 +48,8 @@ func (a StopControlAuthority) Valid() bool { return a.token != nil }
 type SessionServer interface {
 	ServeRuntime(context.Context, net.Listener, any, *worker.RuntimeClaim, Admission, Admission, PeerFence, ServerExit, chan<- error) error
 	CloseRuntimeIntake() error
+	CancelRuntimeRequests()
+	SettleRuntimeSessions(context.Context) error
 }
 
 // Composition carries an internal transport capability into daemon assembly.

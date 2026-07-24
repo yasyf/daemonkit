@@ -1073,12 +1073,16 @@ func (r *Runtime) shutdown(
 		errs = append(errs, fmt.Errorf("daemon: close intake: %w", err))
 	}
 	cancelActivation()
-	cancelServe()
+	r.server.CancelRuntimeRequests()
 	settled := true
 	if err := r.settleAdmission(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("daemon: settle admission: %w", err))
 		settled = false
+	} else if err := r.server.SettleRuntimeSessions(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("daemon: settle session transport: %w", err))
+		settled = false
 	}
+	cancelServe()
 	if err := r.settleProduct(ctx); err != nil {
 		cause := errors.Join(ErrShutdownIncomplete, fmt.Errorf("daemon: settle product: %w", err))
 		errs = append(errs, cause)
@@ -1147,6 +1151,15 @@ func (r *Runtime) abortBegin(
 	_ = r.Drain()
 	_ = r.server.CloseRuntimeIntake()
 	cancelActivation()
+	var settleErr error
+	if !joined {
+		r.server.CancelRuntimeRequests()
+		if err := r.settleAdmission(ctx); err != nil {
+			settleErr = fmt.Errorf("daemon: settle admission: %w", err)
+		} else if err := r.server.SettleRuntimeSessions(ctx); err != nil {
+			settleErr = fmt.Errorf("daemon: settle session transport: %w", err)
+		}
+	}
 	cancelServe()
 	var serveErr error
 	if !joined {
@@ -1161,7 +1174,7 @@ func (r *Runtime) abortBegin(
 		cause = serveErr
 	}
 	closeErr := r.closeAcquired(ctx, listener, lock)
-	return errors.Join(cause, closeErr)
+	return errors.Join(cause, settleErr, closeErr)
 }
 
 func (r *Runtime) retainOwnership(listener net.Listener, lock *proc.FileLockHandle) {

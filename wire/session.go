@@ -446,6 +446,40 @@ func (s *session) responseWritten(id uint64) (<-chan error, error) {
 	return state.terminalWriteChannel(), nil
 }
 
+func (s *session) settleTerminalRequests(ctx context.Context) error {
+	s.mu.Lock()
+	states := make([]*requestState, 0, len(s.active))
+	for _, state := range s.active {
+		state.mu.Lock()
+		terminalSent := state.terminalSent
+		state.mu.Unlock()
+		if terminalSent {
+			states = append(states, state)
+		}
+	}
+	s.mu.Unlock()
+	for _, state := range states {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-state.settled:
+		}
+	}
+	return nil
+}
+
+func (s *session) cancelRequests() {
+	s.mu.Lock()
+	states := make([]*requestState, 0, len(s.active))
+	for _, state := range s.active {
+		states = append(states, state)
+	}
+	s.mu.Unlock()
+	for _, state := range states {
+		state.cancel()
+	}
+}
+
 func (s *session) readLoop(ctx context.Context) error {
 	for {
 		frame, sidecar, err := s.codec.readFrameWithSidecar()

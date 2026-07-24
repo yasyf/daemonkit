@@ -277,14 +277,8 @@ func (s *Server) serveRuntime(
 	if started != nil {
 		started <- nil
 	}
-	var acceptErr error
-	select {
-	case <-ctx.Done():
-		_ = s.CloseIntake()
-		acceptErr = <-acceptDone
-	case acceptErr = <-acceptDone:
-		_ = s.CloseIntake()
-	}
+	acceptErr := s.awaitAccept(ctx, acceptDone)
+	_ = s.CloseIntake()
 	acceptErr = serverExit(wrapAcceptError(acceptErr))
 
 	s.settleReadiness()
@@ -292,6 +286,22 @@ func (s *Server) serveRuntime(
 	s.sessionWG.Wait()
 	s.stopWorkers()
 	return acceptErr
+}
+
+func (s *Server) awaitAccept(ctx context.Context, acceptDone <-chan error) error {
+	select {
+	case <-ctx.Done():
+		_ = s.CloseIntake()
+		return <-acceptDone
+	case acceptErr := <-acceptDone:
+		s.mu.Lock()
+		intakeClosed := s.intakeClosed
+		s.mu.Unlock()
+		if wrapAcceptError(acceptErr) == nil && intakeClosed && ctx.Err() == nil {
+			<-ctx.Done()
+		}
+		return acceptErr
+	}
 }
 
 func (s *Server) start(
@@ -847,6 +857,33 @@ func (s *Server) closeSessions() {
 	for _, sess := range sessions {
 		sess.close()
 	}
+}
+
+func (s *Server) cancelRequests() {
+	s.mu.Lock()
+	sessions := make([]*session, 0, len(s.sessions))
+	for sess := range s.sessions {
+		sessions = append(sessions, sess)
+	}
+	s.mu.Unlock()
+	for _, sess := range sessions {
+		sess.cancelRequests()
+	}
+}
+
+func (s *Server) settleSessions(ctx context.Context) error {
+	s.mu.Lock()
+	sessions := make([]*session, 0, len(s.sessions))
+	for sess := range s.sessions {
+		sessions = append(sessions, sess)
+	}
+	s.mu.Unlock()
+	for _, sess := range sessions {
+		if err := sess.settleTerminalRequests(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Server) verifyPeer(ctx context.Context, peer Peer, role trust.PeerRole) (trust.PeerRole, bool, error) {

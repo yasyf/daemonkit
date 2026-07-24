@@ -104,6 +104,10 @@ func (s *runtimeTestServer) CloseRuntimeIntake() error {
 	return nil
 }
 
+func (s *runtimeTestServer) CancelRuntimeRequests() {}
+
+func (s *runtimeTestServer) SettleRuntimeSessions(context.Context) error { return nil }
+
 func (s *runtimeTestServer) admissions(t *testing.T) (runtimeauth.Admission, runtimeauth.Admission) {
 	t.Helper()
 	s.mu.Lock()

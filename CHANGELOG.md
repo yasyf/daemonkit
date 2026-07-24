@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep accepted wire sessions alive after runtime intake closes, then settle
+  every written terminal response through its session-bound acknowledgement
+  before canceling transport during shutdown.
+
 ## [0.17.3] - 2026-07-24
 
 ### Fixed

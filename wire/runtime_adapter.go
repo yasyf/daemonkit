@@ -57,3 +57,9 @@ func (a runtimeServerAdapter) ServeRuntime(
 }
 
 func (a runtimeServerAdapter) CloseRuntimeIntake() error { return a.server.CloseIntake() }
+
+func (a runtimeServerAdapter) CancelRuntimeRequests() { a.server.cancelRequests() }
+
+func (a runtimeServerAdapter) SettleRuntimeSessions(ctx context.Context) error {
+	return a.server.settleSessions(ctx)
+}
