@@ -118,16 +118,24 @@ func requireVerifier(t *testing.T) {
 
 func resolvesTo(t *testing.T, conn *net.UnixConn, req string) bool {
 	t.Helper()
-	identity, err := peer.FromConn(conn)
+	resolved, err := tryResolve(conn, req)
 	if err != nil {
 		t.Fatalf("PeerFromConn: %v", err)
 	}
+	return resolved
+}
+
+func tryResolve(conn *net.UnixConn, req string) (bool, error) {
+	identity, err := peer.FromConn(conn)
+	if err != nil {
+		return false, err
+	}
 	guest, err := copyGuest(identity.Audit)
 	if err != nil {
-		return false
+		return false, nil
 	}
 	defer cfRelease(guest)
-	return checkValidity(guest, req) == nil
+	return checkValidity(guest, req) == nil, nil
 }
 
 func eventually(t *testing.T, d time.Duration, cond func() bool) bool {
@@ -156,8 +164,20 @@ func TestPeerTokenIsQueryTimeLive_TF1(t *testing.T) {
 	if _, err := conn.Write([]byte{1}); err != nil {
 		t.Fatalf("signal helper: %v", err)
 	}
-	if !eventually(t, 5*time.Second, func() bool { return resolvesTo(t, conn, sleepReq) }) {
-		t.Fatal("peer identity never became /bin/sleep after the exec — substitution not observed")
+	var transitionErr error
+	if !eventually(t, 5*time.Second, func() bool {
+		resolved, err := tryResolve(conn, sleepReq)
+		if err == nil {
+			transitionErr = nil
+			return resolved
+		}
+		if !errors.Is(err, proc.ErrIdentityChanged) {
+			t.Fatalf("PeerFromConn after exec: %v", err)
+		}
+		transitionErr = err
+		return false
+	}) {
+		t.Fatalf("peer identity never became /bin/sleep after the exec — substitution not observed: %v", transitionErr)
 	}
 }
 

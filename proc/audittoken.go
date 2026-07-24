@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
@@ -82,6 +83,12 @@ func BindAuditTokenIdentity(token AuditToken, pid int) (Identity, error) {
 	}
 	after, err := ExecutablePathAuditToken(token)
 	if err != nil {
+		if errors.Is(err, ErrNoProcess) {
+			return Identity{}, errors.Join(
+				ErrIdentityChanged,
+				fmt.Errorf("bind audit token after process probe: %w", err),
+			)
+		}
 		return Identity{}, fmt.Errorf("bind audit token after process probe: %w", err)
 	}
 	if before != after {

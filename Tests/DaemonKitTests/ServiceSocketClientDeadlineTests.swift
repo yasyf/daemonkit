@@ -516,6 +516,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
     }
 
     @Test func malformedLifecycleBeforePeerCloseIsProtocolTerminal() async throws {
+        let closeGate = ServiceWriteGate()
         try await withRawServicePeers(count: 1) { _, codec in
             let subscription = try nextRequest(codec)
             guard subscription.operation == readinessSubscribeOperation else {
@@ -527,18 +528,26 @@ extension SocketTransportTests.ServiceSocketClientTests {
                 flags: .end,
                 payload: Data("{}".utf8)
             ))
+            closeGate.block()
         } operation: { path in
+            defer { closeGate.unblock() }
             let client = try ServiceSocketClient(
                 path: path,
                 wireBuild: "service.v1",
                 noProgressTimeout: 1
             )
             let expected = RuntimeReadinessValidationError.invalidResponse("readiness event fields")
-            await #expect(throws: expected) {
+            do {
                 _ = try await client.call(genericServiceCall(
                     operation: "work",
                     deadline: Date().addingTimeInterval(2)
                 ))
+                Issue.record("malformed lifecycle did not fail the call")
+                return
+            } catch {
+                guard error as? RuntimeReadinessValidationError == expected else {
+                    throw error
+                }
             }
             let termination = await client.termination.wait()
             guard case let .failed(error) = termination else {
