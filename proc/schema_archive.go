@@ -11,14 +11,13 @@ import (
 )
 
 // UnsupportedSchemaPolicy selects how a keyed store reacts to an on-disk schema
-// it does not recognize. The zero value fails closed.
+// it does not recognize. The zero value, like FailUnsupportedSchema, fails closed.
 type UnsupportedSchemaPolicy uint8
 
 const (
-	unsupportedSchemaUnset UnsupportedSchemaPolicy = iota
 	// FailUnsupportedSchema fails the open with ErrRecordSchema and leaves the
 	// store on disk. It is the zero-value default.
-	FailUnsupportedSchema
+	FailUnsupportedSchema UnsupportedSchemaPolicy = iota + 1
 	// ArchiveUnsupportedSchema renames the offending store aside, opens a fresh
 	// one, and logs one warning. No data is read or migrated.
 	ArchiveUnsupportedSchema
