@@ -23,6 +23,46 @@ func TestCaskTemplateRequiresExactStopHook(t *testing.T) {
 	}
 }
 
+func TestCaskTemplateHandlesMissingBinaryHusks(t *testing.T) {
+	rendered, err := renderCaskTemplate("--stop-and-uninstall-service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	preflightStart := strings.Index(rendered, "\n  preflight do")
+	postflightStart := strings.Index(rendered, "\n  postflight do")
+	uninstallPreflightStart := strings.Index(rendered, "\n  uninstall_preflight do")
+	zapStart := strings.Index(rendered, "\n  zap trash:")
+	if preflightStart < 0 || postflightStart < 0 || uninstallPreflightStart < 0 || zapStart < 0 {
+		t.Fatal("cask is missing an expected stanza")
+	}
+	preflight := rendered[preflightStart:postflightStart]
+	uninstallPreflight := rendered[uninstallPreflightStart:zapStart]
+	guarded := regexp.MustCompile(`(?s)if File\.executable\?\(installed_binary\)(.*?)\n\s*(?:elsif|end)\b`)
+	for name, stanza := range map[string]string{
+		"preflight":           preflight,
+		"uninstall_preflight": uninstallPreflight,
+	} {
+		match := guarded.FindStringSubmatch(stanza)
+		if match == nil {
+			t.Fatalf("%s does not guard the exact stop hook with File.executable?", name)
+		}
+		if !strings.Contains(match[1], `args: ["--stop-and-uninstall-service"]`) {
+			t.Fatalf("%s stop hook is not inside the File.executable? guard", name)
+		}
+		if !strings.Contains(match[1], "must_succeed: true") {
+			t.Fatalf("%s guarded stop hook does not fail closed", name)
+		}
+	}
+	if !strings.Contains(preflight, "elsif Dir.exist?(installed_app)") ||
+		!strings.Contains(preflight, "FileUtils.rm_r(installed_app)") {
+		t.Fatal("preflight does not remove a binary-less app husk")
+	}
+	if strings.Count(rendered, "FileUtils.rm_r(installed_app)") != 1 ||
+		strings.Contains(uninstallPreflight, "FileUtils.rm_r") {
+		t.Fatal("app husk removal must exist in preflight only")
+	}
+}
+
 func TestCaskTemplateUsesAuthoritativeAssetURL(t *testing.T) {
 	rendered, err := renderCaskTemplate("--stop-and-uninstall-service")
 	if err != nil {

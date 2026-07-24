@@ -30,14 +30,16 @@ cask "__CASK_TOKEN__" do
   app "__APP_NAME__.app"
 
   preflight do
-    # An existing installation must settle and unregister through the product's
-    # identity-verified daemonkit stop path before Homebrew replaces its bundle.
-    # A present app with a missing or failing hook is a hard failure.
+    # Stop only through the installed binary's exact product hook. An app
+    # directory without that binary is a husk; remove it before the app move.
     installed_app = "#{appdir}/__APP_NAME__.app"
-    if Dir.exist?(installed_app)
-      system_command "#{installed_app}/Contents/MacOS/__BINARY_NAME__",
+    installed_binary = "#{installed_app}/Contents/MacOS/__BINARY_NAME__"
+    if File.executable?(installed_binary)
+      system_command installed_binary,
                      args: ["__STOP_UNINSTALL_ARG__"],
                      must_succeed: true
+    elsif Dir.exist?(installed_app)
+      FileUtils.rm_r(installed_app)
     end
   end
 
@@ -53,13 +55,15 @@ cask "__CASK_TOKEN__" do
   end
 
   uninstall_preflight do
-    # Boot the supervisor OUT before the app is quit/removed — quitting under a
-    # live KeepAlive/SMAppService registration just triggers an instant relaunch.
-    # The required product hook invokes AppKeepAlive.Stop (or the product's
-    # equally exact stable-bundle service API), proves absence, then unregisters.
-    system_command "#{appdir}/__APP_NAME__.app/Contents/MacOS/__BINARY_NAME__",
-                   args: ["__STOP_UNINSTALL_ARG__"],
-                   must_succeed: true
+    # Stop only through the installed binary's exact product hook. A binary-less
+    # app directory is a husk, with nothing registered to stop.
+    installed_app = "#{appdir}/__APP_NAME__.app"
+    installed_binary = "#{installed_app}/Contents/MacOS/__BINARY_NAME__"
+    if File.executable?(installed_binary)
+      system_command installed_binary,
+                     args: ["__STOP_UNINSTALL_ARG__"],
+                     must_succeed: true
+    end
   end
 
   zap trash: [
