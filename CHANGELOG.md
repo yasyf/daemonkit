@@ -6,6 +6,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-07-23
+
+### Added
+
+- Go `wire.ServiceClient` and Swift `ServiceSocketClient` keep one lazy,
+  exact-build session across service startup and replace it across drain,
+  listener turnover, and takeover. Typed `runtime_starting` and
+  `server_draining` response codes distinguish the only safe retry states.
+- `service.StopBudget` and `StandardStopBudget` expose the exact identity,
+  durable-tracking, child-settlement, parent-margin, and deferred-untrack
+  phases that bound `Controller.StopRuntime`.
+
+### Changed
+
+- The application release template pins the shared staging and publication
+  actions to their atomic-publication implementations.
+
+### Fixed
+
+- Graceful wire shutdown waits for an interrupted whole-frame write to settle,
+  so admission cannot close ahead of a completed response during GoAway.
+- LaunchAgent convergence enables the exact loaded job before bootstrap or
+  kickstart and retries the complete bootout/bootstrap/enable sequence after a
+  transient load failure. Disabled jobs are repaired instead of being accepted
+  as converged.
+
 ## [0.10.0] - 2026-07-23
 
 ### Added
@@ -265,7 +291,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/yasyf/daemonkit/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/yasyf/daemonkit/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/yasyf/daemonkit/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/yasyf/daemonkit/compare/v0.8.0...v0.8.1

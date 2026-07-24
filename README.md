@@ -21,7 +21,7 @@ go: added github.com/yasyf/daemonkit v<version>
 Add the package to your dependencies and link the `DaemonKit` library product into your app or helper target:
 
 ```swift
-.package(url: "https://github.com/yasyf/daemonkit", exact: "0.10.0"),
+.package(url: "https://github.com/yasyf/daemonkit", exact: "0.11.0"),
 ```
 
 </details>
@@ -62,17 +62,17 @@ One row per package; the Status column is each surface's live state.
 | Surface | Owns | Status |
 |---|---|---|
 | `proc` | Detached spawn, single-entrant sockets, process caps, child reaping, exact epoch-1 durable process ledger | Landed |
-| `service` | Exact desired/applied/loaded LaunchAgent state with typed restart policy, durable convergence, and signed-app stop ownership | Landed |
+| `service` | Exact desired/applied/loaded LaunchAgent state with typed restart policy, durable convergence, explicit runtime stop budgets, and signed-app stop ownership | Landed |
 | `version` | Release/dev version taxonomy, newest-wins skew | Landed |
 | `paths` | The `~/<app>` state layout: daemon socket, HTTP handshake file, per-subject artifacts, start lock, sqlite database, daemon log, turn-snapshot scratch dirs | Landed |
 | `bundle` | Info.plist reads, stable `.app` path conventions | Landed |
 | `deployment` | Exact signed-application publication, service-plan fencing, durable recovery, deactivation, and status | Landed |
-| `wire` | Exact-v1 persistent business transport, typed product observations, receipt-authenticated stop control, and the sole composed daemon runtime constructor | Landed |
+| `wire` | Exact-v1 persistent business transport, generation-aware service clients, typed product observations, receipt-authenticated stop control, and the sole composed daemon runtime constructor | Landed |
 | `trust` | Codesign peer verification (audit-token designated requirements) | Landed |
 | `daemon` | Opaque process runtime, readiness, ordered shutdown, skew observation, embedded processes, and idle exit | Landed |
 | `drain` | Drain-on-upgrade: journals, fences, dead-peer adoption | Landed |
 | `supervise` | Bounded disposable workers and managed long-lived process handles with pre-exec durable identity, readiness gating, cancellation settlement, and cross-generation orphan recovery | Landed |
-| `Sources/DaemonKit` | Swift: signed-process App Group resolution, socket serving, peer trust (same-UID floor + designated-requirement pinning), `SMAppService` login items, snapshot watching | Landed |
+| `Sources/DaemonKit` | Swift: generation-aware service clients, signed-process App Group resolution, socket serving, peer trust (same-UID floor + designated-requirement pinning), `SMAppService` login items, snapshot watching | Landed |
 
 The LaunchAgents `service` writes use no socket activation — the daemon binds and flocks its own socket (`proc`); launchd only keeps the process alive. Every `Agent` and `AppKeepAlive` selects `RestartAlways`, `RestartOnFailure`, or `NoRestart`; the policy is rendered directly into the launchd plist. On the Swift side, `DaemonKit` reconciles `SMAppService` login items (opening the Login Items settings pane when the item needs approval), watches snapshot directories, and rides the signed `.app` bundle for a stable bundle + TCC identity.
 
@@ -85,7 +85,7 @@ advancing recovery. The canonical product path is
 state, and locks live under
 `$HOME/Applications/.daemonkit-deployment/<Product>`.
 
-Status: v0.10.0 is the hard-cut release line. Protocol and durable-state epochs
+Status: v0.11.0 is the hard-cut release line. Protocol and durable-state epochs
 begin at 1 with exact equality; the API stabilizes at v1.0.0.
 
 Licensed under [PolyForm-Noncommercial-1.0.0](LICENSE).
