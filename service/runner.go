@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/worker"
 )
 
@@ -74,7 +75,7 @@ func newControllerWorkerRuntime(limit int, reaper *proc.Reaper) (*controllerWork
 	if err != nil {
 		return nil, err
 	}
-	claim, err := pool.ClaimRuntime()
+	claim, err := pool.ClaimRuntime(trust.VerifierWorkerBudgets())
 	if err != nil {
 		return nil, err
 	}

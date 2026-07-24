@@ -4,7 +4,31 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.18.0] - 2026-07-24
+
+### Added
+
+- `trust.VerifierWorkerBudgets` fixes the verifier worker lane's time and byte
+  bounds as daemonkit-owned constants, so the verifier lane no longer inherits
+  the product pool's budgets and a product configuration can never truncate a
+  verifier verdict. Caller deadlines beyond the lane's time budget clamp to it.
+- `trust.ProcessVerifier.Probe` runs one complete verifier child exchange and
+  reports transport health only; any well-formed verdict passes.
+
+### Changed
+
+- **Breaking:** `worker.Pool.ClaimRuntime` now takes `worker.VerifierBudgets`
+  (pass `trust.VerifierWorkerBudgets()`); direct callers must update. Products
+  that only construct pools are unaffected.
+- `daemon.Runtime.Begin` self-probes the trust verifier after worker activation
+  and before serving. A daemon whose executable does not dispatch
+  `trust.RunVerifierChild`, or whose verifier lane cannot complete an exchange,
+  now refuses to start with `daemon.ErrTrustVerifierProbe` instead of silently
+  rejecting every peer as untrusted.
+- The wire server logs peer-verification infrastructure failures — worker
+  kills, decode failures, child exec errors, and fail-closed verifier absence
+  (`trust.ErrNoVerifier`) — at Error level; policy denial verdicts keep their
+  Debug logging. The peer-facing response stays `PeerUntrusted` in both cases.
 
 ## [0.17.4] - 2026-07-24
 
@@ -469,7 +493,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.17.4...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/yasyf/daemonkit/compare/v0.17.4...v0.18.0
 [0.17.4]: https://github.com/yasyf/daemonkit/compare/v0.17.3...v0.17.4
 [0.17.3]: https://github.com/yasyf/daemonkit/compare/v0.17.2...v0.17.3
 [0.17.2]: https://github.com/yasyf/daemonkit/compare/v0.17.1...v0.17.2

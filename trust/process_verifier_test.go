@@ -47,7 +47,7 @@ printf '{"protocol":1,"result":"trusted"}\n'
 	if err != nil {
 		t.Fatal(err)
 	}
-	claim, err := pool.ClaimRuntime()
+	claim, err := pool.ClaimRuntime(VerifierWorkerBudgets())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,5 +101,49 @@ printf '{"protocol":1,"result":"trusted"}\n'
 	}
 	if len(records) != 0 {
 		t.Fatalf("verifier records after settled checks = %#v", records)
+	}
+}
+
+func TestProcessVerifierSurvivesPathologicalProductPoolBudgets(t *testing.T) {
+	directory := t.TempDir()
+	executable := filepath.Join(directory, "verifier-child")
+	script := `#!/bin/sh
+printf '{"protocol":1,"result":"trusted"}\n'
+`
+	if err := os.WriteFile(executable, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	reaper := &proc.Reaper{
+		Store: &proc.FileStore{Path: filepath.Join(directory, "workers.json")}, Generation: proc.OwnerGeneration{1},
+	}
+	pool, err := worker.NewPool(worker.Config{
+		Capacity: 1, QueueCapacity: 1, MaxTotalRun: 5 * time.Second,
+		MaxStdinBytes: 0, MaxStdoutBytes: 1, MaxStderrBytes: 1,
+	}, reaper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := pool.ClaimRuntime(VerifierWorkerBudgets())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := claim.Recover(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := claim.Activate(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := claim.Close(ctx); err != nil {
+			t.Errorf("wait for verifier pool: %v", err)
+		}
+	})
+	verifier := ProcessVerifier{Runner: claim, Executable: executable}
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	if err := verifier.Check(ctx, peer.Identity{UID: os.Geteuid()}); err != nil {
+		t.Fatalf("verifier round trip under 1-byte product budget: %v", err)
 	}
 }

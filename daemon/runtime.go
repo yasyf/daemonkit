@@ -23,6 +23,8 @@ import (
 // DefaultShutdownTimeout bounds graceful runtime shutdown when no timeout is configured.
 const DefaultShutdownTimeout = 30 * time.Second
 
+const trustProbeTimeout = 10 * time.Second
+
 // Activation is one generation-bound consumer preparation authority.
 type Activation struct {
 	runtime    *Runtime
@@ -299,7 +301,7 @@ func (r *Runtime) Begin(ctx context.Context) (activation Activation, err error) 
 		r.finish(err)
 		return Activation{}, err
 	}
-	claim, claimErr := r.cfg.Workers.ClaimRuntime()
+	claim, claimErr := r.cfg.Workers.ClaimRuntime(trust.VerifierWorkerBudgets())
 	if claimErr != nil {
 		_ = r.cfg.Children.ReleaseRuntime()
 		r.mu.Lock()
@@ -355,6 +357,12 @@ func (r *Runtime) Begin(ctx context.Context) (activation Activation, err error) 
 	r.mu.Lock()
 	r.workerActivated = true
 	r.mu.Unlock()
+	if probeErr := r.probeTrustVerifier(ctx); probeErr != nil {
+		closeErr := r.closeAcquired(ctx, listener, lock)
+		err = errors.Join(fmt.Errorf("%w: %w", ErrTrustVerifierProbe, probeErr), closeErr)
+		r.finish(err)
+		return Activation{}, err
+	}
 
 	signalCh, stopSignals := r.signalChannel()
 	activationCtx, cancelActivation := context.WithCancel(context.WithoutCancel(ctx))
@@ -448,6 +456,17 @@ func (r *Runtime) Begin(ctx context.Context) (activation Activation, err error) 
 	activation = Activation{runtime: r, generation: generation, ctx: activationCtx}
 	go r.runStarted(listener, lock, signalCh, stopSignals, serveDone)
 	return activation, nil
+}
+
+// probeTrustVerifier proves one verifier child exchange end to end before the
+// runtime serves. The verdict is ignored: the probe's minimal self identity
+// (euid is all a nil-requirement policy consumes; pid is carried but unused)
+// exists only to carry the exchange, and only transport failures abort startup.
+func (r *Runtime) probeTrustVerifier(ctx context.Context) error {
+	probeCtx, cancel := context.WithTimeout(ctx, trustProbeTimeout)
+	defer cancel()
+	verifier := trust.ProcessVerifier{Runner: r.trustWorkers, Executable: r.trustExecutable}
+	return verifier.Probe(probeCtx, peeridentity.Identity{PID: os.Getpid(), UID: os.Geteuid()})
 }
 
 func (r *Runtime) startupStopCause() error {

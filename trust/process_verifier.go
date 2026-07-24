@@ -18,6 +18,7 @@ import (
 const (
 	verifierChildMode     = "--daemonkit-trust-verifier-v1"
 	verifierProtocol      = 1
+	verifierMaxTotalRun   = 30 * time.Second
 	maxVerifierPayload    = 16 << 10
 	maxVerifierResponse   = 4 << 10
 	verifierResultTrusted = "trusted"
@@ -25,6 +26,18 @@ const (
 	verifierResultAbsent  = "no_verifier"
 	verifierResultFailed  = "failed"
 )
+
+// VerifierWorkerBudgets sizes a runtime claim's verifier lane for the verifier
+// child exchange. These bounds are daemonkit-owned constants; products no
+// longer size the verifier lane.
+func VerifierWorkerBudgets() worker.VerifierBudgets {
+	return worker.VerifierBudgets{
+		MaxTotalRun:    verifierMaxTotalRun,
+		MaxStdinBytes:  maxVerifierPayload,
+		MaxStdoutBytes: maxVerifierResponse,
+		MaxStderrBytes: maxVerifierResponse,
+	}
+}
 
 // ProcessVerifier runs code-identity verification in a disposable child.
 type ProcessVerifier struct {
@@ -37,69 +50,93 @@ type ProcessVerifier struct {
 
 // Check verifies peer in a child that is killed and reaped when ctx expires.
 func (v ProcessVerifier) Check(ctx context.Context, peer peer.Identity) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if v.Runner == nil {
-		return errors.New("trust: verifier task runner is required")
-	}
-	if strings.TrimSpace(v.Executable) == "" {
-		return errors.New("trust: verifier executable is required")
-	}
-	if v.Policy.Requirement != nil {
-		if err := v.Policy.Requirement.validate(); err != nil {
-			return err
-		}
-	}
-	payload, err := json.Marshal(verifierRequest{
-		Protocol: verifierProtocol, Peer: peer, Requirement: v.Policy.Requirement,
-	})
+	response, err := v.exchange(ctx, peer)
 	if err != nil {
-		return fmt.Errorf("trust: encode verifier request: %w", err)
-	}
-	if len(payload) > maxVerifierPayload {
-		return fmt.Errorf("trust: verifier request is %d bytes, maximum is %d", len(payload), maxVerifierPayload)
-	}
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		return errors.New("trust: verifier deadline is required")
-	}
-	result, err := v.Runner.RunVerifier(ctx, worker.CommandRequest{
-		Path: v.Executable, Dir: filepath.Dir(v.Executable),
-		Args:         []string{verifierChildMode, base64.RawURLEncoding.EncodeToString(payload)},
-		TotalTimeout: time.Until(deadline),
-	})
-	if err != nil {
-		return fmt.Errorf("trust: run verifier child: %w", err)
-	}
-	if err := ctx.Err(); err != nil {
 		return err
-	}
-	var response verifierResponse
-	if len(result.Stdout) > maxVerifierResponse {
-		return fmt.Errorf("trust: verifier response is %d bytes, maximum is %d", len(result.Stdout), maxVerifierResponse)
-	}
-	if err := json.Unmarshal(result.Stdout, &response); err != nil {
-		return fmt.Errorf("trust: decode verifier response: %w", err)
-	}
-	if response.Protocol != verifierProtocol {
-		return fmt.Errorf("trust: verifier response protocol %d is not %d", response.Protocol, verifierProtocol)
 	}
 	switch response.Result {
-	case verifierResultTrusted:
-		if response.Error != "" {
-			return errors.New("trust: trusted verifier response included an error")
-		}
-		return nil
 	case verifierResultDenied:
 		return fmt.Errorf("%w: %s", ErrUntrustedPeer, response.Error)
 	case verifierResultAbsent:
 		return fmt.Errorf("%w: %s", ErrNoVerifier, response.Error)
 	case verifierResultFailed:
 		return fmt.Errorf("trust: verifier child: %s", response.Error)
-	default:
-		return fmt.Errorf("trust: unknown verifier result %q", response.Result)
 	}
+	return nil
+}
+
+// Probe runs one complete verifier child exchange against peer and reports
+// transport health only: any well-formed verdict passes, including denials.
+func (v ProcessVerifier) Probe(ctx context.Context, peer peer.Identity) error {
+	_, err := v.exchange(ctx, peer)
+	return err
+}
+
+func (v ProcessVerifier) exchange(ctx context.Context, peer peer.Identity) (verifierResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return verifierResponse{}, err
+	}
+	if v.Runner == nil {
+		return verifierResponse{}, errors.New("trust: verifier task runner is required")
+	}
+	if strings.TrimSpace(v.Executable) == "" {
+		return verifierResponse{}, errors.New("trust: verifier executable is required")
+	}
+	if v.Policy.Requirement != nil {
+		if err := v.Policy.Requirement.validate(); err != nil {
+			return verifierResponse{}, err
+		}
+	}
+	payload, err := json.Marshal(verifierRequest{
+		Protocol: verifierProtocol, Peer: peer, Requirement: v.Policy.Requirement,
+	})
+	if err != nil {
+		return verifierResponse{}, fmt.Errorf("trust: encode verifier request: %w", err)
+	}
+	if len(payload) > maxVerifierPayload {
+		return verifierResponse{}, fmt.Errorf("trust: verifier request is %d bytes, maximum is %d", len(payload), maxVerifierPayload)
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return verifierResponse{}, errors.New("trust: verifier deadline is required")
+	}
+	total := time.Until(deadline)
+	// The verifier lane's MaxTotalRun is a fixed budget: a caller deadline
+	// beyond it must clamp here or the pool rejects every run pre-spawn.
+	if total > verifierMaxTotalRun {
+		total = verifierMaxTotalRun
+	}
+	result, err := v.Runner.RunVerifier(ctx, worker.CommandRequest{
+		Path: v.Executable, Dir: filepath.Dir(v.Executable),
+		Args:         []string{verifierChildMode, base64.RawURLEncoding.EncodeToString(payload)},
+		TotalTimeout: total,
+	})
+	if err != nil {
+		return verifierResponse{}, fmt.Errorf("trust: run verifier child: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return verifierResponse{}, err
+	}
+	var response verifierResponse
+	if len(result.Stdout) > maxVerifierResponse {
+		return verifierResponse{}, fmt.Errorf("trust: verifier response is %d bytes, maximum is %d", len(result.Stdout), maxVerifierResponse)
+	}
+	if err := json.Unmarshal(result.Stdout, &response); err != nil {
+		return verifierResponse{}, fmt.Errorf("trust: decode verifier response: %w", err)
+	}
+	if response.Protocol != verifierProtocol {
+		return verifierResponse{}, fmt.Errorf("trust: verifier response protocol %d is not %d", response.Protocol, verifierProtocol)
+	}
+	switch response.Result {
+	case verifierResultTrusted:
+		if response.Error != "" {
+			return verifierResponse{}, errors.New("trust: trusted verifier response included an error")
+		}
+	case verifierResultDenied, verifierResultAbsent, verifierResultFailed:
+	default:
+		return verifierResponse{}, fmt.Errorf("trust: unknown verifier result %q", response.Result)
+	}
+	return response, nil
 }
 
 // RunVerifierChild recognizes and executes one exact verifier-child invocation.

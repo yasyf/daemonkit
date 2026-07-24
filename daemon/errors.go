@@ -25,6 +25,12 @@ var ErrSequenceExhausted = errors.New("daemon: sequence exhausted")
 // ErrSessionServerStopped reports a session server that returned without a shutdown request.
 var ErrSessionServerStopped = errors.New("daemon: session server stopped unexpectedly")
 
+// ErrTrustVerifierProbe means the serve-time self-probe could not complete one
+// verifier child exchange, so every peer would be silently rejected as
+// untrusted. The daemon executable must dispatch trust.RunVerifierChild at the
+// top of main, before argument parsing.
+var ErrTrustVerifierProbe = errors.New("daemon: trust verifier self-probe failed; the daemon executable must dispatch trust.RunVerifierChild")
+
 // ErrShutdownIncomplete requires process exit with retained owned state.
 var ErrShutdownIncomplete = errors.New("daemon: shutdown incomplete")
 

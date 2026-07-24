@@ -47,7 +47,7 @@ func TestRuntimeClaimAndRecoveryGateAdmission(t *testing.T) {
 	if result, err := pool.Run(context.Background(), request); err == nil || result.Receipt.ProcessIdentity().PID != 0 {
 		t.Fatalf("unclaimed Run = %+v, %v", result, err)
 	}
-	claim, err := pool.ClaimRuntime()
+	claim, err := pool.ClaimRuntime(workerTestVerifierBudgets())
 	if err != nil {
 		t.Fatalf("ClaimRuntime: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestRuntimeClaimAndRecoveryGateAdmission(t *testing.T) {
 	if err := claim.Activate(); !errors.Is(err, ErrRuntimeOwnership) {
 		t.Fatalf("stale claim Activate = %v", err)
 	}
-	claim, err = pool.ClaimRuntime()
+	claim, err = pool.ClaimRuntime(workerTestVerifierBudgets())
 	if err != nil {
 		t.Fatalf("second ClaimRuntime: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestRuntimeClaimReleaseSettlesFailedRecoveryExactlyOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPool: %v", err)
 	}
-	claim, err := pool.ClaimRuntime()
+	claim, err := pool.ClaimRuntime(workerTestVerifierBudgets())
 	if err != nil {
 		t.Fatalf("ClaimRuntime: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestRuntimeClaimReleaseSettlesFailedRecoveryExactlyOnce(t *testing.T) {
 		t.Fatalf("idempotent Release with canceled context: %v", err)
 	}
 
-	next, err := pool.ClaimRuntime()
+	next, err := pool.ClaimRuntime(workerTestVerifierBudgets())
 	if err != nil {
 		t.Fatalf("ClaimRuntime after failed recovery release: %v", err)
 	}
@@ -232,6 +232,41 @@ func TestRunRejectsInputBeforeSpawnAndKillsOnOutputLimit(t *testing.T) {
 	}
 	if _, err := pool.Run(context.Background(), shellRequest(t.TempDir(), "printf ok")); err != nil {
 		t.Fatalf("pool did not reuse after settled output kill: %v", err)
+	}
+}
+
+func TestClaimRuntimeVerifierLaneIgnoresPathologicalProductBudgets(t *testing.T) {
+	config := workerTestConfig()
+	config.MaxStdoutBytes = 1
+	config.MaxStderrBytes = 1
+	pool, err := NewPool(config, workerTestReaper(t))
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	claim, err := pool.ClaimRuntime(workerTestVerifierBudgets())
+	if err != nil {
+		t.Fatalf("ClaimRuntime: %v", err)
+	}
+	if err := claim.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if err := claim.Activate(); err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := claim.Close(ctx); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+	const verdict = `{"protocol":1,"result":"trusted"}`
+	result, err := claim.RunVerifier(context.Background(), shellRequest(t.TempDir(), "printf '"+verdict+"'"))
+	if err != nil || string(result.Stdout) != verdict {
+		t.Fatalf("verifier lane under 1-byte product budget = %q, %v", result.Stdout, err)
+	}
+	if _, err := pool.Run(context.Background(), shellRequest(t.TempDir(), "printf '"+verdict+"'")); !errors.Is(err, ErrOutputLimit) {
+		t.Fatalf("product lane escaped its own budget: %v", err)
 	}
 }
 
@@ -580,6 +615,12 @@ func workerTestConfig() Config {
 	}
 }
 
+func workerTestVerifierBudgets() VerifierBudgets {
+	return VerifierBudgets{
+		MaxTotalRun: 3 * time.Second, MaxStdinBytes: 1024, MaxStdoutBytes: 1024, MaxStderrBytes: 1024,
+	}
+}
+
 func workerTestReaper(t *testing.T) *proc.Reaper {
 	t.Helper()
 	generation, err := proc.ProcessGeneration()
@@ -612,7 +653,7 @@ func newWorkerTestPoolWithoutCleanup(t *testing.T, config Config) (*Pool, *Runti
 	if err != nil {
 		t.Fatalf("NewPool: %v", err)
 	}
-	claim, err := pool.ClaimRuntime()
+	claim, err := pool.ClaimRuntime(workerTestVerifierBudgets())
 	if err != nil {
 		t.Fatalf("ClaimRuntime: %v", err)
 	}

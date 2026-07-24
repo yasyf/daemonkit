@@ -461,7 +461,13 @@ func (s *Server) startConnection(
 	if err != nil {
 		cancelVerify()
 		s.rejectHandshakeCodec(conn, codec, ResponseCodePeerUntrusted, ErrUntrustedPeer)
-		return fmt.Errorf("wire: verify peer: %w", err)
+		err = fmt.Errorf("wire: verify peer: %w", err)
+		// The peer sees only PeerUntrusted; an infrastructure failure is not a
+		// policy denial and must be loud on the daemon side.
+		if !errors.Is(err, ErrUntrustedPeer) && !errors.Is(err, trust.ErrUntrustedPeer) {
+			s.Log.Error("wire: peer verification infrastructure failure", "err", err)
+		}
+		return err
 	}
 	fencePermit, err := peerFence(verifyCtx, peer, role)
 	cancelVerify()

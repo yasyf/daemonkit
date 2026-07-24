@@ -105,7 +105,33 @@ candidate path, swap the installed app, inspect private JSON, or remove the
 canonical app. Exact v1 receipts, service state, and locks live beside the app
 under `.daemonkit-deployment/<Product>`.
 
-Status: v0.17.3 is the hard-cut release line. Protocol and durable-state epochs
+## The consumer trust contract
+
+Peer verification runs in a disposable child of the daemon's own executable.
+The one obligation a product keeps is dispatching that child verb at the top of
+`main`, before argument parsing or any other output:
+
+```go
+func main() {
+	if handled, err := trust.RunVerifierChild(os.Args[1:], os.Stdout); handled {
+		if err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	// ordinary argument parsing and startup
+}
+```
+
+daemonkit owns the other half of the exchange: the verifier worker lane is
+sized from daemonkit's constants, so a product's worker pool budgets cannot
+truncate a verdict, and `daemon.Runtime.Begin` proves one verifier exchange end
+to end against the daemon's own identity before serving. A daemon whose
+executable skips the dispatch refuses to start with
+`daemon.ErrTrustVerifierProbe` instead of silently rejecting every peer as
+untrusted.
+
+Status: v0.18.0 is the hard-cut release line. Protocol and durable-state epochs
 begin at 1 with exact equality; the API stabilizes at v1.0.0.
 
 Licensed under [PolyForm-Noncommercial-1.0.0](LICENSE).

@@ -124,17 +124,21 @@ func (s *runtimeTestServer) stop() { s.forceOnce.Do(func() { close(s.force) }) }
 
 type runtimeOrderingStore struct {
 	proc.Store
-	socket string
-	loads  atomic.Int32
+	socket        string
+	recoveryLoads int32
+	loads         atomic.Int32
 }
 
+// Load fences only the recovery loads; the trust self-probe legitimately
+// tracks a verifier child after listener acquisition.
 func (s *runtimeOrderingStore) Load(ctx context.Context) ([]proc.Record, error) {
-	if _, err := os.Stat(s.socket); err == nil {
-		return nil, errors.New("recovery ran after listener acquisition")
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, err
+	if s.loads.Add(1) <= s.recoveryLoads {
+		if _, err := os.Stat(s.socket); err == nil {
+			return nil, errors.New("recovery ran after listener acquisition")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
 	}
-	s.loads.Add(1)
 	return s.Store.Load(ctx)
 }
 
@@ -334,11 +338,11 @@ func TestRuntimeBeginRecoversEveryProcessOwnerBeforeListener(t *testing.T) {
 	socket := filepath.Join(dir, "daemon.sock")
 	workerBase := &proc.FileStore{Path: filepath.Join(dir, "workers.db")}
 	childBase := &proc.FileStore{Path: filepath.Join(dir, "children.db")}
-	workerStore := &runtimeOrderingStore{Store: workerBase, socket: socket}
-	childStore := &runtimeOrderingStore{Store: childBase, socket: socket}
+	workerStore := &runtimeOrderingStore{Store: workerBase, socket: socket, recoveryLoads: 2}
+	childStore := &runtimeOrderingStore{Store: childBase, socket: socket, recoveryLoads: 1}
 	server := newRuntimeTestServer()
 	server.onServe = func(net.Listener) error {
-		if workerStore.loads.Load() != 2 || childStore.loads.Load() != 1 {
+		if workerStore.loads.Load() < 2 || childStore.loads.Load() < 1 {
 			return errors.New("listener served before every process owner recovered")
 		}
 		return nil
@@ -389,6 +393,52 @@ func TestRuntimeBeginRecoversEveryProcessOwnerBeforeListener(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := closeRuntimeTest(t, runtime); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRuntimeBeginAbortsWhenTrustProbeCannotCompleteExchange(t *testing.T) {
+	rig := newRuntimeTestRig(t, nil, 0, nil, nil)
+	executable := filepath.Join(runtimeTestDir(t), "verifier-child")
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rig.runtime.trustExecutable = executable
+	ctx, cancel := context.WithTimeout(context.Background(), runtimeTestTimeout)
+	defer cancel()
+	if _, err := rig.runtime.Begin(ctx); !errors.Is(err, ErrTrustVerifierProbe) {
+		t.Fatalf("Begin with non-dispatching verifier = %v", err)
+	}
+	if err := waitRuntimeTest(t, rig.runtime); !errors.Is(err, ErrTrustVerifierProbe) {
+		t.Fatalf("Wait = %v, want probe failure", err)
+	}
+	rig.runtime.mu.Lock()
+	retained := rig.runtime.retainedListener != nil || rig.runtime.retainedLock != nil
+	rig.runtime.mu.Unlock()
+	if retained {
+		t.Fatal("probe abort retained listener ownership instead of unwinding")
+	}
+	if _, err := os.Stat(rig.socket); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("probe abort left the socket bound: %v", err)
+	}
+}
+
+func TestRuntimeBeginTrustProbePassesOnDenialVerdict(t *testing.T) {
+	rig := newRuntimeTestRig(t, nil, 0, nil, nil)
+	executable := filepath.Join(runtimeTestDir(t), "verifier-child")
+	script := `#!/bin/sh
+: > "$0.ran"
+printf '{"protocol":1,"result":"untrusted","error":"probe denial"}\n'
+`
+	if err := os.WriteFile(executable, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rig.runtime.trustExecutable = executable
+	rig.ready(t, "ready")
+	if _, err := os.Stat(executable + ".ran"); err != nil {
+		t.Fatalf("probe did not run the verifier child: %v", err)
+	}
+	if err := closeRuntimeTest(t, rig.runtime); err != nil {
 		t.Fatal(err)
 	}
 }

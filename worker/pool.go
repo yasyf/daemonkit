@@ -53,6 +53,16 @@ type Config struct {
 	MaxStderrBytes int
 }
 
+// VerifierBudgets fixes the verifier lane's time and byte bounds independently
+// of the product pool configuration, so a product's own budgets can never
+// truncate a verifier exchange.
+type VerifierBudgets struct {
+	MaxTotalRun    time.Duration
+	MaxStdinBytes  int
+	MaxStdoutBytes int
+	MaxStderrBytes int
+}
+
 // CommandRequest is copied and validated before it can enter the queue.
 type CommandRequest struct {
 	Path         string
@@ -146,7 +156,8 @@ func newPool(config Config, reaper *proc.Reaper) (*Pool, error) {
 }
 
 // ClaimRuntime assigns this open, unused pool to one pending daemon Runtime.
-func (p *Pool) ClaimRuntime() (*RuntimeClaim, error) {
+// The verifier lane is sized from budgets alone, never from this pool's config.
+func (p *Pool) ClaimRuntime(budgets VerifierBudgets) (*RuntimeClaim, error) {
 	if p == nil {
 		return nil, ErrRuntimeOwnership
 	}
@@ -158,10 +169,13 @@ func (p *Pool) ClaimRuntime() (*RuntimeClaim, error) {
 	if err := p.manager.ClaimRuntime(); err != nil {
 		return nil, errors.Join(ErrRuntimeOwnership, err)
 	}
-	verifierConfig := p.config
-	verifierConfig.Capacity = 1
-	verifierConfig.QueueCapacity = 0
-	verifier, err := newPool(verifierConfig, p.reaper)
+	verifier, err := newPool(Config{
+		Capacity: 1, QueueCapacity: 0,
+		MaxTotalRun:    budgets.MaxTotalRun,
+		MaxStdinBytes:  budgets.MaxStdinBytes,
+		MaxStdoutBytes: budgets.MaxStdoutBytes,
+		MaxStderrBytes: budgets.MaxStderrBytes,
+	}, p.reaper)
 	if err != nil {
 		_ = p.manager.ReleaseRuntime()
 		return nil, errors.Join(ErrRuntimeOwnership, err)
