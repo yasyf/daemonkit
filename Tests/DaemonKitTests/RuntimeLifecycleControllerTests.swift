@@ -41,6 +41,40 @@ private final class StringSlotProbe: @unchecked Sendable {
     }
 }
 
+private final class ActivationCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    var value: Int {
+        lock.withLock { count }
+    }
+
+    func increment() {
+        lock.withLock { count += 1 }
+    }
+}
+
+private final class SecondRegistrationGate: @unchecked Sendable {
+    let secondEntered = AsyncLatch()
+    private let lock = NSLock()
+    private let releaseSecond = DispatchSemaphore(value: 0)
+    private var attempts = 0
+
+    func enter() {
+        let isSecond = lock.withLock {
+            attempts += 1
+            return attempts == 2
+        }
+        guard isSecond else { return }
+        secondEntered.finish()
+        releaseSecond.wait()
+    }
+
+    func release() {
+        releaseSecond.signal()
+    }
+}
+
 private enum TestRuntimeFailure: Error {
     case failed
 }
@@ -382,6 +416,112 @@ extension SocketTransportTests.RuntimeLifecycleControllerTests {
             #expect(!terminal.rejected)
             let expected = try RuntimeReadinessCodec.encodeSubscribe()
             #expect(terminal.payload == expected)
+            #expect(await handler.snapshot().isEmpty)
+        }
+    }
+
+    @Test func duplicateReadinessCannotReplaceTerminalSettlementOwner() async throws {
+        try await withAsyncCleanup { cleanup in
+            let directory = try shortSocketDir()
+            cleanup.add { try? FileManager.default.removeItem(at: directory) }
+            let path = directory.appendingPathComponent("duplicate-readiness.sock").path
+            let activationGate = OneShotRegistrationGate()
+            let registrationGate = SecondRegistrationGate()
+            let handler = LifecycleHandlerProbe()
+            let runtime = try DaemonRuntime(
+                path: path,
+                wireBuild: "service.v1",
+                identity: identity,
+                handler: RuntimeHandlerSpec { request in await handler.handle(request) }
+            )
+            runtime.controller.registrationAttemptHook = { registrationGate.enter() }
+            runtime.controller.activationHook = { activationGate.register() }
+            cleanup.add {
+                registrationGate.release()
+                activationGate.release()
+                try? await runtime.shutdown(deadline: Date().addingTimeInterval(2))
+            }
+            _ = try await runtime.begin(deadline: Date().addingTimeInterval(2))
+            let client = try await SocketClient(
+                path: path,
+                wireBuild: "service.v1",
+                role: "readiness-controller.v1"
+            )
+            cleanup.add { await client.close() }
+
+            let first = try await client.call(
+                operation: runtimeReadinessSubscribeOperation,
+                payload: RuntimeReadinessCodec.encodeSubscribe(),
+                deadline: Date().addingTimeInterval(2)
+            )
+            #expect(!first.rejected)
+            await activationGate.firstEntered.wait()
+
+            let duplicateCall = Task {
+                try await client.call(
+                    operation: runtimeReadinessSubscribeOperation,
+                    payload: RuntimeReadinessCodec.encodeSubscribe(),
+                    deadline: Date().addingTimeInterval(2)
+                )
+            }
+            await registrationGate.secondEntered.wait()
+
+            let drain = Task { try await runtime.controller.closeIntake() }
+            while runtime.controller.currentEvent().progress.state != .draining {
+                await Task.yield()
+            }
+            registrationGate.release()
+            let duplicate = try await duplicateCall.value
+            #expect(duplicate.rejected)
+            #expect(duplicate.code == .readinessSubscriptionExists)
+            #expect(duplicate.reason == "wire: readiness subscription already registered")
+            #expect(runtime.controller.subscriberCount == 1)
+            #expect(await handler.snapshot().isEmpty)
+
+            activationGate.release()
+            try await drain.value
+        }
+    }
+
+    @Test func activeReadinessSubscriptionRejectsDuplicateWithoutReactivation() async throws {
+        try await withAsyncCleanup { cleanup in
+            let directory = try shortSocketDir()
+            cleanup.add { try? FileManager.default.removeItem(at: directory) }
+            let path = directory.appendingPathComponent("active-duplicate-readiness.sock").path
+            let handler = LifecycleHandlerProbe()
+            let runtime = try DaemonRuntime(
+                path: path,
+                wireBuild: "service.v1",
+                identity: identity,
+                handler: RuntimeHandlerSpec { request in await handler.handle(request) }
+            )
+            let activations = ActivationCounter()
+            runtime.controller.activationHook = { activations.increment() }
+            cleanup.add { try? await runtime.shutdown(deadline: Date().addingTimeInterval(2)) }
+            _ = try await runtime.begin(deadline: Date().addingTimeInterval(2))
+            let client = try await SocketClient(
+                path: path,
+                wireBuild: "service.v1",
+                role: "readiness-controller.v1"
+            )
+            cleanup.add { await client.close() }
+
+            let first = try await client.call(
+                operation: runtimeReadinessSubscribeOperation,
+                payload: RuntimeReadinessCodec.encodeSubscribe(),
+                deadline: Date().addingTimeInterval(2)
+            )
+            #expect(!first.rejected)
+            let duplicate = try await client.call(
+                operation: runtimeReadinessSubscribeOperation,
+                payload: RuntimeReadinessCodec.encodeSubscribe(),
+                deadline: Date().addingTimeInterval(2)
+            )
+            #expect(duplicate.rejected)
+            #expect(duplicate.code == .readinessSubscriptionExists)
+            #expect(duplicate.reason == "wire: readiness subscription already registered")
+            #expect(activations.value == 1)
+            #expect(runtime.controller.subscriberCount == 1)
             #expect(await handler.snapshot().isEmpty)
         }
     }

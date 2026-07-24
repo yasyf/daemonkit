@@ -55,7 +55,13 @@ func serviceTestServer(
             guard let session = request.session.implementation else {
                 throw SessionTransportError.disconnected
             }
-            runtimeLifecycle.register(session)
+            guard runtimeLifecycle.register(session) else {
+                return .terminal(SocketTerminal(
+                    rejected: true,
+                    code: .readinessSubscriptionExists,
+                    reason: "wire: readiness subscription already registered"
+                ))
+            }
             Task {
                 await request.session.waitUntilClosed()
                 runtimeLifecycle.unregister(session)
@@ -456,7 +462,7 @@ extension SocketTransportTests {
             }
         }
 
-        @Test func canceledReadinessDriverWakesNextCallerWithoutPolling() async throws {
+        @Test func canceledReadinessDriverRetiresSubscribedSessionWithoutPolling() async throws {
             try await withAsyncCleanup { cleanup in
                 let directory = try shortSocketDir()
                 cleanup.add { try? FileManager.default.removeItem(at: directory) }
@@ -507,7 +513,7 @@ extension SocketTransportTests {
                 let terminal = try await second.value
                 #expect(terminal.payload == Data(#""healthy""#.utf8))
                 #expect(gate.callCount == 2)
-                #expect(await client.startedGenerations == 1)
+                #expect(await client.startedGenerations == 2)
                 gate.release()
             }
         }

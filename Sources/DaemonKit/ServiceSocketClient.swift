@@ -478,6 +478,10 @@ private extension ServiceSocketClient {
             stateSignal.signal()
         case .rejected:
             guard let terminal = attempt.terminal else { throw ServiceSocketClientError.malformedAttempt }
+            if terminal.code == .readinessSubscriptionExists {
+                await retire(current.0)
+                throw Transition.reconnect
+            }
             throw ServiceSocketRejectionError(
                 code: terminal.code ?? SocketResponseCode(rawValue: "untyped"),
                 reason: terminal.reason ?? "wire: readiness rejected"

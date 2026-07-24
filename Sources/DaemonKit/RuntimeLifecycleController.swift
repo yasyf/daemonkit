@@ -193,10 +193,15 @@ enum RuntimeWaitResult: @unchecked Sendable {
 
 /// RuntimeLifecycleController owns lifecycle, publication, and business admission atomically.
 final class RuntimeLifecycleController: @unchecked Sendable {
+    private enum SubscriberState {
+        case registering
+        case active
+        case terminalPending(LifecycleWriteReceipt)
+    }
+
     private final class Subscriber: @unchecked Sendable {
         weak var session: ServerSession?
-        var active = false
-        var pendingTerminal: LifecycleWriteReceipt?
+        var state = SubscriberState.registering
 
         init(session: ServerSession) {
             self.session = session
@@ -228,6 +233,7 @@ final class RuntimeLifecycleController: @unchecked Sendable {
     private var admissions = 0
     private var workers = 0
     private var activities: Set<UUID> = []
+    var registrationAttemptHook: (@Sendable () -> Void)?
     var registrationHook: (@Sendable () -> Void)?
     var activationHook: (@Sendable () -> Void)?
     var admissionRevocationHook: (@Sendable () -> Void)?
@@ -645,9 +651,18 @@ extension RuntimeLifecycleController {
         }
     }
 
-    func register(_ session: ServerSession) {
-        lock.withLock { subscribers[ObjectIdentifier(session)] = Subscriber(session: session) }
-        registrationHook?()
+    func register(_ session: ServerSession) -> Bool {
+        registrationAttemptHook?()
+        let registered = lock.withLock {
+            let id = ObjectIdentifier(session)
+            guard subscribers[id] == nil else { return false }
+            subscribers[id] = Subscriber(session: session)
+            return true
+        }
+        if registered {
+            registrationHook?()
+        }
+        return registered
     }
 
     func activate(_ session: ServerSession) {
@@ -657,12 +672,20 @@ extension RuntimeLifecycleController {
         lock.withLock {
             let id = ObjectIdentifier(session)
             guard let subscriber = subscribers[id], subscriber.session != nil else { return }
-            subscriber.active = true
+            let pending: LifecycleWriteReceipt?
+            switch subscriber.state {
+            case .registering:
+                pending = nil
+            case let .terminalPending(receipt):
+                pending = receipt
+            case .active:
+                preconditionFailure("readiness subscription activated more than once")
+            }
+            subscriber.state = .active
             do {
                 let payload = try JSONEncoder().encode(current)
                 if let receipt = try session.enqueueLifecycle(payload), current.progress.isTerminal {
-                    if let pending = subscriber.pendingTerminal {
-                        subscriber.pendingTerminal = nil
+                    if let pending {
                         relay = (receipt, pending)
                     } else {
                         terminalReceipts.append(receipt)
@@ -670,8 +693,7 @@ extension RuntimeLifecycleController {
                 }
             } catch {
                 shouldClose = true
-                subscriber.pendingTerminal?.finish(.failure(error))
-                subscriber.pendingTerminal = nil
+                pending?.finish(.failure(error))
             }
         }
         if let (receipt, pending) = relay {
@@ -686,9 +708,13 @@ extension RuntimeLifecycleController {
     }
 
     func unregister(_ session: ServerSession) {
-        let pending = lock.withLock {
-            subscribers.removeValue(forKey: ObjectIdentifier(session))
-        }?.pendingTerminal
+        let pending = lock.withLock { () -> LifecycleWriteReceipt? in
+            guard let subscriber = subscribers.removeValue(forKey: ObjectIdentifier(session)) else {
+                return nil
+            }
+            guard case let .terminalPending(receipt) = subscriber.state else { return nil }
+            return receipt
+        }
         pending?.finish(.failure(SessionTransportError.disconnected))
     }
 
@@ -709,7 +735,13 @@ extension RuntimeLifecycleController {
                 guard let session = request.session.implementation else {
                     throw SessionTransportError.disconnected
                 }
-                register(session)
+                guard register(session) else {
+                    return .terminal(SocketTerminal(
+                        rejected: true,
+                        code: .readinessSubscriptionExists,
+                        reason: "wire: readiness subscription already registered"
+                    ))
+                }
                 Task {
                     await request.session.waitUntilClosed()
                     self.unregister(session)
@@ -865,20 +897,23 @@ private extension RuntimeLifecycleController {
         var stale: [ObjectIdentifier] = []
         for (id, subscriber) in subscribers {
             guard let session = subscriber.session else { stale.append(id); continue }
-            guard subscriber.active else {
+            switch subscriber.state {
+            case .registering:
                 if progress.isTerminal {
                     let pending = LifecycleWriteReceipt()
-                    subscriber.pendingTerminal = pending
+                    subscriber.state = .terminalPending(pending)
                     result.receipts.append(pending)
                 }
-                continue
-            }
-            do {
-                if let receipt = try session.enqueueLifecycle(prepared.payload) {
-                    result.receipts.append(receipt)
+            case .active:
+                do {
+                    if let receipt = try session.enqueueLifecycle(prepared.payload) {
+                        result.receipts.append(receipt)
+                    }
+                } catch {
+                    result.sessionsToClose.append(session)
                 }
-            } catch {
-                result.sessionsToClose.append(session)
+            case .terminalPending:
+                preconditionFailure("terminal readiness transition repeated")
             }
         }
         for id in stale {
