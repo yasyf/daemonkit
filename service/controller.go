@@ -464,12 +464,6 @@ func (c *Controller) install(ctx context.Context, agent Agent) error {
 	if err := c.reload(ctx, agent, path); err != nil {
 		return err
 	}
-	if out, err := c.launchctl(ctx, "enable", serviceTarget(agent.Label)); err != nil {
-		return fmt.Errorf("launchctl enable: %w: %s", err, strings.TrimSpace(out))
-	}
-	if out, err := c.launchctl(ctx, "kickstart", serviceTarget(agent.Label)); err != nil {
-		return fmt.Errorf("launchctl kickstart: %w: %s", err, strings.TrimSpace(out))
-	}
 	return nil
 }
 
@@ -542,8 +536,16 @@ func (c *Controller) reload(ctx context.Context, agent Agent, path string) error
 				return lastErr
 			}
 		} else {
+			out, err = c.launchctl(ctx, "enable", serviceTarget(agent.Label))
+			if err != nil {
+				return fmt.Errorf("launchctl enable: %w: %s", err, strings.TrimSpace(out))
+			}
 			out, err = c.launchctl(ctx, "bootstrap", domainTarget(), path)
 			if err == nil {
+				out, err = c.launchctl(ctx, "kickstart", serviceTarget(agent.Label))
+				if err != nil {
+					return fmt.Errorf("launchctl kickstart: %w: %s", err, strings.TrimSpace(out))
+				}
 				return nil
 			}
 			lastErr = fmt.Errorf("launchctl bootstrap: %w: %s", err, strings.TrimSpace(out))

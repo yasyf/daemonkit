@@ -585,6 +585,136 @@ func TestControllerPersistsDesiredBeforeEffectsAndResumesAfterFailure(t *testing
 	}
 }
 
+func TestControllerInstallUsesExactLaunchctlOrder(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	agent := controllerAgent(t, "com.example.install-order")
+	path, err := agent.PlistPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls [][]string
+	run := launchctlStub(func(args []string) (string, error) {
+		calls = append(calls, append([]string(nil), args...))
+		if args[0] == "bootout" {
+			return "not loaded", launchctlExit(launchctlNotLoadedExit)
+		}
+		return "", nil
+	})
+	controller, _, _, _ := newTestController(t, controllerState{
+		Desired: map[string]Agent{}, Applied: map[string]Agent{},
+	}, run, nil)
+	if err := controller.Converge(context.Background(), []Agent{agent}); err != nil {
+		t.Fatalf("Converge() = %v", err)
+	}
+	want := [][]string{
+		{"bootout", serviceTarget(agent.Label)},
+		{"enable", serviceTarget(agent.Label)},
+		{"bootstrap", domainTarget(), path},
+		{"kickstart", serviceTarget(agent.Label)},
+	}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("launchctl calls = %v, want %v", calls, want)
+	}
+}
+
+func TestControllerInstallEnableFailureStopsAndRetryRestartsAtBootout(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	agent := controllerAgent(t, "com.example.enable-failure")
+	path, err := agent.PlistPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	errEnable := launchctlExit(launchctlInFluxExit)
+	failEnable := true
+	var calls [][]string
+	run := launchctlStub(func(args []string) (string, error) {
+		calls = append(calls, append([]string(nil), args...))
+		switch args[0] {
+		case "bootout":
+			return "not loaded", launchctlExit(launchctlNotLoadedExit)
+		case "enable":
+			if failEnable {
+				return "in flux", errEnable
+			}
+		}
+		return "", nil
+	})
+	controller, _, store, _ := newTestController(t, controllerState{
+		Desired: map[string]Agent{}, Applied: map[string]Agent{},
+	}, run, nil)
+	if err := controller.Converge(context.Background(), []Agent{agent}); !errors.Is(err, errEnable) {
+		t.Fatalf("Converge() = %v, want enable failure", err)
+	}
+	wantFailure := [][]string{
+		{"bootout", serviceTarget(agent.Label)},
+		{"enable", serviceTarget(agent.Label)},
+	}
+	if !reflect.DeepEqual(calls, wantFailure) {
+		t.Fatalf("failed launchctl calls = %v, want %v", calls, wantFailure)
+	}
+	if _, ok := store.state.Applied[agent.Label]; ok {
+		t.Fatal("enable failure was marked applied")
+	}
+
+	failEnable = false
+	calls = nil
+	if err := controller.Converge(context.Background(), []Agent{agent}); err != nil {
+		t.Fatalf("retry Converge() = %v", err)
+	}
+	wantRetry := [][]string{
+		{"bootout", serviceTarget(agent.Label)},
+		{"enable", serviceTarget(agent.Label)},
+		{"bootstrap", domainTarget(), path},
+		{"kickstart", serviceTarget(agent.Label)},
+	}
+	if !reflect.DeepEqual(calls, wantRetry) {
+		t.Fatalf("retry launchctl calls = %v, want %v", calls, wantRetry)
+	}
+}
+
+func TestControllerInstallRetryRepeatsSequenceBeforeKickstart(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	agent := controllerAgent(t, "com.example.bootstrap-retry")
+	path, err := agent.PlistPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls [][]string
+	bootstrapCalls := 0
+	run := launchctlStub(func(args []string) (string, error) {
+		calls = append(calls, append([]string(nil), args...))
+		switch args[0] {
+		case "bootout":
+			return "not loaded", launchctlExit(launchctlNotLoadedExit)
+		case "bootstrap":
+			bootstrapCalls++
+			if bootstrapCalls == 1 {
+				return "in flux", launchctlExit(launchctlInFluxExit)
+			}
+		}
+		return "", nil
+	})
+	controller, _, _, _ := newTestController(t, controllerState{
+		Desired: map[string]Agent{}, Applied: map[string]Agent{},
+	}, run, nil)
+	controller.retryWait = func(context.Context, time.Duration) error { return nil }
+	if err := controller.Converge(context.Background(), []Agent{agent}); err != nil {
+		t.Fatalf("Converge() = %v", err)
+	}
+	want := [][]string{
+		{"bootout", serviceTarget(agent.Label)},
+		{"enable", serviceTarget(agent.Label)},
+		{"bootstrap", domainTarget(), path},
+		{"bootout", serviceTarget(agent.Label)},
+		{"enable", serviceTarget(agent.Label)},
+		{"bootstrap", domainTarget(), path},
+		{"kickstart", serviceTarget(agent.Label)},
+	}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("launchctl calls = %v, want %v", calls, want)
+	}
+}
+
 func TestControllerExactSetRemovesStaleBeforeInstallingDesired(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	stale := controllerAgent(t, "com.example.stale")
@@ -684,7 +814,7 @@ func TestControllerVerifyPropagatesUnexpectedLaunchctlFailure(t *testing.T) {
 	}
 }
 
-func TestControllerRetriesWholeReloadPairOnLaunchdEIO(t *testing.T) {
+func TestControllerRetriesWholeLoadSequenceOnLaunchdEIO(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	agent := controllerAgent(t, "com.example.retry")
 	agent.LimitLoadToSessionType = SessionTypeBackground
@@ -735,23 +865,19 @@ func TestControllerRetriesWholeReloadPairOnLaunchdEIO(t *testing.T) {
 			if !reflect.DeepEqual(delays, wantDelays) {
 				t.Fatalf("retry delays = %v, want %v", delays, wantDelays)
 			}
-			wantBootout, wantBootstrap := bootstrapAttempts, 0
-			if test.failure == "bootstrap" {
-				wantBootstrap = bootstrapAttempts
-			}
-			var bootouts, bootstraps, managers int
-			for _, call := range calls {
-				switch call[0] {
-				case "bootout":
-					bootouts++
-				case "bootstrap":
-					bootstraps++
-				case "managername":
-					managers++
+			var wantCalls [][]string
+			for range bootstrapAttempts {
+				wantCalls = append(wantCalls, []string{"bootout", serviceTarget(agent.Label)})
+				if test.failure == "bootstrap" {
+					wantCalls = append(wantCalls,
+						[]string{"enable", serviceTarget(agent.Label)},
+						[]string{"bootstrap", domainTarget(), "/tmp/retry.plist"},
+					)
 				}
 			}
-			if bootouts != wantBootout || bootstraps != wantBootstrap || managers != 1 {
-				t.Fatalf("calls = %v; bootout/bootstrap/manager = %d/%d/%d, want %d/%d/1", calls, bootouts, bootstraps, managers, wantBootout, wantBootstrap)
+			wantCalls = append(wantCalls, []string{"managername"})
+			if !reflect.DeepEqual(calls, wantCalls) {
+				t.Fatalf("launchctl calls = %v, want %v", calls, wantCalls)
 			}
 		})
 	}
