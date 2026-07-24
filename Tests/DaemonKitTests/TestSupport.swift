@@ -45,9 +45,14 @@ func withAsyncCleanup<Result>(
 }
 
 func shortSocketDir() throws -> URL {
-    let directory = URL(fileURLWithPath: "/tmp/dk-\(getpid())-\(UInt32.random(in: 0 ..< 0xFFFF))")
-    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-    return directory
+    var template = Array("/tmp/dk-XXXXXX".utf8CString)
+    let created = template.withUnsafeMutableBufferPointer { buffer in
+        mkdtemp(buffer.baseAddress)
+    }
+    guard let created else {
+        throw SessionTransportError.systemCall(operation: "mkdtemp", errno: errno)
+    }
+    return URL(fileURLWithPath: String(cString: created), isDirectory: true)
 }
 
 func makeAddress(path: String) -> sockaddr_un? {
