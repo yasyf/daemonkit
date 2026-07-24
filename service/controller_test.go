@@ -849,7 +849,7 @@ func TestControllerVerifyEnableFailureIsNotConverged(t *testing.T) {
 		}
 		return "", nil
 	})
-	controller, _, _, _ := newTestController(t, controllerState{
+	controller, _, store, _ := newTestController(t, controllerState{
 		Desired: map[string]Agent{agent.Label: agent}, Applied: map[string]Agent{agent.Label: agent},
 	}, run, nil)
 	failEnable = true
@@ -865,6 +865,18 @@ func TestControllerVerifyEnableFailureIsNotConverged(t *testing.T) {
 	}
 	if !reflect.DeepEqual(calls, want) {
 		t.Fatalf("launchctl calls = %v, want %v", calls, want)
+	}
+	if got := store.state.Applied[agent.Label]; !reflect.DeepEqual(got, agent) {
+		t.Fatalf("applied agent changed after verification failure: %#v", got)
+	}
+
+	failEnable = false
+	calls = nil
+	if err := controller.Converge(context.Background(), []Agent{agent}); err != nil {
+		t.Fatalf("retry Converge() = %v", err)
+	}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("retry launchctl calls = %v, want %v", calls, want)
 	}
 }
 
