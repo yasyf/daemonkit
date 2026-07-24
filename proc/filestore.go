@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -51,7 +52,10 @@ type FileStore struct {
 	Path string
 	// MaxOutstanding bounds records plus unacknowledged receipts. Zero uses
 	// defaultMaxOutstanding.
-	MaxOutstanding           uint64
+	MaxOutstanding uint64
+	// UnsupportedSchema decides what open does when the store on disk is not the
+	// exact current schema. The zero value fails closed with ErrRecordSchema.
+	UnsupportedSchema        UnsupportedSchemaPolicy
 	stopControlNow           func() time.Time
 	stopControlAfterArmStamp func()
 }
@@ -95,7 +99,23 @@ func (s *FileStore) open(ctx context.Context) (*bolt.DB, error) {
 	}
 	if err := db.Update(initializeFileStore); err != nil {
 		_ = db.Close()
-		return nil, err
+		if s.UnsupportedSchema != ArchiveUnsupportedSchema || !errors.Is(err, ErrRecordSchema) {
+			return nil, err
+		}
+		backup, archiveErr := ArchiveUnsupportedStore(s.Path)
+		if archiveErr != nil {
+			return nil, errors.Join(err, archiveErr)
+		}
+		slog.Warn("proc: archived unsupported-schema keyed store",
+			"path", s.Path, "backup", backup, "schema", recordSchemaVersion)
+		created = true
+		if db, err = bolt.Open(s.Path, 0o600, &bolt.Options{Timeout: timeout}); err != nil {
+			return nil, fmt.Errorf("proc: reopen keyed file store after archive: %w", err)
+		}
+		if err := db.Update(initializeFileStore); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
 	}
 	fileInfo, err := os.Stat(s.Path)
 	if err != nil {
