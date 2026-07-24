@@ -1,4 +1,3 @@
-import Darwin
 import Foundation
 
 /// One deadline-bounded logical unary request.
@@ -78,7 +77,7 @@ public final class ServiceSocketTerminationSignal: @unchecked Sendable {
     }
 }
 
-private final class ServiceStateSignal: @unchecked Sendable {
+final class ServiceStateSignal: @unchecked Sendable {
     private let lock = NSLock()
     private var revision: UInt64 = 0
     private var waiters: [UUID: CheckedContinuation<Void, Error>] = [:]
@@ -139,11 +138,6 @@ public struct ServiceSocketRejectionError: Error, Sendable {
 
 /// A persistent unary client that crosses expected service startup and takeover.
 public actor ServiceSocketClient {
-    private struct HandoffUsage {
-        var accepted = 0
-        var inFlight = 0
-    }
-
     struct Generation: Sendable {
         let id: UInt64
         let client: Task<SocketClient, Error>
@@ -177,7 +171,6 @@ public actor ServiceSocketClient {
     private var nextGeneration: UInt64 = 1
     private var closed = false
     private var terminal: (any Error)?
-    private var handoffUsage: [UInt64: HandoffUsage] = [:]
     private var retrySleepHook: (@Sendable () -> Void)?
     public nonisolated let termination = ServiceSocketTerminationSignal()
 
@@ -341,96 +334,6 @@ public actor ServiceSocketClient {
                 throw error
             }
         }
-    }
-
-    func handoff(
-        descriptor: Int32,
-        expectedRuntimeBuild: String,
-        parentDeadline: Date
-    ) async throws {
-        var ownsDescriptor = true
-        defer {
-            if ownsDescriptor {
-                Darwin.close(descriptor)
-            }
-        }
-        let deadline = min(parentDeadline, Date().addingTimeInterval(brokerHandoffMaximumDuration))
-        guard deadline > Date() else { throw ServiceSocketClientError.deadlineExceeded }
-        while true {
-            let receipt = try await acquireReadyRuntime(
-                expectedRuntimeBuild: expectedRuntimeBuild,
-                deadline: deadline
-            )
-            guard let current = generation,
-                  let client = try? await current.client.value,
-                  generation?.id == current.id
-            else { throw SessionTransportError.disconnected }
-            var usage = handoffUsage[current.id] ?? HandoffUsage()
-            if usage.accepted == 256, usage.inFlight == 0 {
-                handoffUsage.removeValue(forKey: current.id)
-                await retire(current)
-                continue
-            }
-            if usage.inFlight == 4 || usage.accepted + usage.inFlight == 256 {
-                let revision = stateSignal.currentRevision
-                let progress = RuntimeProgressTracker(
-                    wireBuild: wireBuild,
-                    expected: receipt.runtimeIdentity,
-                    noProgressTimeout: noProgressTimeout
-                )
-                try await waitForStateChange(after: revision, deadline: deadline, progress: progress)
-                continue
-            }
-            usage.inFlight += 1
-            handoffUsage[current.id] = usage
-            do {
-                let request = try BrokerHandoffCodec.makeRequest(identity: receipt.runtimeIdentity)
-                ownsDescriptor = false
-                let terminal = try await client.core.handoff(
-                    owner: client,
-                    descriptor: descriptor,
-                    payload: request.payload,
-                    deadline: deadline
-                )
-                guard !terminal.rejected else {
-                    throw BrokerHandoffError.responseRejected(terminal.code, terminal.reason)
-                }
-                guard terminal.error == nil,
-                      let payload = terminal.payload
-                else { throw BrokerHandoffError.invalidPayload }
-                let response = try BrokerHandoffCodec.decode(payload)
-                guard response.nonce == request.nonce,
-                      response.identity == receipt.runtimeIdentity
-                else { throw BrokerHandoffError.responseMismatch }
-                finishHandoff(generation: current.id, accepted: true)
-                if handoffUsage[current.id]?.accepted == 256 {
-                    handoffUsage.removeValue(forKey: current.id)
-                    await retire(current)
-                }
-                return
-            } catch {
-                finishHandoff(generation: current.id, accepted: false)
-                if !ownsDescriptor, !Self.keepsHandoffSession(after: error) {
-                    await retire(current)
-                }
-                throw error
-            }
-        }
-    }
-
-    static func keepsHandoffSession(after error: any Error) -> Bool {
-        guard case let BrokerHandoffError.responseRejected(code, _) = error else { return false }
-        return code == .handoffPendingCapacity
-    }
-
-    private func finishHandoff(generation: UInt64, accepted: Bool) {
-        guard var usage = handoffUsage[generation], usage.inFlight > 0 else { return }
-        usage.inFlight -= 1
-        if accepted {
-            usage.accepted += 1
-        }
-        handoffUsage[generation] = usage
-        stateSignal.signal()
     }
 
     /// Closes the service lifetime and its current session generation.
@@ -814,7 +717,6 @@ private extension ServiceSocketClient {
     func retire(_ current: Generation) async {
         guard generation?.id == current.id else { return }
         generation = nil
-        handoffUsage.removeValue(forKey: current.id)
         stateSignal.signal()
         if generationObservation?.id == current.id {
             generationObservation = nil

@@ -15,7 +15,7 @@ extension SocketTransportTests {
         }
 
         @Test func onlyPendingCapacityKeepsTheExactCarrierSession() {
-            #expect(ServiceSocketClient.keepsHandoffSession(after: BrokerHandoffError.responseRejected(
+            #expect(BrokerHandoffClient.keepsSession(after: BrokerHandoffError.responseRejected(
                 .handoffPendingCapacity,
                 nil
             )))
@@ -24,14 +24,39 @@ extension SocketTransportTests {
                 .handoffSessionExhausted,
                 .permissionDenied,
             ] {
-                #expect(!ServiceSocketClient.keepsHandoffSession(after: BrokerHandoffError.responseRejected(
+                #expect(!BrokerHandoffClient.keepsSession(after: BrokerHandoffError.responseRejected(
                     code,
                     nil
                 )))
             }
-            #expect(!ServiceSocketClient.keepsHandoffSession(after: BrokerHandoffError.deliveryUnknown))
-            #expect(!ServiceSocketClient.keepsHandoffSession(after: BrokerHandoffError.invalidPayload))
-            #expect(!ServiceSocketClient.keepsHandoffSession(after: BrokerHandoffError.responseMismatch))
+            #expect(!BrokerHandoffClient.keepsSession(after: BrokerHandoffError.deliveryUnknown))
+            #expect(!BrokerHandoffClient.keepsSession(after: BrokerHandoffError.invalidPayload))
+            #expect(!BrokerHandoffClient.keepsSession(after: BrokerHandoffError.responseMismatch))
+        }
+
+        @Test func bridgeRequiresDistinctNonemptyLifecycleAndHandoffRoles() throws {
+            let lifecycle = RuntimeClientConfiguration(
+                path: "/tmp/daemon.sock",
+                wireBuild: "suite.v1",
+                role: "lifecycle",
+                noProgressTimeout: 1
+            )
+            #expect(throws: BrokerHandoffError.invalidPayload) {
+                _ = try BrokerSocketBridge(
+                    path: "/tmp/broker.sock",
+                    lifecycle: lifecycle,
+                    handoffRole: "",
+                    expectedRuntimeBuild: "app.v1"
+                )
+            }
+            #expect(throws: BrokerHandoffError.invalidPayload) {
+                _ = try BrokerSocketBridge(
+                    path: "/tmp/broker.sock",
+                    lifecycle: lifecycle,
+                    handoffRole: lifecycle.role,
+                    expectedRuntimeBuild: "app.v1"
+                )
+            }
         }
 
         @Test func canonicalPayloadIsStrictAndNonceIsPaddedBase64() throws {
@@ -406,12 +431,13 @@ extension SocketTransportTests.BrokerHandoffTests {
     private func makeBridge(path: String) throws -> BrokerSocketBridge {
         try BrokerSocketBridge(
             path: path,
-            daemon: RuntimeClientConfiguration(
+            lifecycle: RuntimeClientConfiguration(
                 path: path + ".daemon",
                 wireBuild: "suite.v1",
-                role: SessionPeerRole.unprotected,
+                role: "lifecycle",
                 noProgressTimeout: 1
             ),
+            handoffRole: "handoff",
             expectedRuntimeBuild: "app.v1"
         )
     }

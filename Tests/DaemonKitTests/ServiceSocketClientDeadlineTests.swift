@@ -455,21 +455,6 @@ extension SocketTransportTests.ServiceSocketClientTests {
         let identity = RuntimeIdentity(runtimeBuild: "app.v1", processGeneration: testOwnerGeneration())
         let responseGate = ServiceWriteGate()
         try await withRawServicePeers(count: 1) { _, codec in
-            let receipt = try nextRequest(codec)
-            guard receipt.operation == runtimeReceiptOperation else {
-                throw SessionTransportError.invalidFrame("expected runtime receipt request")
-            }
-            try writeRawTerminal(RuntimeReceiptCodec.encodeResponse(identity), for: receipt, to: codec)
-            let subscription = try nextRequest(codec)
-            guard subscription.operation == readinessSubscribeOperation else {
-                throw SessionTransportError.invalidFrame("expected readiness subscription")
-            }
-            try writeRawTerminal(readinessSubscribeAck, for: subscription, to: codec)
-            try codec.write(SessionFrame(
-                kind: .lifecycle,
-                flags: .end,
-                payload: lifecyclePayload(.ready, sequence: 2)
-            ))
             let handoff = try nextRequest(codec)
             guard handoff.operation == brokerHandoffOperation else {
                 throw SessionTransportError.invalidFrame("expected broker handoff request")
@@ -477,15 +462,11 @@ extension SocketTransportTests.ServiceSocketClientTests {
             responseGate.block()
         } operation: { path in
             defer { responseGate.unblock() }
-            let client = try serviceTestClient(
+            let client = try BrokerHandoffClient(
                 path: path,
                 wireBuild: "service.v1",
-                role: SessionPeerRole.unprotected,
-                noProgressTimeout: 1
-            )
-            _ = try await client.acquireReadyRuntime(
-                expectedRuntimeBuild: "app.v1",
-                deadline: Date().addingTimeInterval(1)
+                role: "handoff",
+                configuration: .init()
             )
             var connected: [Int32] = [-1, -1]
             try #require(socketpair(AF_UNIX, SOCK_STREAM, 0, &connected) == 0)
@@ -495,7 +476,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
             await #expect(throws: BrokerHandoffError.deliveryUnknown) {
                 try await client.handoff(
                     descriptor: passed,
-                    expectedRuntimeBuild: "app.v1",
+                    runtimeIdentity: identity,
                     parentDeadline: started.addingTimeInterval(0.03)
                 )
             }

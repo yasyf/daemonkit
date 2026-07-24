@@ -101,6 +101,196 @@ private let brokerHandoffLog = Logger(
 )
 private let descriptorInheritanceLock = NSLock()
 
+actor BrokerHandoffClient {
+    private struct Usage {
+        var accepted = 0
+        var inFlight = 0
+    }
+
+    private struct Generation: Sendable {
+        let id: UInt64
+        let client: Task<SocketClient, Error>
+    }
+
+    private let path: String
+    private let wireBuild: String
+    private let role: String
+    private let configuration: SocketClient.Configuration
+    private let stateSignal = ServiceStateSignal()
+    private var generation: Generation?
+    private var usage: [UInt64: Usage] = [:]
+    private var nextGeneration: UInt64 = 1
+    private var closed = false
+
+    init(
+        path: String,
+        wireBuild: String,
+        role: String,
+        configuration: SocketClient.Configuration
+    ) throws {
+        guard !wireBuild.isEmpty else { throw SessionTransportError.handshake("empty wireBuild") }
+        guard !role.isEmpty else { throw SessionTransportError.handshake("empty role") }
+        self.path = path
+        self.wireBuild = wireBuild
+        self.role = role
+        self.configuration = configuration
+    }
+
+    func handoff(
+        descriptor: Int32,
+        runtimeIdentity: RuntimeIdentity,
+        parentDeadline: Date
+    ) async throws {
+        var ownsDescriptor = true
+        defer {
+            if ownsDescriptor {
+                Darwin.close(descriptor)
+            }
+        }
+        let deadline = min(parentDeadline, Date().addingTimeInterval(brokerHandoffMaximumDuration))
+        guard deadline > Date() else { throw ServiceSocketClientError.deadlineExceeded }
+        while true {
+            let current = try await session(deadline: deadline)
+            var currentUsage = usage[current.generation.id] ?? Usage()
+            if currentUsage.accepted == 256, currentUsage.inFlight == 0 {
+                await retire(current.generation)
+                continue
+            }
+            if currentUsage.inFlight == 4 || currentUsage.accepted + currentUsage.inFlight == 256 {
+                try await waitForCapacity(after: stateSignal.currentRevision, deadline: deadline)
+                continue
+            }
+            currentUsage.inFlight += 1
+            usage[current.generation.id] = currentUsage
+            do {
+                let request = try BrokerHandoffCodec.makeRequest(identity: runtimeIdentity)
+                ownsDescriptor = false
+                let terminal = try await current.client.core.handoff(
+                    owner: current.client,
+                    descriptor: descriptor,
+                    payload: request.payload,
+                    deadline: deadline
+                )
+                guard !terminal.rejected else {
+                    throw BrokerHandoffError.responseRejected(terminal.code, terminal.reason)
+                }
+                guard terminal.error == nil, let payload = terminal.payload else {
+                    throw BrokerHandoffError.invalidPayload
+                }
+                let response = try BrokerHandoffCodec.decode(payload)
+                guard response.nonce == request.nonce, response.identity == runtimeIdentity else {
+                    throw BrokerHandoffError.responseMismatch
+                }
+                finish(generation: current.generation.id, accepted: true)
+                if usage[current.generation.id]?.accepted == 256 {
+                    await retire(current.generation)
+                }
+                return
+            } catch {
+                finish(generation: current.generation.id, accepted: false)
+                if !ownsDescriptor, !Self.keepsSession(after: error) {
+                    await retire(current.generation)
+                }
+                throw error
+            }
+        }
+    }
+
+    func close() async {
+        guard !closed else { return }
+        closed = true
+        stateSignal.signal()
+        if let generation {
+            await retire(generation)
+        }
+    }
+
+    static func keepsSession(after error: any Error) -> Bool {
+        guard case let BrokerHandoffError.responseRejected(code, _) = error else { return false }
+        return code == .handoffPendingCapacity
+    }
+
+    private func session(deadline: Date) async throws -> (generation: Generation, client: SocketClient) {
+        guard !closed else { throw ServiceSocketClientError.closed }
+        guard deadline > Date() else { throw ServiceSocketClientError.deadlineExceeded }
+        let current: Generation
+        if let generation {
+            current = generation
+        } else {
+            var attemptConfiguration = configuration
+            attemptConfiguration.handshakeTimeout = min(
+                attemptConfiguration.handshakeTimeout,
+                deadline.timeIntervalSinceNow
+            )
+            let id = nextGeneration
+            nextGeneration += 1
+            let path = path
+            let wireBuild = wireBuild
+            let role = role
+            current = Generation(
+                id: id,
+                client: Task {
+                    try await SocketClient(
+                        path: path,
+                        wireBuild: wireBuild,
+                        role: role,
+                        configuration: attemptConfiguration
+                    )
+                }
+            )
+            generation = current
+        }
+        do {
+            let client = try await current.client.value
+            guard !closed, generation?.id == current.id else {
+                await client.close()
+                throw ServiceSocketClientError.closed
+            }
+            return (current, client)
+        } catch {
+            if generation?.id == current.id {
+                generation = nil
+                usage.removeValue(forKey: current.id)
+                stateSignal.signal()
+            }
+            throw error
+        }
+    }
+
+    private func retire(_ current: Generation) async {
+        guard generation?.id == current.id else { return }
+        generation = nil
+        usage.removeValue(forKey: current.id)
+        stateSignal.signal()
+        if let client = try? await current.client.value {
+            await client.close()
+        }
+    }
+
+    private func finish(generation: UInt64, accepted: Bool) {
+        guard var current = usage[generation], current.inFlight > 0 else { return }
+        current.inFlight -= 1
+        if accepted {
+            current.accepted += 1
+        }
+        usage[generation] = current
+        stateSignal.signal()
+    }
+
+    private func waitForCapacity(after revision: UInt64, deadline: Date) async throws {
+        guard deadline > Date() else { throw ServiceSocketClientError.deadlineExceeded }
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask { try await self.stateSignal.wait(after: revision) }
+            group.addTask {
+                try await Task.sleep(until: .now + .seconds(deadline.timeIntervalSinceNow))
+                throw ServiceSocketClientError.deadlineExceeded
+            }
+            _ = try await group.next()
+            group.cancelAll()
+        }
+    }
+}
+
 /// BrokerSocketBridge owns the App Group listener and exposes no accepted descriptor.
 public final class BrokerSocketBridge: @unchecked Sendable {
     private struct SocketNode: Equatable {
@@ -116,7 +306,8 @@ public final class BrokerSocketBridge: @unchecked Sendable {
 
     private let path: String
     private let expectedRuntimeBuild: String
-    private let client: ServiceSocketClient
+    private let lifecycleClient: ServiceSocketClient
+    private let handoffClient: BrokerHandoffClient
     private let acceptQueue = DispatchQueue(label: "com.yasyf.daemonkit.BrokerSocketBridge.accept")
     private let lock = NSLock()
     private var listener: Int32 = -1
@@ -128,31 +319,43 @@ public final class BrokerSocketBridge: @unchecked Sendable {
     public convenience init(
         container: AppGroupContainer,
         socket: AppGroupContainer.SocketLeaf,
-        daemon: RuntimeClientConfiguration,
+        lifecycle: RuntimeClientConfiguration,
+        handoffRole: String,
         expectedRuntimeBuild: String
     ) throws {
         try self.init(
             path: container.socketPath(leaf: socket),
-            daemon: daemon,
+            lifecycle: lifecycle,
+            handoffRole: handoffRole,
             expectedRuntimeBuild: expectedRuntimeBuild
         )
     }
 
     init(
         path: String,
-        daemon: RuntimeClientConfiguration,
+        lifecycle: RuntimeClientConfiguration,
+        handoffRole: String,
         expectedRuntimeBuild: String
     ) throws {
         guard !expectedRuntimeBuild.isEmpty else { throw BrokerHandoffError.invalidPayload }
+        guard !handoffRole.isEmpty, handoffRole != lifecycle.role else {
+            throw BrokerHandoffError.invalidPayload
+        }
         self.path = path
         self.expectedRuntimeBuild = expectedRuntimeBuild
-        client = try ServiceSocketClient(
-            path: daemon.path,
-            wireBuild: daemon.wireBuild,
-            role: daemon.role,
-            noProgressTimeout: daemon.noProgressTimeout,
-            configuration: daemon.socket,
-            onProgress: daemon.onProgress
+        lifecycleClient = try ServiceSocketClient(
+            path: lifecycle.path,
+            wireBuild: lifecycle.wireBuild,
+            role: lifecycle.role,
+            noProgressTimeout: lifecycle.noProgressTimeout,
+            configuration: lifecycle.socket,
+            onProgress: lifecycle.onProgress
+        )
+        handoffClient = try BrokerHandoffClient(
+            path: lifecycle.path,
+            wireBuild: lifecycle.wireBuild,
+            role: handoffRole,
+            configuration: lifecycle.socket
         )
     }
 
@@ -185,12 +388,24 @@ public final class BrokerSocketBridge: @unchecked Sendable {
                         }
                         let accepted = try await acceptConnection(bound.descriptor)
                         pending += 1
-                        group.addTask { [client, expectedRuntimeBuild] in
+                        group.addTask { [lifecycleClient, handoffClient, expectedRuntimeBuild] in
+                            var ownsDescriptor = true
+                            defer {
+                                if ownsDescriptor {
+                                    Darwin.close(accepted)
+                                }
+                            }
                             do {
-                                try await client.handoff(
-                                    descriptor: accepted,
+                                let deadline = Date().addingTimeInterval(brokerHandoffMaximumDuration)
+                                let receipt = try await lifecycleClient.acquireReadyRuntime(
                                     expectedRuntimeBuild: expectedRuntimeBuild,
-                                    parentDeadline: Date().addingTimeInterval(brokerHandoffMaximumDuration)
+                                    deadline: deadline
+                                )
+                                ownsDescriptor = false
+                                try await handoffClient.handoff(
+                                    descriptor: accepted,
+                                    runtimeIdentity: receipt.runtimeIdentity,
+                                    parentDeadline: deadline
                                 )
                             } catch {
                                 brokerHandoffLog.error("connected socket handoff failed: \(String(describing: error), privacy: .public)")
@@ -209,14 +424,16 @@ public final class BrokerSocketBridge: @unchecked Sendable {
         } catch {
             let expectedStop = lock.withLock { stopped }
             closeListener(bound)
-            await client.close()
+            await lifecycleClient.close()
+            await handoffClient.close()
             if expectedStop {
                 return
             }
             throw error
         }
         closeListener(bound)
-        await client.close()
+        await lifecycleClient.close()
+        await handoffClient.close()
     }
 
     /// Stops admission and closes the authenticated outbound session.
@@ -237,7 +454,8 @@ public final class BrokerSocketBridge: @unchecked Sendable {
         if let owned {
             release(owned)
         }
-        await client.close()
+        await lifecycleClient.close()
+        await handoffClient.close()
     }
 
     private func bindListener() throws -> BoundListener {
