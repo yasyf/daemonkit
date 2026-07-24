@@ -298,24 +298,22 @@ func TestActivationStateRejectsLegacyShortOperationID(t *testing.T) {
 	}
 }
 
-func TestDeactivateInstalledRequiresReceiptAndEnforcesUpgradeOrder(t *testing.T) {
+func TestDeactivateCurrentInstalledUsesSealedActivationAndEnforcesUpgradeOrder(t *testing.T) {
 	fixture := newActivationFixture(t)
-	deactivate := DeactivateInstalledConfig{
-		ConsumerBuild: fixture.config.ConsumerBuild,
-		PolicyDigest:  fixture.config.PolicyDigest,
+	deactivate := DeactivateCurrentInstalledConfig{
+		Current: CurrentInstalledSpec{AppPath: fixture.appPath, Identity: fixture.spec.Identity},
 		RuntimeQuiesce: func(context.Context, RuntimeStopper, DeactivateInstalledOperation) (RuntimeProof, error) {
 			return NewRuntimeProof(true, proc.OwnerGeneration{}, SHA256{8})
 		},
 	}
-	if _, err := fixture.controller.DeactivateInstalled(t.Context(), deactivate); !errors.Is(err, ErrInvalidConfig) {
+	if _, err := fixture.controller.DeactivateCurrentInstalled(t.Context(), deactivate); !errors.Is(err, ErrInstallConflict) {
 		t.Fatalf("deactivate without receipt = %v", err)
 	}
 	active, err := fixture.controller.ActivateInstalled(t.Context(), fixture.config)
 	if err != nil {
 		t.Fatal(err)
 	}
-	deactivate.Expected = active
-	removed, err := fixture.controller.DeactivateInstalled(t.Context(), deactivate)
+	removed, err := fixture.controller.DeactivateCurrentInstalled(t.Context(), deactivate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -331,7 +329,7 @@ func TestDeactivateInstalledRequiresReceiptAndEnforcesUpgradeOrder(t *testing.T)
 	if err := requireRealDirectory(fixture.appPath); err != nil {
 		t.Fatalf("deactivation removed app: %v", err)
 	}
-	replayed, err := fixture.controller.DeactivateInstalled(t.Context(), deactivate)
+	replayed, err := fixture.controller.DeactivateCurrentInstalled(t.Context(), deactivate)
 	if err != nil || replayed.OperationID() != removed.OperationID() {
 		t.Fatalf("deactivation replay = %#v, %v", replayed, err)
 	}

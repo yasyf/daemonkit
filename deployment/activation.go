@@ -31,6 +31,12 @@ type InstalledSpec struct {
 	Identity codeidentity.CodeIdentity
 }
 
+// CurrentInstalledSpec names the fixed installed app without requiring its prior build.
+type CurrentInstalledSpec struct {
+	AppPath  string
+	Identity codeidentity.CodeIdentity
+}
+
 // ActivateInstalledConfig seals one already-attested signed app activation.
 type ActivateInstalledConfig struct {
 	Expected      InstalledAttestation
@@ -40,11 +46,9 @@ type ActivateInstalledConfig struct {
 	Readiness     func(context.Context, InstalledOperation) (ReadinessProof, error)
 }
 
-// DeactivateInstalledConfig seals one activation removal operation.
-type DeactivateInstalledConfig struct {
-	Expected       ActivationReceipt
-	ConsumerBuild  string
-	PolicyDigest   SHA256
+// DeactivateCurrentInstalledConfig removes the sealed activation at one fixed app identity.
+type DeactivateCurrentInstalledConfig struct {
+	Current        CurrentInstalledSpec
 	RuntimeQuiesce func(context.Context, RuntimeStopper, DeactivateInstalledOperation) (RuntimeProof, error)
 }
 
@@ -516,15 +520,15 @@ func (c *Controller) StatusInstalled(ctx context.Context, spec InstalledSpec) (I
 	return InstalledStatus{state: state, attestation: attestation, receipt: &public}, nil
 }
 
-// DeactivateInstalled removes exact service ownership while retaining the packaged app.
-func (c *Controller) DeactivateInstalled(ctx context.Context, config DeactivateInstalledConfig) (DeactivationReceipt, error) {
-	if err := validateDeactivateConfig(config); err != nil {
+// DeactivateCurrentInstalled attests and removes the controller-sealed current activation.
+func (c *Controller) DeactivateCurrentInstalled(ctx context.Context, config DeactivateCurrentInstalledConfig) (DeactivationReceipt, error) {
+	if err := validateCurrentInstalledSpec(config.Current); err != nil {
 		return DeactivationReceipt{}, err
 	}
-	if c == nil || c.openService == nil || c.operationID == nil {
+	if config.RuntimeQuiesce == nil || c == nil || c.verifier == nil || c.openService == nil || c.operationID == nil {
 		return DeactivationReceipt{}, ErrInvalidConfig
 	}
-	paths := deploymentPathsForApp(config.Expected.Generation().Path())
+	paths := deploymentPathsForApp(config.Current.AppPath)
 	if err := requireRealDirectory(paths.metadataDir); err != nil {
 		return DeactivationReceipt{}, fmt.Errorf("%w: activation receipt is required", ErrInstallConflict)
 	}
@@ -533,54 +537,63 @@ func (c *Controller) DeactivateInstalled(ctx context.Context, config DeactivateI
 		return DeactivationReceipt{}, err
 	}
 	defer lock.Close()
-	return c.deactivateLocked(ctx, config, paths)
+	receipt, err := c.deactivateCurrentLocked(ctx, config, paths)
+	if err != nil {
+		return DeactivationReceipt{}, err
+	}
+	if apply, applyErr := readApply(paths.apply); applyErr == nil && apply.Phase == applyActive {
+		if err := removeIfExistsDurable(paths.apply); err != nil {
+			return DeactivationReceipt{}, err
+		}
+	} else if applyErr != nil && !errors.Is(applyErr, os.ErrNotExist) {
+		return DeactivationReceipt{}, applyErr
+	}
+	return receipt, nil
 }
 
-func validateDeactivateConfig(config DeactivateInstalledConfig) error {
-	if !config.Expected.Active() || !validOperationID(config.Expected.OperationID()) ||
-		strings.TrimSpace(config.ConsumerBuild) == "" || config.ConsumerBuild != strings.TrimSpace(config.ConsumerBuild) ||
-		config.RuntimeQuiesce == nil {
-		return fmt.Errorf("%w: exact active receipt, consumer build, and runtime quiesce are required", ErrInvalidConfig)
-	}
-	if err := config.Expected.Generation().stored.validate(); err != nil {
+func validateCurrentInstalledSpec(spec CurrentInstalledSpec) error {
+	if err := validateCanonicalAppPath(spec.AppPath); err != nil {
 		return err
 	}
-	return config.PolicyDigest.validate("policy digest")
+	if _, err := spec.Identity.DRString(); err != nil {
+		return fmt.Errorf("%w: current code identity: %w", ErrInvalidConfig, err)
+	}
+	return nil
 }
 
-func (c *Controller) deactivateLocked(
+func (c *Controller) deactivateCurrentLocked(
 	ctx context.Context,
-	config DeactivateInstalledConfig,
+	config DeactivateCurrentInstalledConfig,
 	paths deploymentPaths,
 ) (DeactivationReceipt, error) {
-	expected := config.Expected
 	activation, err := readActivation(paths.activation)
 	if errors.Is(err, os.ErrNotExist) {
 		tombstone, tombstoneErr := readDeactivation(paths.deactivation)
 		if tombstoneErr != nil {
 			return DeactivationReceipt{}, fmt.Errorf("%w: activation receipt is required", ErrInstallConflict)
 		}
-		if tombstone.ActivationOperationID != expected.OperationID() || tombstone.ConsumerBuild != config.ConsumerBuild ||
-			tombstone.PolicyDigest != config.PolicyDigest.String() || tombstone.Phase != deactivationInactive {
+		if tombstone.Phase != deactivationInactive || !currentMatchesGeneration(config.Current, tombstone.Generation) {
 			return DeactivationReceipt{}, fmt.Errorf("%w: deactivation replay differs from receipt", ErrInstallConflict)
+		}
+		if err := c.attestStoredGeneration(ctx, tombstone.Generation); err != nil {
+			return DeactivationReceipt{}, err
 		}
 		return tombstone.public()
 	}
 	if err != nil {
 		return DeactivationReceipt{}, err
 	}
+	if !currentMatchesGeneration(config.Current, activation.Generation) {
+		return DeactivationReceipt{}, fmt.Errorf("%w: current app identity differs from sealed activation", ErrInstallConflict)
+	}
+	if err := c.attestStoredGeneration(ctx, activation.Generation); err != nil {
+		return DeactivationReceipt{}, err
+	}
 	publicActivation, err := activation.public()
 	if err != nil {
 		return DeactivationReceipt{}, err
 	}
-	expectedReadiness, _ := expected.Readiness()
-	publicReadiness, _ := publicActivation.Readiness()
-	if activation.ConsumerBuild != config.ConsumerBuild || activation.PolicyDigest != config.PolicyDigest.String() ||
-		activation.OperationID != expected.OperationID() || !reflect.DeepEqual(activation.Generation, expected.Generation().stored) ||
-		publicActivation.Plan().Digest() != expected.Plan().Digest() || !reflect.DeepEqual(publicReadiness, expectedReadiness) {
-		return DeactivationReceipt{}, fmt.Errorf("%w: deactivation config differs from activation", ErrInstallConflict)
-	}
-	if err := verifyGenerationIdentity(expected.Generation().Path(), activation.Generation.FileID); err != nil {
+	if err := verifyGenerationIdentity(activation.Generation.Path, activation.Generation.FileID); err != nil {
 		return DeactivationReceipt{}, fmt.Errorf("%w: canonical app generation changed: %w", ErrInstallConflict, err)
 	}
 	tombstone, err := readDeactivation(paths.deactivation)
@@ -589,8 +602,8 @@ func (c *Controller) deactivateLocked(
 	} else if err != nil {
 		return DeactivationReceipt{}, err
 	} else if tombstone.Phase == deactivationInactive {
-		if tombstone.ActivationOperationID == expected.OperationID() && tombstone.ConsumerBuild == config.ConsumerBuild &&
-			tombstone.PolicyDigest == config.PolicyDigest.String() &&
+		if tombstone.ActivationOperationID == activation.OperationID && tombstone.ConsumerBuild == activation.ConsumerBuild &&
+			tombstone.PolicyDigest == activation.PolicyDigest &&
 			tombstone.ActivationFingerprint == activation.ConfigFingerprint {
 			if err := removeIfExistsDurable(paths.activation); err != nil {
 				return DeactivationReceipt{}, err
@@ -609,9 +622,10 @@ func (c *Controller) deactivateLocked(
 		}
 		tombstone = &deactivationReceiptWire{
 			Identity: deactivationIdentity, Schema: activationSchema, OperationID: operationID,
-			ActivationOperationID: expected.OperationID(),
-			ConsumerBuild:         config.ConsumerBuild, PolicyDigest: config.PolicyDigest.String(),
+			ActivationOperationID: activation.OperationID,
+			ConsumerBuild:         activation.ConsumerBuild, PolicyDigest: activation.PolicyDigest,
 			ActivationFingerprint: activation.ConfigFingerprint, Phase: deactivationPrepared,
+			Generation: activation.Generation,
 		}
 		if err := writeJSONDurable(paths.deactivation, tombstone); err != nil {
 			return DeactivationReceipt{}, err
@@ -620,8 +634,8 @@ func (c *Controller) deactivateLocked(
 			return DeactivationReceipt{}, err
 		}
 	}
-	if tombstone.ActivationOperationID != expected.OperationID() || tombstone.ConsumerBuild != config.ConsumerBuild ||
-		tombstone.PolicyDigest != config.PolicyDigest.String() ||
+	if tombstone.ActivationOperationID != activation.OperationID || tombstone.ConsumerBuild != activation.ConsumerBuild ||
+		tombstone.PolicyDigest != activation.PolicyDigest || !reflect.DeepEqual(tombstone.Generation, activation.Generation) ||
 		tombstone.ActivationFingerprint != activation.ConfigFingerprint {
 		return DeactivationReceipt{}, fmt.Errorf("%w: deactivation receipt differs from request", ErrInstallConflict)
 	}
@@ -711,6 +725,24 @@ func (c *Controller) deactivateLocked(
 		return DeactivationReceipt{}, err
 	}
 	return tombstone.public()
+}
+
+func currentMatchesGeneration(spec CurrentInstalledSpec, generation storedGeneration) bool {
+	return generation.Path == spec.AppPath && generation.TeamID == spec.Identity.TeamID &&
+		generation.SigningIdentifier == spec.Identity.SigningIdentifier
+}
+
+func (c *Controller) attestStoredGeneration(ctx context.Context, expected storedGeneration) error {
+	generation, err := inspectInstalled(ctx, c.verifier, expected.Path, expected.Version, codeidentity.CodeIdentity{
+		TeamID: expected.TeamID, SigningIdentifier: expected.SigningIdentifier,
+	})
+	if err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(generation, expected) {
+		return fmt.Errorf("%w: installed app differs from sealed activation", ErrInstallConflict)
+	}
+	return nil
 }
 
 type runtimeStopAccess struct {

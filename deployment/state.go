@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/proc"
@@ -16,7 +18,19 @@ import (
 const (
 	activationIdentity   = "daemonkit.deployment.activation.v1"
 	deactivationIdentity = "daemonkit.deployment.deactivation.v1"
+	applyIdentity        = "daemonkit.deployment.apply.v1"
 	activationSchema     = 1
+)
+
+type applyPhase string
+
+const (
+	applyPrepared   applyPhase = "prepared"
+	applyQuiesced   applyPhase = "quiesced"
+	applySwapped    applyPhase = "swapped"
+	applyActive     applyPhase = "active"
+	applyRollback   applyPhase = "rollback"
+	applyRolledBack applyPhase = "rolled_back"
 )
 
 type activationPhase string
@@ -85,6 +99,23 @@ type deactivationReceiptWire struct {
 	ActivationFingerprint string              `json:"activation_fingerprint"`
 	Phase                 deactivationPhase   `json:"phase"`
 	RuntimeProof          *storedRuntimeProof `json:"runtime_proof,omitempty"`
+	Generation            storedGeneration    `json:"generation"`
+}
+
+type applyReceiptWire struct {
+	Identity            string                 `json:"identity"`
+	Schema              int                    `json:"schema"`
+	OperationID         string                 `json:"operation_id"`
+	ConfigFingerprint   string                 `json:"config_fingerprint"`
+	Phase               applyPhase             `json:"phase"`
+	TargetPath          string                 `json:"target_path"`
+	Candidate           storedGeneration       `json:"candidate"`
+	Prior               *activationReceiptWire `json:"prior,omitempty"`
+	ConsumerBuild       string                 `json:"consumer_build"`
+	PolicyDigest        string                 `json:"policy_digest"`
+	Plan                storedPlan             `json:"plan"`
+	ActivationOperation string                 `json:"activation_operation,omitempty"`
+	RollbackOperation   string                 `json:"rollback_operation,omitempty"`
 }
 
 func storePlan(plan service.Plan) storedPlan {
@@ -120,6 +151,17 @@ func readActivation(path string) (*activationReceiptWire, error) {
 
 func readDeactivation(path string) (*deactivationReceiptWire, error) {
 	var receipt deactivationReceiptWire
+	if err := readExactJSON(path, &receipt); err != nil {
+		return nil, err
+	}
+	if err := receipt.validate(); err != nil {
+		return nil, err
+	}
+	return &receipt, nil
+}
+
+func readApply(path string) (*applyReceiptWire, error) {
+	var receipt applyReceiptWire
 	if err := readExactJSON(path, &receipt); err != nil {
 		return nil, err
 	}
@@ -169,7 +211,7 @@ func (receipt activationReceiptWire) validate() error {
 	if receipt.Phase != activationPrepared && receipt.Phase != activationActive {
 		return ErrInstallState
 	}
-	if err := receipt.Generation.validate(); err != nil {
+	if err := receipt.Generation.validateStored(); err != nil {
 		return err
 	}
 	if _, err := restorePlan(receipt.Plan); err != nil {
@@ -197,6 +239,9 @@ func (receipt deactivationReceiptWire) validate() error {
 	if receipt.Phase != deactivationPrepared && receipt.Phase != deactivationInactive {
 		return ErrInstallState
 	}
+	if err := receipt.Generation.validateStored(); err != nil {
+		return err
+	}
 	if receipt.Phase == deactivationPrepared && receipt.RuntimeProof != nil {
 		return ErrInstallState
 	}
@@ -209,10 +254,58 @@ func (receipt deactivationReceiptWire) validate() error {
 	return nil
 }
 
+func (receipt applyReceiptWire) validate() error {
+	if receipt.Identity != applyIdentity || receipt.Schema != activationSchema || !validOperationID(receipt.OperationID) ||
+		receipt.ConfigFingerprint == "" || receipt.TargetPath == "" || receipt.ConsumerBuild == "" ||
+		!validDigestString(receipt.PolicyDigest) {
+		return ErrInstallState
+	}
+	if receipt.Phase != applyPrepared && receipt.Phase != applyQuiesced && receipt.Phase != applySwapped &&
+		receipt.Phase != applyActive && receipt.Phase != applyRollback && receipt.Phase != applyRolledBack {
+		return ErrInstallState
+	}
+	if err := receipt.Candidate.validateStored(); err != nil {
+		return err
+	}
+	if receipt.Prior != nil {
+		if err := receipt.Prior.validate(); err != nil {
+			return err
+		}
+		if receipt.Prior.Phase != activationActive || receipt.Prior.Generation.Path != receipt.TargetPath {
+			return ErrInstallState
+		}
+	}
+	if _, err := restorePlan(receipt.Plan); err != nil {
+		return err
+	}
+	if receipt.ActivationOperation != "" && !validOperationID(receipt.ActivationOperation) {
+		return ErrInstallState
+	}
+	if receipt.RollbackOperation != "" && !validOperationID(receipt.RollbackOperation) {
+		return ErrInstallState
+	}
+	if receipt.Phase == applyActive && receipt.ActivationOperation == "" {
+		return ErrInstallState
+	}
+	return nil
+}
+
 func (generation storedGeneration) validate() error {
 	if err := validateCanonicalAppPath(generation.Path); err != nil {
 		return errors.Join(ErrInstallState, err)
 	}
+	return generation.validateFields()
+}
+
+func (generation storedGeneration) validateStored() error {
+	if generation.Path == "" || !filepath.IsAbs(generation.Path) || filepath.Clean(generation.Path) != generation.Path ||
+		!strings.HasSuffix(filepath.Base(generation.Path), ".app") || filepath.Base(generation.Path) == ".app" {
+		return ErrInstallState
+	}
+	return generation.validateFields()
+}
+
+func (generation storedGeneration) validateFields() error {
 	if generation.Version == "" || generation.TeamID == "" || generation.SigningIdentifier == "" ||
 		generation.DesignatedRequirement == "" || !validCDHash(generation.CDHash) ||
 		!validDigestString(generation.EntitlementsDigest) || !validDigestString(generation.BundleDigest) ||

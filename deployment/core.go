@@ -109,6 +109,8 @@ type deploymentPaths struct {
 	deactivation   string
 	serviceState   string
 	serviceProcess string
+	apply          string
+	prior          string
 }
 
 func deploymentPathsForApp(appPath string) deploymentPaths {
@@ -121,6 +123,8 @@ func deploymentPathsForApp(appPath string) deploymentPaths {
 		deactivation:   filepath.Join(metadata, "deactivation.json"),
 		serviceState:   filepath.Join(metadata, "services.db"),
 		serviceProcess: filepath.Join(metadata, "service-workers.db"),
+		apply:          filepath.Join(metadata, "apply.json"),
+		prior:          filepath.Join(metadata, "prior.app"),
 	}
 }
 
