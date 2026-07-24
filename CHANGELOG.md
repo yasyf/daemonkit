@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-23
+
 ### Added
 
 - The `artifact` package resolves a version-exact executable from a declarative
@@ -30,6 +32,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `proc.ArchiveUnsupportedStore` exposes the rename-aside for reuse.
   `service.ControllerConfig.UnsupportedSchema` threads the policy to the
   worker/process-record store.
+
+### Changed
+
+- Also carries the wire and runtime work landed on `main` since the 0.11.0
+  preparation: the authenticated broker socket handoff, explicit peer-role
+  session binding, typed runtime recovery and durable stop replay, sealed
+  spawned sessions, and the lifecycle/workers/trust hard cut.
+
+### Fixed
+
+- The rendered application cask guards its stop hook on the installed binary
+  being executable and removes a binary-less husk left by an aborted upgrade,
+  so `brew upgrade` no longer aborts with exit 127 when Homebrew has already
+  moved the app aside.
 
 ## [0.11.0] - 2026-07-23
 
