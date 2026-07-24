@@ -6,6 +6,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The `artifact` package resolves a version-exact executable from a declarative
+  descriptor (schema 1, dotslash dialect). `Store.Resolve` materializes a
+  release binary into a content-addressed cache (hash-while-streaming,
+  verify-before-rename), a Python tool into a version-addressed `uv tool` store,
+  or a signed app through `deployment.Controller` (attest-only, with a
+  `brew upgrade --cask` handoff, for TCC-bound installs). A dynamic version is
+  refused for a release binary, which has no independent integrity gate.
+  Resolution pins the exact descriptor version and never consults a latest
+  release.
+- `ghrelease.Latest` queries a repository's latest published release for
+  self-update flows; artifact resolution never consults it.
+- `version.Equal` reports exact-release equality, treating the TAG and BARE
+  spellings of one release as equal but nothing looser.
+- `proc.FileStamp` is a cross-process throttle: at most one `Claim` succeeds per
+  window, resolving racing processes to a single winner.
+- `proc.FileStore.UnsupportedSchema` opts a keyed store into archiving a wedged
+  store aside and continuing fresh instead of failing closed;
+  `proc.ArchiveUnsupportedStore` exposes the rename-aside for reuse.
+  `service.ControllerConfig.UnsupportedSchema` threads the policy to the
+  worker/process-record store.
+
 ## [0.11.0] - 2026-07-23
 
 ### Added
