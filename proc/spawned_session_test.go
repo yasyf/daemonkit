@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -245,6 +246,96 @@ func TestSpawnedSessionManagerExchangeAndOneShotClaims(t *testing.T) {
 	}
 }
 
+func TestSpawnedSessionRejectsReparentedEndpoint(t *testing.T) {
+	manager, _ := newManagerTest(t, 1)
+	self, err := spawnedCurrentIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var signature SignatureDigest
+	signature[0] = 1
+	diagnostic := filepath.Join(t.TempDir(), "reparent-diagnostic")
+	request, err := NewSpawnRequest(SpawnConfig{
+		RecoveryID: RecoveryTaskID, Executable: self.Executable,
+		Args: []string{"-test.run=^TestSpawnedSessionHelperProcess$", "-test.v"},
+		Env: []string{
+			"SPAWNED_SESSION_DIAGNOSTIC=" + diagnostic,
+			"SPAWNED_SESSION_HELPER=1",
+			"SPAWNED_SESSION_REPARENT_WRAPPER=1",
+		},
+		Stdin: StdioNull, Stdout: StdioNull, Stderr: StdioNull,
+		SpawnedSession: true, ExpectedSignature: &signature,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, receipt, err := manager.Prepare(t.Context(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := child.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	endpoint, err := child.ClaimSpawnedSession(t.Context(), receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if _, err := endpoint.OpenForWire(ctx, spawnedsession.WireAuthority()); err == nil {
+		t.Fatal("reparented spawned-session endpoint was accepted")
+	}
+	if exit := waitManagerChild(t, child); exit.Code != 0 {
+		t.Fatalf("wrapper exit = %+v", exit)
+	}
+	payload, err := os.ReadFile(diagnostic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(payload) != "reparent-rejected" {
+		t.Fatalf("reparent diagnostic = %q", payload)
+	}
+}
+
+func TestSpawnedSessionParentRejectsMalformedAcknowledgement(t *testing.T) {
+	manager, _ := newManagerTest(t, 1)
+	self, err := spawnedCurrentIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var signature SignatureDigest
+	signature[0] = 1
+	request, err := NewSpawnRequest(SpawnConfig{
+		RecoveryID: RecoveryTaskID, Executable: self.Executable,
+		Args:  []string{"-test.run=^TestSpawnedSessionHelperProcess$", "-test.v"},
+		Env:   []string{"SPAWNED_SESSION_HELPER=1", "SPAWNED_SESSION_BAD_ACK=1"},
+		Stdin: StdioNull, Stdout: StdioNull, Stderr: StdioNull,
+		SpawnedSession: true, ExpectedSignature: &signature,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, receipt, err := manager.Prepare(t.Context(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := child.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	endpoint, err := child.ClaimSpawnedSession(t.Context(), receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if _, err := endpoint.OpenForWire(ctx, spawnedsession.WireAuthority()); !errors.Is(err, ErrSpawnedSessionIdentity) {
+		t.Fatalf("malformed acknowledgement = %v, want identity mismatch", err)
+	}
+	if exit := waitManagerChild(t, child); exit.Code != 0 {
+		t.Fatalf("malformed-ack helper exit = %+v", exit)
+	}
+}
+
 func TestSpawnedSessionHelperProcess(t *testing.T) {
 	if os.Getenv("SPAWNED_SESSION_HELPER") != "1" {
 		t.Skip("helper body; runs only re-exec'd")
@@ -254,6 +345,82 @@ func TestSpawnedSessionHelperProcess(t *testing.T) {
 	fail := func(err error) {
 		_ = os.WriteFile(os.Getenv("SPAWNED_SESSION_DIAGNOSTIC"), []byte(err.Error()), 0o600)
 		t.Fatal(err)
+	}
+	if os.Getenv("SPAWNED_SESSION_REPARENT_GRANDCHILD") == "1" {
+		flags, err := unix.FcntlInt(spawnedSessionFD, unix.F_GETFD, 0)
+		if err != nil {
+			fail(err)
+			return
+		}
+		if _, err := ClaimSpawnedSessionIdentity(ctx); !errors.Is(err, ErrSpawnedSessionIdentity) {
+			fail(fmt.Errorf("reparented claim = %v, want identity mismatch", err))
+			return
+		}
+		after, err := unix.FcntlInt(spawnedSessionFD, unix.F_GETFD, 0)
+		if err != nil || after != flags {
+			fail(fmt.Errorf("reparented descriptor changed: flags=%#x want=%#x err=%v", after, flags, err))
+			return
+		}
+		if err := os.WriteFile(os.Getenv("SPAWNED_SESSION_DIAGNOSTIC"), []byte("reparent-rejected"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if os.Getenv("SPAWNED_SESSION_REPARENT_WRAPPER") == "1" {
+		session := os.NewFile(spawnedSessionFD, "daemonkit-reparented-session")
+		if session == nil {
+			fail(errors.New("wrap inherited spawned-session descriptor"))
+			return
+		}
+		defer session.Close()
+		first, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+		if err != nil {
+			fail(err)
+			return
+		}
+		defer first.Close()
+		second, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+		if err != nil {
+			fail(err)
+			return
+		}
+		defer second.Close()
+		command := exec.Command(os.Args[0], "-test.run=^TestSpawnedSessionHelperProcess$", "-test.v")
+		command.Env = append(os.Environ(), "SPAWNED_SESSION_REPARENT_GRANDCHILD=1")
+		command.ExtraFiles = []*os.File{first, second, session}
+		if output, err := command.CombinedOutput(); err != nil {
+			fail(fmt.Errorf("run reparented child: %w: %s", err, output))
+		}
+		return
+	}
+	if os.Getenv("SPAWNED_SESSION_BAD_ACK") == "1" {
+		file := os.NewFile(spawnedSessionFD, "daemonkit-malformed-ack-session")
+		if file == nil {
+			fail(errors.New("wrap malformed-ack descriptor"))
+			return
+		}
+		conn, err := net.FileConn(file)
+		closeErr := file.Close()
+		if err != nil || closeErr != nil {
+			fail(errors.Join(err, closeErr))
+			return
+		}
+		defer conn.Close()
+		var bootstrap spawnedSessionBootstrap
+		if err := readSpawnedSessionObject(ctx, conn, &bootstrap); err != nil {
+			fail(err)
+			return
+		}
+		ack := spawnedSessionAck{
+			Version:       spawnedSessionBootstrapVersion,
+			Nonce:         append([]byte(nil), bootstrap.Nonce...),
+			ReceiptDigest: append([]byte(nil), bootstrap.ReceiptDigest...),
+		}
+		ack.Nonce[0] ^= 0xff
+		if err := writeSpawnedSessionObject(ctx, conn, ack); err != nil {
+			fail(err)
+		}
+		return
 	}
 	type claimResult struct {
 		identity SpawnedSessionIdentity
