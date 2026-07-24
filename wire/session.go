@@ -67,6 +67,7 @@ type session struct {
 	accepted       *AcceptedSession
 	outbound       chan sessionOutbound
 	eventCredits   *creditWindow
+	lifecycleLane  *latestWriteLane
 	requestsDone   chan struct{}
 	writerDone     chan struct{}
 	disconnected   chan struct{}
@@ -93,18 +94,30 @@ type sessionOutbound struct {
 	frame       Frame
 	done        chan error
 	beforeWrite func()
+	afterWrite  func(error)
+}
+
+type lifecycleWriteReceipt struct {
+	lane       *latestWriteLane
+	generation uint64
+}
+
+func (r lifecycleWriteReceipt) wait(ctx context.Context) error {
+	return r.lane.wait(ctx, r.generation)
 }
 
 type requestState struct {
-	cancel          context.CancelFunc
-	chunks          chan Chunk
-	inbound         *boundedStream[Chunk]
-	responseCredits *creditWindow
-	deliveryDone    chan struct{}
-	deliveryOnce    sync.Once
-	terminalAck     chan struct{}
-	settled         chan struct{}
-	settledOnce     sync.Once
+	cancel            context.CancelFunc
+	chunks            chan Chunk
+	inbound           *boundedStream[Chunk]
+	responseCredits   *creditWindow
+	deliveryDone      chan struct{}
+	deliveryOnce      sync.Once
+	terminalAck       chan struct{}
+	terminalWrite     chan error
+	settled           chan struct{}
+	settledOnce       sync.Once
+	terminalWriteOnce sync.Once
 
 	mu            sync.Mutex
 	inputSequence streamSequence
@@ -116,12 +129,30 @@ type requestState struct {
 
 func (s *requestState) close() {
 	s.cancel()
+	s.markTerminalWrite(context.Canceled)
 	s.mu.Lock()
 	s.inputEnded = true
 	s.mu.Unlock()
 	s.inbound.close()
 	s.responseCredits.close()
 	s.deliveryOnce.Do(func() { close(s.deliveryDone) })
+}
+
+func (s *requestState) markTerminalWrite(err error) {
+	terminalWrite := s.terminalWriteChannel()
+	s.terminalWriteOnce.Do(func() {
+		terminalWrite <- err
+		close(terminalWrite)
+	})
+}
+
+func (s *requestState) terminalWriteChannel() chan error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.terminalWrite == nil {
+		s.terminalWrite = make(chan error, 1)
+	}
+	return s.terminalWrite
 }
 
 func (s *requestState) error() error {
@@ -185,6 +216,7 @@ func (s *session) stop() {
 	s.closeOnce.Do(func() {
 		s.cancel()
 		s.eventCredits.close()
+		s.lifecycleLane.fail(s.ctx.Err())
 		s.mu.Lock()
 		states := make([]*requestState, 0, len(s.active))
 		for _, state := range s.active {
@@ -255,21 +287,24 @@ func (s *session) interruptActiveWrite(active <-chan struct{}) <-chan struct{} {
 func (s *session) writeLoop() {
 	defer s.writerWG.Done()
 	defer close(s.writerDone)
-	var terminalErr error
+	var (
+		terminalErr     error
+		pendingOrdinary *sessionOutbound
+	)
 	for {
 		if terminalErr != nil {
+			if pendingOrdinary != nil {
+				completeSessionOutbound(*pendingOrdinary, terminalErr)
+				pendingOrdinary = nil
+			}
 			select {
 			case outgoing := <-s.outbound:
-				if outgoing.done != nil {
-					outgoing.done <- terminalErr
-				}
+				completeSessionOutbound(outgoing, terminalErr)
 			case <-s.requestsDone:
 				for {
 					select {
 					case outgoing := <-s.outbound:
-						if outgoing.done != nil {
-							outgoing.done <- terminalErr
-						}
+						completeSessionOutbound(outgoing, terminalErr)
 					default:
 						return
 					}
@@ -277,37 +312,93 @@ func (s *session) writeLoop() {
 			}
 			continue
 		}
-		select {
-		case <-s.ctx.Done():
-			terminalErr = s.ctx.Err()
-		case outgoing := <-s.outbound:
-			if outgoing.beforeWrite != nil {
-				outgoing.beforeWrite()
-			}
-			writeDone, ok := s.beginWrite()
-			if !ok {
-				err := s.ctx.Err()
-				if err == nil {
-					err = context.Canceled
-				}
-				if outgoing.done != nil {
-					outgoing.done <- err
-				}
-				terminalErr = err
+		var outgoing sessionOutbound
+		if lifecycle, ok := s.takeLifecycleOutbound(); ok {
+			outgoing = lifecycle
+		} else if pendingOrdinary != nil {
+			outgoing = *pendingOrdinary
+			pendingOrdinary = nil
+		} else {
+			select {
+			case <-s.ctx.Done():
+				terminalErr = s.ctx.Err()
 				continue
-			}
-			err := s.codec.WriteFrame(outgoing.frame)
-			s.finishWrite(writeDone)
-			if outgoing.done != nil {
-				outgoing.done <- err
-			}
-			if err != nil {
-				s.writerErr = err
-				s.close()
-				terminalErr = err
+			case <-s.lifecycleLane.notify:
+				continue
+			case ordinary := <-s.outbound:
+				if lifecycle, ok := s.takeLifecycleOutbound(); ok {
+					pendingOrdinary = &ordinary
+					outgoing = lifecycle
+				} else {
+					outgoing = ordinary
+				}
 			}
 		}
+		if outgoing.beforeWrite != nil {
+			outgoing.beforeWrite()
+		}
+		writeDone, ok := s.beginWrite()
+		if !ok {
+			err := s.ctx.Err()
+			if err == nil {
+				err = context.Canceled
+			}
+			completeSessionOutbound(outgoing, err)
+			terminalErr = err
+			continue
+		}
+		err := s.codec.WriteFrame(outgoing.frame)
+		s.finishWrite(writeDone)
+		completeSessionOutbound(outgoing, err)
+		if err != nil {
+			s.writerErr = err
+			s.close()
+			terminalErr = err
+		}
 	}
+}
+
+func completeSessionOutbound(outgoing sessionOutbound, err error) {
+	if outgoing.afterWrite != nil {
+		outgoing.afterWrite(err)
+	}
+	if outgoing.done != nil {
+		outgoing.done <- err
+	}
+}
+
+func (s *session) takeLifecycleOutbound() (sessionOutbound, bool) {
+	generation, payload, ok, err := s.lifecycleLane.tryTake()
+	if err != nil || !ok {
+		return sessionOutbound{}, false
+	}
+	return sessionOutbound{
+		frame: Frame{Kind: FrameLifecycle, Flags: FlagEnd, Payload: payload},
+		afterWrite: func(err error) {
+			s.lifecycleLane.complete(generation, err)
+		},
+	}, true
+}
+
+func (s *session) offerLifecycle(payload []byte, terminal bool) (lifecycleWriteReceipt, error) {
+	if len(payload) == 0 {
+		return lifecycleWriteReceipt{}, fmt.Errorf("%w: empty lifecycle payload", ErrInvalidFrame)
+	}
+	generation, err := s.lifecycleLane.offer(append([]byte(nil), payload...), terminal)
+	if err != nil {
+		return lifecycleWriteReceipt{}, err
+	}
+	return lifecycleWriteReceipt{lane: s.lifecycleLane, generation: generation}, nil
+}
+
+func (s *session) responseWritten(id uint64) (<-chan error, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.active[id]
+	if state == nil {
+		return nil, fmt.Errorf("wire: request %d is not active", id)
+	}
+	return state.terminalWriteChannel(), nil
 }
 
 func (s *session) readLoop(ctx context.Context) error {
@@ -397,6 +488,7 @@ func (s *session) receiveRequest(ctx context.Context, frame Frame) error {
 		responseCredits: newCreditWindow(),
 		deliveryDone:    make(chan struct{}),
 		terminalAck:     make(chan struct{}),
+		terminalWrite:   make(chan error, 1),
 		settled:         make(chan struct{}),
 	}
 	if frame.Flags&FlagEnd != 0 {
@@ -674,7 +766,11 @@ func (s *session) receiveWindow(frame Frame) error {
 		return fmt.Errorf("%w: response or event window", ErrInvalidFrame)
 	}
 	if frame.ID == 0 {
-		return s.eventCredits.grant(frame.Sequence)
+		err := s.eventCredits.grant(frame.Sequence)
+		if errors.Is(err, errStreamClosed) && s.ctx.Err() != nil {
+			return s.ctx.Err()
+		}
+		return err
 	}
 	s.mu.Lock()
 	state := s.active[frame.ID]
@@ -802,7 +898,7 @@ func (s *session) sendAdmittedRejected(
 }
 
 func (s *session) sendResponse(ctx context.Context, id uint64, response Response) error {
-	return s.sendResponseWritten(ctx, id, response, nil)
+	return s.sendResponseWritten(ctx, id, response, nil, nil)
 }
 
 func (s *session) sendAdmittedResponse(
@@ -811,11 +907,13 @@ func (s *session) sendAdmittedResponse(
 	state *requestState,
 	response Response,
 ) error {
-	return s.sendResponseWritten(ctx, id, response, func() {
+	err := s.sendResponseWritten(ctx, id, response, func() {
 		state.mu.Lock()
 		state.terminalSent = true
 		state.mu.Unlock()
-	})
+	}, state.markTerminalWrite)
+	state.markTerminalWrite(err)
+	return err
 }
 
 func (s *session) sendResponseWritten(
@@ -823,12 +921,18 @@ func (s *session) sendResponseWritten(
 	id uint64,
 	response Response,
 	beforeWrite func(),
+	afterWrite func(error),
 ) error {
 	payload, err := json.Marshal(response)
 	if err != nil {
 		return fmt.Errorf("wire: marshal envelope: %w", err)
 	}
-	return s.enqueueAndWait(ctx, Frame{Kind: FrameResponse, Flags: FlagEnd, ID: id, Payload: payload}, beforeWrite)
+	return s.enqueueAndWait(
+		ctx,
+		Frame{Kind: FrameResponse, Flags: FlagEnd, ID: id, Payload: payload},
+		beforeWrite,
+		afterWrite,
+	)
 }
 
 func (s *session) enqueue(ctx context.Context, frame Frame) error {
@@ -849,10 +953,25 @@ func (s *session) enqueue(ctx context.Context, frame Frame) error {
 	}
 }
 
-func (s *session) enqueueAndWait(ctx context.Context, frame Frame, beforeWrite func()) error {
+func (s *session) enqueueAndWait(
+	ctx context.Context,
+	frame Frame,
+	beforeWrite func(),
+	afterWrite func(error),
+) error {
+	return s.enqueueOnAndWait(ctx, s.outbound, frame, beforeWrite, afterWrite)
+}
+
+func (s *session) enqueueOnAndWait(
+	ctx context.Context,
+	queue chan<- sessionOutbound,
+	frame Frame,
+	beforeWrite func(),
+	afterWrite func(error),
+) error {
 	done := make(chan error, 1)
 	select {
-	case s.outbound <- sessionOutbound{frame: frame, done: done, beforeWrite: beforeWrite}:
+	case queue <- sessionOutbound{frame: frame, done: done, beforeWrite: beforeWrite, afterWrite: afterWrite}:
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-s.ctx.Done():

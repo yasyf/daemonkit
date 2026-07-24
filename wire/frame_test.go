@@ -164,6 +164,12 @@ func TestFrameKindStructuralValidation(t *testing.T) {
 		{name: "ack missing generation", frame: Frame{Kind: FrameAck, Flags: FlagEnd, ID: 1}},
 		{name: "ack short generation", frame: Frame{Kind: FrameAck, Flags: FlagEnd, ID: 1, Payload: make([]byte, sessionGenerationBytes-1)}},
 		{name: "ack routing", frame: Frame{Kind: FrameAck, Flags: FlagEnd, ID: 1, Op: "mutate", Payload: make([]byte, sessionGenerationBytes)}},
+		{name: "lifecycle product topic", frame: Frame{Kind: FrameLifecycle, Flags: FlagEnd, Op: "changed", Payload: []byte("ready")}},
+		{name: "lifecycle request id", frame: Frame{Kind: FrameLifecycle, Flags: FlagEnd, ID: 1, Payload: []byte("ready")}},
+		{name: "lifecycle sequence", frame: Frame{Kind: FrameLifecycle, Flags: FlagEnd, Sequence: 1, Payload: []byte("ready")}},
+		{name: "lifecycle empty payload", frame: Frame{Kind: FrameLifecycle, Flags: FlagEnd}},
+		{name: "foreign window topic", frame: Frame{Kind: FrameWindow, Sequence: 1, Op: "changed"}},
+		{name: "request window topic", frame: Frame{Kind: FrameWindow, ID: 1, Sequence: 1, Op: "daemon.lifecycle.readiness"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -174,5 +180,8 @@ func TestFrameKindStructuralValidation(t *testing.T) {
 	}
 	if _, err := encodeFrame(Frame{Kind: FrameEvent, Flags: FlagEnd, Op: "changed", Payload: []byte("payload")}); err != nil {
 		t.Fatalf("valid event payload: %v", err)
+	}
+	if _, err := encodeFrame(Frame{Kind: FrameLifecycle, Flags: FlagEnd, Payload: []byte("ready")}); err != nil {
+		t.Fatalf("valid lifecycle payload: %v", err)
 	}
 }

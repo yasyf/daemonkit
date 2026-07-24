@@ -542,6 +542,7 @@ func (s *Server) serveConn(
 		admitProtected: admitProtected,
 		outbound:       make(chan sessionOutbound, s.outboundQueue()),
 		eventCredits:   newCreditWindow(),
+		lifecycleLane:  newLatestWriteLane(),
 		requestsDone:   make(chan struct{}),
 		writerDone:     make(chan struct{}),
 		disconnected:   make(chan struct{}),

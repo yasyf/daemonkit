@@ -61,6 +61,8 @@ const (
 	FrameWindow
 	// FrameAck confirms that a terminal response reached the client.
 	FrameAck
+	// FrameLifecycle carries one daemon-owned lifecycle snapshot.
+	FrameLifecycle
 )
 
 // FrameFlags modifies a frame without changing its kind.
@@ -125,7 +127,11 @@ func (c *Codec) ReadFrame() (frame Frame, err error) {
 			return Frame{}, fmt.Errorf("wire: set read deadline: %w", err)
 		}
 		defer func() {
-			err = errors.Join(err, clearReadDeadline(c.conn))
+			clearErr := clearReadDeadline(c.conn)
+			if err == nil && isCompletedFrameClose(clearErr) {
+				clearErr = nil
+			}
+			err = errors.Join(err, clearErr)
 		}()
 	}
 	var prefix [4]byte
@@ -190,7 +196,11 @@ func (c *Codec) writeFrame(frame Frame) (complete bool, err error) {
 			return false, fmt.Errorf("wire: set write deadline: %w", err)
 		}
 		defer func() {
-			err = errors.Join(err, clearWriteDeadline(c.conn))
+			clearErr := clearWriteDeadline(c.conn)
+			if err == nil && complete && isCompletedFrameClose(clearErr) {
+				clearErr = nil
+			}
+			err = errors.Join(err, clearErr)
 		}()
 	}
 	written, err := writeFull(c.conn, packet)
@@ -199,6 +209,10 @@ func (c *Codec) writeFrame(frame Frame) (complete bool, err error) {
 		return complete, fmt.Errorf("wire: write frame: %w", err)
 	}
 	return true, nil
+}
+
+func isCompletedFrameClose(err error) bool {
+	return errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe)
 }
 
 func clearReadDeadline(conn net.Conn) error {
@@ -298,7 +312,7 @@ func decodeFrame(body []byte) (Frame, error) {
 	return frame, nil
 }
 
-func (k FrameKind) valid() bool { return k >= FrameHello && k <= FrameAck }
+func (k FrameKind) valid() bool { return k >= FrameHello && k <= FrameLifecycle }
 
 func uint32Length(field string, value int) (uint32, error) {
 	if value < 0 || uint64(value) > math.MaxUint32 {
@@ -385,6 +399,11 @@ func validateFrame(frame Frame) error {
 		if frame.Flags != FlagEnd || frame.ID == 0 || frame.Sequence != 0 || frame.DeadlineUnixMilli != 0 ||
 			frame.Op != "" || frame.Tenant != "" || len(frame.Payload) != sessionGenerationBytes {
 			return fmt.Errorf("%w: acknowledgement frame", ErrInvalidFrame)
+		}
+	case FrameLifecycle:
+		if frame.Flags != FlagEnd || frame.ID != 0 || frame.Sequence != 0 || frame.DeadlineUnixMilli != 0 ||
+			frame.Op != "" || frame.Tenant != "" || len(frame.Payload) == 0 {
+			return fmt.Errorf("%w: lifecycle frame", ErrInvalidFrame)
 		}
 	}
 	return nil

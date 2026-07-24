@@ -33,7 +33,8 @@ func TestTerminalIntentPrecedesBlockingWrite(t *testing.T) {
 	session := &session{
 		server: &Server{}, conn: barrier, codec: NewCodec(barrier), ctx: ctx, cancel: cancel,
 		generation: make([]byte, sessionGenerationBytes), outbound: make(chan sessionOutbound, 1),
-		requestsDone: make(chan struct{}), writerDone: make(chan struct{}),
+		lifecycleLane: newLatestWriteLane(),
+		requestsDone:  make(chan struct{}), writerDone: make(chan struct{}),
 		active: map[uint64]*requestState{1: state},
 	}
 	session.writerWG.Add(1)
