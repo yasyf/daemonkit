@@ -18,6 +18,7 @@ type Publication struct {
 	generation uint64
 	stage      uint64
 	lease      *publicationLease
+	value      any
 }
 
 type (
@@ -131,6 +132,25 @@ func (s *PublicationSlot[T]) Stage(activation Activation, value T) (Publication,
 	lifecycle.mu.Unlock()
 	core.runtime.mu.Unlock()
 	return publication, nil
+}
+
+// Value returns the exact value pinned by an already-admitted publication.
+// The caller's admission lease must remain live for the entire use of value.
+func (s *PublicationSlot[T]) Value(publication Publication) (T, error) {
+	var zero T
+	if s == nil || s.core == nil {
+		return zero, ErrPublicationUnavailable
+	}
+	core := s.core
+	core.lifecycle.mu.Lock()
+	defer core.lifecycle.mu.Unlock()
+	if publication.core != core || publication.token != s.token || publication.generation != core.generation ||
+		publication.stage != core.publishedStage || publication.lease == nil || !publication.lease.alive ||
+		publication.value == nil {
+		return zero, ErrPublicationStale
+	}
+	boxed := publication.value.(publicationValue[T])
+	return boxed.value, nil
 }
 
 // Acquire pins the committed value in the Runtime admission lane until release.

@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.17.2] - 2026-07-24
 
+### Added
+
+- `daemon.PublicationSlot.Value` resolves the exact resource graph carried by
+  an already-admitted request while its admission lease remains live, without
+  opening a nested admission or consulting the runtime's current publication.
+
 ### Fixed
 
 - Re-prove exact dedicated-session absence when Darwin reports `EPERM` for a

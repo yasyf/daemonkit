@@ -854,7 +854,9 @@ func (r *Runtime) admitReady() (Publication, func(), error) {
 		lifecycle.mu.Unlock()
 		return Publication{}, nil, ErrRuntimeNotReady
 	}
-	publication := Publication{core: core, token: core.token, generation: core.generation, stage: core.publishedStage}
+	publication := Publication{
+		core: core, token: core.token, generation: core.generation, stage: core.publishedStage, value: core.published,
+	}
 	lease := &publicationLease{alive: true}
 	publication.lease = lease
 	lifecycle.inflight++
