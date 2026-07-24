@@ -86,6 +86,20 @@ public enum SessionTransportError: Error, Equatable, Sendable {
     case disconnected
 }
 
+extension SessionTransportError {
+    var isPeerEndWriteFailure: Bool {
+        switch self {
+        case .disconnected:
+            true
+        case let .systemCall(operation, code):
+            operation == "send"
+                && (code == EPIPE || code == ECONNRESET || code == ECONNABORTED || code == ENOTCONN)
+        default:
+            false
+        }
+    }
+}
+
 struct SessionWireIdentity: Codable, Sendable {
     let protocolVersion: UInt16
     let wireBuild: String

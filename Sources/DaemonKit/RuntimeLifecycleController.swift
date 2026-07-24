@@ -219,7 +219,7 @@ final class RuntimeLifecycleController: @unchecked Sendable {
     private let lock = NSLock()
     private var current: RuntimeReadinessEvent
     private var subscribers: [ObjectIdentifier: Subscriber] = [:]
-    private var terminalReceipts: [LifecycleWriteReceipt] = []
+    private var terminalReceipts: [SubscriberReceipt] = []
     private var activation: (id: UUID, context: RuntimeActivationContext)?
     private var slots: Set<UUID> = []
     private var staged: [UUID: StagedPublication] = [:]
@@ -235,6 +235,7 @@ final class RuntimeLifecycleController: @unchecked Sendable {
     private var activities: Set<UUID> = []
     var registrationAttemptHook: (@Sendable () -> Void)?
     var registrationHook: (@Sendable () -> Void)?
+    var unregistrationHook: (@Sendable () -> Void)?
     var activationHook: (@Sendable () -> Void)?
     var admissionRevocationHook: (@Sendable () -> Void)?
     var subscriberCount: Int {
@@ -542,7 +543,7 @@ extension RuntimeLifecycleController {
         candidate.context.cancel()
         transition.sessionsToClose.forEach { $0.close() }
         finishWaiters(.failed(cause))
-        try await Self.settle(transition.receipts)
+        try await settle(transition.receipts)
     }
 
     func failStarting() async throws {
@@ -561,7 +562,7 @@ extension RuntimeLifecycleController {
         transition.1?.cancel()
         transition.0.sessionsToClose.forEach { $0.close() }
         finishWaiters(.failed(cause))
-        try await Self.settle(transition.0.receipts)
+        try await settle(transition.0.receipts)
     }
 
     func closeIntake(deadline: Date? = nil) async throws {
@@ -601,7 +602,7 @@ extension RuntimeLifecycleController {
         if let result = transition.2 {
             finishWaiters(result)
         }
-        try await Self.settle(transition.0.receipts, deadline: deadline)
+        try await settle(transition.0.receipts, deadline: deadline)
     }
 
     func wait() async -> RuntimeWaitResult {
@@ -688,7 +689,11 @@ extension RuntimeLifecycleController {
                     if let pending {
                         relay = (receipt, pending)
                     } else {
-                        terminalReceipts.append(receipt)
+                        terminalReceipts.append(SubscriberReceipt(
+                            id: id,
+                            session: session,
+                            receipt: receipt
+                        ))
                     }
                 }
             } catch {
@@ -708,6 +713,7 @@ extension RuntimeLifecycleController {
     }
 
     func unregister(_ session: ServerSession) {
+        unregistrationHook?()
         let pending = lock.withLock { () -> LifecycleWriteReceipt? in
             guard let subscriber = subscribers.removeValue(forKey: ObjectIdentifier(session)) else {
                 return nil
@@ -761,8 +767,14 @@ extension RuntimeLifecycleController {
 }
 
 private extension RuntimeLifecycleController {
+    private struct SubscriberReceipt: @unchecked Sendable {
+        let id: ObjectIdentifier
+        let session: ServerSession
+        let receipt: LifecycleWriteReceipt
+    }
+
     private struct TransitionResult {
-        var receipts: [LifecycleWriteReceipt] = []
+        var receipts: [SubscriberReceipt] = []
         var sessionsToClose: [ServerSession] = []
     }
 
@@ -874,7 +886,7 @@ private extension RuntimeLifecycleController {
         terminalization.context?.cancel()
         terminalization.transition.sessionsToClose.forEach { $0.close() }
         finishWaiters(terminalization.result)
-        Task { try? await Self.settle(terminalization.transition.receipts) }
+        Task { try? await self.settle(terminalization.transition.receipts) }
     }
 
     private func finishTerminalization(
@@ -886,7 +898,7 @@ private extension RuntimeLifecycleController {
         terminalization.transition.sessionsToClose.forEach { $0.close() }
         finishWaiters(terminalization.result)
         if awaitingReceipts {
-            try await Self.settle(terminalization.transition.receipts)
+            try await settle(terminalization.transition.receipts)
         }
     }
 
@@ -896,18 +908,29 @@ private extension RuntimeLifecycleController {
         var result = TransitionResult()
         var stale: [ObjectIdentifier] = []
         for (id, subscriber) in subscribers {
-            guard let session = subscriber.session else { stale.append(id); continue }
+            guard let session = subscriber.session, session.isConnected else {
+                stale.append(id)
+                continue
+            }
             switch subscriber.state {
             case .registering:
                 if progress.isTerminal {
                     let pending = LifecycleWriteReceipt()
                     subscriber.state = .terminalPending(pending)
-                    result.receipts.append(pending)
+                    result.receipts.append(SubscriberReceipt(
+                        id: id,
+                        session: session,
+                        receipt: pending
+                    ))
                 }
             case .active:
                 do {
                     if let receipt = try session.enqueueLifecycle(prepared.payload) {
-                        result.receipts.append(receipt)
+                        result.receipts.append(SubscriberReceipt(
+                            id: id,
+                            session: session,
+                            receipt: receipt
+                        ))
                     }
                 } catch {
                     result.sessionsToClose.append(session)
@@ -936,14 +959,26 @@ private extension RuntimeLifecycleController {
         }
     }
 
-    private static func settle(
-        _ receipts: [LifecycleWriteReceipt],
+    private func settle(
+        _ receipts: [SubscriberReceipt],
         deadline: Date? = nil
     ) async throws {
         var firstError: Error?
-        for receipt in receipts {
-            do { try await receipt.wait(deadline: deadline) }
+        for owned in receipts {
+            do { try await owned.receipt.wait(deadline: deadline) }
             catch {
+                if let transport = error as? SessionTransportError,
+                   transport.isPeerEndWriteFailure
+                {
+                    owned.session.close()
+                    lock.withLock {
+                        guard let subscriber = subscribers[owned.id],
+                              subscriber.session === owned.session
+                        else { return }
+                        subscribers.removeValue(forKey: owned.id)
+                    }
+                    continue
+                }
                 if firstError == nil {
                     firstError = error
                 }

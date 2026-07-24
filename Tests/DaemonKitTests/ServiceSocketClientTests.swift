@@ -260,6 +260,19 @@ final class OneShotRegistrationGate: @unchecked Sendable {
     }
 }
 
+final class ServiceCloseStepRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var steps: [ServiceSocketCloseStep] = []
+
+    func append(_ step: ServiceSocketCloseStep) {
+        lock.withLock { steps.append(step) }
+    }
+
+    func snapshot() -> [ServiceSocketCloseStep] {
+        lock.withLock { steps }
+    }
+}
+
 actor ServiceResponseSequence {
     private var terminals: [SocketTerminal]
     private var calls = 0
@@ -459,6 +472,46 @@ extension SocketTransportTests {
                 }
                 #expect(await responses.callCount() == 12)
                 #expect(await client.startedGenerations == 1)
+            }
+        }
+
+        @Test func closeSettlesSocketBeforeCancelingLifecycleObserver() async throws {
+            try await withAsyncCleanup { cleanup in
+                let directory = try shortSocketDir()
+                cleanup.add { try? FileManager.default.removeItem(at: directory) }
+                let path = directory.appendingPathComponent("close-order.sock").path
+                let lifecycle = try testRuntimeController()
+                let server = serviceTestServer(
+                    path: path,
+                    wireBuild: "service.v1",
+                    runtimeLifecycle: lifecycle
+                ) { _ in
+                    .terminal(SocketTerminal(payload: Data(#""healthy""#.utf8)))
+                }
+                try await server.start()
+                cleanup.add { await server.stop() }
+                let client = try serviceTestClient(
+                    path: path,
+                    wireBuild: "service.v1",
+                    role: SessionPeerRole.unprotected,
+                    noProgressTimeout: 1
+                )
+                cleanup.add { await client.close() }
+
+                let terminal = try await client.call(genericServiceCall(
+                    operation: "work",
+                    deadline: Date().addingTimeInterval(2)
+                ))
+                #expect(terminal.payload == Data(#""healthy""#.utf8))
+                let recorder = ServiceCloseStepRecorder()
+                await client.setCloseStepHook { recorder.append($0) }
+                await client.close()
+
+                #expect(recorder.snapshot() == [.socketSettled, .observerCanceled])
+                guard case .closed = await client.termination.wait() else {
+                    Issue.record("explicit close retained a service failure")
+                    return
+                }
             }
         }
 

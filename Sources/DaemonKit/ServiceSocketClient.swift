@@ -77,6 +77,11 @@ public final class ServiceSocketTerminationSignal: @unchecked Sendable {
     }
 }
 
+enum ServiceSocketCloseStep: Equatable, Sendable {
+    case socketSettled
+    case observerCanceled
+}
+
 final class ServiceStateSignal: @unchecked Sendable {
     private let lock = NSLock()
     private var revision: UInt64 = 0
@@ -172,6 +177,7 @@ public actor ServiceSocketClient {
     private var closed = false
     private var terminal: (any Error)?
     private var retrySleepHook: (@Sendable () -> Void)?
+    private var closeStepHook: (@Sendable (ServiceSocketCloseStep) -> Void)?
     public nonisolated let termination = ServiceSocketTerminationSignal()
 
     var startedGenerations: UInt64 {
@@ -180,6 +186,10 @@ public actor ServiceSocketClient {
 
     func setRetrySleepHook(_ hook: @escaping @Sendable () -> Void) {
         retrySleepHook = hook
+    }
+
+    func setCloseStepHook(_ hook: @escaping @Sendable (ServiceSocketCloseStep) -> Void) {
+        closeStepHook = hook
     }
 
     /// Creates a lazy exact-build service client.
@@ -342,13 +352,21 @@ public actor ServiceSocketClient {
         closed = true
         stateSignal.signal()
         termination.finish(.closed)
-        lifecycleObserver?.cancel()
-        lifecycleObserver = nil
-        guard let current = generation else { return }
-        generation = nil
-        current.client.cancel()
-        if let client = try? await current.client.value {
-            await client.close()
+        if let current = generation {
+            current.client.cancel()
+            if let client = try? await current.client.value {
+                await client.close()
+                closeStepHook?(.socketSettled)
+            }
+            if generation?.id == current.id {
+                generation = nil
+            }
+        }
+        if lifecycleObserver != nil {
+            closeStepHook?(.observerCanceled)
+            lifecycleObserver?.cancel()
+            lifecycleObserver = nil
+            lifecycleObserverGeneration = nil
         }
     }
 }
@@ -557,7 +575,9 @@ private extension ServiceSocketClient {
     }
 
     func receiveLifecycle(_ event: RuntimeReadinessEvent, generation current: Generation) async {
-        guard generation?.id == current.id, lifecycleObserverGeneration == current.id else { return }
+        guard !closed, generation?.id == current.id,
+              lifecycleObserverGeneration == current.id
+        else { return }
         do {
             try publish(event, generation: current)
         } catch {
@@ -566,7 +586,9 @@ private extension ServiceSocketClient {
     }
 
     func receiveLifecycleFailure(_ error: any Error, generation current: Generation) async {
-        guard generation?.id == current.id, lifecycleObserverGeneration == current.id else { return }
+        guard !closed, generation?.id == current.id,
+              lifecycleObserverGeneration == current.id
+        else { return }
         lifecycleFailure = (current.id, error)
         stateSignal.signal()
     }

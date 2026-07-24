@@ -142,6 +142,10 @@ final class ServerSession: @unchecked Sendable {
         return try lifecyclePublisher.publish(payload)
     }
 
+    var isConnected: Bool {
+        lock.withLock { !closed }
+    }
+
     func close() {
         lock.lock()
         guard !closed else {

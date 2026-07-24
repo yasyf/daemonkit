@@ -526,6 +526,49 @@ extension SocketTransportTests.RuntimeLifecycleControllerTests {
         }
     }
 
+    @Test func closeIntakePrunesDisconnectedActiveSubscriber() async throws {
+        try await withAsyncCleanup { cleanup in
+            let directory = try shortSocketDir()
+            cleanup.add { try? FileManager.default.removeItem(at: directory) }
+            let path = directory.appendingPathComponent("disconnected-subscriber.sock").path
+            let runtime = try DaemonRuntime(
+                path: path,
+                wireBuild: "service.v1",
+                identity: identity,
+                handler: RuntimeHandlerSpec { _ in
+                    .terminal(SocketTerminal(payload: Data("true".utf8)))
+                }
+            )
+            let slot: RuntimePublicationSlot<String> = runtime.newPublicationSlot()
+            let gate = ServiceWriteGate()
+            runtime.controller.unregistrationHook = { gate.block() }
+            cleanup.add {
+                gate.unblock()
+                try? await runtime.shutdown(deadline: Date().addingTimeInterval(2))
+            }
+            let activation = try await runtime.begin(deadline: Date().addingTimeInterval(2))
+            try activation.commitReady(slot.stage(activation, value: "ready"))
+            let client = try await SocketClient(
+                path: path,
+                wireBuild: "service.v1",
+                role: "readiness-controller.v1"
+            )
+            let subscription = try await client.call(
+                operation: runtimeReadinessSubscribeOperation,
+                payload: RuntimeReadinessCodec.encodeSubscribe(),
+                deadline: Date().addingTimeInterval(2)
+            )
+            #expect(!subscription.rejected)
+            #expect(runtime.controller.subscriberCount == 1)
+
+            client.abort()
+            await gate.started.wait()
+            try await runtime.controller.closeIntake(deadline: Date().addingTimeInterval(1))
+            #expect(runtime.controller.subscriberCount == 0)
+            gate.unblock()
+        }
+    }
+
     @Test func failureRetainsCauseLocallyAndLastExplicitDetailOnWire() async throws {
         let controller = try liveRuntimeController(
             wireBuild: "service.v1",
