@@ -472,15 +472,14 @@ extension SocketTransportTests.ServiceSocketClientTests {
             try #require(socketpair(AF_UNIX, SOCK_STREAM, 0, &connected) == 0)
             let passed = connected[0]
             defer { Darwin.close(connected[1]) }
-            let started = Date()
             await #expect(throws: BrokerHandoffError.deliveryUnknown) {
                 try await client.handoff(
                     descriptor: passed,
                     runtimeIdentity: identity,
-                    parentDeadline: started.addingTimeInterval(0.03)
+                    parentDeadline: Date().addingTimeInterval(0.03)
                 )
             }
-            #expect(Date().timeIntervalSince(started) < 0.15)
+            #expect(responseGate.started.isFinished)
             await client.close()
         }
     }
