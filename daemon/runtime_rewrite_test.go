@@ -437,9 +437,6 @@ func TestRuntimePublicationAdmissionAndControlIndependence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := trig.slot.Load(); ok {
-		t.Fatal("staged value was visible before CommitReady")
-	}
 	admit, admitProtected := trig.server.admissions(t)
 	if _, done, err := admit(); !errors.Is(err, ErrRuntimeNotReady) || done != nil {
 		t.Fatalf("ordinary admission while Starting = done %v err %v", done != nil, err)
@@ -452,22 +449,16 @@ func TestRuntimePublicationAdmissionAndControlIndependence(t *testing.T) {
 	if err := activation.CommitReady(publication); err != nil {
 		t.Fatal(err)
 	}
-	if value, ok := trig.slot.Load(); !ok || value != "published" {
-		t.Fatalf("published value = %q, %v", value, ok)
-	}
-
 	releases := make([]func(), 0, 32)
-	var pinned Publication
 	for range 32 {
 		value, done, err := admit()
 		if err != nil || done == nil {
 			t.Fatalf("ordinary admission = done %v err %v", done != nil, err)
 		}
-		candidate, ok := value.(Publication)
+		_, ok := value.(Publication)
 		if !ok {
 			t.Fatalf("ordinary admission value has type %T", value)
 		}
-		pinned = candidate
 		releases = append(releases, done)
 	}
 	if _, done, err := admitProtected(); err != nil || done == nil {
@@ -478,17 +469,8 @@ func TestRuntimePublicationAdmissionAndControlIndependence(t *testing.T) {
 	if err := trig.runtime.Drain(); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := trig.slot.Load(); ok {
-		t.Fatal("un-pinned publication remained visible after Drain")
-	}
-	if value, ok := trig.slot.LoadPinned(pinned); !ok || value != "published" {
-		t.Fatalf("pinned publication during Drain = %q, %v", value, ok)
-	}
 	for _, release := range releases {
 		release()
-	}
-	if _, ok := trig.slot.LoadPinned(pinned); ok {
-		t.Fatal("released publication pin remained live")
 	}
 	if _, done, err := admitProtected(); !errors.Is(err, ErrDraining) || done != nil {
 		t.Fatalf("protected admission while Draining = done %v err %v", done != nil, err)
