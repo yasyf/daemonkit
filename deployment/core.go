@@ -1,4 +1,5 @@
-// Package deployment activates an already-installed fixed signed application.
+// Package deployment owns sealed installation, activation, upgrade, and removal
+// of one fixed signed application.
 package deployment
 
 import (

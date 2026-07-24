@@ -75,7 +75,7 @@ One row per package; the Status column is each surface's live state.
 | `version` | Release/dev version taxonomy, newest-wins skew | Landed |
 | `paths` | The `~/<app>` state layout: daemon socket, HTTP handshake file, per-subject artifacts, start lock, sqlite database, daemon log, turn-snapshot scratch dirs | Landed |
 | `bundle` | Info.plist reads, stable `.app` path conventions | Landed |
-| `deployment` | Exact activation and deactivation of a caller-packaged fixed signed app | Landed |
+| `deployment` | Exact local staging, installation, activation, upgrade, deactivation, rollback, and uninstall of a fixed signed app | Landed |
 | `wire` | Exact-v1 persistent business transport, generation-aware service clients, typed product observations, receipt-authenticated stop control, and the sole composed daemon runtime constructor | Landed |
 | `trust` | Codesign peer verification (audit-token designated requirements) | Landed |
 | `daemon` | Opaque process runtime, readiness, ordered shutdown, skew observation, embedded processes, and idle exit | Landed |
@@ -91,17 +91,18 @@ and readiness preflight. A separate persistent handoff session sends only
 `daemon.broker-handoff.v1`, pinned to the exact ready-runtime receipt. There is
 no single-role or compatibility initializer.
 
-`deployment.Controller` never downloads, stages, replaces, adopts, or deletes
-an application. The old signed helper first calls `DeactivateInstalled` and
-proves its activation receipt and services are absent. Packaging then replaces
-and verifies the fixed app. The new helper calls `ActivateInstalled` with a
-sealed `AttestInstalled` result, exact service plan, build, policy, and readiness
-proof. Daemonkit generates and persists each 64-hex operation ID. Exact v1
-receipts, service state, and locks live beside the app under
-`.daemonkit-deployment/<Product>`; `StatusInstalled` reports a matching app with
-no receipt as `verified_unactivated`.
+`deployment.Controller` never downloads an application. Packaging supplies one
+exact local signed `.app` resource. `ApplyInstalledCandidate` copies it into a
+private controller-owned stage, verifies its bundle digest, version, signature,
+identity, and file generation, then owns first install or atomic upgrade through
+activation and rollback. `DeactivateCurrentInstalled` derives prior build,
+policy, plan, and generation only from sealed state. `UninstallCurrentInstalled`
+owns quiescence and crash-recoverable namespace removal. Consumers never write a
+candidate path, swap the installed app, inspect private JSON, or remove the
+canonical app. Exact v1 receipts, service state, and locks live beside the app
+under `.daemonkit-deployment/<Product>`.
 
-Status: v0.15.0 is the hard-cut release line. Protocol and durable-state epochs
+Status: v0.17.0 is the hard-cut release line. Protocol and durable-state epochs
 begin at 1 with exact equality; the API stabilizes at v1.0.0.
 
 Licensed under [PolyForm-Noncommercial-1.0.0](LICENSE).

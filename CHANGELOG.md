@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `deployment.ApplyInstalledCandidate` owns exact local candidate copying,
+  attestation, first install, atomic upgrade, activation, rollback, and durable
+  replay without exposing a staging path or downloading an artifact.
+- `deployment.DeactivateCurrentInstalled` derives prior generation, build,
+  policy, and plan from controller-sealed state and recovers any pending apply
+  transaction before deactivation.
+- `deployment.UninstallCurrentInstalled` owns exact quiescence, deactivation,
+  atomic private removal, deletion, and lost-response recovery. Consumers no
+  longer remove a canonical installed app themselves.
+
 ## [0.16.0] - 2026-07-23
 
 ### Fixed
