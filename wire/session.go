@@ -95,6 +95,11 @@ type session struct {
 
 	stopMu          sync.Mutex
 	stopPreparation *sessionStopPreparation
+
+	handoffMu       sync.Mutex
+	handoffPending  int
+	handoffAttempts int
+	handoffNonces   map[[brokerHandoffNonceBytes]byte]struct{}
 }
 
 type sessionOutbound struct {
@@ -134,17 +139,31 @@ type requestState struct {
 	transportErr  error
 	terminalSent  bool
 	terminalAcked bool
+	sidecar       frameSidecar
 }
 
 func (s *requestState) close() {
 	s.cancel()
 	s.markTerminalWrite(context.Canceled)
+	var sidecar frameSidecar
 	s.mu.Lock()
 	s.inputEnded = true
+	s.sidecar, sidecar = nil, s.sidecar
 	s.mu.Unlock()
+	if sidecar != nil {
+		_ = sidecar.close()
+	}
 	s.inbound.close()
 	s.responseCredits.close()
 	s.deliveryOnce.Do(func() { close(s.deliveryDone) })
+}
+
+func (s *requestState) takeSidecar() frameSidecar {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sidecar := s.sidecar
+	s.sidecar = nil
+	return sidecar
 }
 
 func (s *requestState) markTerminalWrite(err error) {
@@ -429,40 +448,68 @@ func (s *session) responseWritten(id uint64) (<-chan error, error) {
 
 func (s *session) readLoop(ctx context.Context) error {
 	for {
-		frame, err := s.codec.ReadFrame()
+		frame, sidecar, err := s.codec.readFrameWithSidecar()
 		if err != nil {
 			return err
 		}
 		switch frame.Kind {
 		case FrameRequest:
-			if err := s.receiveRequest(ctx, frame); err != nil {
+			if err := s.receiveRequest(ctx, frame, sidecar); err != nil {
 				return err
 			}
 		case FrameCancel:
+			if sidecar != nil {
+				_ = sidecar.close()
+				return errInvalidFrameSidecar
+			}
 			if err := s.receiveCancel(frame); err != nil {
 				return err
 			}
 		case FrameStream:
+			if sidecar != nil {
+				_ = sidecar.close()
+				return errInvalidFrameSidecar
+			}
 			if err := s.receiveStream(frame); err != nil {
 				return err
 			}
 		case FrameWindow:
+			if sidecar != nil {
+				_ = sidecar.close()
+				return errInvalidFrameSidecar
+			}
 			if err := s.receiveWindow(frame); err != nil {
 				return err
 			}
 		case FrameAck:
+			if sidecar != nil {
+				_ = sidecar.close()
+				return errInvalidFrameSidecar
+			}
 			if err := s.receiveAck(frame); err != nil {
 				return err
 			}
 		case FrameGoAway:
+			if sidecar != nil {
+				_ = sidecar.close()
+				return errInvalidFrameSidecar
+			}
 			return errPeerGoAway
 		default:
+			if sidecar != nil {
+				_ = sidecar.close()
+			}
 			return fmt.Errorf("%w: client frame kind %d", ErrInvalidFrame, frame.Kind)
 		}
 	}
 }
 
-func (s *session) receiveRequest(ctx context.Context, frame Frame) error {
+func (s *session) receiveRequest(ctx context.Context, frame Frame, sidecar frameSidecar) (err error) {
+	defer func() {
+		if sidecar != nil {
+			err = errors.Join(err, sidecar.close())
+		}
+	}()
 	if frame.ID == 0 || frame.Op == "" || frame.Sequence != 0 {
 		return fmt.Errorf("%w: request frame", ErrInvalidFrame)
 	}
@@ -510,6 +557,14 @@ func (s *session) receiveRequest(ctx context.Context, frame Frame) error {
 		s.mu.Unlock()
 		return s.sendRejected(ctx, frame.ID, ErrInvalidFrame.Error())
 	}
+	if entry.route == routeHandoff && (frame.Flags != FlagEnd || frame.Tenant != "" || sidecar == nil) {
+		s.mu.Unlock()
+		return fmt.Errorf("%w: invalid broker handoff request", errInvalidFrameSidecar)
+	}
+	if entry.route != routeHandoff && sidecar != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("%w: descriptor on operation %q", errInvalidFrameSidecar, frame.Op)
+	}
 	requestCtx, cancel := s.server.requestContext(ctx, frame)
 	state := &requestState{
 		cancel:          cancel,
@@ -520,7 +575,9 @@ func (s *session) receiveRequest(ctx context.Context, frame Frame) error {
 		terminalAck:     make(chan struct{}),
 		terminalWrite:   make(chan error, 1),
 		settled:         make(chan struct{}),
+		sidecar:         sidecar,
 	}
+	sidecar = nil
 	if frame.Flags&FlagEnd != 0 {
 		state.inputEnded = true
 		state.inbound.close()
@@ -541,6 +598,7 @@ func (s *session) receiveRequest(ctx context.Context, frame Frame) error {
 
 func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, entry entry, state *requestState) {
 	var finishAdmission func()
+	var handoffEnvelope brokerHandoffEnvelope
 	defer func() {
 		state.close()
 		s.removeRequest(frame.ID)
@@ -552,6 +610,39 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 	}()
 
 	switch entry.route {
+	case routeHandoff:
+		if s.wireBuild != s.server.WireBuild {
+			if err := s.sendRejectedCode(sessionCtx, frame.ID, ResponseCodeBuildMismatch, ErrBuildMismatch.Error()); err != nil {
+				s.closeOnRequestError()
+			}
+			return
+		}
+		var err error
+		handoffEnvelope, err = s.server.authorizeBrokerHandoff(s.role, frame.Payload)
+		if err != nil {
+			code, _ := brokerHandoffRejection(err)
+			if err := s.sendRejectedCode(sessionCtx, frame.ID, code, err.Error()); err != nil {
+				s.closeOnRequestError()
+			}
+			return
+		}
+		err = s.server.authorizePreReady(requestCtx, entry, Request{
+			Op: frame.Op, Peer: s.peer, WireBuild: s.wireBuild,
+			Payload: append([]byte(nil), frame.Payload...),
+		})
+		if err != nil {
+			code := ResponseCode("")
+			switch {
+			case errors.Is(err, ErrDraining):
+				code = ResponseCodeRuntimeDraining
+			case errors.Is(err, ErrNotReady):
+				code = ResponseCodeRuntimeStarting
+			}
+			if err := s.sendRejectedCode(sessionCtx, frame.ID, code, err.Error()); err != nil {
+				s.closeOnRequestError()
+			}
+			return
+		}
 	case routeStopPrepare:
 		if s.wireBuild != s.server.WireBuild {
 			if err := s.sendRejected(sessionCtx, frame.ID, ErrBuildMismatch.Error()); err != nil {
@@ -673,7 +764,12 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 		Session:     s.accepted,
 		Publication: publication,
 	}
-	value, err := s.server.dispatch(requestCtx, entry, req)
+	var value any
+	if entry.route == routeHandoff {
+		value, err = s.server.executeBrokerHandoff(requestCtx, s, state, handoffEnvelope)
+	} else {
+		value, err = s.server.dispatch(requestCtx, entry, req)
+	}
 	if requestErr := requestCtx.Err(); requestErr != nil {
 		err = requestErr
 	}
@@ -696,6 +792,17 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 	}
 	if errors.Is(err, ErrQueueFull) {
 		if err := s.sendAdmittedRejected(sessionCtx, frame.ID, state, err.Error()); err != nil {
+			s.closeOnRequestError()
+			return
+		}
+		finishAdmission()
+		if err := s.waitTerminalAck(sessionCtx, state); err != nil {
+			s.closeOnRequestError()
+		}
+		return
+	}
+	if code, rejected := brokerHandoffRejection(err); entry.route == routeHandoff && rejected {
+		if err := s.sendAdmittedRejectedCode(sessionCtx, frame.ID, state, code, err.Error()); err != nil {
 			s.closeOnRequestError()
 			return
 		}

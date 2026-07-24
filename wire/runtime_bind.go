@@ -34,6 +34,7 @@ func (s *Server) bindRuntime(
 	control runtimeControl,
 	stopStore *proc.FileStore,
 	observations []ObservationRoute,
+	trustPolicy trust.TrustPolicy,
 ) error {
 	if control == nil {
 		return errors.New("wire: runtime control is required")
@@ -215,6 +216,19 @@ func (s *Server) bindRuntime(
 			return fmt.Errorf("wire: observation op %q is already registered", op)
 		}
 	}
+	handoffEnabled := false
+	for _, role := range trustPolicy.RoleNames() {
+		if trustPolicy.AllowsHandoff(role) {
+			handoffEnabled = true
+			break
+		}
+	}
+	if handoffEnabled {
+		if _, exists := s.handlers[brokerHandoffOp]; exists {
+			return fmt.Errorf("wire: broker handoff op %q is already registered", brokerHandoffOp)
+		}
+		s.handlers[brokerHandoffOp] = entry{class: classControl, route: routeHandoff}
+	}
 	s.handlers[stopControlPrepareOp] = entry{class: classControl, route: routeStopPrepare, h: prepareStopHandler}
 	s.handlers[stopControlOp] = entry{class: classControl, route: routeStop, h: stopHandler}
 	s.handlers[runtimeReadinessSubscribeOp] = entry{
@@ -264,6 +278,7 @@ func (s *Server) bindRuntime(
 	s.stopTargetProcessGeneration = health.ProcessGeneration
 	s.runtimeBuild = build
 	s.processGeneration = health.ProcessGeneration
+	s.trustPolicy = trustPolicy
 	s.hasObservations = true
 	s.lifecycle = lifecycle
 	return nil

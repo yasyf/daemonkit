@@ -20,6 +20,14 @@ var (
 	ErrStreamOrder = errors.New("wire: stream sequence violation")
 	// ErrSessionCapacity means the authenticated server has no session slot.
 	ErrSessionCapacity = errors.New("wire: session capacity exhausted")
+	// ErrHandoffPendingCapacity means a broker session already has the maximum
+	// number of connected-socket handoffs in flight.
+	ErrHandoffPendingCapacity = errors.New("wire: broker handoff pending capacity exhausted")
+	// ErrHandoffReplay means a broker session reused a handoff nonce.
+	ErrHandoffReplay = errors.New("wire: broker handoff nonce replay")
+	// ErrHandoffSessionExhausted means a broker session reached its fixed
+	// accepted-handoff limit.
+	ErrHandoffSessionExhausted = errors.New("wire: broker handoff session exhausted")
 )
 
 // ResponseCode is a stable machine-readable terminal status.
@@ -39,6 +47,12 @@ const (
 	// ResponseCodePermissionDenied rejects an authenticated role without exact
 	// private-control authority.
 	ResponseCodePermissionDenied ResponseCode = "permission_denied"
+	// ResponseCodeHandoffPendingCapacity identifies bounded broker backpressure.
+	ResponseCodeHandoffPendingCapacity ResponseCode = "handoff_pending_capacity"
+	// ResponseCodeHandoffReplay identifies a nonce already consumed by this session.
+	ResponseCodeHandoffReplay ResponseCode = "handoff_replay"
+	// ResponseCodeHandoffSessionExhausted retires a broker session at its exact limit.
+	ResponseCodeHandoffSessionExhausted ResponseCode = "handoff_session_exhausted"
 )
 
 // WireIdentity is exchanged during the mandatory exact-version handshake.
@@ -136,6 +150,12 @@ func responseCodeCause(code ResponseCode) error {
 		return ErrUntrustedPeer
 	case ResponseCodePermissionDenied:
 		return ErrPermissionDenied
+	case ResponseCodeHandoffPendingCapacity:
+		return ErrHandoffPendingCapacity
+	case ResponseCodeHandoffReplay:
+		return ErrHandoffReplay
+	case ResponseCodeHandoffSessionExhausted:
+		return ErrHandoffSessionExhausted
 	default:
 		return nil
 	}

@@ -64,6 +64,7 @@ func NewRuntime(config RuntimeConfig) (*daemon.Runtime, error) {
 		runtime,
 		config.StopControlStore,
 		config.Observations,
+		config.TrustPolicy,
 	); err != nil {
 		return nil, err
 	}

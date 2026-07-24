@@ -92,14 +92,17 @@ type Codec struct {
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
 
-	conn    net.Conn
-	readMu  sync.Mutex
-	writeMu sync.Mutex
+	conn      net.Conn
+	rights    frameRightsCodec
+	rightsErr error
+	readMu    sync.Mutex
+	writeMu   sync.Mutex
 }
 
 // NewCodec wraps conn with the default frame cap and no deadlines.
 func NewCodec(conn net.Conn) *Codec {
-	return &Codec{MaxFrame: DefaultMaxFrame, conn: conn}
+	rights, err := newFrameRightsCodec(conn)
+	return &Codec{MaxFrame: DefaultMaxFrame, conn: conn, rights: rights, rightsErr: err}
 }
 
 // SetDeadline installs one absolute deadline for both directions. It disables
@@ -120,11 +123,26 @@ func (c *Codec) ClearDeadline() error {
 
 // ReadFrame reads one complete frame and rejects foreign versions before payload use.
 func (c *Codec) ReadFrame() (frame Frame, err error) {
+	frame, sidecar, err := c.readFrameWithSidecar()
+	if sidecar != nil {
+		closeErr := sidecar.close()
+		if err == nil {
+			err = fmt.Errorf("%w: descriptor is not valid for this reader", errInvalidFrameSidecar)
+		}
+		err = errors.Join(err, closeErr)
+	}
+	return frame, err
+}
+
+func (c *Codec) readFrameWithSidecar() (frame Frame, sidecar frameSidecar, err error) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
+	if c.rightsErr != nil {
+		return Frame{}, nil, c.rightsErr
+	}
 	if c.ReadTimeout > 0 {
 		if err := c.conn.SetReadDeadline(time.Now().Add(c.ReadTimeout)); err != nil {
-			return Frame{}, fmt.Errorf("wire: set read deadline: %w", err)
+			return Frame{}, nil, fmt.Errorf("wire: set read deadline: %w", err)
 		}
 		defer func() {
 			clearErr := clearReadDeadline(c.conn)
@@ -134,12 +152,15 @@ func (c *Codec) ReadFrame() (frame Frame, err error) {
 			err = errors.Join(err, clearErr)
 		}()
 	}
+	if c.rights != nil {
+		return c.rights.readFrame(c.MaxFrame)
+	}
 	var prefix [4]byte
 	if _, err := io.ReadFull(c.conn, prefix[:]); err != nil {
 		if errors.Is(err, io.ErrUnexpectedEOF) {
-			return Frame{}, ErrFrameTruncated
+			return Frame{}, nil, ErrFrameTruncated
 		}
-		return Frame{}, err
+		return Frame{}, nil, err
 	}
 	n := int(binary.BigEndian.Uint32(prefix[:]))
 	limit := c.MaxFrame
@@ -147,19 +168,20 @@ func (c *Codec) ReadFrame() (frame Frame, err error) {
 		limit = DefaultMaxFrame
 	}
 	if n > limit {
-		return Frame{}, fmt.Errorf("%w: %d > %d", ErrFrameTooLarge, n, limit)
+		return Frame{}, nil, fmt.Errorf("%w: %d > %d", ErrFrameTooLarge, n, limit)
 	}
 	if n < frameHeaderSize {
-		return Frame{}, fmt.Errorf("%w: body length %d", ErrInvalidFrame, n)
+		return Frame{}, nil, fmt.Errorf("%w: body length %d", ErrInvalidFrame, n)
 	}
 	body := make([]byte, n)
 	if _, err := io.ReadFull(c.conn, body); err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return Frame{}, ErrFrameTruncated
+			return Frame{}, nil, ErrFrameTruncated
 		}
-		return Frame{}, err
+		return Frame{}, nil, err
 	}
-	return decodeFrame(body)
+	frame, err = decodeFrame(body)
+	return frame, nil, err
 }
 
 // WriteFrame writes one complete frame under the configured bound.

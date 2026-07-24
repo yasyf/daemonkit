@@ -56,6 +56,7 @@ const (
 )
 
 var reservedOps = map[Op]struct{}{
+	brokerHandoffOp:             {},
 	stopControlPrepareOp:        {},
 	stopControlOp:               {},
 	runtimeReadinessSubscribeOp: {},
@@ -77,6 +78,7 @@ const (
 	routeLifecycle
 	routeStopPrepare
 	routeStop
+	routeHandoff
 )
 
 type daemonAdmission func() (daemon.Publication, func(), error)
@@ -144,6 +146,7 @@ type Server struct {
 	handlers                     map[Op]entry
 	listener                     net.Listener
 	started                      bool
+	intakeClosed                 bool
 	sessions                     map[*session]struct{}
 	streamWindow                 uint32
 	trustPolicy                  trust.TrustPolicy
@@ -155,6 +158,10 @@ type Server struct {
 	lifecycle                    *daemon.Lifecycle
 	runtimeBuild                 string
 	processGeneration            proc.OwnerGeneration
+	runtimeContext               context.Context
+	runtimeAdmit                 daemonAdmission
+	runtimeAdmitProtected        daemonAdmission
+	runtimePeerFence             runtimeauth.PeerFence
 	readinessMu                  sync.Mutex
 	readinessSubscribers         map[*session]*readinessSubscription
 	readinessSubscriptionsClosed bool
@@ -257,7 +264,7 @@ func (s *Server) serveRuntime(
 	} else if s.lifecycle != lifecycle {
 		return errors.New("wire: lifecycle controller differs from bound runtime")
 	}
-	workers, err := s.start(listener)
+	workers, err := s.start(ctx, listener, admit, admitProtected, peerFence)
 	if err != nil {
 		if started != nil {
 			started <- err
@@ -287,7 +294,12 @@ func (s *Server) serveRuntime(
 	return acceptErr
 }
 
-func (s *Server) start(listener net.Listener) (int, error) {
+func (s *Server) start(
+	ctx context.Context,
+	listener net.Listener,
+	admit, admitProtected daemonAdmission,
+	peerFence runtimeauth.PeerFence,
+) (int, error) {
 	if s.WireBuild == "" {
 		return 0, errors.New("wire: WireBuild is required")
 	}
@@ -304,7 +316,12 @@ func (s *Server) start(listener net.Listener) (int, error) {
 		return 0, ErrServerStarted
 	}
 	s.started = true
+	s.intakeClosed = false
 	s.listener = listener
+	s.runtimeContext = ctx
+	s.runtimeAdmit = admit
+	s.runtimeAdmitProtected = admitProtected
+	s.runtimePeerFence = peerFence
 	s.sessions = make(map[*session]struct{})
 	s.streamWindow = streamWindow
 	if s.Log == nil {
@@ -359,6 +376,7 @@ func wrapAcceptError(err error) error {
 func (s *Server) CloseIntake() error {
 	s.mu.Lock()
 	listener := s.listener
+	s.intakeClosed = true
 	s.mu.Unlock()
 	s.readinessMu.Lock()
 	s.readinessSubscriptionsClosed = true
@@ -381,62 +399,109 @@ func (s *Server) accept(ctx context.Context, admit, admitProtected daemonAdmissi
 			s.rejectHandshake(ctx, conn, ResponseCodePeerUntrusted, ErrUntrustedPeer)
 			continue
 		}
-		codec := NewCodec(conn)
-		codec.MaxFrame = s.maxFrame()
-		if err := codec.SetDeadline(earlierDeadline(ctx, s.handshakeTimeout())); err != nil {
-			_ = conn.Close()
-			continue
+		if err := s.startConnection(ctx, ctx, unix, admit, admitProtected, peerFence); err != nil {
+			s.Log.Debug("wire: reject accepted connection", "err", err)
 		}
-		identity, err := s.readClientHello(codec)
-		if err != nil {
-			code := ResponseCodePeerUntrusted
-			if errors.Is(err, ErrBuildMismatch) {
-				code = ResponseCodeBuildMismatch
-			}
-			s.rejectHandshakeCodec(conn, codec, code, err)
-			continue
-		}
-		peer, err := PeerFromConn(unix)
-		if err != nil {
-			s.rejectHandshakeCodec(conn, codec, ResponseCodePeerUntrusted, ErrUntrustedPeer)
-			s.Log.Debug("wire: reject unidentified peer", "err", err)
-			continue
-		}
-		verifyCtx, cancelVerify := context.WithTimeout(ctx, s.peerVerificationTimeout())
-		role, protected, err := s.verifyPeer(verifyCtx, peer, identity.Role)
-		if err != nil {
-			cancelVerify()
-			s.rejectHandshakeCodec(conn, codec, ResponseCodePeerUntrusted, ErrUntrustedPeer)
-			s.Log.Debug("wire: reject untrusted peer", "err", err)
-			continue
-		}
-		fencePermit, err := peerFence(verifyCtx, peer, role)
-		cancelVerify()
-		if err != nil {
-			s.rejectHandshakeCodec(conn, codec, ResponseCodePeerUntrusted, ErrUntrustedPeer)
-			s.Log.Debug("wire: reject child peer fence", "err", err)
-			continue
-		}
-		capacity, ok := s.acquireSessionCapacity(role, protected)
-		if !ok {
-			if fencePermit != nil {
-				fencePermit.Rollback()
-			}
-			s.rejectHandshakeCodec(conn, codec, ResponseCodeSessionCapacity, ErrSessionCapacity)
-			continue
-		}
-		s.sessionWG.Add(1)
-		go func(conn net.Conn, codec *Codec, identity handshakeIdentity, peer Peer, role trust.PeerRole, protected bool, capacity sessionCapacity, fencePermit *runtimeauth.PeerFencePermit) {
-			releaseCapacity := sync.OnceFunc(func() { s.releaseSessionCapacity(capacity) })
-			defer func() {
-				releaseCapacity()
-				s.sessionWG.Done()
-			}()
-			if err := s.serveConn(ctx, conn, codec, identity, peer, role, protected, admit, admitProtected, releaseCapacity, fencePermit); err != nil && !isDisconnect(err) {
-				s.Log.Debug("wire: session ended", "err", err)
-			}
-		}(conn, codec, identity, peer, role, protected, capacity, fencePermit)
 	}
+}
+
+func (s *Server) adoptHandoffConnection(verifyParent context.Context, conn *net.UnixConn) error {
+	s.mu.Lock()
+	runtimeContext := s.runtimeContext
+	admit := s.runtimeAdmit
+	admitProtected := s.runtimeAdmitProtected
+	peerFence := s.runtimePeerFence
+	closed := s.intakeClosed
+	s.mu.Unlock()
+	if closed || runtimeContext == nil || admit == nil || admitProtected == nil || peerFence == nil {
+		_ = conn.Close()
+		return ErrDraining
+	}
+	return s.startConnection(verifyParent, runtimeContext, conn, admit, admitProtected, peerFence)
+}
+
+func (s *Server) startConnection(
+	verifyParent, runtimeContext context.Context,
+	conn *net.UnixConn,
+	admit, admitProtected daemonAdmission,
+	peerFence runtimeauth.PeerFence,
+) error {
+	codec := NewCodec(conn)
+	codec.MaxFrame = s.maxFrame()
+	if err := codec.SetDeadline(earlierDeadline(verifyParent, s.handshakeTimeout())); err != nil {
+		_ = conn.Close()
+		return err
+	}
+	identity, err := s.readClientHello(codec)
+	if err != nil {
+		code := ResponseCodePeerUntrusted
+		if errors.Is(err, ErrBuildMismatch) {
+			code = ResponseCodeBuildMismatch
+		}
+		s.rejectHandshakeCodec(conn, codec, code, err)
+		return err
+	}
+	peer, err := PeerFromConn(conn)
+	if err != nil {
+		s.rejectHandshakeCodec(conn, codec, ResponseCodePeerUntrusted, ErrUntrustedPeer)
+		return fmt.Errorf("wire: identify peer: %w", err)
+	}
+	verifyCtx, cancelVerify := context.WithTimeout(verifyParent, s.peerVerificationTimeout())
+	role, protected, err := s.verifyPeer(verifyCtx, peer, identity.Role)
+	if err != nil {
+		cancelVerify()
+		s.rejectHandshakeCodec(conn, codec, ResponseCodePeerUntrusted, ErrUntrustedPeer)
+		return fmt.Errorf("wire: verify peer: %w", err)
+	}
+	fencePermit, err := peerFence(verifyCtx, peer, role)
+	cancelVerify()
+	if err != nil {
+		s.rejectHandshakeCodec(conn, codec, ResponseCodePeerUntrusted, ErrUntrustedPeer)
+		return fmt.Errorf("wire: child peer fence: %w", err)
+	}
+	if err := verifyParent.Err(); err != nil {
+		if fencePermit != nil {
+			fencePermit.Rollback()
+		}
+		_ = conn.Close()
+		return err
+	}
+
+	s.mu.Lock()
+	if s.intakeClosed || runtimeContext.Err() != nil {
+		s.mu.Unlock()
+		if fencePermit != nil {
+			fencePermit.Rollback()
+		}
+		_ = conn.Close()
+		return ErrDraining
+	}
+	capacity, ok := s.acquireSessionCapacity(role, protected)
+	if ok {
+		s.sessionWG.Add(1)
+	}
+	s.mu.Unlock()
+	if !ok {
+		if fencePermit != nil {
+			fencePermit.Rollback()
+		}
+		s.rejectHandshakeCodec(conn, codec, ResponseCodeSessionCapacity, ErrSessionCapacity)
+		return ErrSessionCapacity
+	}
+	go func() {
+		releaseCapacity := sync.OnceFunc(func() { s.releaseSessionCapacity(capacity) })
+		defer func() {
+			releaseCapacity()
+			s.sessionWG.Done()
+		}()
+		if err := s.serveConn(
+			runtimeContext, conn, codec, identity, peer, role, protected,
+			admit, admitProtected, releaseCapacity, fencePermit,
+		); err != nil && !isDisconnect(err) {
+			s.Log.Debug("wire: session ended", "err", err)
+		}
+	}()
+	return nil
 }
 
 func (s *Server) serveConn(
