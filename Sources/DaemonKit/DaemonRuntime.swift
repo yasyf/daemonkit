@@ -44,13 +44,20 @@ final class DaemonRuntime: @unchecked Sendable {
         )
         self.identity = identity
         self.controller = controller
+        let productHandler = handler.operation
         server = SocketServer(
             path: path,
             wireBuild: wireBuild,
             configuration: configuration,
             runtimeLifecycle: controller,
+            controlOperations: [runtimeReadinessSubscribeOperation, runtimeReceiptOperation],
             sessionPolicy: sessionPolicy,
-            handler: handler.operation
+            handler: { request in
+                if let response = controller.handleControl(request) {
+                    return response
+                }
+                return await productHandler(request)
+            }
         )
     }
 

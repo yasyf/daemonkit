@@ -691,6 +691,41 @@ extension RuntimeLifecycleController {
         }?.pendingTerminal
         pending?.finish(.failure(SessionTransportError.disconnected))
     }
+
+    func handleControl(_ request: SocketRequest) -> SocketResponse? {
+        switch request.operation {
+        case runtimeReceiptOperation:
+            do {
+                try RuntimeReceiptCodec.decodeRequest(request.payload)
+                return try .terminal(SocketTerminal(
+                    payload: RuntimeReceiptCodec.encodeResponse(runtimeIdentity)
+                ))
+            } catch {
+                return .terminal(SocketTerminal(error: "wire: invalid runtime receipt request"))
+            }
+        case runtimeReadinessSubscribeOperation:
+            do {
+                try RuntimeReadinessCodec.decodeSubscribeAck(request.payload)
+                guard let session = request.session.implementation else {
+                    throw SessionTransportError.disconnected
+                }
+                register(session)
+                Task {
+                    await request.session.waitUntilClosed()
+                    self.unregister(session)
+                }
+                return try .terminal(SocketTerminal(
+                    payload: RuntimeReadinessCodec.encodeSubscribe()
+                ) {
+                    self.activate(session)
+                })
+            } catch {
+                return .terminal(SocketTerminal(error: "wire: invalid readiness subscription"))
+            }
+        default:
+            return nil
+        }
+    }
 }
 
 private extension RuntimeLifecycleController {

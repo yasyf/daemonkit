@@ -81,6 +81,29 @@ struct StaticSessionServiceRuntimeTests {
         try await replacement.shutdown(deadline: Date().addingTimeInterval(2))
     }
 
+    @Test func publicServiceClientAcquiresReceiptReadinessAndCallsTypedRoute() async throws {
+        let directory = try shortSocketDir()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("service-client.sock").path
+        let runtime = try stringService(path: path) { "reply:\($0)" }
+        try await runtime.start(deadline: Date().addingTimeInterval(2))
+        let client = try ServiceSocketClient(
+            path: path,
+            wireBuild: "service.v1",
+            role: "dev.yasyf.test.client.v1",
+            noProgressTimeout: 1
+        )
+        let terminal = try await client.call(ServiceSocketCall(
+            operation: "echo",
+            payload: Data("public".utf8),
+            runtimeTarget: .exact(runtime.identity),
+            deadline: Date().addingTimeInterval(2)
+        ))
+        #expect(try terminal.payload.map { try JSONDecoder().decode(String.self, from: $0) } == "reply:public")
+        await client.close()
+        try await runtime.shutdown(deadline: Date().addingTimeInterval(2))
+    }
+
     @Test func exactHandshakeAndRouteRejectBeforeTypedDispatch() async throws {
         let directory = try shortSocketDir()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -228,6 +251,77 @@ struct StaticSessionServiceRuntimeTests {
         }
     }
 
+    @Test func laterStreamOverflowRejectsAndSameSessionRemainsUsable() async throws {
+        try await withAsyncCleanup { cleanup in
+            let directory = try shortSocketDir()
+            cleanup.add { try? FileManager.default.removeItem(at: directory) }
+            let path = directory.appendingPathComponent("stream-overflow.sock").path
+            let calls = LockedCounter()
+            let runtime = try stringService(
+                path: path,
+                configuration: sessionServiceConfiguration(maximumRequestBytes: 4)
+            ) { value in
+                calls.increment()
+                return value
+            }
+            try await runtime.start(deadline: Date().addingTimeInterval(2))
+            cleanup.add { try? await runtime.shutdown(deadline: Date().addingTimeInterval(2)) }
+            let client = try await SocketClient(
+                path: path,
+                wireBuild: "service.v1",
+                role: "dev.yasyf.test.client.v1"
+            )
+            cleanup.add { await client.close() }
+
+            let overflow = try await client.open(
+                operation: "echo",
+                payload: Data("12".utf8),
+                endInput: false
+            )
+            try await overflow.sendChunk(Data("34".utf8))
+            try await overflow.sendChunk(Data("5".utf8))
+            try? await overflow.closeSend()
+            let rejected = try await overflow.response()
+            #expect(rejected.rejected)
+            #expect(rejected.code == .requestTooLarge)
+            #expect(calls.value == 0)
+
+            let exact = try await client.call(operation: "echo", payload: Data("1234".utf8))
+            #expect(try exact.payload.map { try JSONDecoder().decode(String.self, from: $0) } == "1234")
+            #expect(calls.value == 1)
+        }
+    }
+
+    @Test func cancellationWhileAwaitingStreamNeverDispatchesAndSessionRecovers() async throws {
+        try await withAsyncCleanup { cleanup in
+            let directory = try shortSocketDir()
+            cleanup.add { try? FileManager.default.removeItem(at: directory) }
+            let path = directory.appendingPathComponent("stream-cancel.sock").path
+            let calls = LockedCounter()
+            let runtime = try stringService(path: path) { value in
+                calls.increment()
+                return value
+            }
+            try await runtime.start(deadline: Date().addingTimeInterval(2))
+            cleanup.add { try? await runtime.shutdown(deadline: Date().addingTimeInterval(2)) }
+            let client = try await SocketClient(
+                path: path,
+                wireBuild: "service.v1",
+                role: "dev.yasyf.test.client.v1"
+            )
+            cleanup.add { await client.close() }
+
+            let canceled = try await client.open(operation: "echo", endInput: false)
+            await canceled.cancel()
+            _ = try? await canceled.response()
+            #expect(calls.value == 0)
+
+            let healthy = try await client.call(operation: "echo", payload: Data("ok".utf8))
+            #expect(try healthy.payload.map { try JSONDecoder().decode(String.self, from: $0) } == "ok")
+            #expect(calls.value == 1)
+        }
+    }
+
     @Test func shutdownCancelsHandlerAndRejectsFurtherAdmission() async throws {
         let directory = try shortSocketDir()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -372,7 +466,9 @@ private final class LockedCounter: @unchecked Sendable {
     private let lock = NSLock()
     private var count = 0
 
-    var value: Int { lock.withLock { count } }
+    var value: Int {
+        lock.withLock { count }
+    }
 
     func increment() {
         lock.withLock { count += 1 }

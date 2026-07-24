@@ -354,7 +354,7 @@ extension SocketTransportTests {
 }
 
 extension SocketTransportTests.RuntimeLifecycleControllerTests {
-    @Test func swiftServerRejectsProtectedReadinessBeforeHandler() async throws {
+    @Test func swiftRuntimeOwnsProtectedReadinessBeforeHandler() async throws {
         try await withAsyncCleanup { cleanup in
             let directory = try shortSocketDir()
             cleanup.add { try? FileManager.default.removeItem(at: directory) }
@@ -379,8 +379,9 @@ extension SocketTransportTests.RuntimeLifecycleControllerTests {
                 payload: RuntimeReadinessCodec.encodeSubscribe(),
                 deadline: Date().addingTimeInterval(2)
             )
-            #expect(terminal.rejected)
-            #expect(terminal.code == .permissionDenied)
+            #expect(!terminal.rejected)
+            let expected = try RuntimeReadinessCodec.encodeSubscribe()
+            #expect(terminal.payload == expected)
             #expect(await handler.snapshot().isEmpty)
         }
     }
@@ -734,7 +735,7 @@ extension SocketTransportTests.RuntimeLifecycleControllerTests {
         _ = await call.result
     }
 
-    @Test func swiftServerHasNoProtectedRuntimeReceiptHandler() async throws {
+    @Test func swiftRuntimeOwnsProtectedRuntimeReceiptBeforeHandler() async throws {
         try await withAsyncCleanup { cleanup in
             let directory = try shortSocketDir()
             cleanup.add { try? FileManager.default.removeItem(at: directory) }
@@ -754,12 +755,11 @@ extension SocketTransportTests.RuntimeLifecycleControllerTests {
                 role: SessionPeerRole.unprotected
             )
             cleanup.add { await client.close() }
-            await #expect(throws: RuntimeReceiptUnavailableError.self) {
-                _ = try await client.acquireRuntimeReceipt(
-                    expectedRuntimeBuild: "app.v1",
-                    deadline: Date().addingTimeInterval(1)
-                )
-            }
+            let receipt = try await client.acquireRuntimeReceipt(
+                expectedRuntimeBuild: "app.v1",
+                deadline: Date().addingTimeInterval(1)
+            )
+            #expect(receipt.runtimeIdentity == identity)
             #expect(await handler.snapshot().isEmpty)
         }
     }

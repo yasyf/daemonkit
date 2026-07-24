@@ -236,7 +236,8 @@ final class ServerSession: @unchecked Sendable {
         guard frame.id != 0, !frame.operation.isEmpty, frame.sequence == 0 else {
             throw SessionTransportError.invalidFrame("request")
         }
-        if frame.operation.hasPrefix("daemon.") {
+        let control = controlOperations.contains(frame.operation)
+        if frame.operation.hasPrefix("daemon."), !control {
             try await sendRejected(
                 id: frame.id,
                 code: .permissionDenied,
@@ -244,7 +245,15 @@ final class ServerSession: @unchecked Sendable {
             )
             return
         }
-        if let sessionPolicy, frame.operation != sessionPolicy.operation {
+        if control, !frame.tenant.isEmpty {
+            try await sendRejected(
+                id: frame.id,
+                code: .permissionDenied,
+                reason: "wire: control operation tenant must be empty"
+            )
+            return
+        }
+        if !control, let sessionPolicy, frame.operation != sessionPolicy.operation {
             try await sendRejected(
                 id: frame.id,
                 code: .permissionDenied,
@@ -252,7 +261,7 @@ final class ServerSession: @unchecked Sendable {
             )
             return
         }
-        if let sessionPolicy, frame.tenant != sessionPolicy.tenant {
+        if !control, let sessionPolicy, frame.tenant != sessionPolicy.tenant {
             try await sendRejected(
                 id: frame.id,
                 code: .permissionDenied,
@@ -263,7 +272,7 @@ final class ServerSession: @unchecked Sendable {
         let admission = try admit(
             frame,
             clientWireBuild: identity.wireBuild,
-            control: controlOperations.contains(frame.operation)
+            control: control
         )
         guard case let .accepted(state, runtimeAdmission) = admission else {
             guard case let .rejected(code, reason) = admission else { return }

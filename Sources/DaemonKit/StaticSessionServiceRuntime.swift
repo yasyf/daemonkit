@@ -139,10 +139,9 @@ public final class StaticSessionServiceRuntime<Request: Sendable, Response: Send
             handle: handler.handle
         )
         let dispatch = SessionServiceDispatch<Request, Response>()
-        let effectiveUserID: uid_t
-        switch trust {
+        let effectiveUserID: uid_t = switch trust {
         case .sameEffectiveUser:
-            effectiveUserID = geteuid()
+            geteuid()
         }
         let runtime = try DaemonRuntime(
             path: path,
@@ -199,9 +198,9 @@ public final class StaticSessionServiceRuntime<Request: Sendable, Response: Send
     public func wait() async -> SessionServiceRuntimeResult {
         switch await runtime.wait() {
         case let .failed(error):
-            return .failed(error)
+            .failed(error)
         case .draining:
-            return .draining
+            .draining
         }
     }
 
@@ -311,7 +310,7 @@ private struct SessionServiceRoute<Request: Sendable, Response: Sendable>: Senda
             let response = await handle(decoded)
             try Task.checkCancellation()
             do {
-                return .terminal(SocketTerminal(payload: try codec.encode(response)))
+                return try .terminal(SocketTerminal(payload: codec.encode(response)))
             } catch {
                 return .terminal(SocketTerminal(error: "daemonkit: response encode failed"))
             }
