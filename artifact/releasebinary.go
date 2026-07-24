@@ -101,7 +101,7 @@ func (s Store) materializeReleaseBinary(ctx context.Context, desc *Descriptor, e
 		return fmt.Errorf("%w: entrypoint %q missing after materialization", ErrInvalidDescriptor, entry.Path)
 	}
 	// A resolved binary must be executable; extracted archive members are 0600.
-	if err := os.Chmod(stageEntry, 0o755); err != nil {
+	if err := os.Chmod(stageEntry, 0o755); err != nil { // #nosec G302 -- the verified entrypoint must be executable.
 		return fmt.Errorf("artifact: mark entrypoint executable: %w", err)
 	}
 	if err := writeCacheMeta(stage, desc.Name, entry); err != nil {
