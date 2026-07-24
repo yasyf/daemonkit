@@ -18,6 +18,9 @@ struct RuntimeLifecycleSequenceExhaustedError: Error, Equatable, Sendable {}
 /// RuntimeServerTerminatedError reports listener loss before lifecycle shutdown.
 struct RuntimeServerTerminatedError: Error, Equatable, Sendable {}
 
+/// RuntimeStartFailedError reports a generation that never reached Ready.
+struct RuntimeStartFailedError: Error, Equatable, Sendable {}
+
 /// RuntimeActivationContext is the preparation lifetime of one runtime generation.
 final class RuntimeActivationContext: @unchecked Sendable {
     private let lock = NSLock()
@@ -534,6 +537,25 @@ extension RuntimeLifecycleController {
         transition.sessionsToClose.forEach { $0.close() }
         finishWaiters(.failed(cause))
         try await Self.settle(transition.receipts)
+    }
+
+    func failStarting() async throws {
+        let cause = RuntimeStartFailedError()
+        let transition = try lock.withLock { () throws -> (TransitionResult, RuntimeActivationContext?)? in
+            guard !poisoned, current.progress.state == .starting else { return nil }
+            let prepared = try prepareLocked(state: .failed, detail: current.progress.detail)
+            let context = activation?.context
+            activation = nil
+            staged.removeAll()
+            activities.removeAll()
+            waitResult = .failed(cause)
+            return (applyLocked(prepared), context)
+        }
+        guard let transition else { return }
+        transition.1?.cancel()
+        transition.0.sessionsToClose.forEach { $0.close() }
+        finishWaiters(.failed(cause))
+        try await Self.settle(transition.0.receipts)
     }
 
     func closeIntake(deadline: Date? = nil) async throws {

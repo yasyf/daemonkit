@@ -48,7 +48,7 @@ final class SocketServer: @unchecked Sendable {
     }
 
     private enum StopAction {
-        case settle(Int32)
+        case beginSettlement(Int32)
         case waitForStart
         case waitForStop
         case finishIdle
@@ -271,8 +271,13 @@ extension SocketServer {
             try await waitForStartAndStop(deadline: deadline)
         case .waitForStop:
             try await waitForStop(deadline: deadline)
-        case let .settle(writeDescriptor):
-            try await settleStop(writeDescriptor: writeDescriptor, deadline: deadline)
+        case let .beginSettlement(writeDescriptor):
+            Task { await self.settleStop(writeDescriptor: writeDescriptor) }
+            if let deadline {
+                try await stopLatch.wait(deadline: deadline)
+            } else {
+                await stopLatch.wait()
+            }
         }
     }
 
@@ -287,7 +292,7 @@ extension SocketServer {
                 return .waitForStart
             case .serving:
                 state = .stopping
-                return .settle(shutdownWriteDescriptor)
+                return .beginSettlement(shutdownWriteDescriptor)
             case .stopping, .stopped:
                 return .waitForStop
             }
@@ -315,7 +320,7 @@ extension SocketServer {
         }
     }
 
-    private func settleStop(writeDescriptor: Int32, deadline: Date?) async throws {
+    private func settleStop(writeDescriptor: Int32) async {
         var byte: UInt8 = 1
         while Darwin.write(writeDescriptor, &byte, 1) < 0 {
             if errno == EINTR {
@@ -328,14 +333,8 @@ extension SocketServer {
         acceptQueue.async {
             acceptLoopSettled.finish()
         }
-        if let deadline {
-            try await acceptLoopSettled.wait(deadline: deadline)
-        } else {
-            await acceptLoopSettled.wait()
-        }
-        if deadline == nil {
-            await stopDrainHook?()
-        }
+        await acceptLoopSettled.wait()
+        await stopDrainHook?()
         let (active, connectionSnapshot): ([ServerSession], [ServerConnection]) = lock.withLock {
             (Array(sessions.values), Array(connections))
         }
@@ -345,27 +344,14 @@ extension SocketServer {
         for connection in connectionSnapshot {
             connection.shutdown()
         }
-        let settled = await withCheckedContinuation { continuation in
+        await withCheckedContinuation { continuation in
             DispatchQueue.global().async { [sessionGroup] in
-                guard let deadline else {
-                    sessionGroup.wait()
-                    continuation.resume(returning: true)
-                    return
-                }
-                let remaining = deadline.timeIntervalSinceNow
-                guard remaining > 0 else {
-                    continuation.resume(returning: false)
-                    return
-                }
-                let result = sessionGroup.wait(timeout: .now() + remaining)
-                continuation.resume(returning: result == .success)
+                sessionGroup.wait()
+                continuation.resume()
             }
         }
-        guard settled else { throw RuntimeShutdownError.deadlineExceeded }
-        try releaseListenerResources(deadline: deadline)
-        if deadline == nil {
-            await stopFinishHook?()
-        }
+        releaseListenerResources()
+        await stopFinishHook?()
         stopLatch.finish()
     }
 
@@ -408,9 +394,8 @@ extension SocketServer {
         )
     }
 
-    private func releaseListenerResources(deadline: Date?) throws {
+    private func releaseListenerResources() {
         // The listener path and descriptors are one synchronously released ownership unit.
-        try requireShutdownBudget(deadline)
         if listenerDescriptor >= 0 {
             Darwin.close(listenerDescriptor)
             listenerDescriptor = -1
@@ -425,12 +410,6 @@ extension SocketServer {
         }
         unlink(path)
         lock.withLock { state = .stopped }
-    }
-
-    private func requireShutdownBudget(_ deadline: Date?) throws {
-        if let deadline, deadline <= Date() {
-            throw RuntimeShutdownError.deadlineExceeded
-        }
     }
 
     private func bind() throws -> Int32 {
@@ -571,6 +550,15 @@ extension SocketServer {
                     throw SessionTransportError.systemCall(operation: "getpeereid", errno: errno)
                 }
                 return SocketPeer(effectiveUserID: user, effectiveGroupID: group)
+            }
+            if let sessionPolicy, peer.effectiveUserID != sessionPolicy.effectiveUserID {
+                try? await rejectHandshake(
+                    descriptor: descriptor,
+                    queue: setupQueue,
+                    code: .peerUntrusted,
+                    reason: "wire: peer effective user does not match service owner"
+                )
+                return
             }
             guard reserveSession() else {
                 try? await rejectHandshake(

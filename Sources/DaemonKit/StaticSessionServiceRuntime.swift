@@ -189,6 +189,7 @@ public final class StaticSessionServiceRuntime<Request: Sendable, Response: Send
             try activation.commitReady(publication)
             lock.withLock { state = .running }
         } catch {
+            await runtime.settleFailedStart()
             lock.withLock { state = .stopped }
             throw error
         }
@@ -209,8 +210,9 @@ public final class StaticSessionServiceRuntime<Request: Sendable, Response: Send
         let acquired = lock.withLock { () -> (Task<Void, Error>?, Bool) in
             switch state {
             case .idle:
-                state = .stopped
-                return (nil, false)
+                let task = Task { try await self.runtime.shutdown(deadline: deadline) }
+                state = .shuttingDown(task)
+                return (task, false)
             case .starting:
                 return (nil, true)
             case .running:
@@ -294,7 +296,7 @@ private struct SessionServiceRoute<Request: Sendable, Response: Sendable>: Senda
             }
             for try await chunk in request.chunks {
                 try Task.checkCancellation()
-                guard payload.count <= maximumRequestBytes - chunk.payload.count else {
+                guard chunk.payload.count <= maximumRequestBytes - payload.count else {
                     return rejected(.requestTooLarge, "wire: request exceeds service limit")
                 }
                 payload.append(chunk.payload)

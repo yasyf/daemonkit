@@ -257,6 +257,41 @@ struct StaticSessionServiceRuntimeTests {
         await client.close()
     }
 
+    @Test func timedOutShutdownRetainsOneSettlementOwnerAndCanBeRejoined() async throws {
+        let directory = try shortSocketDir()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("retry.sock").path
+        let entered = AsyncLatch()
+        let release = AsyncLatch()
+        let runtime = try stringService(path: path) { value in
+            entered.finish()
+            await release.wait()
+            return value
+        }
+        try await runtime.start(deadline: Date().addingTimeInterval(2))
+        let client = try await SocketClient(
+            path: path,
+            wireBuild: "service.v1",
+            role: "dev.yasyf.test.client.v1"
+        )
+        let call = Task { try await client.call(operation: "echo", payload: Data("wait".utf8)) }
+        await entered.wait()
+
+        await #expect(throws: RuntimeShutdownError.deadlineExceeded) {
+            try await runtime.shutdown(deadline: Date().addingTimeInterval(0.02))
+        }
+        #expect(FileManager.default.fileExists(atPath: path))
+        release.finish()
+        try await runtime.shutdown(deadline: Date().addingTimeInterval(2))
+        #expect(!FileManager.default.fileExists(atPath: path))
+        _ = await call.result
+        await client.close()
+
+        let replacement = try stringService(path: path)
+        try await replacement.start(deadline: Date().addingTimeInterval(2))
+        try await replacement.shutdown(deadline: Date().addingTimeInterval(2))
+    }
+
     @Test func startIsSingleUse() async throws {
         let directory = try shortSocketDir()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -270,6 +305,66 @@ struct StaticSessionServiceRuntimeTests {
         if case .draining = await runtime.wait() {} else {
             Issue.record("runtime did not retain draining result")
         }
+    }
+
+    @Test func shutdownBeforeStartRetainsDrainingResult() async throws {
+        let directory = try shortSocketDir()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let runtime = try stringService(path: directory.appendingPathComponent("idle.sock").path)
+        try await runtime.shutdown(deadline: Date().addingTimeInterval(2))
+        if case .draining = await runtime.wait() {} else {
+            Issue.record("idle shutdown did not retain draining result")
+        }
+    }
+
+    @Test func bindFailureRetainsFailedResult() async throws {
+        let directory = try shortSocketDir()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("occupied.sock").path
+        try Data("occupied".utf8).write(to: URL(fileURLWithPath: path))
+        let runtime = try stringService(path: path)
+        await #expect(throws: SocketServerError.self) {
+            try await runtime.start(deadline: Date().addingTimeInterval(2))
+        }
+        if case .failed = await runtime.wait() {} else {
+            Issue.record("bind failure did not retain failed result")
+        }
+    }
+
+    @Test func postBindDeadlineCleansListenerBeforeReturning() async throws {
+        let directory = try shortSocketDir()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("deadline.sock").path
+        let runtime = try DaemonRuntime(
+            path: path,
+            wireBuild: "service.v1",
+            identity: RuntimeIdentity(
+                runtimeBuild: "service-build.v1",
+                processGeneration: testOwnerGeneration()
+            ),
+            handler: RuntimeHandlerSpec { _ in .terminal(SocketTerminal()) }
+        )
+        let entered = AsyncLatch()
+        let release = AsyncLatch()
+        runtime.serverStartCommitHook = {
+            entered.finish()
+            await release.wait()
+        }
+        let start = Task { try await runtime.begin(deadline: Date().addingTimeInterval(0.02)) }
+        await entered.wait()
+        try await Task.sleep(for: .milliseconds(30))
+        release.finish()
+        await #expect(throws: RuntimeShutdownError.deadlineExceeded) {
+            _ = try await start.value
+        }
+        #expect(!FileManager.default.fileExists(atPath: path))
+        if case .failed = await runtime.wait() {} else {
+            Issue.record("post-bind deadline did not retain failed result")
+        }
+
+        let replacement = try stringService(path: path)
+        try await replacement.start(deadline: Date().addingTimeInterval(2))
+        try await replacement.shutdown(deadline: Date().addingTimeInterval(2))
     }
 }
 

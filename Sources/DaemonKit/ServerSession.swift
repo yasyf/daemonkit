@@ -187,16 +187,6 @@ final class ServerSession: @unchecked Sendable {
             throw SessionTransportError.handshake("empty role")
         }
         if let sessionPolicy {
-            guard peer.effectiveUserID == sessionPolicy.effectiveUserID else {
-                try await rejectHandshake(
-                    code: .peerUntrusted,
-                    reason: "wire: peer effective user does not match service owner"
-                )
-                throw SocketHandshakeRejectionError(
-                    code: .peerUntrusted,
-                    reason: "wire: peer effective user does not match service owner"
-                )
-            }
             guard identity.role == sessionPolicy.role else {
                 try await rejectHandshake(
                     code: .permissionDenied,

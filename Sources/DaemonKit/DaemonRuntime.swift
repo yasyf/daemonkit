@@ -21,8 +21,14 @@ final class DaemonRuntime: @unchecked Sendable {
     private let lock = NSLock()
     private var began = false
     private var shutDown = false
+    private var failedStartCleanup: Task<Void, Never>?
 
     let identity: RuntimeIdentity
+
+    var serverStartCommitHook: (@Sendable () async -> Void)? {
+        get { server.startCommitHook }
+        set { server.startCommitHook = newValue }
+    }
 
     init(
         path: String,
@@ -65,15 +71,10 @@ final class DaemonRuntime: @unchecked Sendable {
             return try controller.beginActivation()
         } catch {
             if serverStarted {
-                do {
-                    try await server.stopRuntime(deadline: deadline)
-                    controller.finishShutdown()
-                } catch {
-                    lock.withLock { shutDown = true }
-                    throw RuntimeShutdownError.deadlineExceeded
-                }
+                await settleFailedStart()
             } else {
                 controller.finishShutdown()
+                lock.withLock { shutDown = true }
             }
             throw error
         }
@@ -99,8 +100,30 @@ final class DaemonRuntime: @unchecked Sendable {
         controller.statusSnapshot()
     }
 
+    /// Retains and joins complete cleanup after any partially-started generation.
+    func settleFailedStart() async {
+        let task = lock.withLock { () -> Task<Void, Never> in
+            if let failedStartCleanup {
+                return failedStartCleanup
+            }
+            shutDown = true
+            let task = Task { [controller, server] in
+                try? await controller.failStarting()
+                await server.stop()
+                controller.finishShutdown()
+            }
+            failedStartCleanup = task
+            return task
+        }
+        await task.value
+    }
+
     /// Stops serving by the deadline and clears publication only after complete settlement.
     func shutdown(deadline: Date) async throws {
+        if let failedStartCleanup = lock.withLock({ failedStartCleanup }) {
+            await failedStartCleanup.value
+            return
+        }
         let shouldStop = lock.withLock {
             guard !shutDown else { return false }
             shutDown = true
