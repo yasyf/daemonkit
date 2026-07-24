@@ -1,16 +1,78 @@
+import Darwin
 import Foundation
 
 final class SessionWriter: @unchecked Sendable {
+    private enum Priority {
+        case ordinary
+        case settlement
+        case lifecycle
+    }
+
     private final class Entry: @unchecked Sendable {
         let id = UUID()
         let frame: SessionFrame
-        let continuation: CheckedContinuation<Void, Error>
+        private let descriptorLock = NSLock()
+        private var descriptorToPass: Int32?
+        let descriptorDeadline: Date?
+        let completion: @Sendable (Result<Void, Error>) -> Void
+        let startObserver: (@Sendable () -> Void)?
         var canceled = false
         var started = false
+        var superseded = false
 
-        init(frame: SessionFrame, continuation: CheckedContinuation<Void, Error>) {
+        init(
+            frame: SessionFrame,
+            continuation: CheckedContinuation<Void, Error>,
+            startObserver: (@Sendable () -> Void)? = nil
+        ) {
             self.frame = frame
-            self.continuation = continuation
+            descriptorToPass = nil
+            descriptorDeadline = nil
+            completion = { continuation.resume(with: $0) }
+            self.startObserver = startObserver
+        }
+
+        init(
+            frame: SessionFrame,
+            completion: @escaping @Sendable (Result<Void, Error>) -> Void
+        ) {
+            self.frame = frame
+            descriptorToPass = nil
+            descriptorDeadline = nil
+            self.completion = completion
+            startObserver = nil
+        }
+
+        deinit {
+            closeDescriptor()
+        }
+
+        func passedDescriptor() -> Int32? {
+            descriptorLock.withLock { descriptorToPass }
+        }
+
+        func closeDescriptor() {
+            let descriptor = descriptorLock.withLock { () -> Int32? in
+                let descriptor = descriptorToPass
+                descriptorToPass = nil
+                return descriptor
+            }
+            if let descriptor {
+                Darwin.close(descriptor)
+            }
+        }
+
+        init(
+            frame: SessionFrame,
+            descriptorToPass: Int32,
+            deadline: Date,
+            continuation: CheckedContinuation<Void, Error>
+        ) {
+            self.frame = frame
+            self.descriptorToPass = descriptorToPass
+            descriptorDeadline = deadline
+            completion = { continuation.resume(with: $0) }
+            startObserver = nil
         }
     }
 
@@ -26,11 +88,13 @@ final class SessionWriter: @unchecked Sendable {
     private let queue: DispatchQueue
     private let admissionHook: (@Sendable (SessionFrame) -> Void)?
     private let startHook: (@Sendable (SessionFrame) -> Void)?
+    private let selectionHook: (@Sendable (SessionFrame) -> Void)?
     private let lock = NSLock()
     private var accepting = true
     private var admitted = 0
     private var waiting: [Entry] = []
     private var settlementWaiting: [Entry] = []
+    private var lifecycleWaiting: [Entry] = []
     private var settlementTurnUsed = false
     private var active: [UUID: Entry] = [:]
     private var terminalError: Error?
@@ -40,26 +104,39 @@ final class SessionWriter: @unchecked Sendable {
         maximumPendingWrites: Int,
         label: String,
         admissionHook: (@Sendable (SessionFrame) -> Void)? = nil,
-        startHook: (@Sendable (SessionFrame) -> Void)? = nil
+        startHook: (@Sendable (SessionFrame) -> Void)? = nil,
+        selectionHook: (@Sendable (SessionFrame) -> Void)? = nil
     ) {
         self.codec = codec
         self.maximumPendingWrites = maximumPendingWrites
         self.admissionHook = admissionHook
         self.startHook = startHook
+        self.selectionHook = selectionHook
         queue = DispatchQueue(label: label)
     }
 
     func write(_ frame: SessionFrame) async throws {
+        try await write(frame, startObserver: nil)
+    }
+
+    func writeTracked(_ frame: SessionFrame, startObserver: @escaping @Sendable () -> Void) async throws {
+        try await write(frame, startObserver: startObserver)
+    }
+
+    private func write(
+        _ frame: SessionFrame,
+        startObserver: (@Sendable () -> Void)?
+    ) async throws {
         let cancellation = CancellationRegistration()
         try await withTaskCancellationHandler {
             try Task.checkCancellation()
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                let entry = Entry(frame: frame, continuation: continuation)
+                let entry = Entry(frame: frame, continuation: continuation, startObserver: startObserver)
                 guard cancellation.install(entry.id) else {
                     continuation.resume(throwing: CancellationError())
                     return
                 }
-                submit(entry, cancellation: cancellation, priority: false)
+                submit(entry, cancellation: cancellation, priority: .ordinary)
             }
         } onCancel: {
             if let id = cancellation.cancel() {
@@ -71,15 +148,46 @@ final class SessionWriter: @unchecked Sendable {
     func writeCommitted(_ frame: SessionFrame) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             let entry = Entry(frame: frame, continuation: continuation)
-            submit(entry, cancellation: nil, priority: false)
+            submit(entry, cancellation: nil, priority: .ordinary)
+        }
+    }
+
+    func writePassingDescriptor(
+        _ frame: SessionFrame,
+        descriptor: Int32,
+        deadline: Date
+    ) async throws {
+        if Task.isCancelled {
+            Darwin.close(descriptor)
+            throw CancellationError()
+        }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let entry = Entry(
+                frame: frame,
+                descriptorToPass: descriptor,
+                deadline: deadline,
+                continuation: continuation
+            )
+            submit(entry, cancellation: nil, priority: .ordinary)
         }
     }
 
     func writeSettlement(_ frame: SessionFrame) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             let entry = Entry(frame: frame, continuation: continuation)
-            submit(entry, cancellation: nil, priority: true)
+            submit(entry, cancellation: nil, priority: .settlement)
         }
+    }
+
+    func writeLifecycle(_ frame: SessionFrame) async throws {
+        try await enqueueLifecycle(frame).wait()
+    }
+
+    func enqueueLifecycle(_ frame: SessionFrame) -> LifecycleWriteReceipt {
+        let receipt = LifecycleWriteReceipt()
+        let entry = Entry(frame: frame) { receipt.finish($0) }
+        submit(entry, cancellation: nil, priority: .lifecycle)
+        return receipt
     }
 
     func close(with frame: SessionFrame) async throws {
@@ -89,9 +197,10 @@ final class SessionWriter: @unchecked Sendable {
             let rejected = lock.withLock { () -> [Entry]? in
                 guard accepting else { return nil }
                 accepting = false
-                let rejected = waiting + settlementWaiting
+                let rejected = waiting + settlementWaiting + lifecycleWaiting
                 waiting.removeAll()
                 settlementWaiting.removeAll()
+                lifecycleWaiting.removeAll()
                 active[entry.id] = entry
                 admitted += 1
                 enqueue(entry)
@@ -102,7 +211,8 @@ final class SessionWriter: @unchecked Sendable {
                 return
             }
             for entry in rejected {
-                entry.continuation.resume(throwing: SessionTransportError.disconnected)
+                entry.closeDescriptor()
+                entry.completion(.failure(SessionTransportError.disconnected))
             }
         }
         try Task.checkCancellation()
@@ -111,13 +221,15 @@ final class SessionWriter: @unchecked Sendable {
     func abort() {
         let rejected = lock.withLock {
             accepting = false
-            let rejected = waiting + settlementWaiting
+            let rejected = waiting + settlementWaiting + lifecycleWaiting
             waiting.removeAll()
             settlementWaiting.removeAll()
+            lifecycleWaiting.removeAll()
             return rejected
         }
         for entry in rejected {
-            entry.continuation.resume(throwing: SessionTransportError.disconnected)
+            entry.closeDescriptor()
+            entry.completion(.failure(SessionTransportError.disconnected))
         }
     }
 
@@ -130,20 +242,36 @@ final class SessionWriter: @unchecked Sendable {
             afterDrained { continuation.resume() }
         }
     }
+}
 
-    private func submit(_ entry: Entry, cancellation: CancellationRegistration?, priority: Bool) {
+private extension SessionWriter {
+    private func submit(_ entry: Entry, cancellation: CancellationRegistration?, priority: Priority) {
+        var displacedLifecycle: Entry?
         let error = lock.withLock { () -> Error? in
             guard cancellation?.isCanceled != true else { return CancellationError() }
             guard accepting else {
                 return terminalError ?? SessionTransportError.disconnected
             }
             if admitted >= 1 {
-                if priority {
+                switch priority {
+                case .lifecycle:
+                    if let selected = active.values.first(where: {
+                        $0.frame.kind == .lifecycle && !$0.started
+                    }) {
+                        selected.superseded = true
+                    }
+                    if let displaced = lifecycleWaiting.first {
+                        lifecycleWaiting[0] = entry
+                        displacedLifecycle = displaced
+                    } else {
+                        lifecycleWaiting.append(entry)
+                    }
+                case .settlement:
                     guard settlementWaiting.count < maximumPendingWrites else {
                         return SessionTransportError.invalidFrame("settlement write queue exceeded capacity")
                     }
                     settlementWaiting.append(entry)
-                } else {
+                case .ordinary:
                     guard waiting.count < maximumPendingWrites else {
                         return SessionTransportError.invalidFrame("write queue exceeded capacity")
                     }
@@ -158,32 +286,63 @@ final class SessionWriter: @unchecked Sendable {
             enqueue(entry)
             return nil
         }
+        displacedLifecycle?.completion(.success(()))
         if let error {
-            entry.continuation.resume(throwing: error)
+            entry.closeDescriptor()
+            entry.completion(.failure(error))
         }
     }
 
     private func enqueue(_ entry: Entry) {
         queue.async { [self] in
-            let preflight = lock.withLock { () -> Error? in
+            let preflight = lock.withLock { () -> Result<Bool, Error> in
+                if entry.superseded {
+                    return .success(false)
+                }
                 if entry.canceled {
-                    return CancellationError()
+                    return .failure(CancellationError())
                 }
                 entry.started = true
-                return terminalError
+                if let terminalError {
+                    return .failure(terminalError)
+                }
+                return .success(true)
             }
             let result: Result<Void, Error>
-            if let preflight {
-                result = .failure(preflight)
-            } else {
+            switch preflight {
+            case let .failure(error):
+                result = .failure(error)
+            case .success(false):
+                result = .success(())
+            case .success(true):
+                entry.startObserver?()
                 startHook?(entry.frame)
-                result = Result { try codec.write(entry.frame) }
+                result = Result {
+                    if let descriptorToPass = entry.passedDescriptor() {
+                        do {
+                            try codec.write(
+                                entry.frame,
+                                passing: descriptorToPass,
+                                deadline: entry.descriptorDeadline!,
+                                onDescriptorSent: { entry.closeDescriptor() }
+                            )
+                        } catch {
+                            if entry.passedDescriptor() == nil {
+                                throw BrokerHandoffError.deliveryUnknown
+                            }
+                            throw error
+                        }
+                    } else {
+                        try codec.write(entry.frame)
+                    }
+                }
             }
             finish(entry, result: result)
         }
     }
 
     private func finish(_ entry: Entry, result: Result<Void, Error>) {
+        entry.closeDescriptor()
         let outcome = lock.withLock { () -> FinishResult in
             active.removeValue(forKey: entry.id)
             admitted -= 1
@@ -191,9 +350,10 @@ final class SessionWriter: @unchecked Sendable {
             if case let .failure(error) = result, !(error is CancellationError) {
                 accepting = false
                 terminalError = error
-                let rejected = waiting + settlementWaiting
+                let rejected = waiting + settlementWaiting + lifecycleWaiting
                 waiting.removeAll()
                 settlementWaiting.removeAll()
+                lifecycleWaiting.removeAll()
                 return FinishResult(
                     completion: completion,
                     next: nil,
@@ -201,14 +361,16 @@ final class SessionWriter: @unchecked Sendable {
                     rejectionError: error
                 )
             }
-            guard accepting, !settlementWaiting.isEmpty || !waiting.isEmpty else {
-                if settlementWaiting.isEmpty, waiting.isEmpty {
+            guard accepting, !lifecycleWaiting.isEmpty || !settlementWaiting.isEmpty || !waiting.isEmpty else {
+                if lifecycleWaiting.isEmpty, settlementWaiting.isEmpty, waiting.isEmpty {
                     settlementTurnUsed = false
                 }
                 return FinishResult(completion: completion, next: nil, rejected: [], rejectionError: nil)
             }
             let next: Entry
-            if !settlementWaiting.isEmpty, waiting.isEmpty || !settlementTurnUsed {
+            if !lifecycleWaiting.isEmpty {
+                next = lifecycleWaiting.removeFirst()
+            } else if !settlementWaiting.isEmpty, waiting.isEmpty || !settlementTurnUsed {
                 next = settlementWaiting.removeFirst()
                 settlementTurnUsed = true
             } else {
@@ -220,12 +382,14 @@ final class SessionWriter: @unchecked Sendable {
             return FinishResult(completion: completion, next: next, rejected: [], rejectionError: nil)
         }
         if let next = outcome.next {
+            selectionHook?(next.frame)
             enqueue(next)
         }
         for entry in outcome.rejected {
-            entry.continuation.resume(throwing: outcome.rejectionError ?? SessionTransportError.disconnected)
+            entry.closeDescriptor()
+            entry.completion(.failure(outcome.rejectionError ?? SessionTransportError.disconnected))
         }
-        entry.continuation.resume(with: outcome.completion)
+        entry.completion(outcome.completion)
     }
 
     private func cancel(_ id: UUID) {
@@ -238,7 +402,8 @@ final class SessionWriter: @unchecked Sendable {
             }
             return nil
         }
-        waiter?.continuation.resume(throwing: CancellationError())
+        waiter?.closeDescriptor()
+        waiter?.completion(.failure(CancellationError()))
     }
 }
 

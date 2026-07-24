@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 
 /// Errors thrown while binding or running a ``SocketServer``.
-public enum SocketServerError: Error, Sendable {
+enum SocketServerError: Error, Sendable {
     case pathTooLong(path: String, limit: Int)
     case addressInUse(path: String)
     case socketFailed(errno: Int32)
@@ -14,9 +14,9 @@ public enum SocketServerError: Error, Sendable {
 }
 
 /// The immutable OS identity captured from an accepted socket.
-public struct SocketPeer: Sendable {
-    public let effectiveUserID: uid_t
-    public let effectiveGroupID: gid_t
+struct SocketPeer: Sendable {
+    let effectiveUserID: uid_t
+    let effectiveGroupID: gid_t
 }
 
 /// One ordered request-stream chunk.
@@ -27,19 +27,20 @@ public struct SocketRequestChunk: Sendable {
 }
 
 /// A request admitted on a persistent session.
-public struct SocketRequest: Sendable {
-    public let id: UInt64
-    public let operation: String
-    public let tenant: String
-    public let payload: Data
-    public let chunks: SocketChunkStream
-    public let peer: SocketPeer
-    public let peerWireBuild: String
-    public let session: SocketSession
+struct SocketRequest: Sendable {
+    let id: UInt64
+    let operation: String
+    let tenant: String
+    let payload: Data
+    let chunks: SocketChunkStream
+    let peer: SocketPeer
+    let peerWireBuild: String
+    let session: SocketSession
+    let runtimeAdmission: RuntimeAdmissionPin?
 }
 
 /// A trusted persistent server session exposed to request handlers.
-public final class SocketSession: @unchecked Sendable {
+final class SocketSession: @unchecked Sendable {
     weak var implementation: ServerSession?
     private let lifecycle: SocketSessionLifecycle
 
@@ -49,17 +50,17 @@ public final class SocketSession: @unchecked Sendable {
     }
 
     /// Whether the authenticated peer connection remains live.
-    public var isConnected: Bool {
+    var isConnected: Bool {
         lifecycle.isConnected
     }
 
     /// Suspends until the authenticated peer connection closes.
-    public func waitUntilClosed() async {
+    func waitUntilClosed() async {
         await lifecycle.waitUntilClosed()
     }
 
     /// Pushes one event to the peer on the session's serialized writer.
-    public func pushEvent(topic: String, payload: Data = Data()) async throws {
+    func pushEvent(topic: String, payload: Data = Data()) async throws {
         guard !topic.isEmpty else {
             throw SessionTransportError.invalidFrame("empty event topic")
         }

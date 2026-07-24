@@ -3,17 +3,17 @@ import Foundation
 import os
 
 /// A unix-domain persistent v1 session server.
-public final class SocketServer: @unchecked Sendable {
-    public struct Configuration: Sendable {
-        public var maximumFrameBytes: Int
-        public var maximumActiveRequests: Int
-        public var maximumSessions: Int
-        public var streamQueueDepth: Int
-        public var maximumPendingWrites: Int
-        public var handshakeTimeout: TimeInterval
-        public var writeTimeout: TimeInterval
+final class SocketServer: @unchecked Sendable {
+    struct Configuration: Sendable {
+        var maximumFrameBytes: Int
+        var maximumActiveRequests: Int
+        var maximumSessions: Int
+        var streamQueueDepth: Int
+        var maximumPendingWrites: Int
+        var handshakeTimeout: TimeInterval
+        var writeTimeout: TimeInterval
 
-        public init(
+        init(
             maximumFrameBytes: Int = daemonKitDefaultMaximumFrameBytes,
             maximumActiveRequests: Int = 64,
             maximumSessions: Int = 64,
@@ -38,6 +38,13 @@ public final class SocketServer: @unchecked Sendable {
         case serving
         case stopping
         case stopped
+    }
+
+    private enum StopAction {
+        case settle(Int32)
+        case waitForStart
+        case waitForStop
+        case finishIdle
     }
 
     private enum SocketPathProbe {
@@ -122,7 +129,7 @@ public final class SocketServer: @unchecked Sendable {
     private let path: String
     private let wireBuild: String
     private let configuration: Configuration
-    private let trust: PeerTrust
+    private let runtimeLifecycle: RuntimeLifecycleController?
     private let handler: @Sendable (SocketRequest) async -> SocketResponse
     private let acceptQueue = DispatchQueue(label: "com.yasyf.daemonkit.SocketServer.accept")
     private let controlQueue = DispatchQueue(label: "com.yasyf.daemonkit.SocketServer.control")
@@ -136,30 +143,47 @@ public final class SocketServer: @unchecked Sendable {
     private var shutdownWriteDescriptor: Int32 = -1
     private var sessions: [Int32: ServerSession] = [:]
     private var connections: Set<ServerConnection> = []
+    private var sessionReservations = 0
     var stopDrainHook: (@Sendable () async -> Void)?
     var startCommitHook: (@Sendable () async -> Void)?
     var stopFinishHook: (@Sendable () async -> Void)?
     var stopWaitHook: (@Sendable () async -> Void)?
 
-    public init(
+    init(
         path: String,
         wireBuild: String,
         configuration: Configuration = .init(),
-        trust: PeerTrust,
         handler: @escaping @Sendable (SocketRequest) async -> SocketResponse
     ) {
         self.path = path
         self.wireBuild = wireBuild
         self.configuration = configuration
-        self.trust = trust
+        runtimeLifecycle = nil
+        self.handler = handler
+    }
+
+    init(
+        path: String,
+        wireBuild: String,
+        configuration: Configuration = .init(),
+        runtimeLifecycle: RuntimeLifecycleController,
+        handler: @escaping @Sendable (SocketRequest) async -> SocketResponse
+    ) {
+        self.path = path
+        self.wireBuild = wireBuild
+        self.configuration = configuration
+        self.runtimeLifecycle = runtimeLifecycle
         self.handler = handler
     }
 }
 
 extension SocketServer {
     /// Reclaims a stale socket, binds with mode 0600, and starts accepting sessions.
-    public func start() async throws {
+    func start() async throws {
         guard !wireBuild.isEmpty else { throw SocketServerError.emptyWireBuild }
+        guard runtimeLifecycle?.wireBuild == nil || runtimeLifecycle?.wireBuild == wireBuild else {
+            throw RuntimeReadinessValidationError.invalidResponse("runtime lifecycle wire build")
+        }
         guard configuration.maximumFrameBytes > 0,
               configuration.maximumActiveRequests > 0,
               configuration.maximumSessions > 0,
@@ -193,6 +217,7 @@ extension SocketServer {
                         self.listenerDescriptor = resources.listener
                         self.shutdownReadDescriptor = resources.shutdownRead
                         self.shutdownWriteDescriptor = resources.shutdownWrite
+                        self.runtimeLifecycle?.markServerLive()
                         self.acceptQueue.async { [weak self] in self?.acceptLoop() }
                         self.state = .serving
                         return true
@@ -212,14 +237,31 @@ extension SocketServer {
     }
 
     /// Stops intake, disconnects sessions, joins their request tasks, and unlinks the path.
-    public func stop() async {
-        enum Action {
-            case settle(Int32)
-            case waitForStart
-            case waitForStop
-            case finishIdle
+    func stop() async {
+        try? await stop(deadline: nil)
+    }
+
+    func stopRuntime(deadline: Date) async throws {
+        guard deadline > Date() else { throw RuntimeShutdownError.deadlineExceeded }
+        try await stop(deadline: deadline)
+    }
+
+    private func stop(deadline: Date?) async throws {
+        switch stopAction() {
+        case .finishIdle:
+            startLatch.finish()
+            stopLatch.finish()
+        case .waitForStart:
+            try await waitForStartAndStop(deadline: deadline)
+        case .waitForStop:
+            try await waitForStop(deadline: deadline)
+        case let .settle(writeDescriptor):
+            try await settleStop(writeDescriptor: writeDescriptor, deadline: deadline)
         }
-        let action = lock.withLock { () -> Action in
+    }
+
+    private func stopAction() -> StopAction {
+        lock.withLock {
             switch state {
             case .idle:
                 state = .stopped
@@ -234,23 +276,30 @@ extension SocketServer {
                 return .waitForStop
             }
         }
-        switch action {
-        case .finishIdle:
-            startLatch.finish()
-            stopLatch.finish()
-            return
-        case .waitForStart:
+    }
+
+    private func waitForStartAndStop(deadline: Date?) async throws {
+        if let deadline {
+            try await startLatch.wait(deadline: deadline)
+            try await stopLatch.wait(deadline: deadline)
+        } else {
             await startLatch.wait()
             await stopLatch.wait()
-            return
-        case .waitForStop:
-            await stopWaitHook?()
-            await stopLatch.wait()
-            return
-        case .settle:
-            break
         }
-        guard case let .settle(writeDescriptor) = action else { return }
+    }
+
+    private func waitForStop(deadline: Date?) async throws {
+        if deadline == nil {
+            await stopWaitHook?()
+        }
+        if let deadline {
+            try await stopLatch.wait(deadline: deadline)
+        } else {
+            await stopLatch.wait()
+        }
+    }
+
+    private func settleStop(writeDescriptor: Int32, deadline: Date?) async throws {
         var byte: UInt8 = 1
         while Darwin.write(writeDescriptor, &byte, 1) < 0 {
             if errno == EINTR {
@@ -259,12 +308,18 @@ extension SocketServer {
             // A full nonblocking pipe already has a pending shutdown signal.
             break
         }
-        await withCheckedContinuation { continuation in
-            acceptQueue.async {
-                continuation.resume()
-            }
+        let acceptLoopSettled = AsyncLatch()
+        acceptQueue.async {
+            acceptLoopSettled.finish()
         }
-        await stopDrainHook?()
+        if let deadline {
+            try await acceptLoopSettled.wait(deadline: deadline)
+        } else {
+            await acceptLoopSettled.wait()
+        }
+        if deadline == nil {
+            await stopDrainHook?()
+        }
         let (active, connectionSnapshot): ([ServerSession], [ServerConnection]) = lock.withLock {
             (Array(sessions.values), Array(connections))
         }
@@ -274,26 +329,27 @@ extension SocketServer {
         for connection in connectionSnapshot {
             connection.shutdown()
         }
-        await withCheckedContinuation { continuation in
+        let settled = await withCheckedContinuation { continuation in
             DispatchQueue.global().async { [sessionGroup] in
-                sessionGroup.wait()
-                continuation.resume()
+                guard let deadline else {
+                    sessionGroup.wait()
+                    continuation.resume(returning: true)
+                    return
+                }
+                let remaining = deadline.timeIntervalSinceNow
+                guard remaining > 0 else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                let result = sessionGroup.wait(timeout: .now() + remaining)
+                continuation.resume(returning: result == .success)
             }
         }
-        let resources = lock.withLock {
-            let resources = ListenerResources(
-                listener: listenerDescriptor,
-                shutdownRead: shutdownReadDescriptor,
-                shutdownWrite: shutdownWriteDescriptor
-            )
-            listenerDescriptor = -1
-            shutdownReadDescriptor = -1
-            shutdownWriteDescriptor = -1
-            state = .stopped
-            return resources
+        guard settled else { throw RuntimeShutdownError.deadlineExceeded }
+        try releaseListenerResources(deadline: deadline)
+        if deadline == nil {
+            await stopFinishHook?()
         }
-        await closeResources(resources)
-        await stopFinishHook?()
         stopLatch.finish()
     }
 
@@ -336,21 +392,28 @@ extension SocketServer {
         )
     }
 
-    private func closeResources(_ resources: ListenerResources) async {
-        await withCheckedContinuation { continuation in
-            controlQueue.async { [path] in
-                unlink(path)
-                if resources.listener >= 0 {
-                    Darwin.close(resources.listener)
-                }
-                if resources.shutdownRead >= 0 {
-                    Darwin.close(resources.shutdownRead)
-                }
-                if resources.shutdownWrite >= 0 {
-                    Darwin.close(resources.shutdownWrite)
-                }
-                continuation.resume()
-            }
+    private func releaseListenerResources(deadline: Date?) throws {
+        // The listener path and descriptors are one synchronously released ownership unit.
+        try requireShutdownBudget(deadline)
+        if listenerDescriptor >= 0 {
+            Darwin.close(listenerDescriptor)
+            listenerDescriptor = -1
+        }
+        if shutdownReadDescriptor >= 0 {
+            Darwin.close(shutdownReadDescriptor)
+            shutdownReadDescriptor = -1
+        }
+        if shutdownWriteDescriptor >= 0 {
+            Darwin.close(shutdownWriteDescriptor)
+            shutdownWriteDescriptor = -1
+        }
+        unlink(path)
+        lock.withLock { state = .stopped }
+    }
+
+    private func requireShutdownBudget(_ deadline: Date?) throws {
+        if let deadline, deadline <= Date() {
+            throw RuntimeShutdownError.deadlineExceeded
         }
     }
 
@@ -431,6 +494,8 @@ extension SocketServer {
     }
 
     private func acceptLoop() {
+        var terminalError: (any Error)?
+        defer { runtimeLifecycle?.markServerTerminal(terminalError) }
         while true {
             var descriptors = [
                 pollfd(fd: listenerDescriptor, events: Int16(POLLIN), revents: 0),
@@ -441,27 +506,27 @@ extension SocketServer {
                 if errno == EINTR {
                     continue
                 }
+                terminalError = SessionTransportError.systemCall(operation: "poll", errno: errno)
                 break
             }
             if descriptors[1].revents != 0 {
                 break
             }
-            guard descriptors[0].revents & Int16(POLLIN) != 0 else { continue }
+            guard descriptors[0].revents & Int16(POLLIN) != 0 else {
+                terminalError = SessionTransportError.systemCall(operation: "poll", errno: EIO)
+                break
+            }
             let descriptor = accept(listenerDescriptor, nil, nil)
             if descriptor < 0 {
                 if errno == EINTR || errno == ECONNABORTED {
                     continue
                 }
+                terminalError = SessionTransportError.systemCall(operation: "accept", errno: errno)
                 socketServerLog.error("accept failed: \(String(cString: strerror(errno)), privacy: .public)")
-                continue
+                break
             }
             let connection = ServerConnection(descriptor: descriptor)
             lock.lock()
-            if connections.count >= configuration.maximumSessions {
-                lock.unlock()
-                connection.close()
-                continue
-            }
             connections.insert(connection)
             lock.unlock()
             sessionGroup.enter()
@@ -480,9 +545,10 @@ extension SocketServer {
         }
         do {
             let setupQueue = DispatchQueue(label: "com.yasyf.daemonkit.SocketServer.setup.\(descriptor)")
-            let peer = try await setupQueue.performIO { [trust] in
+            try await setupQueue.performIO {
                 try self.configure(descriptor)
-                try trust.check(descriptor: descriptor)
+            }
+            let peer = try await setupQueue.performIO {
                 var user = uid_t()
                 var group = gid_t()
                 guard getpeereid(descriptor, &user, &group) == 0 else {
@@ -490,12 +556,23 @@ extension SocketServer {
                 }
                 return SocketPeer(effectiveUserID: user, effectiveGroupID: group)
             }
+            guard reserveSession() else {
+                try? await rejectHandshake(
+                    descriptor: descriptor,
+                    queue: setupQueue,
+                    code: .sessionCapacity,
+                    reason: "wire: session capacity exhausted"
+                )
+                return
+            }
+            defer { releaseSession() }
             let session = ServerSession(
                 descriptor: descriptor,
                 shutdown: { connection.shutdown() },
                 wireBuild: wireBuild,
                 peer: peer,
                 configuration: configuration,
+                runtimeLifecycle: runtimeLifecycle,
                 handler: handler
             )
             insert(session, descriptor: descriptor)
@@ -523,6 +600,42 @@ extension SocketServer {
         lock.lock()
         sessions.removeValue(forKey: descriptor)
         lock.unlock()
+    }
+
+    private func reserveSession() -> Bool {
+        lock.withLock {
+            guard sessionReservations < configuration.maximumSessions else { return false }
+            sessionReservations += 1
+            return true
+        }
+    }
+
+    private func releaseSession() {
+        lock.withLock {
+            precondition(sessionReservations > 0)
+            sessionReservations -= 1
+        }
+    }
+
+    private func rejectHandshake(
+        descriptor: Int32,
+        queue: DispatchQueue,
+        code: SocketResponseCode,
+        reason: String
+    ) async throws {
+        try await queue.performIO {
+            let codec = SessionFrameCodec(
+                descriptor: descriptor,
+                maximumFrameBytes: self.configuration.maximumFrameBytes,
+                writeTimeout: self.configuration.writeTimeout
+            )
+            let payload = try SessionHandshakeCodec.encodeRejection(
+                wireBuild: self.wireBuild,
+                code: code,
+                reason: reason
+            )
+            try codec.write(SessionFrame(kind: .helloAck, flags: .end, payload: payload))
+        }
     }
 
     private func removeConnection(_ connection: ServerConnection) {
@@ -566,429 +679,5 @@ extension SocketServer {
                 body(rebound, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
-    }
-}
-
-final class ServerSession: @unchecked Sendable {
-    let descriptor: Int32
-    private let serverWireBuild: String
-    private let peer: SocketPeer
-    private let configuration: SocketServer.Configuration
-    private let handler: @Sendable (SocketRequest) async -> SocketResponse
-    private let shutdownDescriptor: @Sendable () -> Void
-    private let codec: SessionFrameCodec
-    private let readQueue: DispatchQueue
-    private let writer: SessionWriter
-    private let eventWindow = SocketCreditWindow()
-    private let lifecycle = SocketSessionLifecycle()
-    private let generation: Data
-    private let lock = NSLock()
-    private var active: [UInt64: ServerRequestState] = [:]
-    private var seen: Set<UInt64> = []
-    private var watermark: UInt64 = 0
-    private var closed = false
-
-    init(
-        descriptor: Int32,
-        shutdown: @escaping @Sendable () -> Void,
-        wireBuild: String,
-        peer: SocketPeer,
-        configuration: SocketServer.Configuration,
-        handler: @escaping @Sendable (SocketRequest) async -> SocketResponse
-    ) {
-        self.descriptor = descriptor
-        shutdownDescriptor = shutdown
-        serverWireBuild = wireBuild
-        self.peer = peer
-        self.configuration = configuration
-        self.handler = handler
-        var uuid = UUID().uuid
-        generation = withUnsafeBytes(of: &uuid) { Data($0) }
-        codec = SessionFrameCodec(
-            descriptor: descriptor,
-            maximumFrameBytes: configuration.maximumFrameBytes,
-            writeTimeout: configuration.writeTimeout
-        )
-        writer = SessionWriter(
-            codec: codec,
-            maximumPendingWrites: configuration.maximumPendingWrites,
-            label: "com.yasyf.daemonkit.SocketServer.write.\(descriptor)"
-        )
-        readQueue = DispatchQueue(label: "com.yasyf.daemonkit.SocketServer.read.\(descriptor)")
-    }
-
-    deinit {
-        lifecycle.close()
-    }
-
-    func run() async throws {
-        do {
-            let clientWireBuild = try await handshake()
-            while true {
-                let frame = try await read()
-                switch frame.kind {
-                case .request:
-                    try await receiveRequest(frame, clientWireBuild: clientWireBuild)
-                case .cancel:
-                    try await receiveCancel(frame)
-                case .stream:
-                    try await receiveStream(frame)
-                case .window:
-                    try await receiveWindow(frame)
-                case .acknowledgment:
-                    try await receiveAcknowledgement(frame)
-                case .goAway:
-                    close()
-                    await eventWindow.close()
-                    await settleRequests()
-                    return
-                default:
-                    throw SessionTransportError.invalidFrame("client frame kind \(frame.kind)")
-                }
-            }
-        } catch {
-            close()
-            await eventWindow.close()
-            await settleRequests()
-            throw error
-        }
-    }
-
-    func write(_ frame: SessionFrame) async throws {
-        let isClosed = lock.withLock { closed }
-        if isClosed {
-            throw SessionTransportError.disconnected
-        }
-        try await writer.write(frame)
-    }
-
-    func writeSettlement(_ frame: SessionFrame) async throws {
-        let isClosed = lock.withLock { closed }
-        if isClosed {
-            throw SessionTransportError.disconnected
-        }
-        try await writer.writeSettlement(frame)
-    }
-
-    func pushEvent(topic: String, payload: Data) async throws {
-        guard await eventWindow.acquire() else { throw CancellationError() }
-        try await write(SessionFrame(kind: .event, flags: .end, operation: topic, payload: payload))
-    }
-
-    func close() {
-        lock.lock()
-        guard !closed else {
-            lock.unlock()
-            return
-        }
-        closed = true
-        lock.unlock()
-        lifecycle.close()
-        writer.abort()
-        Task { await eventWindow.close() }
-        shutdownDescriptor()
-    }
-
-    func drainIO() async {
-        writer.abort()
-        shutdownDescriptor()
-        await withCheckedContinuation { continuation in
-            writer.afterDrained { [readQueue] in
-                readQueue.async {
-                    continuation.resume()
-                }
-            }
-        }
-    }
-
-    private func handshake() async throws -> String {
-        let frame = try await read(timeout: configuration.handshakeTimeout)
-        guard frame.kind == .hello, frame.flags == .end, frame.id == 0,
-              frame.sequence == 0, frame.operation.isEmpty, frame.tenant.isEmpty
-        else {
-            throw SessionTransportError.handshake("invalid hello")
-        }
-        let identity = try JSONDecoder().decode(SessionWireIdentity.self, from: frame.payload)
-        guard identity.protocolVersion == daemonKitSessionProtocolVersion else {
-            throw SessionTransportError.unsupportedProtocolVersion(identity.protocolVersion)
-        }
-        guard !identity.wireBuild.isEmpty else {
-            throw SessionTransportError.handshake("empty wireBuild")
-        }
-        guard identity.session == nil else {
-            throw SessionTransportError.handshake("client supplied a session generation")
-        }
-        let payload = try JSONEncoder().encode(SessionWireIdentity(
-            protocolVersion: daemonKitSessionProtocolVersion,
-            wireBuild: serverWireBuild,
-            session: generation
-        ))
-        try await write(SessionFrame(kind: .helloAck, flags: .end, payload: payload))
-        return identity.wireBuild
-    }
-
-    private func read(timeout: TimeInterval = 0) async throws -> SessionFrame {
-        try await readQueue.performIO {
-            try self.codec.read(timeout: timeout)
-        }
-    }
-
-    private enum Admission {
-        case accepted(ServerRequestState)
-        case rejected(String)
-    }
-
-    private func receiveRequest(_ frame: SessionFrame, clientWireBuild: String) async throws {
-        guard frame.id != 0, !frame.operation.isEmpty, frame.sequence == 0 else {
-            throw SessionTransportError.invalidFrame("request")
-        }
-        let admission = try admit(frame, clientWireBuild: clientWireBuild)
-        guard case let .accepted(state) = admission else {
-            guard case let .rejected(reason) = admission else { return }
-            try await sendRejected(id: frame.id, reason: reason)
-            return
-        }
-        if frame.flags.contains(.end) {
-            await state.finishInitialInput()
-        }
-
-        let chunks = SocketChunkStream(channel: state.channel) {
-            Task { await state.cancel() }
-        } consumptionOperation: { [weak self] _ in
-            guard let self else { throw SessionTransportError.disconnected }
-            try await writeSettlement(SessionFrame(kind: .window, id: frame.id, sequence: 1))
-        }
-        try await write(SessionFrame(
-            kind: .window,
-            id: frame.id,
-            sequence: UInt32(configuration.streamQueueDepth)
-        ))
-        let publicSession = SocketSession(implementation: self, lifecycle: lifecycle)
-        let request = SocketRequest(
-            id: frame.id,
-            operation: frame.operation,
-            tenant: frame.tenant,
-            payload: frame.payload,
-            chunks: chunks,
-            peer: peer,
-            peerWireBuild: clientWireBuild,
-            session: publicSession
-        )
-        let task = Task { [weak self] in
-            guard let self else { return }
-            var response = await handler(request)
-            if let transportError = await state.error() {
-                await cancelAndSettle(response)
-                response = .terminal(SocketTerminal(error: String(describing: transportError)))
-            } else if Task.isCancelled {
-                await cancelAndSettle(response)
-                response = .terminal(SocketTerminal(error: "wire: request canceled"))
-            }
-            do {
-                try await send(response, id: frame.id, state: state)
-            } catch {
-                socketServerLog.debug("response failed: \(String(describing: error), privacy: .public)")
-            }
-            await state.finish()
-            remove(frame.id)
-        }
-        await state.attach(task)
-        if frame.deadlineUnixMilliseconds > 0 {
-            let interval = SessionTime.remainingMilliseconds(until: frame.deadlineUnixMilliseconds)
-            let timer = Task {
-                try? await Task.sleep(for: .milliseconds(interval))
-                if !Task.isCancelled {
-                    task.cancel()
-                }
-            }
-            await state.attachDeadline(timer)
-        }
-    }
-}
-
-private extension ServerSession {
-    private func admit(_ frame: SessionFrame, clientWireBuild: String) throws -> Admission {
-        lock.lock()
-        defer { lock.unlock() }
-        guard frame.id > watermark, !seen.contains(frame.id) else {
-            throw SessionTransportError.duplicateRequestID(frame.id)
-        }
-        guard frame.id - watermark <= UInt64(configuration.maximumActiveRequests),
-              active.count < configuration.maximumActiveRequests
-        else {
-            return .rejected("wire: queue at capacity")
-        }
-        seen.insert(frame.id)
-        while seen.remove(watermark + 1) != nil {
-            watermark += 1
-        }
-        if clientWireBuild != serverWireBuild {
-            return .rejected("wire: client wireBuild does not match server wireBuild")
-        }
-        let state = ServerRequestState(capacity: configuration.streamQueueDepth)
-        active[frame.id] = state
-        return .accepted(state)
-    }
-
-    private func receiveCancel(_ frame: SessionFrame) async throws {
-        guard frame.id != 0, frame.flags == .end, frame.operation.isEmpty,
-              frame.tenant.isEmpty, frame.payload.isEmpty
-        else {
-            throw SessionTransportError.invalidFrame("cancel")
-        }
-        await request(frame.id)?.cancel()
-    }
-
-    private func receiveStream(_ frame: SessionFrame) async throws {
-        guard frame.id != 0, frame.operation.isEmpty, frame.tenant.isEmpty else {
-            throw SessionTransportError.invalidFrame("stream")
-        }
-        await request(frame.id)?.receive(frame)
-    }
-
-    private func settleRequests() async {
-        let requests = takeRequests()
-        for request in requests {
-            await request.settle()
-        }
-    }
-
-    private func takeRequests() -> [ServerRequestState] {
-        lock.lock()
-        let requests = Array(active.values)
-        active.removeAll()
-        lock.unlock()
-        return requests
-    }
-
-    private func send(_ response: SocketResponse, id: UInt64, state: ServerRequestState) async throws {
-        switch response {
-        case let .terminal(terminal):
-            try await sendTerminal(terminal, id: id, state: state)
-        case let .stream(stream):
-            try await send(stream, id: id, state: state)
-        }
-        try await state.waitForTerminalAcknowledgement(timeout: configuration.writeTimeout)
-    }
-
-    private func send(_ stream: SocketResponseStream, id: UInt64, state: ServerRequestState) async throws {
-        let settlement = SocketResponseSettlement(stream: stream)
-        var sequence = SessionSequence()
-        try await withTaskCancellationHandler {
-            do {
-                while true {
-                    try Task.checkCancellation()
-                    guard await state.responseWindow.acquire() else { throw CancellationError() }
-                    guard let payload = try await stream.nextChunk() else { break }
-                    let current = try sequence.take()
-                    try await write(SessionFrame(kind: .stream, id: id, sequence: current, payload: payload))
-                }
-                let terminal = try await settlement.value().get()
-                try Task.checkCancellation()
-                try await sendTerminal(terminal, id: id, state: state)
-            } catch is CancellationError {
-                stream.cancel()
-                _ = await settlement.value()
-                try await sendTerminal(SocketTerminal(error: "wire: request canceled"), id: id, state: state)
-            } catch {
-                stream.cancel()
-                _ = await settlement.value()
-                try await sendTerminal(SocketTerminal(error: String(describing: error)), id: id, state: state)
-            }
-        } onCancel: {
-            stream.cancel()
-        }
-    }
-
-    private func cancelAndSettle(_ response: SocketResponse) async {
-        guard case let .stream(stream) = response else { return }
-        stream.cancel()
-        _ = await SocketResponseSettlement(stream: stream).value()
-    }
-
-    private func sendTerminal(_ terminal: SocketTerminal, id: UInt64, state: ServerRequestState) async throws {
-        let envelope = try responseEnvelope(terminal, acknowledge: true)
-        try await state.writeTerminal { [self] in
-            try await writeSettlement(SessionFrame(kind: .response, flags: .end, id: id, payload: envelope))
-        }
-    }
-
-    private func sendRejected(id: UInt64, reason: String) async throws {
-        try await writeSettlement(SessionFrame(
-            kind: .response,
-            flags: .end,
-            id: id,
-            payload: responseEnvelope(SocketTerminal(rejected: true, reason: reason))
-        ))
-    }
-
-    private func remove(_ id: UInt64) {
-        lock.lock()
-        active.removeValue(forKey: id)
-        lock.unlock()
-    }
-
-    private func responseEnvelope(_ response: SocketTerminal, acknowledge: Bool = false) throws -> Data {
-        var members: [String] = []
-        if acknowledge {
-            members.append("\"ack\":true")
-        }
-        if response.rejected {
-            members.append("\"rejected\":true")
-        }
-        if let code = response.code {
-            try members.append("\"code\":\(jsonString(code.rawValue))")
-        }
-        if let reason = response.reason {
-            try members.append("\"reason\":\(jsonString(reason))")
-        }
-        if let error = response.error {
-            try members.append("\"err\":\(jsonString(error))")
-        }
-        if let payload = response.payload {
-            guard (try? JSONSerialization.jsonObject(with: payload, options: [.fragmentsAllowed])) != nil else {
-                throw SessionTransportError.invalidFrame("response payload is not JSON")
-            }
-            guard let payloadString = String(data: payload, encoding: .utf8) else {
-                throw SessionTransportError.invalidFrame("response payload is not UTF-8 JSON")
-            }
-            members.append("\"payload\":\(payloadString)")
-        }
-        return Data("{\(members.joined(separator: ","))}".utf8)
-    }
-
-    private func jsonString(_ value: String) throws -> String {
-        let data = try JSONSerialization.data(withJSONObject: [value])
-        guard let array = String(data: data, encoding: .utf8) else {
-            throw SessionTransportError.invalidFrame("JSON string encoding is not UTF-8")
-        }
-        return String(array.dropFirst().dropLast())
-    }
-}
-
-private extension ServerSession {
-    func request(_ id: UInt64) -> ServerRequestState? {
-        lock.lock()
-        let state = active[id]
-        lock.unlock()
-        return state
-    }
-
-    func receiveWindow(_ frame: SessionFrame) async throws {
-        guard frame.flags.isEmpty, frame.sequence > 0, frame.operation.isEmpty,
-              frame.tenant.isEmpty, frame.payload.isEmpty
-        else { throw SessionTransportError.invalidFrame("response or event window") }
-        if frame.id == 0 {
-            await eventWindow.grant(frame.sequence)
-            return
-        }
-        await request(frame.id)?.grantResponseCredits(frame.sequence)
-    }
-
-    func receiveAcknowledgement(_ frame: SessionFrame) async throws {
-        guard frame.flags == .end, frame.id != 0, frame.sequence == 0,
-              frame.operation.isEmpty, frame.tenant.isEmpty, frame.payload == generation,
-              let state = request(frame.id), await state.acknowledgeTerminal()
-        else { throw SessionTransportError.invalidFrame("acknowledgement") }
     }
 }

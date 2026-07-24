@@ -1,6 +1,12 @@
 import Darwin
 import Foundation
 
+func deadlineSleepNanoseconds(until deadline: Date) -> UInt64 {
+    let remaining = max(0, deadline.timeIntervalSinceNow)
+    let maximum = TimeInterval(UInt64.max - 1) / 1_000_000_000
+    return UInt64(min(remaining, maximum) * 1_000_000_000)
+}
+
 extension DispatchQueue {
     func performIO<Output: Sendable>(
         _ operation: @escaping @Sendable () throws -> Output
@@ -25,9 +31,19 @@ extension NSLock {
 }
 
 final class AsyncLatch: @unchecked Sendable {
+    private struct DeadlineWaiter {
+        let continuation: CheckedContinuation<Void, Error>
+        let timeout: Task<Void, Never>
+    }
+
     private let lock = NSLock()
     private var finished = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var deadlineWaiters: [UUID: DeadlineWaiter] = [:]
+
+    var isFinished: Bool {
+        lock.withLock { finished }
+    }
 
     func wait() async {
         await withCheckedContinuation { continuation in
@@ -44,17 +60,57 @@ final class AsyncLatch: @unchecked Sendable {
         }
     }
 
+    func wait(deadline: Date) async throws {
+        guard deadline > Date() else { throw RuntimeShutdownError.deadlineExceeded }
+        try await withCheckedThrowingContinuation { continuation in
+            let id = UUID()
+            let resume = lock.withLock { () -> Bool in
+                guard !finished else { return true }
+                let timeout = Task { [weak self] in
+                    let nanoseconds = deadlineSleepNanoseconds(until: deadline)
+                    if nanoseconds > 0 {
+                        try? await Task.sleep(nanoseconds: nanoseconds)
+                    }
+                    guard !Task.isCancelled else { return }
+                    self?.timeout(id)
+                }
+                deadlineWaiters[id] = DeadlineWaiter(
+                    continuation: continuation,
+                    timeout: timeout
+                )
+                return false
+            }
+            if resume {
+                continuation.resume()
+            }
+        }
+    }
+
     func finish() {
-        let pending = lock.withLock {
-            guard !finished else { return [CheckedContinuation<Void, Never>]() }
+        let pending = lock.withLock { () -> (
+            [CheckedContinuation<Void, Never>],
+            [DeadlineWaiter]
+        ) in
+            guard !finished else { return ([], []) }
             finished = true
             let pending = waiters
             waiters.removeAll()
-            return pending
+            let deadlines = Array(deadlineWaiters.values)
+            deadlineWaiters.removeAll()
+            return (pending, deadlines)
         }
-        for waiter in pending {
+        for waiter in pending.0 {
             waiter.resume()
         }
+        for waiter in pending.1 {
+            waiter.timeout.cancel()
+            waiter.continuation.resume()
+        }
+    }
+
+    private func timeout(_ id: UUID) {
+        let waiter = lock.withLock { deadlineWaiters.removeValue(forKey: id) }
+        waiter?.continuation.resume(throwing: RuntimeShutdownError.deadlineExceeded)
     }
 }
 

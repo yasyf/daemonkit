@@ -173,6 +173,18 @@ actor SocketBoundedChannel<Element: Sendable> {
         return true
     }
 
+    func offerLatest(_ element: Element) -> Bool {
+        guard terminal == nil else { return false }
+        if !receivers.isEmpty {
+            let receiver = receivers.removeFirst()
+            receiver.continuation.resume(returning: element)
+            return true
+        }
+        buffer.removeAll(keepingCapacity: true)
+        append(element)
+        return true
+    }
+
     private func send(id: UUID, element: Element) async -> Bool {
         guard terminal == nil else { return false }
         if !receivers.isEmpty {
@@ -207,6 +219,14 @@ actor SocketBoundedChannel<Element: Sendable> {
 
     func finish(throwing error: Error) {
         finish(with: .failure(error), discarding: true)
+    }
+
+    func finishRetaining(
+        where predicate: @Sendable (Element) -> Bool,
+        throwing error: Error
+    ) {
+        buffer.removeAll { !predicate($0) }
+        finish(with: .failure(error), discarding: false)
     }
 
     func discard() {

@@ -100,7 +100,7 @@ extension SocketTransportTests {
                     rejected: true,
                     reason: "terminal metadata"
                 )
-                let upstream = SocketServer(path: upstreamPath, wireBuild: "relay-test", trust: .sameEffectiveUser) { _ in
+                let upstream = SocketServer(path: upstreamPath, wireBuild: "relay-test") { _ in
                     .stream(SocketResponseStream(
                         nextChunk: { await chunks.next() },
                         terminal: { expectedTerminal },
@@ -112,8 +112,7 @@ extension SocketTransportTests {
                 let upstreamClient = try await SocketClient(
                     path: upstreamPath,
                     wireBuild: "relay-test",
-                    configuration: .init(streamQueueDepth: 2),
-                    trust: .sameEffectiveUser
+                    configuration: .init(streamQueueDepth: 2)
                 )
                 cleanup.add { await upstreamClient.close() }
                 let relay = try await makeRelay(path: relayPath, upstream: upstreamClient)
@@ -121,8 +120,7 @@ extension SocketTransportTests {
                 let client = try await SocketClient(
                     path: relayPath,
                     wireBuild: "relay-test",
-                    configuration: .init(streamQueueDepth: 2),
-                    trust: .sameEffectiveUser
+                    configuration: .init(streamQueueDepth: 2)
                 )
                 cleanup.add { await client.close() }
 
@@ -149,7 +147,7 @@ extension SocketTransportTests {
                 let upstreamPath = directory.appendingPathComponent("up.sock").path
                 let relayPath = directory.appendingPathComponent("relay.sock").path
                 let chunks = CancelableChunks()
-                let upstream = SocketServer(path: upstreamPath, wireBuild: "relay-test", trust: .sameEffectiveUser) { _ in
+                let upstream = SocketServer(path: upstreamPath, wireBuild: "relay-test") { _ in
                     .stream(SocketResponseStream(
                         nextChunk: { try await chunks.next() },
                         terminal: { await chunks.terminal() },
@@ -158,11 +156,11 @@ extension SocketTransportTests {
                 }
                 try await upstream.start()
                 cleanup.add { await upstream.stop() }
-                let upstreamClient = try await SocketClient(path: upstreamPath, wireBuild: "relay-test", trust: .sameEffectiveUser)
+                let upstreamClient = try await SocketClient(path: upstreamPath, wireBuild: "relay-test")
                 cleanup.add { await upstreamClient.close() }
                 let relay = try await makeRelay(path: relayPath, upstream: upstreamClient)
                 cleanup.add { await relay.stop() }
-                let client = try await SocketClient(path: relayPath, wireBuild: "relay-test", trust: .sameEffectiveUser)
+                let client = try await SocketClient(path: relayPath, wireBuild: "relay-test")
                 cleanup.add { await client.close() }
 
                 let call = try await client.open(operation: "catalog.open_at")
@@ -190,7 +188,7 @@ extension SocketTransportTests {
                 cleanup.add { try? FileManager.default.removeItem(at: directory) }
                 let path = directory.appendingPathComponent("server.sock").path
                 let unread = CountedChunks(count: 128, size: 64 * 1024)
-                let server = SocketServer(path: path, wireBuild: "relay-test", trust: .sameEffectiveUser) { request in
+                let server = SocketServer(path: path, wireBuild: "relay-test") { request in
                     if request.operation == "unread" {
                         return .stream(SocketResponseStream(
                             nextChunk: { await unread.next() },
@@ -205,8 +203,7 @@ extension SocketTransportTests {
                 let client = try await SocketClient(
                     path: path,
                     wireBuild: "relay-test",
-                    configuration: .init(streamQueueDepth: 1),
-                    trust: .sameEffectiveUser
+                    configuration: .init(streamQueueDepth: 1)
                 )
                 cleanup.add { await client.close() }
 
@@ -225,7 +222,7 @@ extension SocketTransportTests {
                 let directory = try relaySocketDirectory()
                 cleanup.add { try? FileManager.default.removeItem(at: directory) }
                 let path = directory.appendingPathComponent("server.sock").path
-                let server = SocketServer(path: path, wireBuild: "relay-test", trust: .sameEffectiveUser) { _ in
+                let server = SocketServer(path: path, wireBuild: "relay-test") { _ in
                     .stream(SocketResponseStream(
                         nextChunk: { nil },
                         terminal: { SocketTerminal(payload: Data("true".utf8)) },
@@ -237,8 +234,7 @@ extension SocketTransportTests {
                 let client = try await SocketClient(
                     path: path,
                     wireBuild: "relay-test",
-                    configuration: .init(streamQueueDepth: 1),
-                    trust: .sameEffectiveUser
+                    configuration: .init(streamQueueDepth: 1)
                 )
                 cleanup.add { await client.close() }
                 let call = try await client.open(operation: "empty")
@@ -253,7 +249,7 @@ extension SocketTransportTests {
         }
 
         private func makeRelay(path: String, upstream: SocketClient) async throws -> SocketServer {
-            let relay = SocketServer(path: path, wireBuild: "relay-test", trust: .sameEffectiveUser) { request in
+            let relay = SocketServer(path: path, wireBuild: "relay-test") { request in
                 do {
                     return try await .relaying(upstream.open(
                         operation: request.operation,

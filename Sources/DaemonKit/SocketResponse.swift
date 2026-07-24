@@ -10,7 +10,34 @@ public struct SocketResponseCode: RawRepresentable, Equatable, Hashable, Sendabl
     }
 
     public static let runtimeStarting = SocketResponseCode(rawValue: "runtime_starting")
-    public static let serverDraining = SocketResponseCode(rawValue: "server_draining")
+    public static let runtimeDraining = SocketResponseCode(rawValue: "runtime_draining")
+    public static let buildMismatch = SocketResponseCode(rawValue: "build_mismatch")
+    public static let sessionCapacity = SocketResponseCode(rawValue: "session_capacity")
+    public static let peerUntrusted = SocketResponseCode(rawValue: "peer_untrusted")
+    public static let permissionDenied = SocketResponseCode(rawValue: "permission_denied")
+    public static let handoffPendingCapacity = SocketResponseCode(rawValue: "handoff_pending_capacity")
+    public static let handoffReplay = SocketResponseCode(rawValue: "handoff_replay")
+    public static let handoffSessionExhausted = SocketResponseCode(rawValue: "handoff_session_exhausted")
+}
+
+/// An authenticated server's typed handshake rejection.
+public struct SocketHandshakeRejectionError: Error, CustomStringConvertible, Sendable {
+    public let code: SocketResponseCode
+    public let reason: String
+
+    public var description: String {
+        reason
+    }
+}
+
+/// An exact wire-build mismatch proven by the handshake acknowledgment.
+public struct SocketWireBuildMismatchError: Error, CustomStringConvertible, Equatable, Sendable {
+    public let server: String
+    public let client: String
+
+    public var description: String {
+        "wire: build mismatch: server=\(server.debugDescription) client=\(client.debugDescription)"
+    }
 }
 
 /// The terminal envelope emitted after any response stream ends.
@@ -20,6 +47,7 @@ public struct SocketTerminal: Sendable {
     public let rejected: Bool
     public let code: SocketResponseCode?
     public let reason: String?
+    let afterWrite: (@Sendable () -> Void)?
 
     public init(
         payload: Data? = nil,
@@ -33,16 +61,26 @@ public struct SocketTerminal: Sendable {
         self.rejected = rejected
         self.code = code
         self.reason = reason
+        afterWrite = nil
+    }
+
+    init(payload: Data, afterWrite: @escaping @Sendable () -> Void) {
+        self.payload = payload
+        error = nil
+        rejected = false
+        code = nil
+        reason = nil
+        self.afterWrite = afterWrite
     }
 }
 
 /// A pull-driven response stream whose terminal envelope is resolved after its final chunk.
-public struct SocketResponseStream: Sendable {
+struct SocketResponseStream: Sendable {
     private let nextChunkOperation: @Sendable () async throws -> Data?
     private let terminalOperation: @Sendable () async throws -> SocketTerminal
     private let cancellation: SocketResponseCancellation
 
-    public init(
+    init(
         nextChunk: @escaping @Sendable () async throws -> Data?,
         terminal: @escaping @Sendable () async throws -> SocketTerminal,
         cancel: @escaping @Sendable () -> Void
@@ -66,12 +104,12 @@ public struct SocketResponseStream: Sendable {
 }
 
 /// A response is either terminal now or a stream with a deferred terminal envelope.
-public enum SocketResponse: Sendable {
+enum SocketResponse: Sendable {
     case terminal(SocketTerminal)
     case stream(SocketResponseStream)
 }
 
-public extension SocketResponse {
+extension SocketResponse {
     /// Relays a client call without buffering its output or resolving its terminal envelope early.
     static func relaying(_ call: SocketCall) -> SocketResponse {
         .stream(SocketResponseStream(
