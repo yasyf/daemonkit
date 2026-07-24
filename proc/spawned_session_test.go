@@ -38,7 +38,7 @@ func TestSpawnedSessionSocketpairIsUnixStreamAndCloseOnExec(t *testing.T) {
 	}
 }
 
-func TestSpawnedSessionRejectsAndClosesForeignInheritedDescriptor(t *testing.T) {
+func TestSpawnedSessionRejectsForeignInheritedDescriptorWithoutMutation(t *testing.T) {
 	read, write, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
@@ -46,11 +46,19 @@ func TestSpawnedSessionRejectsAndClosesForeignInheritedDescriptor(t *testing.T) 
 	defer read.Close()
 	defer write.Close()
 	fd := int(read.Fd())
+	flags, err := unix.FcntlInt(read.Fd(), unix.F_GETFD, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := claimSpawnedSessionIdentity(context.Background(), fd); !errors.Is(err, ErrSpawnedSessionIdentity) {
 		t.Fatalf("foreign descriptor claim = %v, want identity mismatch", err)
 	}
-	if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
-		t.Fatalf("foreign descriptor remained open: %v", err)
+	after, err := unix.FcntlInt(read.Fd(), unix.F_GETFD, 0)
+	if err != nil {
+		t.Fatalf("foreign descriptor was closed: %v", err)
+	}
+	if after != flags {
+		t.Fatalf("foreign descriptor flags = %#x, want unchanged %#x", after, flags)
 	}
 }
 

@@ -15,7 +15,6 @@ import (
 	"os"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -39,7 +38,10 @@ var (
 	ErrSpawnedSessionIdentity = errors.New("proc: spawned session identity mismatch")
 
 	spawnedSessionRandom = rand.Read
-	spawnedIdentityUsed  atomic.Bool
+	spawnedIdentityClaim struct {
+		sync.Mutex
+		used bool
+	}
 )
 
 type spawnedSessionProcess struct {
@@ -182,7 +184,11 @@ func (s *spawnedSessionParent) claim(
 			fmt.Errorf("proc: generate spawned session nonce: wrote %d: %w", written, err),
 		)
 	}
-	receiptDigest := digestSpawnedSessionReceipt(receipt)
+	parentProcess := spawnedSessionProcess{
+		PID: parent.PID, UID: os.Geteuid(), StartTime: parent.StartTime,
+		Boot: parent.Boot, Comm: parent.Comm, Executable: parent.Executable,
+	}
+	receiptDigest := digestSpawnedSessionReceipt(receipt, parentProcess)
 	bootstrap := spawnedSessionBootstrap{
 		Version: spawnedSessionBootstrapVersion,
 		Nonce:   append([]byte(nil), nonce[:]...), ReceiptDigest: append([]byte(nil), receiptDigest[:]...),
@@ -193,10 +199,7 @@ func (s *spawnedSessionParent) claim(
 			PID: receipt.process.PID, UID: os.Geteuid(), StartTime: receipt.process.StartTime,
 			Boot: receipt.process.Boot, Comm: receipt.process.Comm, Executable: receipt.executable,
 		},
-		Parent: spawnedSessionProcess{
-			PID: parent.PID, UID: os.Geteuid(), StartTime: parent.StartTime,
-			Boot: parent.Boot, Comm: parent.Comm, Executable: parent.Executable,
-		},
+		Parent: parentProcess,
 	}
 	if err := writeSpawnedSessionObject(ctx, conn, bootstrap); err != nil {
 		_ = s.close()
@@ -210,7 +213,7 @@ func (s *spawnedSessionParent) claim(
 	return SpawnedSessionEndpoint{state: s}, nil
 }
 
-func digestSpawnedSessionReceipt(receipt ProcessReceipt) [sha256.Size]byte {
+func digestSpawnedSessionReceipt(receipt ProcessReceipt, parent spawnedSessionProcess) [sha256.Size]byte {
 	h := sha256.New()
 	writeSpawnDigestBytes(h, []byte("daemonkit.proc.spawned-session-receipt.v1"))
 	writeSpawnDigestBytes(h, []byte(receipt.executable))
@@ -221,6 +224,12 @@ func digestSpawnedSessionReceipt(receipt ProcessReceipt) [sha256.Size]byte {
 	writeSpawnDigestBytes(h, []byte(strconv.Itoa(receipt.process.PID)))
 	writeSpawnDigestBytes(h, receipt.signature[:])
 	writeSpawnDigestBytes(h, []byte{boolByte(receipt.hasSignature), boolByte(receipt.spawnedSession)})
+	writeSpawnDigestBytes(h, []byte(strconv.Itoa(parent.PID)))
+	writeSpawnDigestBytes(h, []byte(strconv.Itoa(parent.UID)))
+	writeSpawnDigestBytes(h, []byte(parent.StartTime))
+	writeSpawnDigestBytes(h, []byte(parent.Boot))
+	writeSpawnDigestBytes(h, []byte(parent.Comm))
+	writeSpawnDigestBytes(h, []byte(parent.Executable))
 	var digest [sha256.Size]byte
 	copy(digest[:], h.Sum(nil))
 	return digest
@@ -299,43 +308,67 @@ func (s *spawnedSessionParent) close() error {
 
 // ClaimSpawnedSessionIdentity consumes the fixed inherited spawned-session endpoint.
 func ClaimSpawnedSessionIdentity(ctx context.Context) (SpawnedSessionIdentity, error) {
-	if !spawnedIdentityUsed.CompareAndSwap(false, true) {
+	spawnedIdentityClaim.Lock()
+	defer spawnedIdentityClaim.Unlock()
+	if spawnedIdentityClaim.used {
 		return SpawnedSessionIdentity{}, ErrSpawnedSessionClaimed
 	}
-	return claimSpawnedSessionIdentity(ctx, spawnedSessionFD)
+	identity, err := claimSpawnedSessionIdentity(ctx, spawnedSessionFD)
+	if err != nil {
+		return SpawnedSessionIdentity{}, err
+	}
+	spawnedIdentityClaim.used = true
+	return identity, nil
 }
 
 func claimSpawnedSessionIdentity(ctx context.Context, fd int) (SpawnedSessionIdentity, error) {
-	unix.CloseOnExec(fd)
-	kind, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TYPE)
-	if err != nil || kind != unix.SOCK_STREAM {
-		_ = unix.Close(fd)
+	parent, err := spawnedSessionProcessIdentity(os.Getppid())
+	if err != nil {
 		return SpawnedSessionIdentity{}, errors.Join(ErrSpawnedSessionIdentity, err)
 	}
-	address, err := unix.Getsockname(fd)
+	return claimSpawnedSessionIdentityForParent(ctx, fd, parent)
+}
+
+func claimSpawnedSessionIdentityForParent(
+	ctx context.Context,
+	fd int,
+	parent spawnedSessionProcess,
+) (SpawnedSessionIdentity, error) {
+	duplicateFD, err := unix.FcntlInt(uintptr(fd), unix.F_DUPFD_CLOEXEC, 0)
 	if err != nil {
-		_ = unix.Close(fd)
+		return SpawnedSessionIdentity{}, errors.Join(ErrSpawnedSessionIdentity, err)
+	}
+	file := os.NewFile(uintptr(duplicateFD), "daemonkit-spawned-session-candidate")
+	if file == nil {
+		_ = unix.Close(duplicateFD)
+		return SpawnedSessionIdentity{}, ErrSpawnedSessionIdentity
+	}
+	defer file.Close()
+	kind, err := unix.GetsockoptInt(duplicateFD, unix.SOL_SOCKET, unix.SO_TYPE)
+	if err != nil || kind != unix.SOCK_STREAM {
+		return SpawnedSessionIdentity{}, errors.Join(ErrSpawnedSessionIdentity, err)
+	}
+	address, err := unix.Getsockname(duplicateFD)
+	if err != nil {
 		return SpawnedSessionIdentity{}, errors.Join(ErrSpawnedSessionIdentity, err)
 	}
 	if _, ok := address.(*unix.SockaddrUnix); !ok {
-		_ = unix.Close(fd)
 		return SpawnedSessionIdentity{}, ErrSpawnedSessionIdentity
 	}
-	file := os.NewFile(uintptr(fd), "daemonkit-spawned-session")
-	if file == nil {
-		_ = unix.Close(fd)
+	peerAddress, err := unix.Getpeername(duplicateFD)
+	if err != nil {
+		return SpawnedSessionIdentity{}, errors.Join(ErrSpawnedSessionIdentity, err)
+	}
+	if _, ok := peerAddress.(*unix.SockaddrUnix); !ok {
 		return SpawnedSessionIdentity{}, ErrSpawnedSessionIdentity
+	}
+	peer, err := spawnedSessionPeerCredentials(duplicateFD)
+	if err != nil || peer.PID != parent.PID || peer.UID != parent.UID {
+		return SpawnedSessionIdentity{}, errors.Join(ErrSpawnedSessionIdentity, err)
 	}
 	conn, err := net.FileConn(file)
-	closeErr := file.Close()
 	if err != nil {
-		return SpawnedSessionIdentity{}, errors.Join(
-			fmt.Errorf("proc: open inherited spawned session: %w", err), closeErr,
-		)
-	}
-	if closeErr != nil {
-		_ = conn.Close()
-		return SpawnedSessionIdentity{}, fmt.Errorf("proc: close inherited spawned session descriptor: %w", closeErr)
+		return SpawnedSessionIdentity{}, fmt.Errorf("proc: open inherited spawned session duplicate: %w", err)
 	}
 	owned := &spawnedsession.OnceConn{Conn: conn}
 	fail := func(err error) (SpawnedSessionIdentity, error) {
@@ -345,11 +378,11 @@ func claimSpawnedSessionIdentity(ctx context.Context, fd int) (SpawnedSessionIde
 	if err := readSpawnedSessionObject(ctx, conn, &bootstrap); err != nil {
 		return fail(fmt.Errorf("proc: read spawned session bootstrap: %w", err))
 	}
-	self, err := spawnedCurrentIdentity()
+	self, err := spawnedSessionProcessIdentity(os.Getpid())
 	if err != nil {
 		return fail(fmt.Errorf("proc: probe spawned session process: %w", err))
 	}
-	if err := validateSpawnedSessionBootstrap(bootstrap, self); err != nil {
+	if err := validateSpawnedSessionBootstrap(bootstrap, self, parent); err != nil {
 		return fail(err)
 	}
 	var nonce, receiptDigest [sha256.Size]byte
@@ -365,6 +398,10 @@ func claimSpawnedSessionIdentity(ctx context.Context, fd int) (SpawnedSessionIde
 	}
 	if err := clearSpawnedSessionDeadline(conn); err != nil {
 		return fail(err)
+	}
+	unix.CloseOnExec(fd)
+	if err := unix.Close(fd); err != nil {
+		return fail(fmt.Errorf("proc: close inherited spawned session descriptor: %w", err))
 	}
 	return SpawnedSessionIdentity{state: &spawnedSessionChild{
 		owned: owned, nonce: nonce, receiptDigest: receiptDigest, peer: bootstrap.Parent,
@@ -383,7 +420,26 @@ func spawnedCurrentIdentity() (Identity, error) {
 	return identity, nil
 }
 
-func validateSpawnedSessionBootstrap(bootstrap spawnedSessionBootstrap, self Identity) error {
+func spawnedSessionProcessIdentity(pid int) (spawnedSessionProcess, error) {
+	identity, err := Probe(pid)
+	if err != nil {
+		return spawnedSessionProcess{}, err
+	}
+	identity.Executable, err = ExecutablePath(identity.PID)
+	if err != nil {
+		return spawnedSessionProcess{}, err
+	}
+	return spawnedSessionProcess{
+		PID: identity.PID, UID: os.Geteuid(), StartTime: identity.StartTime,
+		Boot: identity.Boot, Comm: identity.Comm, Executable: identity.Executable,
+	}, nil
+}
+
+func validateSpawnedSessionBootstrap(
+	bootstrap spawnedSessionBootstrap,
+	self spawnedSessionProcess,
+	parent spawnedSessionProcess,
+) error {
 	if bootstrap.Version != spawnedSessionBootstrapVersion ||
 		len(bootstrap.Nonce) != sha256.Size || len(bootstrap.ReceiptDigest) != sha256.Size ||
 		len(bootstrap.RequestDigest) != sha256.Size || len(bootstrap.Signature) != sha256.Size ||
@@ -394,14 +450,12 @@ func validateSpawnedSessionBootstrap(bootstrap spawnedSessionBootstrap, self Ide
 		bootstrap.OwnerGeneration == (OwnerGeneration{}) || bootstrap.ExpectedExecutable == "" {
 		return ErrSpawnedSessionIdentity
 	}
-	if bootstrap.Child.PID != self.PID || bootstrap.Child.StartTime != self.StartTime ||
-		bootstrap.Child.Boot != self.Boot || bootstrap.Child.UID != os.Geteuid() ||
+	if bootstrap.Child.PID != self.PID || bootstrap.Child.UID != self.UID ||
+		bootstrap.Child.StartTime != self.StartTime || bootstrap.Child.Boot != self.Boot ||
 		bootstrap.Child.Executable != self.Executable || bootstrap.ExpectedExecutable != self.Executable {
 		return ErrSpawnedSessionIdentity
 	}
-	if bootstrap.Parent.PID <= 0 || bootstrap.Parent.UID != os.Geteuid() ||
-		bootstrap.Parent.StartTime == "" || bootstrap.Parent.Boot == "" ||
-		bootstrap.Parent.Executable == "" {
+	if bootstrap.Parent != parent {
 		return ErrSpawnedSessionIdentity
 	}
 	return nil
