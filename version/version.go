@@ -21,8 +21,6 @@ var releaseTriple = regexp.MustCompile(`^v?(\d+)\.(\d+)\.(\d+)`)
 type Version interface {
 	// Newer reports whether this build is strictly newer than other.
 	Newer(other Version) bool
-	// Equal reports whether this build is the exact same build as other.
-	Equal(other Version) bool
 }
 
 // Release is a v?X.Y.Z release triple.
@@ -52,14 +50,6 @@ func (r Release) Newer(other Version) bool {
 	return r.Patch > o.Patch
 }
 
-// Equal reports whether r is the exact same release as other; a Release is never
-// equal to a Dev, and v?X.Y.Z parses to one Release regardless of the "v" prefix,
-// so TAG and BARE spellings of one release compare equal.
-func (r Release) Equal(other Version) bool {
-	o, ok := other.(Release)
-	return ok && r == o
-}
-
 // Newer reports whether d is a strictly newer dev build than other; a Dev
 // outranks every Release and orders against another Dev by BuildUnixNano.
 func (d Dev) Newer(other Version) bool {
@@ -68,13 +58,6 @@ func (d Dev) Newer(other Version) bool {
 		return true
 	}
 	return d.BuildUnixNano > o.BuildUnixNano
-}
-
-// Equal reports whether d is the exact same dev build as other, ordered by the
-// nanosecond the binary was stamped; a Dev is never equal to a Release.
-func (d Dev) Equal(other Version) bool {
-	o, ok := other.(Dev)
-	return ok && d == o
 }
 
 // Parse classifies s as a Dev or a Release. The "9999."-prefixed dev sentinel
@@ -129,11 +112,17 @@ func Newer(a, b string) bool {
 	return Parse(a).Newer(Parse(b))
 }
 
-// Equal reports whether builds a and b are the exact same build. Two spellings
-// of one release ("v12.15.3" and "12.15.3") are equal; a release and a dev
-// build, or two different builds, never are.
+// Equal reports whether a and b name the exact same build. The TAG and BARE
+// spellings of one release ("v12.15.3" and "12.15.3") are equal; every other
+// difference — a prerelease, build metadata, a git-describe suffix, or a
+// distinct triple — is not, because the leading "v" is the only normalization
+// applied.
 func Equal(a, b string) bool {
-	return Parse(a).Equal(Parse(b))
+	return canonicalVersion(a) == canonicalVersion(b)
+}
+
+func canonicalVersion(s string) string {
+	return strings.TrimPrefix(strings.TrimSpace(s), "v")
 }
 
 // DevString returns the canonical development version for buildTime.
