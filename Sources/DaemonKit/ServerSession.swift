@@ -325,19 +325,21 @@ final class ServerSession: @unchecked Sendable {
     }
 
     private func validateRoute(_ frame: SessionFrame, control: Bool) async throws -> Bool {
-        let rejection: String? = if frame.operation.hasPrefix("daemon."), !control {
-            "wire: Swift sessions cannot authorize protected daemonkit operations"
+        let rejection: (SocketResponseCode, String)? = if control, frame.flags != .end {
+            (.invalidRequest, "wire: control operation must be unary")
+        } else if frame.operation.hasPrefix("daemon."), !control {
+            (.permissionDenied, "wire: Swift sessions cannot authorize protected daemonkit operations")
         } else if control, !frame.tenant.isEmpty {
-            "wire: control operation tenant must be empty"
+            (.permissionDenied, "wire: control operation tenant must be empty")
         } else if !control, let sessionPolicy, frame.operation != sessionPolicy.operation {
-            "wire: operation does not match service operation"
+            (.permissionDenied, "wire: operation does not match service operation")
         } else if !control, let sessionPolicy, frame.tenant != sessionPolicy.tenant {
-            "wire: tenant does not match service tenant"
+            (.permissionDenied, "wire: tenant does not match service tenant")
         } else {
             nil
         }
         guard let rejection else { return true }
-        try await sendRejected(id: frame.id, code: .permissionDenied, reason: rejection)
+        try await sendRejected(id: frame.id, code: rejection.0, reason: rejection.1)
         return false
     }
 }

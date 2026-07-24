@@ -763,4 +763,44 @@ extension SocketTransportTests.RuntimeLifecycleControllerTests {
             #expect(await handler.snapshot().isEmpty)
         }
     }
+
+    @Test func protectedControlsRejectStreamedInputBeforeAdmission() async throws {
+        try await withAsyncCleanup { cleanup in
+            let directory = try shortSocketDir()
+            cleanup.add { try? FileManager.default.removeItem(at: directory) }
+            let path = directory.appendingPathComponent("control-unary.sock").path
+            let runtime = try DaemonRuntime(
+                path: path,
+                wireBuild: "service.v1",
+                identity: identity,
+                handler: RuntimeHandlerSpec { _ in .terminal(SocketTerminal()) }
+            )
+            cleanup.add { try? await runtime.shutdown(deadline: Date().addingTimeInterval(2)) }
+            _ = try await runtime.begin(deadline: Date().addingTimeInterval(2))
+            let client = try await SocketClient(
+                path: path,
+                wireBuild: "service.v1",
+                role: SessionPeerRole.unprotected
+            )
+            cleanup.add { await client.close() }
+
+            for operation in [runtimeReceiptOperation, runtimeReadinessSubscribeOperation] {
+                let streamed = try await client.open(
+                    operation: operation,
+                    payload: RuntimeReadinessCodec.encodeSubscribe(),
+                    endInput: false
+                )
+                let terminal = try await streamed.response()
+                #expect(terminal.rejected)
+                #expect(terminal.code == .invalidRequest)
+            }
+            #expect(runtime.controller.subscriberCount == 0)
+
+            let receipt = try await client.acquireRuntimeReceipt(
+                expectedRuntimeBuild: "app.v1",
+                deadline: Date().addingTimeInterval(1)
+            )
+            #expect(receipt.runtimeIdentity == identity)
+        }
+    }
 }
