@@ -111,6 +111,8 @@ type deploymentPaths struct {
 	serviceProcess string
 	apply          string
 	prior          string
+	uninstall      string
+	removed        string
 }
 
 func deploymentPathsForApp(appPath string) deploymentPaths {
@@ -125,6 +127,8 @@ func deploymentPathsForApp(appPath string) deploymentPaths {
 		serviceProcess: filepath.Join(metadata, "service-workers.db"),
 		apply:          filepath.Join(metadata, "apply.json"),
 		prior:          filepath.Join(metadata, "prior.app"),
+		uninstall:      filepath.Join(metadata, "uninstall.json"),
+		removed:        filepath.Join(metadata, "removed.app"),
 	}
 }
 

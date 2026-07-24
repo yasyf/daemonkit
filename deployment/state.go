@@ -19,10 +19,13 @@ const (
 	activationIdentity   = "daemonkit.deployment.activation.v1"
 	deactivationIdentity = "daemonkit.deployment.deactivation.v1"
 	applyIdentity        = "daemonkit.deployment.apply.v1"
+	uninstallIdentity    = "daemonkit.deployment.uninstall.v1"
 	activationSchema     = 1
 )
 
 type applyPhase string
+
+type uninstallPhase string
 
 const (
 	applyPrepared   applyPhase = "prepared"
@@ -31,6 +34,12 @@ const (
 	applyActive     applyPhase = "active"
 	applyRollback   applyPhase = "rollback"
 	applyRolledBack applyPhase = "rolled_back"
+)
+
+const (
+	uninstallPrepared uninstallPhase = "prepared"
+	uninstallMoved    uninstallPhase = "moved"
+	uninstallRemoved  uninstallPhase = "removed"
 )
 
 type activationPhase string
@@ -118,6 +127,16 @@ type applyReceiptWire struct {
 	RollbackOperation   string                 `json:"rollback_operation,omitempty"`
 }
 
+type uninstallReceiptWire struct {
+	Identity              string             `json:"identity"`
+	Schema                int                `json:"schema"`
+	OperationID           string             `json:"operation_id"`
+	DeactivationOperation string             `json:"deactivation_operation"`
+	Phase                 uninstallPhase     `json:"phase"`
+	Generation            storedGeneration   `json:"generation"`
+	RuntimeProof          storedRuntimeProof `json:"runtime_proof"`
+}
+
 func storePlan(plan service.Plan) storedPlan {
 	return storedPlan{Agents: plan.Agents(), Digest: plan.Digest().String()}
 }
@@ -162,6 +181,17 @@ func readDeactivation(path string) (*deactivationReceiptWire, error) {
 
 func readApply(path string) (*applyReceiptWire, error) {
 	var receipt applyReceiptWire
+	if err := readExactJSON(path, &receipt); err != nil {
+		return nil, err
+	}
+	if err := receipt.validate(); err != nil {
+		return nil, err
+	}
+	return &receipt, nil
+}
+
+func readUninstall(path string) (*uninstallReceiptWire, error) {
+	var receipt uninstallReceiptWire
 	if err := readExactJSON(path, &receipt); err != nil {
 		return nil, err
 	}
@@ -285,6 +315,23 @@ func (receipt applyReceiptWire) validate() error {
 		return ErrInstallState
 	}
 	if receipt.Phase == applyActive && receipt.ActivationOperation == "" {
+		return ErrInstallState
+	}
+	return nil
+}
+
+func (receipt uninstallReceiptWire) validate() error {
+	if receipt.Identity != uninstallIdentity || receipt.Schema != activationSchema ||
+		!validOperationID(receipt.OperationID) || !validOperationID(receipt.DeactivationOperation) {
+		return ErrInstallState
+	}
+	if receipt.Phase != uninstallPrepared && receipt.Phase != uninstallMoved && receipt.Phase != uninstallRemoved {
+		return ErrInstallState
+	}
+	if err := receipt.Generation.validateStored(); err != nil {
+		return err
+	}
+	if !receipt.RuntimeProof.Absent || !validDigestString(receipt.RuntimeProof.Digest) {
 		return ErrInstallState
 	}
 	return nil

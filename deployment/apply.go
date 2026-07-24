@@ -82,6 +82,9 @@ func (c *Controller) ApplyInstalledCandidate(
 		return ApplyInstalledCandidateReceipt{}, err
 	}
 	defer lock.Close()
+	if err := retireRemovedUninstall(paths); err != nil {
+		return ApplyInstalledCandidateReceipt{}, err
+	}
 	existing, err := readApply(paths.apply)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
@@ -100,6 +103,23 @@ func (c *Controller) ApplyInstalledCandidate(
 		}
 	}
 	return c.applyCandidateLocked(ctx, config, validated, paths)
+}
+
+func retireRemovedUninstall(paths deploymentPaths) error {
+	receipt, err := readUninstall(paths.uninstall)
+	if errors.Is(err, os.ErrNotExist) {
+		if fileExists(paths.removed) {
+			return fmt.Errorf("%w: private removal state lacks a receipt", ErrInstallConflict)
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if receipt.Phase != uninstallRemoved || fileExists(paths.canonical) || fileExists(paths.removed) {
+		return fmt.Errorf("%w: prior uninstall is not terminal", ErrInstallConflict)
+	}
+	return removeIfExistsDurable(paths.uninstall)
 }
 
 type validatedApply struct {
