@@ -212,6 +212,53 @@ func TestApplyInstalledCandidateRejectsUnsealedCurrentInstall(t *testing.T) {
 	}
 }
 
+func TestNewCandidatePlanRejectsProgramOutsideSource(t *testing.T) {
+	fixture := newActivationFixture(t)
+	source := filepath.Join(filepath.Dir(fixture.appPath), "Package.app")
+	copyDirectory(t, fixture.appPath, source)
+	agents := fixture.config.Plan.Agents()
+	if _, err := NewCandidatePlan(source, agents); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestApplyInstalledCandidateRejectsPostSwapProgramDrift(t *testing.T) {
+	for _, mutate := range []struct {
+		name string
+		fn   func(string) error
+	}{
+		{name: "substituted", fn: func(path string) error { return os.WriteFile(path, []byte("substituted"), 0o755) }},
+		{name: "missing", fn: os.Remove},
+	} {
+		t.Run(mutate.name, func(t *testing.T) {
+			fixture := newActivationFixture(t)
+			config := newApplyConfig(t, fixture, "1.0.0", false)
+			failed := false
+			fixture.controller.failpoint = func(point string) error {
+				if point == "apply:swapped" && !failed {
+					failed = true
+					return errors.New("stop after swap")
+				}
+				return nil
+			}
+			if _, err := fixture.controller.ApplyInstalledCandidate(t.Context(), config); err == nil {
+				t.Fatal("swap checkpoint did not stop")
+			}
+			fixture.controller.failpoint = nil
+			program := filepath.Join(fixture.appPath, "Contents", "MacOS", "Helper")
+			if err := mutate.fn(program); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.controller.ApplyInstalledCandidate(t.Context(), config); !errors.Is(err, ErrInstallConflict) {
+				t.Fatalf("error = %v", err)
+			}
+			if fileExists(deploymentPathsForApp(fixture.appPath).activation) {
+				t.Fatal("drifted program was activated")
+			}
+		})
+	}
+}
+
 func TestApplyInstalledCandidateRejectsSourceMutationAndCleansPartialStage(t *testing.T) {
 	fixture := newActivationFixture(t)
 	config := newApplyConfig(t, fixture, "1.0.0", false)
@@ -278,10 +325,11 @@ func newApplyConfig(t *testing.T, fixture *activationFixture, version string, pr
 	if err != nil {
 		t.Fatal(err)
 	}
+	plan := candidatePlanForSource(t, fixture, source)
 	return ApplyInstalledCandidateConfig{
 		Target:              CurrentInstalledSpec{AppPath: fixture.appPath, Identity: fixture.spec.Identity},
 		CandidateSourcePath: source, CandidateVersion: version, CandidateBundleDigest: digest,
-		ConsumerBuild: "consumer-v2", PolicyDigest: SHA256{4}, Plan: fixture.config.Plan,
+		ConsumerBuild: "consumer-v2", PolicyDigest: SHA256{4}, Plan: plan,
 		RuntimeQuiesce: func(context.Context, RuntimeStopper, DeactivateInstalledOperation) (RuntimeProof, error) {
 			return NewRuntimeProof(true, proc.OwnerGeneration{}, SHA256{5})
 		},
@@ -289,6 +337,23 @@ func newApplyConfig(t *testing.T, fixture *activationFixture, version string, pr
 			return NewReadinessProof("runtime-"+operation.Generation().Version(), proc.OwnerGeneration{2}, SHA256{6})
 		},
 	}
+}
+
+func candidatePlanForSource(t *testing.T, fixture *activationFixture, source string) CandidatePlan {
+	t.Helper()
+	agents := fixture.config.Plan.Agents()
+	for index := range agents {
+		relative, err := filepath.Rel(fixture.appPath, agents[index].Program)
+		if err != nil {
+			t.Fatal(err)
+		}
+		agents[index].Program = filepath.Join(source, relative)
+	}
+	plan, err := NewCandidatePlan(source, agents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return plan
 }
 
 func rollbackReadiness(_ context.Context, operation InstalledOperation) (ReadinessProof, error) {

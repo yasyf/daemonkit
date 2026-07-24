@@ -100,7 +100,7 @@ func TestApplyInstalledCandidateRetiresTerminalUninstall(t *testing.T) {
 	apply := ApplyInstalledCandidateConfig{
 		Target:              CurrentInstalledSpec{AppPath: fixture.appPath, Identity: fixture.spec.Identity},
 		CandidateSourcePath: source, CandidateVersion: "1.0.0", CandidateBundleDigest: digest,
-		ConsumerBuild: "consumer-v2", PolicyDigest: SHA256{4}, Plan: fixture.config.Plan,
+		ConsumerBuild: "consumer-v2", PolicyDigest: SHA256{4}, Plan: candidatePlanForSource(t, fixture, source),
 		RuntimeQuiesce: uninstallConfig(fixture).RuntimeQuiesce, Readiness: fixture.config.Readiness,
 	}
 	if _, err := fixture.controller.ApplyInstalledCandidate(t.Context(), apply); err != nil {

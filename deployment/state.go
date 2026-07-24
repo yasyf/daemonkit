@@ -2,6 +2,7 @@ package deployment
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -73,6 +74,11 @@ type storedPlan struct {
 	Digest string          `json:"digest"`
 }
 
+type storedApplyPlan struct {
+	Agents []service.Agent `json:"agents"`
+	Digest string          `json:"digest"`
+}
+
 type storedReadinessProof struct {
 	RuntimeBuild      string               `json:"runtime_build"`
 	ProcessGeneration proc.OwnerGeneration `json:"process_generation"`
@@ -122,7 +128,7 @@ type applyReceiptWire struct {
 	Prior               *activationReceiptWire `json:"prior,omitempty"`
 	ConsumerBuild       string                 `json:"consumer_build"`
 	PolicyDigest        string                 `json:"policy_digest"`
-	Plan                storedPlan             `json:"plan"`
+	Plan                storedApplyPlan        `json:"plan"`
 	ActivationOperation string                 `json:"activation_operation,omitempty"`
 	RollbackOperation   string                 `json:"rollback_operation,omitempty"`
 }
@@ -147,6 +153,54 @@ func restorePlan(stored storedPlan) (service.Plan, error) {
 		return service.Plan{}, err
 	}
 	return service.RestorePlan(stored.Agents, digest)
+}
+
+func storeApplyPlan(sourceRoot string, plan service.Plan) (storedApplyPlan, error) {
+	agents := plan.Agents()
+	for index := range agents {
+		relative, err := filepath.Rel(sourceRoot, agents[index].Program)
+		if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return storedApplyPlan{}, fmt.Errorf("%w: service program %q is outside candidate source", ErrInvalidConfig, agents[index].Program)
+		}
+		agents[index].Program = filepath.ToSlash(relative)
+	}
+	payload, err := json.Marshal(agents)
+	if err != nil {
+		return storedApplyPlan{}, err
+	}
+	return storedApplyPlan{Agents: agents, Digest: fmt.Sprintf("%x", sha256.Sum256(payload))}, nil
+}
+
+func (stored storedApplyPlan) validate(targetRoot string) error {
+	if !validDigestString(stored.Digest) || len(stored.Agents) == 0 {
+		return ErrInstallState
+	}
+	payload, err := json.Marshal(stored.Agents)
+	if err != nil || fmt.Sprintf("%x", sha256.Sum256(payload)) != stored.Digest {
+		return ErrInstallState
+	}
+	for _, agent := range stored.Agents {
+		if agent.Program == "" || filepath.IsAbs(agent.Program) || filepath.Clean(agent.Program) != agent.Program ||
+			agent.Program == "." || agent.Program == ".." || strings.HasPrefix(agent.Program, ".."+string(filepath.Separator)) {
+			return ErrInstallState
+		}
+		agent.Program = filepath.Join(targetRoot, filepath.FromSlash(agent.Program))
+		if _, err := agent.Plist(); err != nil {
+			return fmt.Errorf("%w: invalid declarative service plan: %w", ErrInstallState, err)
+		}
+	}
+	return nil
+}
+
+func (stored storedApplyPlan) bindInstalled(targetRoot string) (service.Plan, error) {
+	if err := stored.validate(targetRoot); err != nil {
+		return service.Plan{}, err
+	}
+	agents := append([]service.Agent(nil), stored.Agents...)
+	for index := range agents {
+		agents[index].Program = filepath.Join(targetRoot, filepath.FromSlash(agents[index].Program))
+	}
+	return service.NewPlan(agents)
 }
 
 func parsePlanDigest(value string) (service.PlanDigest, error) {
@@ -305,7 +359,7 @@ func (receipt applyReceiptWire) validate() error {
 			return ErrInstallState
 		}
 	}
-	if _, err := restorePlan(receipt.Plan); err != nil {
+	if err := receipt.Plan.validate(receipt.TargetPath); err != nil {
 		return err
 	}
 	if receipt.ActivationOperation != "" && !validOperationID(receipt.ActivationOperation) {

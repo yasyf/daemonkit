@@ -25,9 +25,31 @@ type ApplyInstalledCandidateConfig struct {
 	CandidateBundleDigest SHA256
 	ConsumerBuild         string
 	PolicyDigest          SHA256
-	Plan                  service.Plan
+	Plan                  CandidatePlan
 	RuntimeQuiesce        func(context.Context, RuntimeStopper, DeactivateInstalledOperation) (RuntimeProof, error)
 	Readiness             func(context.Context, InstalledOperation) (ReadinessProof, error)
+}
+
+// CandidatePlan is one exact service policy bound to a packaged app resource.
+type CandidatePlan struct {
+	sourceRoot string
+	stored     storedApplyPlan
+}
+
+// NewCandidatePlan validates a service policy against an existing packaged app.
+func NewCandidatePlan(sourceRoot string, agents []service.Agent) (CandidatePlan, error) {
+	if err := validateCanonicalAppPath(sourceRoot); err != nil {
+		return CandidatePlan{}, err
+	}
+	plan, err := service.NewPlan(agents)
+	if err != nil {
+		return CandidatePlan{}, err
+	}
+	stored, err := storeApplyPlan(sourceRoot, plan)
+	if err != nil {
+		return CandidatePlan{}, err
+	}
+	return CandidatePlan{sourceRoot: sourceRoot, stored: stored}, nil
 }
 
 // ApplyInstalledCandidateReceipt is one terminal installed candidate transaction.
@@ -125,6 +147,7 @@ func retireRemovedUninstall(paths deploymentPaths) error {
 type validatedApply struct {
 	candidatePath string
 	fingerprint   string
+	plan          storedApplyPlan
 }
 
 func validateApplyConfig(config ApplyInstalledCandidateConfig) (validatedApply, error) {
@@ -143,12 +166,10 @@ func validateApplyConfig(config ApplyInstalledCandidateConfig) (validatedApply, 
 	if err := config.PolicyDigest.validate("policy digest"); err != nil {
 		return validatedApply{}, err
 	}
-	if config.Plan.Digest() == (service.PlanDigest{}) {
-		return validatedApply{}, fmt.Errorf("%w: exact service plan is required", ErrInvalidConfig)
+	if config.Plan.sourceRoot != config.CandidateSourcePath || config.Plan.stored.Digest == "" {
+		return validatedApply{}, fmt.Errorf("%w: exact candidate-bound service plan is required", ErrInvalidConfig)
 	}
-	if err := validatePlanProgramLocations(config.Target.AppPath, config.Plan); err != nil {
-		return validatedApply{}, err
-	}
+	plan := config.Plan.stored
 	candidate, err := installedCandidatePath(config.Target.AppPath)
 	if err != nil {
 		return validatedApply{}, err
@@ -159,24 +180,13 @@ func validateApplyConfig(config ApplyInstalledCandidateConfig) (validatedApply, 
 		Target: config.Target.AppPath, Source: config.CandidateSourcePath, Version: config.CandidateVersion,
 		BundleDigest: config.CandidateBundleDigest.String(),
 		TeamID:       config.Target.Identity.TeamID, SigningIdentifier: config.Target.Identity.SigningIdentifier,
-		ConsumerBuild: config.ConsumerBuild, PolicyDigest: config.PolicyDigest.String(),
-		PlanDigest: config.Plan.Digest().String(),
+		ConsumerBuild: config.ConsumerBuild, PolicyDigest: config.PolicyDigest.String(), PlanDigest: plan.Digest,
 	}
 	payload, err := json.Marshal(wire)
 	if err != nil {
 		return validatedApply{}, err
 	}
-	return validatedApply{candidatePath: candidate, fingerprint: fmt.Sprintf("%x", sha256.Sum256(payload))}, nil
-}
-
-func validatePlanProgramLocations(appPath string, plan service.Plan) error {
-	for _, agent := range plan.Agents() {
-		relative, err := filepath.Rel(appPath, agent.Program)
-		if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-			return fmt.Errorf("%w: service program %q is outside canonical app", ErrInvalidConfig, agent.Program)
-		}
-	}
-	return nil
+	return validatedApply{candidatePath: candidate, fingerprint: fmt.Sprintf("%x", sha256.Sum256(payload)), plan: plan}, nil
 }
 
 func validateCurrentInstalledTarget(spec CurrentInstalledSpec) error {
@@ -210,7 +220,7 @@ func (c *Controller) applyCandidateLocked(
 	}
 	if receipt.ConfigFingerprint != validated.fingerprint || receipt.TargetPath != config.Target.AppPath ||
 		receipt.ConsumerBuild != config.ConsumerBuild || receipt.PolicyDigest != config.PolicyDigest.String() ||
-		receipt.Plan.Digest != config.Plan.Digest().String() || !candidateMatchesTarget(config.Target, receipt.Candidate) {
+		receipt.Plan.Digest != validated.plan.Digest || !candidateMatchesTarget(config.Target, receipt.Candidate) {
 		return ApplyInstalledCandidateReceipt{}, fmt.Errorf("%w: pending apply differs from request", ErrInstallConflict)
 	}
 	if receipt.Phase == applyRolledBack {
@@ -259,9 +269,17 @@ func (c *Controller) applyCandidateLocked(
 		if err != nil {
 			return ApplyInstalledCandidateReceipt{}, c.beginRollback(ctx, config, receipt, paths, validated.candidatePath, err)
 		}
+		if !sameGenerationBytes(generation, receipt.Candidate) {
+			return ApplyInstalledCandidateReceipt{}, c.beginRollback(ctx, config, receipt, paths, validated.candidatePath,
+				fmt.Errorf("%w: canonical candidate changed after swap", ErrInstallConflict))
+		}
+		plan, err := receipt.Plan.bindInstalled(paths.canonical)
+		if err != nil {
+			return ApplyInstalledCandidateReceipt{}, c.beginRollback(ctx, config, receipt, paths, validated.candidatePath, err)
+		}
 		activationConfig := ActivateInstalledConfig{
 			Expected: InstalledAttestation{stored: generation}, ConsumerBuild: config.ConsumerBuild,
-			PolicyDigest: config.PolicyDigest, Plan: config.Plan, Readiness: config.Readiness,
+			PolicyDigest: config.PolicyDigest, Plan: plan, Readiness: config.Readiness,
 		}
 		validatedActivation, err := validateActivateConfig(activationConfig)
 		if err != nil {
@@ -359,22 +377,8 @@ func (c *Controller) recoverApplyForDeactivation(
 	case applySwapped, applyRollback:
 	}
 
-	plan, err := restorePlan(receipt.Plan)
-	if err != nil {
-		return err
-	}
-	policy, err := ParseSHA256(receipt.PolicyDigest)
-	if err != nil {
-		return err
-	}
-	digest, err := ParseSHA256(receipt.Candidate.BundleDigest)
-	if err != nil {
-		return err
-	}
 	rollbackConfig := ApplyInstalledCandidateConfig{
-		Target: config.Current, CandidateVersion: receipt.Candidate.Version, CandidateBundleDigest: digest,
-		ConsumerBuild: receipt.ConsumerBuild, PolicyDigest: policy, Plan: plan,
-		RuntimeQuiesce: config.RuntimeQuiesce, Readiness: config.Readiness,
+		Target: config.Current, RuntimeQuiesce: config.RuntimeQuiesce, Readiness: config.Readiness,
 	}
 	if receipt.Phase != applyRollback {
 		receipt.Phase = applyRollback
@@ -475,7 +479,7 @@ func (c *Controller) prepareApply(
 		Identity: applyIdentity, Schema: activationSchema, OperationID: operationID,
 		ConfigFingerprint: validated.fingerprint, Phase: applyPrepared, TargetPath: paths.canonical,
 		Candidate: candidate, Prior: prior, ConsumerBuild: config.ConsumerBuild,
-		PolicyDigest: config.PolicyDigest.String(), Plan: storePlan(config.Plan),
+		PolicyDigest: config.PolicyDigest.String(), Plan: validated.plan,
 	}
 	if err := writeJSONDurable(paths.apply, receipt); err != nil {
 		return nil, err
