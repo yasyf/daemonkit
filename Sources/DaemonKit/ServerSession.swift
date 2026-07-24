@@ -237,38 +237,7 @@ final class ServerSession: @unchecked Sendable {
             throw SessionTransportError.invalidFrame("request")
         }
         let control = controlOperations.contains(frame.operation)
-        if frame.operation.hasPrefix("daemon."), !control {
-            try await sendRejected(
-                id: frame.id,
-                code: .permissionDenied,
-                reason: "wire: Swift sessions cannot authorize protected daemonkit operations"
-            )
-            return
-        }
-        if control, !frame.tenant.isEmpty {
-            try await sendRejected(
-                id: frame.id,
-                code: .permissionDenied,
-                reason: "wire: control operation tenant must be empty"
-            )
-            return
-        }
-        if !control, let sessionPolicy, frame.operation != sessionPolicy.operation {
-            try await sendRejected(
-                id: frame.id,
-                code: .permissionDenied,
-                reason: "wire: operation does not match service operation"
-            )
-            return
-        }
-        if !control, let sessionPolicy, frame.tenant != sessionPolicy.tenant {
-            try await sendRejected(
-                id: frame.id,
-                code: .permissionDenied,
-                reason: "wire: tenant does not match service tenant"
-            )
-            return
-        }
+        guard try await validateRoute(frame, control: control) else { return }
         let admission = try admit(
             frame,
             clientWireBuild: identity.wireBuild,
@@ -353,6 +322,23 @@ final class ServerSession: @unchecked Sendable {
             }
             await state.attachDeadline(timer)
         }
+    }
+
+    private func validateRoute(_ frame: SessionFrame, control: Bool) async throws -> Bool {
+        let rejection: String? = if frame.operation.hasPrefix("daemon."), !control {
+            "wire: Swift sessions cannot authorize protected daemonkit operations"
+        } else if control, !frame.tenant.isEmpty {
+            "wire: control operation tenant must be empty"
+        } else if !control, let sessionPolicy, frame.operation != sessionPolicy.operation {
+            "wire: operation does not match service operation"
+        } else if !control, let sessionPolicy, frame.tenant != sessionPolicy.tenant {
+            "wire: tenant does not match service tenant"
+        } else {
+            nil
+        }
+        guard let rejection else { return true }
+        try await sendRejected(id: frame.id, code: .permissionDenied, reason: rejection)
+        return false
     }
 }
 

@@ -321,7 +321,9 @@ struct StaticSessionServiceRuntimeTests {
             #expect(calls.value == 1)
         }
     }
+}
 
+extension StaticSessionServiceRuntimeTests {
     @Test func shutdownCancelsHandlerAndRejectsFurtherAdmission() async throws {
         let directory = try shortSocketDir()
         defer { try? FileManager.default.removeItem(at: directory) }
