@@ -37,7 +37,7 @@ var (
 	fileStoreLedgerKey          = []byte("ledger")
 	fileStoreOutstandingKey     = []byte("outstanding")
 	fileStoreIdentity           = []byte("daemonkit.proc.file-store.v1")
-	fileStoreFingerprint        = []byte("461e806ff27ab0417cdea0e81ea6060b321d1b7653e33baa1831436fea6bf06e")
+	fileStoreFingerprint        = []byte("2114d0e5e58dfd74db3f61a3adea3ae61d7588e63e240e024c99394d9c45f463")
 )
 
 // ErrReceiptBacklog means durable unacknowledged recovery liabilities reached
@@ -212,7 +212,12 @@ func receiptKey(class RecoveryClass, sequence uint64) []byte {
 }
 
 func recordKey(record Record) string {
-	return strconv.Itoa(record.PID) + "\x00" + record.Boot + "\x00" + record.StartTime
+	key := strconv.Itoa(record.PID) + "\x00" + record.Boot + "\x00" + record.StartTime
+	if record.RecoveryClass == RecoveryStopControl {
+		key += "\x00" + record.OperationID + "\x00" + string(record.StopSession[:]) +
+			"\x00" + string(record.PreparationNonce[:])
+	}
+	return key
 }
 
 func fileStoreLedger(tx *bolt.Tx) (ReceiptLedgerID, error) {
@@ -283,8 +288,8 @@ func decodeStored[T any](data []byte, value *T) error {
 
 var recordJSONFields = []string{
 	"recovery_class", "pid", "start_time", "boot", "comm", "executable", "audit_token",
-	"generation", "process_group", "session_id", "role", "runtime_build", "runtime_protocol",
-	"target_process_generation", "intent", "stop_authority_state", "expires_unix_milli",
+	"generation", "process_group", "session_id", "role", "operation_id", "stop_session",
+	"preparation_nonce", "runtime_protocol", "target_process_generation", "stop_authority_state", "expires_unix_milli",
 }
 
 func validateStoredFieldSet(data []byte, value any) error {
@@ -666,17 +671,21 @@ func (s *FileStore) Remove(ctx context.Context, victims []Record) error {
 	})
 }
 
-// ConsumeStopControl atomically marks and returns the one exact unexpired
-// authority for identity, role, and target runtime generation. The process
-// record remains durable until synchronous untracking or recovery reaping.
+// ConsumeStopControl atomically marks and returns one exact unexpired authority.
+// The process record remains durable until synchronous untracking or recovery reaping.
 func (s *FileStore) ConsumeStopControl(
 	ctx context.Context,
 	identity Identity,
-	role, targetProcessGeneration string,
+	role, operationID string,
+	stopSession StopSessionID,
+	preparationNonce StopPreparationNonce,
+	runtimeProtocol int,
+	targetProcessGeneration string,
 	now time.Time,
 ) (Record, bool, error) {
 	if identity.PID <= 0 || identity.StartTime == "" || identity.Boot == "" ||
-		role == "" || targetProcessGeneration == "" {
+		role == "" || operationID == "" || stopSession == (StopSessionID{}) ||
+		preparationNonce == (StopPreparationNonce{}) || runtimeProtocol <= 0 || targetProcessGeneration == "" {
 		return Record{}, false, errors.New("proc: stop authority lookup is incomplete")
 	}
 	db, err := s.open(ctx)
@@ -687,6 +696,7 @@ func (s *FileStore) ConsumeStopControl(
 	authority := Record{
 		RecoveryClass: RecoveryStopControl,
 		PID:           identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
+		OperationID: operationID, StopSession: stopSession, PreparationNonce: preparationNonce,
 	}
 	var consumed Record
 	err = db.Update(func(tx *bolt.Tx) error {
@@ -711,6 +721,9 @@ func (s *FileStore) ConsumeStopControl(
 			stored.StartTime != identity.StartTime || stored.Boot != identity.Boot ||
 			stored.Comm != identity.Comm || stored.Executable != identity.Executable ||
 			stored.AuditToken != identity.AuditToken || stored.Role != role ||
+			stored.OperationID != operationID || stored.StopSession != stopSession ||
+			stored.PreparationNonce != preparationNonce ||
+			stored.RuntimeProtocol != runtimeProtocol ||
 			stored.TargetProcessGeneration != targetProcessGeneration ||
 			stored.StopAuthorityState != StopAuthorityArmed {
 			return nil

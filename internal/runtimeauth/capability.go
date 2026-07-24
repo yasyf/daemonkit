@@ -29,6 +29,19 @@ type PeerFencePermit struct {
 // PeerFence provisionally verifies one exact armed child identity.
 type PeerFence func(context.Context, peeridentity.Identity) (*PeerFencePermit, error)
 
+type stopControlToken struct{}
+
+// StopControlAuthority seals runtime stop preparation inside daemonkit.
+type StopControlAuthority struct{ token *stopControlToken }
+
+// NewStopControlAuthority constructs one module-private stop authority.
+func NewStopControlAuthority() StopControlAuthority {
+	return StopControlAuthority{token: &stopControlToken{}}
+}
+
+// Valid reports whether the authority was constructed by daemonkit.
+func (a StopControlAuthority) Valid() bool { return a.token != nil }
+
 // SessionServer is the internal authenticated transport boundary.
 type SessionServer interface {
 	ServeRuntime(context.Context, net.Listener, any, *worker.RuntimeClaim, Admission, Admission, PeerFence, ServerExit, chan<- error) error

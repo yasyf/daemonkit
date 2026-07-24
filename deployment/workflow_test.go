@@ -26,7 +26,6 @@ import (
 	"github.com/yasyf/daemonkit/bundle"
 	"github.com/yasyf/daemonkit/codeidentity"
 	"github.com/yasyf/daemonkit/service"
-	"github.com/yasyf/daemonkit/wire"
 )
 
 type verifierStub struct{}
@@ -57,7 +56,7 @@ type deploymentServiceStub struct {
 	status       *service.ReplacementStatus
 	completion   *replacementCompletion
 	acknowledged *replacementCompletion
-	stopRuntime  func(context.Context, service.StopControlSpec) (wire.StopResult, error)
+	stopRuntime  func(context.Context, service.StopRuntimeRequest) (service.StopReceipt, error)
 	events       []string
 	close        int
 }
@@ -242,11 +241,14 @@ func (s *deploymentServiceStub) AcknowledgeDeploymentReplacement(_ context.Conte
 	return nil
 }
 
-func (s *deploymentServiceStub) StopRuntime(ctx context.Context, spec service.StopControlSpec) (wire.StopResult, error) {
+func (s *deploymentServiceStub) StopRuntime(
+	ctx context.Context,
+	request service.StopRuntimeRequest,
+) (service.StopReceipt, error) {
 	if s.stopRuntime != nil {
-		return s.stopRuntime(ctx, spec)
+		return s.stopRuntime(ctx, request)
 	}
-	return wire.StopResult{}, nil
+	return service.StopReceipt{}, nil
 }
 
 func (s *deploymentServiceStub) Close(context.Context) error {
@@ -1478,17 +1480,11 @@ func TestRollbackCrashCheckpointsRestoreExactPriorState(t *testing.T) {
 				var priorReceipt []byte
 				var priorCanonical []byte
 				priorPlan, _ := service.NewPlan(nil)
-				var intents []struct {
-					role   ProofRole
-					intent wire.StopIntent
-				}
+				var runtimeRoles []ProofRole
 				recordRuntime := func(
 					_ context.Context, _ RuntimeStopper, operation RuntimeQuiesceOperation,
 				) (RuntimeProof, error) {
-					intents = append(intents, struct {
-						role   ProofRole
-						intent wire.StopIntent
-					}{operation.Role, operation.Intent})
+					runtimeRoles = append(runtimeRoles, operation.Role)
 					return RuntimeProof{Role: operation.Role, Absent: true, Digest: sha256.Sum256([]byte("runtime"))}, nil
 				}
 				cfg.RuntimeQuiesce = recordRuntime
@@ -1507,7 +1503,7 @@ func TestRollbackCrashCheckpointsRestoreExactPriorState(t *testing.T) {
 						priorPlan = inactive.receipt.plan
 						expectedState = RecoveryInactive
 					}
-					intents = nil
+					runtimeRoles = nil
 					paths := deploymentPathsFor(*cfg)
 					priorReceipt, err = os.ReadFile(paths.receipt)
 					if err != nil {
@@ -1587,7 +1583,7 @@ func TestRollbackCrashCheckpointsRestoreExactPriorState(t *testing.T) {
 				if err != nil || !samePlan(snapshot, priorPlan) {
 					t.Fatalf("service snapshot = %#v, %v", snapshot, err)
 				}
-				assertRollbackIntents(t, scenario, intents)
+				assertRollbackRuntimeRoles(t, scenario, runtimeRoles)
 				cfg.Readiness = baseReadiness
 				controller = newController(client)
 				if active, err := controller.Deploy(t.Context(), *cfg); err != nil || active.state != DeploymentActive {
@@ -1599,23 +1595,16 @@ func TestRollbackCrashCheckpointsRestoreExactPriorState(t *testing.T) {
 	}
 }
 
-func assertRollbackIntents(t *testing.T, scenario string, got []struct {
-	role   ProofRole
-	intent wire.StopIntent
-},
-) {
+func assertRollbackRuntimeRoles(t *testing.T, scenario string, got []ProofRole) {
 	t.Helper()
-	want := map[string][]struct {
-		role   ProofRole
-		intent wire.StopIntent
-	}{
-		"fresh":       {{ProofRollbackRuntime, wire.StopIntentUninstall}},
-		"replace":     {{ProofPriorRuntime, wire.StopIntentUpgrade}, {ProofRollbackRuntime, wire.StopIntentUninstall}},
-		"reconfigure": {{ProofPriorRuntime, wire.StopIntentRestart}, {ProofRollbackRuntime, wire.StopIntentRestart}},
-		"reactivate":  {{ProofRollbackRuntime, wire.StopIntentUninstall}},
+	want := map[string][]ProofRole{
+		"fresh":       {ProofRollbackRuntime},
+		"replace":     {ProofPriorRuntime, ProofRollbackRuntime},
+		"reconfigure": {ProofPriorRuntime, ProofRollbackRuntime},
+		"reactivate":  {ProofRollbackRuntime},
 	}[scenario]
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("runtime quiesce intents = %#v, want %#v", got, want)
+		t.Fatalf("runtime quiesce roles = %#v, want %#v", got, want)
 	}
 }
 
@@ -1636,33 +1625,36 @@ func assertDeploymentResidueClean(t *testing.T, paths deploymentPaths) {
 	}
 }
 
-func TestRuntimeStopAccessIsIntentBoundRevocableAndCancelOwning(t *testing.T) {
+func TestRuntimeStopAccessIsRequestBoundRevocableAndCancelOwning(t *testing.T) {
 	services := newDeploymentServiceStub(t)
 	access := serviceAccess{open: func(context.Context, service.ControllerConfig) (deploymentController, error) {
 		return services, nil
 	}}
 	var calls atomic.Int64
-	services.stopRuntime = func(context.Context, service.StopControlSpec) (wire.StopResult, error) {
+	services.stopRuntime = func(context.Context, service.StopRuntimeRequest) (service.StopReceipt, error) {
 		calls.Add(1)
-		return wire.StopResult{}, nil
+		return service.StopReceipt{}, nil
 	}
-	stopper := newRuntimeStopAccess(t.Context(), access, wire.StopIntentUpgrade)
-	if _, err := stopper.StopRuntime(t.Context(), service.StopControlSpec{Intent: wire.StopIntentRestart}); err == nil {
-		t.Fatal("StopRuntime accepted mismatched callback intent")
+	stopper := newRuntimeStopAccess(t.Context(), access, "stop-operation", "runtime-v1")
+	request := service.StopRuntimeRequest{OperationID: "stop-operation", ExpectedRuntimeBuild: "runtime-v1"}
+	mismatch := request
+	mismatch.OperationID = "other-operation"
+	if _, err := stopper.StopRuntime(t.Context(), mismatch); err == nil {
+		t.Fatal("StopRuntime accepted a request outside the callback scope")
 	}
 	if calls.Load() != 0 {
-		t.Fatal("mismatched intent reached service controller")
+		t.Fatal("mismatched request reached service controller")
 	}
 
 	entered := make(chan struct{})
-	services.stopRuntime = func(ctx context.Context, _ service.StopControlSpec) (wire.StopResult, error) {
+	services.stopRuntime = func(ctx context.Context, _ service.StopRuntimeRequest) (service.StopReceipt, error) {
 		close(entered)
 		<-ctx.Done()
-		return wire.StopResult{}, ctx.Err()
+		return service.StopReceipt{}, ctx.Err()
 	}
 	callDone := make(chan error, 1)
 	go func() {
-		_, err := stopper.StopRuntime(context.Background(), service.StopControlSpec{Intent: wire.StopIntentUpgrade})
+		_, err := stopper.StopRuntime(context.Background(), request)
 		callDone <- err
 	}()
 	<-entered
@@ -1679,7 +1671,7 @@ func TestRuntimeStopAccessIsIntentBoundRevocableAndCancelOwning(t *testing.T) {
 	if err := <-callDone; !errors.Is(err, context.Canceled) {
 		t.Fatalf("in-flight StopRuntime error = %v, want context canceled", err)
 	}
-	if _, err := stopper.StopRuntime(context.Background(), service.StopControlSpec{Intent: wire.StopIntentUpgrade}); !errors.Is(err, errRuntimeStopperExpired) {
+	if _, err := stopper.StopRuntime(context.Background(), request); !errors.Is(err, errRuntimeStopperExpired) {
 		t.Fatalf("retained StopRuntime error = %v, want expired capability", err)
 	}
 }
@@ -1692,16 +1684,17 @@ func TestRuntimeStopAccessRejectsCanceledCallsBeforeControllerOpen(t *testing.T)
 		opens.Add(1)
 		return services, nil
 	}}
-	services.stopRuntime = func(context.Context, service.StopControlSpec) (wire.StopResult, error) {
+	services.stopRuntime = func(context.Context, service.StopRuntimeRequest) (service.StopReceipt, error) {
 		calls.Add(1)
-		return wire.StopResult{}, nil
+		return service.StopReceipt{}, nil
 	}
-	stopper := newRuntimeStopAccess(t.Context(), access, wire.StopIntentRestart)
+	stopper := newRuntimeStopAccess(t.Context(), access, "stop-operation", "runtime-v1")
 	defer stopper.revoke()
+	request := service.StopRuntimeRequest{OperationID: "stop-operation", ExpectedRuntimeBuild: "runtime-v1"}
 
 	preCanceled, cancelPreCanceled := context.WithCancel(t.Context())
 	cancelPreCanceled()
-	if _, err := stopper.StopRuntime(preCanceled, service.StopControlSpec{Intent: wire.StopIntentRestart}); !errors.Is(err, context.Canceled) {
+	if _, err := stopper.StopRuntime(preCanceled, request); !errors.Is(err, context.Canceled) {
 		t.Fatalf("pre-canceled StopRuntime error = %v, want context canceled", err)
 	}
 	if opens.Load() != 0 || calls.Load() != 0 {
@@ -1710,15 +1703,15 @@ func TestRuntimeStopAccessRejectsCanceledCallsBeforeControllerOpen(t *testing.T)
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	services.stopRuntime = func(context.Context, service.StopControlSpec) (wire.StopResult, error) {
+	services.stopRuntime = func(context.Context, service.StopRuntimeRequest) (service.StopReceipt, error) {
 		calls.Add(1)
 		close(entered)
 		<-release
-		return wire.StopResult{}, nil
+		return service.StopReceipt{}, nil
 	}
 	firstDone := make(chan error, 1)
 	go func() {
-		_, err := stopper.StopRuntime(t.Context(), service.StopControlSpec{Intent: wire.StopIntentRestart})
+		_, err := stopper.StopRuntime(t.Context(), request)
 		firstDone <- err
 	}()
 	<-entered
@@ -1726,7 +1719,7 @@ func TestRuntimeStopAccessRejectsCanceledCallsBeforeControllerOpen(t *testing.T)
 	queuedCtx, cancelQueued := context.WithCancel(t.Context())
 	queuedDone := make(chan error, 1)
 	go func() {
-		_, err := stopper.StopRuntime(queuedCtx, service.StopControlSpec{Intent: wire.StopIntentRestart})
+		_, err := stopper.StopRuntime(queuedCtx, request)
 		queuedDone <- err
 	}()
 	deadline := time.Now().Add(time.Second)
@@ -1784,13 +1777,16 @@ func TestRuntimeQuiesceRevokesRetainedStopperAfterCallbackPanic(t *testing.T) {
 		defer func() { recovered = recover() }()
 		_, _ = controller.runtimeQuiesce(
 			t.Context(), *cfg, serviceAccess{open: controller.openController}, "panic-operation",
-			*receipt.Current, wire.StopIntentRestart, ProofPriorRuntime,
+			*receipt.Current, ProofPriorRuntime,
 		)
 	}()
 	if recovered == nil || retained == nil {
 		t.Fatalf("runtime callback panic/retained stopper = %v/%v", recovered, retained)
 	}
-	if _, err := retained.StopRuntime(t.Context(), service.StopControlSpec{Intent: wire.StopIntentRestart}); !errors.Is(err, errRuntimeStopperExpired) {
+	request := service.StopRuntimeRequest{
+		OperationID: "panic-operation", ExpectedRuntimeBuild: receipt.Current.Version,
+	}
+	if _, err := retained.StopRuntime(t.Context(), request); !errors.Is(err, errRuntimeStopperExpired) {
 		t.Fatalf("retained StopRuntime after panic = %v, want expired capability", err)
 	}
 	if opens.Load() != 0 {
@@ -1802,10 +1798,10 @@ func TestRuntimeStopAccessSerializesControllerOwnership(t *testing.T) {
 	services := newDeploymentServiceStub(t)
 	entered := make(chan struct{}, 2)
 	release := make(chan struct{})
-	services.stopRuntime = func(context.Context, service.StopControlSpec) (wire.StopResult, error) {
+	services.stopRuntime = func(context.Context, service.StopRuntimeRequest) (service.StopReceipt, error) {
 		entered <- struct{}{}
 		<-release
-		return wire.StopResult{}, nil
+		return service.StopReceipt{}, nil
 	}
 	var open atomic.Int64
 	var maximum atomic.Int64
@@ -1819,11 +1815,12 @@ func TestRuntimeStopAccessSerializesControllerOwnership(t *testing.T) {
 		}
 		return closeHookController{deploymentController: services, close: func() { open.Add(-1) }}, nil
 	}}
-	stopper := newRuntimeStopAccess(t.Context(), access, wire.StopIntentRestart)
+	stopper := newRuntimeStopAccess(t.Context(), access, "stop-operation", "runtime-v1")
 	defer stopper.revoke()
+	request := service.StopRuntimeRequest{OperationID: "stop-operation", ExpectedRuntimeBuild: "runtime-v1"}
 	done := make(chan error, 2)
 	call := func() {
-		_, err := stopper.StopRuntime(t.Context(), service.StopControlSpec{Intent: wire.StopIntentRestart})
+		_, err := stopper.StopRuntime(t.Context(), request)
 		done <- err
 	}
 	go call()

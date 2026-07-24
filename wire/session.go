@@ -92,6 +92,9 @@ type session struct {
 	writerStateMu   sync.Mutex
 	writerState     uint32
 	activeWriteDone chan struct{}
+
+	stopMu          sync.Mutex
+	stopPreparation *sessionStopPreparation
 }
 
 type sessionOutbound struct {
@@ -221,6 +224,9 @@ func (s *session) closeOnRequestError() {
 func (s *session) stop() {
 	s.closeOnce.Do(func() {
 		s.cancel()
+		s.stopMu.Lock()
+		s.stopPreparation = nil
+		s.stopMu.Unlock()
 		s.eventCredits.close()
 		s.lifecycleLane.fail(s.ctx.Err())
 		s.mu.Lock()
@@ -546,6 +552,23 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 	}()
 
 	switch entry.route {
+	case routeStopPrepare:
+		if s.wireBuild != s.server.WireBuild {
+			if err := s.sendRejected(sessionCtx, frame.ID, ErrBuildMismatch.Error()); err != nil {
+				s.closeOnRequestError()
+			}
+			return
+		}
+		if err := s.server.authorizeStopPreparation(s.role, frame.Payload); err != nil {
+			code := ResponseCode("")
+			if errors.Is(err, ErrPermissionDenied) {
+				code = ResponseCodePermissionDenied
+			}
+			if err := s.sendRejectedCode(sessionCtx, frame.ID, code, err.Error()); err != nil {
+				s.closeOnRequestError()
+			}
+			return
+		}
 	case routeStop:
 		if s.wireBuild != s.server.WireBuild {
 			if err := s.sendRejected(sessionCtx, frame.ID, ErrBuildMismatch.Error()); err != nil {
@@ -554,7 +577,7 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 			return
 		}
 		var err error
-		requestCtx, err = s.server.authorizeStopControl(requestCtx, s.peer, s.role, frame.Payload)
+		requestCtx, err = s.server.authorizeStopControl(requestCtx, s, s.peer, s.role, frame.Payload)
 		if err != nil {
 			code := ResponseCode("")
 			if errors.Is(err, ErrPermissionDenied) {
@@ -602,7 +625,7 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 	}
 	admit := s.admit
 	var releaseObservation func()
-	if entry.route == routeStop || entry.route == routeLifecycle {
+	if entry.route == routeStopPrepare || entry.route == routeStop || entry.route == routeLifecycle {
 		admit = s.admitProtected
 	}
 	if entry.route == routeObservation {

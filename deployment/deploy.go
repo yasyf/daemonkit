@@ -17,7 +17,6 @@ import (
 	"github.com/yasyf/daemonkit/codeidentity"
 	"github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/service"
-	"github.com/yasyf/daemonkit/wire"
 )
 
 const (
@@ -40,7 +39,7 @@ var ErrAmbiguousState = errors.New("deployment: ambiguous deployment state")
 // RuntimeStopper is the narrow controller authority available to the product's
 // exact-runtime quiesce hook.
 type RuntimeStopper interface {
-	StopRuntime(context.Context, service.StopControlSpec) (wire.StopResult, error)
+	StopRuntime(context.Context, service.StopRuntimeRequest) (service.StopReceipt, error)
 }
 
 // RuntimeProof records product evidence for one exact runtime settlement.
@@ -93,12 +92,10 @@ type Operation struct {
 	PlanDigest SHA256
 }
 
-// RuntimeQuiesceOperation binds a runtime stop callback to one exact
-// deployment generation and daemonkit-owned stop intent.
+// RuntimeQuiesceOperation binds a runtime stop callback to one exact deployment generation.
 type RuntimeQuiesceOperation struct {
 	ID         string
 	Generation CanonicalGeneration
-	Intent     wire.StopIntent
 	Role       ProofRole
 }
 

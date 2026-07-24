@@ -302,13 +302,18 @@ func stopControlStoreRecord(pid int, expires time.Time) (Identity, Record) {
 		state = StopAuthorityPending
 		expiresUnixMilli = 0
 	}
+	var stopSession StopSessionID
+	stopSession[0] = 1
+	var preparationNonce StopPreparationNonce
+	preparationNonce[0] = 2
 	return identity, Record{
 		RecoveryClass: RecoveryStopControl,
 		PID:           identity.PID, StartTime: identity.StartTime, Boot: identity.Boot, Comm: identity.Comm,
 		Executable: identity.Executable, AuditToken: identity.AuditToken,
-		Generation: "controller-generation", Role: "com.example.stop", RuntimeBuild: "v2.0.0", RuntimeProtocol: 1,
-		TargetProcessGeneration: "runtime-generation", Intent: "upgrade",
-		StopAuthorityState: state, ExpiresUnixMilli: expiresUnixMilli,
+		Generation: "controller-generation", Role: "com.example.stop", OperationID: "stop-operation",
+		StopSession: stopSession, PreparationNonce: preparationNonce, RuntimeProtocol: 1,
+		TargetProcessGeneration: "runtime-generation",
+		StopAuthorityState:      state, ExpiresUnixMilli: expiresUnixMilli,
 	}
 }
 
@@ -340,7 +345,8 @@ func TestFileStoreStopControlArmCommitReserve(t *testing.T) {
 				t.Fatal(err)
 			}
 			if got, ok, err := store.ConsumeStopControl(
-				t.Context(), identity, pending.Role, pending.TargetProcessGeneration, stamp,
+				t.Context(), identity, pending.Role, pending.OperationID, pending.StopSession,
+				pending.PreparationNonce, pending.RuntimeProtocol, pending.TargetProcessGeneration, stamp,
 			); err != nil || ok || got != (Record{}) {
 				t.Fatalf("pending consume = %+v, %v, %v; want zero, false, nil", got, ok, err)
 			}
@@ -394,7 +400,8 @@ func TestFileStoreStopControlArmCommitReserve(t *testing.T) {
 				t.Fatalf("state = %q, want revoked", revoked.StopAuthorityState)
 			}
 			if consumed, ok, err := store.ConsumeStopControl(
-				t.Context(), identity, pending.Role, pending.TargetProcessGeneration, releaseNow,
+				t.Context(), identity, pending.Role, pending.OperationID, pending.StopSession,
+				pending.PreparationNonce, pending.RuntimeProtocol, pending.TargetProcessGeneration, releaseNow,
 			); err != nil || ok || consumed != (Record{}) {
 				t.Fatalf("revoked consume = %+v, %v, %v; want zero, false, nil", consumed, ok, err)
 			}
@@ -419,7 +426,8 @@ func TestFileStoreStopControlConsumesExactlyOnceConcurrently(t *testing.T) {
 		go func() {
 			<-start
 			got, ok, err := store.ConsumeStopControl(
-				context.Background(), identity, record.Role, record.TargetProcessGeneration, time.Now(),
+				context.Background(), identity, record.Role, record.OperationID, record.StopSession,
+				record.PreparationNonce, record.RuntimeProtocol, record.TargetProcessGeneration, time.Now(),
 			)
 			results <- outcome{record: got, ok: ok, err: err}
 		}()
@@ -442,7 +450,8 @@ func TestFileStoreStopControlConsumesExactlyOnceConcurrently(t *testing.T) {
 		t.Fatalf("successful consumes = %d, want 1", consumed)
 	}
 	if _, ok, err := store.ConsumeStopControl(
-		t.Context(), identity, record.Role, record.TargetProcessGeneration, time.Now(),
+		t.Context(), identity, record.Role, record.OperationID, record.StopSession,
+		record.PreparationNonce, record.RuntimeProtocol, record.TargetProcessGeneration, time.Now(),
 	); err != nil || ok {
 		t.Fatalf("replay = ok %v err %v, want false nil", ok, err)
 	}
@@ -470,20 +479,21 @@ func TestFileStoreConsumedStopControlCannotBeRetracked(t *testing.T) {
 	reaper := &Reaper{Store: store, Generation: "controller-generation"}
 	identity, _ := stopControlStoreRecord(148, time.Time{})
 	record, err := reaper.TrackStopControl(
-		t.Context(), identity, "com.example.stop", "v2.0.0", 1,
-		"runtime-generation", "upgrade", time.Minute,
+		t.Context(), identity, "com.example.stop", "stop-operation", StopSessionID{1},
+		StopPreparationNonce{2}, 1, "runtime-generation", time.Minute,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, ok, err := store.ConsumeStopControl(
-		t.Context(), identity, record.Role, record.TargetProcessGeneration, time.Now(),
+		t.Context(), identity, record.Role, record.OperationID, record.StopSession,
+		record.PreparationNonce, record.RuntimeProtocol, record.TargetProcessGeneration, time.Now(),
 	); err != nil || !ok {
 		t.Fatalf("consume = %v, %v; want true, nil", ok, err)
 	}
 	if _, err := reaper.TrackStopControl(
-		t.Context(), identity, "com.example.stop", "v2.0.0", 1,
-		"runtime-generation", "upgrade", time.Minute,
+		t.Context(), identity, "com.example.stop", "stop-operation", StopSessionID{1},
+		StopPreparationNonce{2}, 1, "runtime-generation", time.Minute,
 	); err == nil || !strings.Contains(err.Error(), "already consumed") {
 		t.Fatalf("retrack error = %v, want already consumed", err)
 	}
@@ -563,13 +573,15 @@ func TestFileStoreStopControlValidatesStoredRecordBeforeConsume(t *testing.T) {
 	malformed.StopAuthorityState = StopAuthorityState("unknown")
 	writeRecord(malformed)
 	if got, ok, err := store.ConsumeStopControl(
-		t.Context(), identity, record.Role, record.TargetProcessGeneration, time.Now(),
+		t.Context(), identity, record.Role, record.OperationID, record.StopSession,
+		record.PreparationNonce, record.RuntimeProtocol, record.TargetProcessGeneration, time.Now(),
 	); !errors.Is(err, ErrInvalidRecord) || ok || got != (Record{}) {
 		t.Fatalf("malformed consume = %+v, %v, %v; want invalid record", got, ok, err)
 	}
 	writeRecord(record)
 	if got, ok, err := store.ConsumeStopControl(
-		t.Context(), identity, record.Role, record.TargetProcessGeneration, time.Now(),
+		t.Context(), identity, record.Role, record.OperationID, record.StopSession,
+		record.PreparationNonce, record.RuntimeProtocol, record.TargetProcessGeneration, time.Now(),
 	); err != nil || !ok || got != record {
 		t.Fatalf("repaired consume = %+v, %v, %v; want record, true, nil", got, ok, err)
 	}
@@ -583,13 +595,15 @@ func TestFileStoreStopControlConsumedMarkerSurvivesReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got, ok, err := store.ConsumeStopControl(
-		t.Context(), identity, record.Role, record.TargetProcessGeneration, time.Now(),
+		t.Context(), identity, record.Role, record.OperationID, record.StopSession,
+		record.PreparationNonce, record.RuntimeProtocol, record.TargetProcessGeneration, time.Now(),
 	); err != nil || !ok || got != record {
 		t.Fatalf("initial consume = %+v, %v, %v", got, ok, err)
 	}
 	reopened := &FileStore{Path: path}
 	if got, ok, err := reopened.ConsumeStopControl(
-		t.Context(), identity, record.Role, record.TargetProcessGeneration, time.Now(),
+		t.Context(), identity, record.Role, record.OperationID, record.StopSession,
+		record.PreparationNonce, record.RuntimeProtocol, record.TargetProcessGeneration, time.Now(),
 	); err != nil || ok || got != (Record{}) {
 		t.Fatalf("reopen replay = %+v, %v, %v; want zero, false, nil", got, ok, err)
 	}
@@ -622,30 +636,40 @@ func TestFileStoreStopControlRejectsNearMatchesWithoutConsuming(t *testing.T) {
 	wrongAudit := identity
 	wrongAudit.AuditToken = auditTokenForPID(identity.PID, 18)
 	for _, test := range []struct {
-		name     string
-		identity Identity
-		role     string
-		target   string
+		name             string
+		identity         Identity
+		role             string
+		operationID      string
+		stopSession      StopSessionID
+		preparationNonce StopPreparationNonce
+		protocol         int
+		target           string
 	}{
-		{name: "pid", identity: wrongPID, role: record.Role, target: record.TargetProcessGeneration},
-		{name: "start", identity: wrongStart, role: record.Role, target: record.TargetProcessGeneration},
-		{name: "boot", identity: wrongBoot, role: record.Role, target: record.TargetProcessGeneration},
-		{name: "comm", identity: wrongComm, role: record.Role, target: record.TargetProcessGeneration},
-		{name: "executable", identity: wrongExecutable, role: record.Role, target: record.TargetProcessGeneration},
-		{name: "audit", identity: wrongAudit, role: record.Role, target: record.TargetProcessGeneration},
-		{name: "role", identity: identity, role: "com.example.other", target: record.TargetProcessGeneration},
-		{name: "target", identity: identity, role: record.Role, target: "other-runtime"},
+		{name: "pid", identity: wrongPID, role: record.Role, operationID: record.OperationID, stopSession: record.StopSession, preparationNonce: record.PreparationNonce, protocol: record.RuntimeProtocol, target: record.TargetProcessGeneration},
+		{name: "start", identity: wrongStart, role: record.Role, operationID: record.OperationID, stopSession: record.StopSession, preparationNonce: record.PreparationNonce, protocol: record.RuntimeProtocol, target: record.TargetProcessGeneration},
+		{name: "boot", identity: wrongBoot, role: record.Role, operationID: record.OperationID, stopSession: record.StopSession, preparationNonce: record.PreparationNonce, protocol: record.RuntimeProtocol, target: record.TargetProcessGeneration},
+		{name: "comm", identity: wrongComm, role: record.Role, operationID: record.OperationID, stopSession: record.StopSession, preparationNonce: record.PreparationNonce, protocol: record.RuntimeProtocol, target: record.TargetProcessGeneration},
+		{name: "executable", identity: wrongExecutable, role: record.Role, operationID: record.OperationID, stopSession: record.StopSession, preparationNonce: record.PreparationNonce, protocol: record.RuntimeProtocol, target: record.TargetProcessGeneration},
+		{name: "audit", identity: wrongAudit, role: record.Role, operationID: record.OperationID, stopSession: record.StopSession, preparationNonce: record.PreparationNonce, protocol: record.RuntimeProtocol, target: record.TargetProcessGeneration},
+		{name: "role", identity: identity, role: "com.example.other", operationID: record.OperationID, stopSession: record.StopSession, preparationNonce: record.PreparationNonce, protocol: record.RuntimeProtocol, target: record.TargetProcessGeneration},
+		{name: "operation", identity: identity, role: record.Role, operationID: "other-operation", stopSession: record.StopSession, preparationNonce: record.PreparationNonce, protocol: record.RuntimeProtocol, target: record.TargetProcessGeneration},
+		{name: "session", identity: identity, role: record.Role, operationID: record.OperationID, stopSession: StopSessionID{9}, preparationNonce: record.PreparationNonce, protocol: record.RuntimeProtocol, target: record.TargetProcessGeneration},
+		{name: "nonce", identity: identity, role: record.Role, operationID: record.OperationID, stopSession: record.StopSession, preparationNonce: StopPreparationNonce{9}, protocol: record.RuntimeProtocol, target: record.TargetProcessGeneration},
+		{name: "protocol", identity: identity, role: record.Role, operationID: record.OperationID, stopSession: record.StopSession, preparationNonce: record.PreparationNonce, protocol: 2, target: record.TargetProcessGeneration},
+		{name: "target", identity: identity, role: record.Role, operationID: record.OperationID, stopSession: record.StopSession, preparationNonce: record.PreparationNonce, protocol: record.RuntimeProtocol, target: "other-runtime"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got, ok, err := store.ConsumeStopControl(
-				t.Context(), test.identity, test.role, test.target, time.Now(),
+				t.Context(), test.identity, test.role, test.operationID, test.stopSession,
+				test.preparationNonce, test.protocol, test.target, time.Now(),
 			); err != nil || ok || got != (Record{}) {
 				t.Fatalf("near match = %+v, %v, %v; want zero, false, nil", got, ok, err)
 			}
 		})
 	}
 	got, ok, err := store.ConsumeStopControl(
-		t.Context(), identity, record.Role, record.TargetProcessGeneration, time.Now(),
+		t.Context(), identity, record.Role, record.OperationID, record.StopSession,
+		record.PreparationNonce, record.RuntimeProtocol, record.TargetProcessGeneration, time.Now(),
 	)
 	if err != nil || !ok || got != record {
 		t.Fatalf("exact consume = %+v, %v, %v; want record, true, nil", got, ok, err)
@@ -660,7 +684,8 @@ func TestFileStoreConsumedStopControlRecoversThroughReceiptAcknowledgement(t *te
 		t.Fatal(err)
 	}
 	if _, ok, err := store.ConsumeStopControl(
-		t.Context(), identity, record.Role, record.TargetProcessGeneration, time.Now(),
+		t.Context(), identity, record.Role, record.OperationID, record.StopSession,
+		record.PreparationNonce, record.RuntimeProtocol, record.TargetProcessGeneration, time.Now(),
 	); err != nil || !ok {
 		t.Fatalf("consume = %v, %v", ok, err)
 	}
@@ -704,7 +729,8 @@ func TestFileStoreStopControlExpiryIsExactAndRetainedForRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got, ok, err := store.ConsumeStopControl(
-		t.Context(), identity, record.Role, record.TargetProcessGeneration, expires,
+		t.Context(), identity, record.Role, record.OperationID, record.StopSession,
+		record.PreparationNonce, record.RuntimeProtocol, record.TargetProcessGeneration, expires,
 	); err != nil || ok || got != (Record{}) {
 		t.Fatalf("consume at expiry = %+v, %v, %v; want zero, false, nil", got, ok, err)
 	}

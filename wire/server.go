@@ -56,6 +56,7 @@ const (
 )
 
 var reservedOps = map[Op]struct{}{
+	stopControlPrepareOp:        {},
 	stopControlOp:               {},
 	runtimeReadinessSubscribeOp: {},
 	runtimeReceiptOp:            {},
@@ -74,6 +75,7 @@ const (
 	routeBusiness routeClass = iota
 	routeObservation
 	routeLifecycle
+	routeStopPrepare
 	routeStop
 )
 

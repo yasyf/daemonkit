@@ -30,6 +30,8 @@ var (
 	controllerDesiredBucket        = []byte("desired")
 	controllerAppliedBucket        = []byte("applied")
 	controllerReplacementBucket    = []byte("replacement")
+	controllerStopIntentBucket     = []byte("stop-runtime-intents")
+	controllerStopReceiptBucket    = []byte("stop-runtime-receipts")
 	controllerReplacementKey       = []byte("fence")
 	controllerReplacementCommitKey = []byte("commit")
 	controllerReplacementAckKey    = []byte("acknowledged")
@@ -37,7 +39,11 @@ var (
 	controllerSchemaKey            = []byte("schema")
 	controllerFingerprintKey       = []byte("fingerprint")
 	controllerIdentity             = []byte("daemonkit.service.controller-store.v1")
-	controllerFingerprint          = []byte("41187f10b4271970a39b5f7beef1972e1c3b802e93eb46f219171fb0b12034cc")
+	controllerFingerprint          = []byte("2f828880de0cd3fb5f645bc6c859064fddf5a401fe088c782c22577c59e14be0")
+	stopRuntimeIntentIdentity      = "daemonkit.service.stop-runtime-intent.v1"
+	stopRuntimeIntentFingerprint   = "ba0705f6c3151c87950d0efd99ac7dac3c956e3cc311ef93677490bc743506da"
+	stopRuntimeReceiptIdentity     = "daemonkit.service.stop-runtime-receipt.v1"
+	stopRuntimeReceiptFingerprint  = "3078d47fc6fb6356a5a351cb83c63d0748c8cbfe2aa179f636dc73f01228a210"
 	replacementIdentity            = "daemonkit.service.replacement-fence.v1"
 	replacementFingerprint         = "d2ad7d3d5fb6b835099c6301c285791b1cd026f859387e0c7e9bdcac23b0285e"
 	replacementCommitIdentity      = "daemonkit.service.replacement-commit.v1"
@@ -132,6 +138,7 @@ func initializeControllerState(tx *bolt.Tx) error {
 	expected := map[string]bool{
 		string(controllerMetaBucket): true, string(controllerDesiredBucket): true,
 		string(controllerAppliedBucket): true, string(controllerReplacementBucket): true,
+		string(controllerStopIntentBucket): true, string(controllerStopReceiptBucket): true,
 	}
 	present := make(map[string]bool, len(expected))
 	if err := tx.ForEach(func(name []byte, _ *bolt.Bucket) error {
@@ -159,6 +166,7 @@ func initializeControllerState(tx *bolt.Tx) error {
 		}
 		for _, name := range [][]byte{
 			controllerDesiredBucket, controllerAppliedBucket, controllerReplacementBucket,
+			controllerStopIntentBucket, controllerStopReceiptBucket,
 		} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return fmt.Errorf("service: create controller bucket %q: %w", name, err)

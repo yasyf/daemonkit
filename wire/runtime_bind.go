@@ -2,18 +2,26 @@ package wire
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/trust"
-	"github.com/yasyf/daemonkit/version"
 )
 
-type stopAuthorityContextKey struct{}
+type sessionStopPreparation struct {
+	role             trust.PeerRole
+	stopSession      proc.StopSessionID
+	preparationNonce proc.StopPreparationNonce
+	target           proc.Identity
+	runtime          RuntimeIdentity
+	protocol         int
+}
 
 type runtimeControl interface {
 	Health(context.Context) (daemon.Health, error)
@@ -61,6 +69,57 @@ func (s *Server) bindRuntime(
 	if !ok || lifecycle == nil {
 		return errors.New("wire: runtime lifecycle is required")
 	}
+	prepareStopHandler := func(ctx context.Context, req Request) (any, error) {
+		var message stopControlPrepareRequest
+		if err := decodeStrict(req.Payload, &message); err != nil {
+			return nil, fmt.Errorf("wire: decode stop preparation: %w", err)
+		}
+		if message.Version != 1 || message.ControlRole == "" {
+			return nil, errors.New("wire: invalid stop preparation request")
+		}
+		health, err := control.Health(ctx)
+		if err != nil {
+			return nil, err
+		}
+		target, err := currentStopControlIdentity()
+		if err != nil {
+			return nil, fmt.Errorf("wire: capture prepared stop target: %w", err)
+		}
+		if target.PID != health.PID || health.RuntimeBuild != build ||
+			health.ProcessGeneration != s.stopTargetProcessGeneration || health.RuntimeProtocol <= 0 {
+			return nil, errors.New("wire: runtime identity changed during stop preparation")
+		}
+		if req.Session == nil || req.Session.s == nil {
+			return nil, errors.New("wire: stop preparation session is required")
+		}
+		var stopSession proc.StopSessionID
+		if len(req.Session.s.generation) != len(stopSession) {
+			return nil, errors.New("wire: stop preparation session identity is invalid")
+		}
+		copy(stopSession[:], req.Session.s.generation)
+		var nonce proc.StopPreparationNonce
+		for nonce == (proc.StopPreparationNonce{}) {
+			if _, err := rand.Read(nonce[:]); err != nil {
+				return nil, fmt.Errorf("wire: generate stop preparation nonce: %w", err)
+			}
+		}
+		runtimeIdentity := RuntimeIdentity{
+			RuntimeBuild: health.RuntimeBuild, ProcessGeneration: health.ProcessGeneration,
+		}
+		preparation := sessionStopPreparation{
+			role: message.ControlRole, stopSession: stopSession, preparationNonce: nonce,
+			target: target, runtime: runtimeIdentity, protocol: health.RuntimeProtocol,
+		}
+		if err := req.Session.s.installStopPreparation(preparation); err != nil {
+			return nil, err
+		}
+		return stopControlPrepareResponse{
+			Version: 1, StopSession: stopSession[:], PreparationNonce: nonce[:],
+			Target:          newStopControlTarget(target, health.ProcessGeneration),
+			RuntimeIdentity: runtimeIdentity,
+			RuntimeProtocol: health.RuntimeProtocol,
+		}, nil
+	}
 	stopHandler := func(ctx context.Context, req Request) (any, error) {
 		var message stopControlRequest
 		if err := decodeStrict(req.Payload, &message); err != nil {
@@ -70,33 +129,56 @@ func (s *Server) bindRuntime(
 		if err != nil {
 			return nil, err
 		}
-		authority, ok := ctx.Value(stopAuthorityContextKey{}).(proc.Record)
-		if !ok {
-			return nil, errors.New("wire: stop control authority is absent")
+		expectedTarget, err := message.Target.identity()
+		if err != nil {
+			return nil, fmt.Errorf("wire: decode expected stop target: %w", err)
 		}
-		if authority.TargetProcessGeneration != s.stopTargetProcessGeneration {
-			return nil, errors.New("wire: stop control targets another runtime generation")
+		expectedRuntime := RuntimeIdentity{
+			RuntimeBuild: health.RuntimeBuild, ProcessGeneration: health.ProcessGeneration,
 		}
-		if authority.RuntimeProtocol != health.RuntimeProtocol {
-			return nil, fmt.Errorf("wire: stop control runtime protocol got %d, want %d", authority.RuntimeProtocol, health.RuntimeProtocol)
+		if message.RuntimeIdentity != expectedRuntime || message.RuntimeProtocol != health.RuntimeProtocol {
+			return nil, errors.New("wire: prepared runtime identity changed before shutdown")
 		}
 		target, err := currentStopControlIdentity()
 		if err != nil {
 			return nil, fmt.Errorf("wire: capture stop target: %w", err)
 		}
-		if target.PID != health.PID {
-			return nil, errors.New("wire: stop target differs from runtime health")
+		if target.PID != health.PID || target != expectedTarget {
+			return nil, errors.New("wire: prepared stop target changed before shutdown")
 		}
 		generation := health.ProcessGeneration
-		if generation == "" || generation != authority.TargetProcessGeneration || generation != s.stopTargetProcessGeneration {
+		if generation == "" || generation != s.stopTargetProcessGeneration {
 			return nil, errors.New("wire: stop target generation changed before shutdown")
+		}
+		if req.Session == nil || req.Session.s == nil {
+			return nil, errors.New("wire: stop control session is required")
+		}
+		var authority proc.Record
+		err = req.Session.s.consumeStopPreparation(message, func(preparation sessionStopPreparation) error {
+			var consumed bool
+			authority, consumed, err = s.stopControlStore.ConsumeStopControl(
+				ctx, req.Peer.ProcessIdentity(), string(req.Session.s.role), message.OperationID,
+				preparation.stopSession, preparation.preparationNonce,
+				message.RuntimeProtocol,
+				s.stopTargetProcessGeneration, time.Now(),
+			)
+			if err != nil {
+				return fmt.Errorf("wire: consume stop control record: %w", err)
+			}
+			if !consumed {
+				return errors.New("wire: no exact unexpired stop control authority")
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		if authority.TargetProcessGeneration != generation || authority.RuntimeProtocol != health.RuntimeProtocol {
+			return nil, errors.New("wire: stop control verifier returned another runtime identity")
 		}
 		response := stopControlResponse{
 			Version: 1, Target: newStopControlTarget(target, generation),
 			RuntimeBuild: health.RuntimeBuild, RuntimeProtocol: health.RuntimeProtocol,
-		}
-		if authority.Intent == string(StopIntentUpgrade) && !version.Newer(authority.RuntimeBuild, health.RuntimeBuild) {
-			return response, nil
 		}
 		if err := control.Shutdown(ctx); err != nil {
 			return nil, err
@@ -119,6 +201,9 @@ func (s *Server) bindRuntime(
 	if _, exists := s.handlers[stopControlOp]; exists {
 		return fmt.Errorf("wire: stop control op %q is already registered", stopControlOp)
 	}
+	if _, exists := s.handlers[stopControlPrepareOp]; exists {
+		return fmt.Errorf("wire: stop preparation op %q is already registered", stopControlPrepareOp)
+	}
 	if _, exists := s.handlers[runtimeReadinessSubscribeOp]; exists {
 		return fmt.Errorf("wire: runtime readiness op %q is already registered", runtimeReadinessSubscribeOp)
 	}
@@ -130,6 +215,7 @@ func (s *Server) bindRuntime(
 			return fmt.Errorf("wire: observation op %q is already registered", op)
 		}
 	}
+	s.handlers[stopControlPrepareOp] = entry{class: classControl, route: routeStopPrepare, h: prepareStopHandler}
 	s.handlers[stopControlOp] = entry{class: classControl, route: routeStop, h: stopHandler}
 	s.handlers[runtimeReadinessSubscribeOp] = entry{
 		class: classControl, route: routeLifecycle,
@@ -183,30 +269,109 @@ func (s *Server) bindRuntime(
 	return nil
 }
 
-func (s *Server) authorizeStopControl(ctx context.Context, peer Peer, role trust.PeerRole, payload []byte) (context.Context, error) {
+func (s *Server) authorizeStopPreparation(role trust.PeerRole, payload []byte) error {
+	var message stopControlPrepareRequest
+	if err := decodeStrict(payload, &message); err != nil {
+		return fmt.Errorf("wire: decode stop preparation authorization: %w", err)
+	}
+	if message.Version != 1 || message.ControlRole == "" {
+		return errors.New("wire: invalid stop preparation request")
+	}
+	if role != message.ControlRole || !s.trustPolicy.AllowsStop(role) {
+		return ErrPermissionDenied
+	}
+	return nil
+}
+
+func (s *Server) authorizeStopControl(
+	ctx context.Context,
+	session *session,
+	peer Peer,
+	role trust.PeerRole,
+	payload []byte,
+) (context.Context, error) {
 	var message stopControlRequest
 	if err := decodeStrict(payload, &message); err != nil {
 		return ctx, fmt.Errorf("wire: decode stop control authorization: %w", err)
 	}
-	if message.Version != 1 {
+	if message.Version != 1 || message.OperationID == "" || strings.TrimSpace(message.OperationID) != message.OperationID ||
+		len(message.OperationID) > 256 || message.RuntimeIdentity.RuntimeBuild == "" ||
+		message.RuntimeIdentity.ProcessGeneration == "" || message.RuntimeProtocol <= 0 {
 		return ctx, errors.New("wire: invalid stop control request")
+	}
+	if _, err := message.Target.identity(); err != nil {
+		return ctx, fmt.Errorf("wire: invalid stop control target: %w", err)
 	}
 	if !s.trustPolicy.AllowsStop(role) {
 		return ctx, ErrPermissionDenied
 	}
-	authority, consumed, err := s.stopControlStore.ConsumeStopControl(
-		ctx, peer.ProcessIdentity(), string(role), s.stopTargetProcessGeneration, time.Now(),
-	)
+	if session == nil || session.peer.ProcessIdentity() != peer.ProcessIdentity() || session.role != role {
+		return ctx, ErrPermissionDenied
+	}
+	if err := session.validateStopPreparation(message); err != nil {
+		return ctx, err
+	}
+	return ctx, nil
+}
+
+func (s *session) installStopPreparation(preparation sessionStopPreparation) error {
+	s.stopMu.Lock()
+	defer s.stopMu.Unlock()
+	if err := s.ctx.Err(); err != nil {
+		return err
+	}
+	if s.stopPreparation != nil {
+		return errors.New("wire: stop preparation is already active on this session")
+	}
+	s.stopPreparation = &preparation
+	return nil
+}
+
+func (s *session) validateStopPreparation(message stopControlRequest) error {
+	s.stopMu.Lock()
+	defer s.stopMu.Unlock()
+	_, err := s.matchStopPreparation(message)
+	return err
+}
+
+func (s *session) consumeStopPreparation(
+	message stopControlRequest,
+	consume func(sessionStopPreparation) error,
+) error {
+	s.stopMu.Lock()
+	defer s.stopMu.Unlock()
+	preparation, err := s.matchStopPreparation(message)
 	if err != nil {
-		return ctx, fmt.Errorf("wire: consume stop control record: %w", err)
+		return err
 	}
-	if !consumed {
-		return ctx, errors.New("wire: no exact unexpired stop control authority")
+	if err := consume(preparation); err != nil {
+		return err
 	}
-	if authority.TargetProcessGeneration != s.stopTargetProcessGeneration {
-		return ctx, errors.New("wire: stop control verifier returned another runtime generation")
+	s.stopPreparation = nil
+	return nil
+}
+
+func (s *session) matchStopPreparation(message stopControlRequest) (sessionStopPreparation, error) {
+	if err := s.ctx.Err(); err != nil {
+		return sessionStopPreparation{}, err
 	}
-	return context.WithValue(ctx, stopAuthorityContextKey{}, authority), nil
+	if s.stopPreparation == nil {
+		return sessionStopPreparation{}, errors.New("wire: no active stop preparation on this session")
+	}
+	preparation := *s.stopPreparation
+	target, err := message.Target.identity()
+	if err != nil {
+		return sessionStopPreparation{}, fmt.Errorf("wire: invalid stop control target: %w", err)
+	}
+	if len(message.StopSession) != len(preparation.stopSession) ||
+		len(message.PreparationNonce) != len(preparation.preparationNonce) ||
+		string(message.StopSession) != string(preparation.stopSession[:]) ||
+		string(message.PreparationNonce) != string(preparation.preparationNonce[:]) ||
+		preparation.role != s.role || target != preparation.target ||
+		message.RuntimeIdentity != preparation.runtime || message.RuntimeProtocol != preparation.protocol {
+		return sessionStopPreparation{}, errors.New("wire: stop control differs from session preparation")
+	}
+	return preparation, nil
 }
 
 func (s *Server) authorizeLifecycleControl(op Op, role trust.PeerRole) error {

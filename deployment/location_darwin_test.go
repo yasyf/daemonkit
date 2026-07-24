@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/wire"
 )
 
 func TestRuntimeStopControlStoreConsumesControllerAuthority(t *testing.T) {
@@ -27,13 +26,18 @@ func TestRuntimeStopControlStoreConsumesControllerAuthority(t *testing.T) {
 	}
 	reaper := &proc.Reaper{Store: controllerStore, Generation: "deployment-controller-test"}
 	const role = "com.example.stop"
+	const operationID = "stop-operation"
 	const target = "runtime-generation"
+	stopSession := proc.StopSessionID{1}
+	preparationNonce := proc.StopPreparationNonce{2}
 	if _, err := reaper.TrackStopControl(
-		context.Background(), identity, role, "build", 1, target, string(wire.StopIntentUpgrade), time.Minute,
+		context.Background(), identity, role, operationID, stopSession, preparationNonce, 1, target, time.Minute,
 	); err != nil {
 		t.Fatal(err)
 	}
-	_, consumed, err := runtimeStore.ConsumeStopControl(t.Context(), identity, role, target, time.Now())
+	_, consumed, err := runtimeStore.ConsumeStopControl(
+		t.Context(), identity, role, operationID, stopSession, preparationNonce, 1, target, time.Now(),
+	)
 	if err != nil || !consumed {
 		t.Fatalf("ConsumeStopControl = %v, %v", consumed, err)
 	}

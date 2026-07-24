@@ -13,7 +13,6 @@ import (
 
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/service"
-	"github.com/yasyf/daemonkit/wire"
 )
 
 const (
@@ -499,11 +498,12 @@ func serviceValue[T any](ctx context.Context, access serviceAccess, operation fu
 var errRuntimeStopperExpired = errors.New("deployment: runtime stopper capability expired")
 
 type runtimeStopAccess struct {
-	services serviceAccess
-	scope    context.Context
-	cancel   context.CancelFunc
-	intent   wire.StopIntent
-	serial   chan struct{}
+	services     serviceAccess
+	scope        context.Context
+	cancel       context.CancelFunc
+	operationID  string
+	runtimeBuild string
+	serial       chan struct{}
 
 	mu       sync.Mutex
 	closed   bool
@@ -511,28 +511,36 @@ type runtimeStopAccess struct {
 	settled  *sync.Cond
 }
 
-func newRuntimeStopAccess(ctx context.Context, services serviceAccess, intent wire.StopIntent) *runtimeStopAccess {
+func newRuntimeStopAccess(
+	ctx context.Context,
+	services serviceAccess,
+	operationID, runtimeBuild string,
+) *runtimeStopAccess {
 	scope, cancel := context.WithCancel(ctx)
 	access := &runtimeStopAccess{
-		services: services, scope: scope, cancel: cancel, intent: intent, serial: make(chan struct{}, 1),
+		services: services, scope: scope, cancel: cancel,
+		operationID: operationID, runtimeBuild: runtimeBuild, serial: make(chan struct{}, 1),
 	}
 	access.serial <- struct{}{}
 	access.settled = sync.NewCond(&access.mu)
 	return access
 }
 
-func (s *runtimeStopAccess) StopRuntime(ctx context.Context, spec service.StopControlSpec) (wire.StopResult, error) {
+func (s *runtimeStopAccess) StopRuntime(
+	ctx context.Context,
+	request service.StopRuntimeRequest,
+) (service.StopReceipt, error) {
 	if err := ctx.Err(); err != nil {
-		return wire.StopResult{}, err
+		return service.StopReceipt{}, err
 	}
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
-		return wire.StopResult{}, errRuntimeStopperExpired
+		return service.StopReceipt{}, errRuntimeStopperExpired
 	}
-	if spec.Intent != s.intent {
+	if request.OperationID != s.operationID || request.ExpectedRuntimeBuild != s.runtimeBuild {
 		s.mu.Unlock()
-		return wire.StopResult{}, fmt.Errorf("deployment: runtime stop intent %q does not match operation intent %q", spec.Intent, s.intent)
+		return service.StopReceipt{}, errors.New("deployment: runtime stop request differs from operation scope")
 	}
 	s.inFlight++
 	s.mu.Unlock()
@@ -550,18 +558,18 @@ func (s *runtimeStopAccess) StopRuntime(ctx context.Context, spec service.StopCo
 	}()
 	select {
 	case <-opCtx.Done():
-		return wire.StopResult{}, opCtx.Err()
+		return service.StopReceipt{}, opCtx.Err()
 	case <-s.serial:
 	}
 	defer func() { s.serial <- struct{}{} }()
 	if err := ctx.Err(); err != nil {
-		return wire.StopResult{}, err
+		return service.StopReceipt{}, err
 	}
 	if err := opCtx.Err(); err != nil {
-		return wire.StopResult{}, err
+		return service.StopReceipt{}, err
 	}
-	return serviceValue(opCtx, s.services, func(controller deploymentController) (wire.StopResult, error) {
-		return controller.StopRuntime(opCtx, spec)
+	return serviceValue(opCtx, s.services, func(controller deploymentController) (service.StopReceipt, error) {
+		return controller.StopRuntime(opCtx, request)
 	})
 }
 
@@ -925,7 +933,7 @@ func (c *Controller) forward(
 		if tx.PriorReceipt != nil && tx.PriorReceipt.State == DeploymentActive && tx.PriorReceipt.Current != nil {
 			proof, err := c.runtimeQuiesce(
 				ctx, cfg, services, tx.OperationID, *tx.PriorReceipt.Current,
-				forwardRuntimeStopIntent(tx.Mode), ProofPriorRuntime,
+				ProofPriorRuntime,
 			)
 			if err != nil {
 				return DeploymentReceipt{}, err
@@ -1268,7 +1276,7 @@ func (c *Controller) rollback(
 		}
 		if tx.Activation != nil && tx.Mode != modeDeactivate {
 			proof, err := c.runtimeQuiesce(
-				ctx, cfg, services, tx.OperationID, tx.Candidate, rollbackRuntimeStopIntent(tx), ProofRollbackRuntime,
+				ctx, cfg, services, tx.OperationID, tx.Candidate, ProofRollbackRuntime,
 			)
 			if err != nil {
 				return c.markRecoveryRequired(paths, tx, errors.Join(cause, err))
@@ -1278,7 +1286,7 @@ func (c *Controller) rollback(
 			tx.PriorReceipt.Current != nil && tx.PriorRuntimeProof == nil {
 			proof, err := c.runtimeQuiesce(
 				ctx, cfg, services, tx.OperationID, *tx.PriorReceipt.Current,
-				forwardRuntimeStopIntent(tx.Mode), ProofPriorRuntime,
+				ProofPriorRuntime,
 			)
 			if err != nil {
 				return c.markRecoveryRequired(paths, tx, errors.Join(cause, err))
@@ -1462,16 +1470,15 @@ func (c *Controller) runtimeQuiesce(
 	services serviceAccess,
 	operationID string,
 	generation storedGeneration,
-	intent wire.StopIntent,
 	role ProofRole,
 ) (RuntimeProof, error) {
 	if err := c.verifyGeneration(ctx, generation); err != nil {
 		return RuntimeProof{}, err
 	}
-	stopper := newRuntimeStopAccess(ctx, services, intent)
+	stopper := newRuntimeStopAccess(ctx, services, operationID, generation.Version)
 	defer stopper.revoke()
 	proof, err := cfg.RuntimeQuiesce(ctx, stopper, RuntimeQuiesceOperation{
-		ID: operationID, Generation: canonicalGeneration(generation), Intent: intent, Role: role,
+		ID: operationID, Generation: canonicalGeneration(generation), Role: role,
 	})
 	if err != nil {
 		return RuntimeProof{}, err
@@ -1483,26 +1490,6 @@ func (c *Controller) runtimeQuiesce(
 		return RuntimeProof{}, errors.Join(ErrRecoveryRequired, errors.New("deployment: RuntimeQuiesce mutated canonical generation"), err)
 	}
 	return proof, nil
-}
-
-func forwardRuntimeStopIntent(mode operationMode) wire.StopIntent {
-	switch mode {
-	case modeReplace:
-		return wire.StopIntentUpgrade
-	case modeReconfigure:
-		return wire.StopIntentRestart
-	case modeDeactivate:
-		return wire.StopIntentUninstall
-	default:
-		return ""
-	}
-}
-
-func rollbackRuntimeStopIntent(tx *deploymentTransaction) wire.StopIntent {
-	if tx.Mode == modeReconfigure && tx.PriorReceipt != nil && tx.PriorReceipt.State == DeploymentActive {
-		return wire.StopIntentRestart
-	}
-	return wire.StopIntentUninstall
 }
 
 func (c *Controller) generationProof(

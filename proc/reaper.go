@@ -2,6 +2,7 @@ package proc
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -9,6 +10,12 @@ import (
 	"syscall"
 	"time"
 )
+
+// StopSessionID binds stop authority to one authenticated wire session.
+type StopSessionID [16]byte
+
+// StopPreparationNonce binds stop authority to one random session-local preparation.
+type StopPreparationNonce [sha256.Size]byte
 
 // DefaultReapGrace bounds the wait between an orphan's SIGTERM and its SIGKILL.
 const DefaultReapGrace = 5 * time.Second
@@ -74,16 +81,17 @@ type Record struct {
 	// SessionID is the dedicated session created with a process-group leader.
 	// It remains the group's durable kernel identity after the leader exits.
 	SessionID int `json:"session_id"`
-	// Role, RuntimeBuild, RuntimeProtocol, TargetProcessGeneration, Intent,
-	// StopAuthorityState, and ExpiresUnixMilli are present only for one-shot
+	// Role, OperationID, StopSession, PreparationNonce, RuntimeProtocol,
+	// TargetProcessGeneration, StopAuthorityState, and ExpiresUnixMilli are present only for one-shot
 	// stop-control process receipts.
-	Role                    string             `json:"role"`
-	RuntimeBuild            string             `json:"runtime_build"`
-	RuntimeProtocol         int                `json:"runtime_protocol"`
-	TargetProcessGeneration string             `json:"target_process_generation"`
-	Intent                  string             `json:"intent"`
-	StopAuthorityState      StopAuthorityState `json:"stop_authority_state"`
-	ExpiresUnixMilli        int64              `json:"expires_unix_milli"`
+	Role                    string               `json:"role"`
+	OperationID             string               `json:"operation_id"`
+	StopSession             StopSessionID        `json:"stop_session"`
+	PreparationNonce        StopPreparationNonce `json:"preparation_nonce"`
+	RuntimeProtocol         int                  `json:"runtime_protocol"`
+	TargetProcessGeneration string               `json:"target_process_generation"`
+	StopAuthorityState      StopAuthorityState   `json:"stop_authority_state"`
+	ExpiresUnixMilli        int64                `json:"expires_unix_milli"`
 }
 
 // Validate rejects an incomplete durable process identity.
@@ -105,8 +113,9 @@ func (r Record) Validate() error {
 		return fmt.Errorf("%w: non-group record has a session id", ErrInvalidRecord)
 	}
 	if r.RecoveryClass == RecoveryStopControl {
-		if r.Role == "" || r.RuntimeBuild == "" || r.RuntimeProtocol <= 0 || r.TargetProcessGeneration == "" ||
-			(r.Intent != "upgrade" && r.Intent != "restart" && r.Intent != "uninstall") || r.ProcessGroup {
+		if r.Role == "" || r.OperationID == "" || r.StopSession == (StopSessionID{}) ||
+			r.PreparationNonce == (StopPreparationNonce{}) || r.RuntimeProtocol <= 0 ||
+			r.TargetProcessGeneration == "" || r.ProcessGroup {
 			return fmt.Errorf("%w: incomplete stop-control authority", ErrInvalidRecord)
 		}
 		switch r.StopAuthorityState {
@@ -121,8 +130,9 @@ func (r Record) Validate() error {
 		default:
 			return fmt.Errorf("%w: invalid stop authority state", ErrInvalidRecord)
 		}
-	} else if r.Role != "" || r.RuntimeBuild != "" || r.RuntimeProtocol != 0 || r.TargetProcessGeneration != "" ||
-		r.Intent != "" || r.StopAuthorityState != "" || r.ExpiresUnixMilli != 0 {
+	} else if r.Role != "" || r.OperationID != "" || r.StopSession != (StopSessionID{}) ||
+		r.PreparationNonce != (StopPreparationNonce{}) || r.RuntimeProtocol != 0 ||
+		r.TargetProcessGeneration != "" || r.StopAuthorityState != "" || r.ExpiresUnixMilli != 0 {
 		return fmt.Errorf("%w: non-stop record carries stop authority", ErrInvalidRecord)
 	}
 	return nil
@@ -315,19 +325,21 @@ func (r *Reaper) trackIdentityRecord(ctx context.Context, rec Record) (Record, e
 func (r *Reaper) TrackStopControl(
 	ctx context.Context,
 	identity Identity,
-	role, build string,
+	role, operationID string,
+	stopSession StopSessionID,
+	preparationNonce StopPreparationNonce,
 	protocol int,
 	targetProcessGeneration string,
-	intent string,
 	authorityWindow time.Duration,
 ) (Record, error) {
 	record := Record{
 		RecoveryClass: RecoveryStopControl,
 		PID:           identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
 		Comm: identity.Comm, Generation: r.Generation, Executable: identity.Executable,
-		AuditToken: identity.AuditToken, Role: role, RuntimeBuild: build, RuntimeProtocol: protocol,
-		TargetProcessGeneration: targetProcessGeneration, Intent: intent,
-		StopAuthorityState: StopAuthorityPending,
+		AuditToken: identity.AuditToken, Role: role, OperationID: operationID,
+		StopSession: stopSession, PreparationNonce: preparationNonce, RuntimeProtocol: protocol,
+		TargetProcessGeneration: targetProcessGeneration,
+		StopAuthorityState:      StopAuthorityPending,
 	}
 	store, ok := r.Store.(interface {
 		addStopControlPending(context.Context, Record) (Record, error)
@@ -367,7 +379,9 @@ func (r *Reaper) RevokeStopControl(ctx context.Context, record Record) (Record, 
 
 // StopControlStore atomically consumes one exact one-shot stop authority.
 type StopControlStore interface {
-	ConsumeStopControl(context.Context, Identity, string, string, time.Time) (Record, bool, error)
+	ConsumeStopControl(
+		context.Context, Identity, string, string, StopSessionID, StopPreparationNonce, int, string, time.Time,
+	) (Record, bool, error)
 }
 
 // TrackGroup records a child whose PID leads its own process group and session.

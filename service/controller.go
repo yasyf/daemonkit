@@ -16,6 +16,8 @@ import (
 
 	dkdaemon "github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/trust"
+	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/daemonkit/worker"
 )
 
@@ -71,13 +73,15 @@ type serviceReceiptRecovery interface {
 // Controller owns one exact durable LaunchAgent set and every launchctl worker
 // used to converge it.
 type Controller struct {
-	config     ControllerConfig
-	runtime    controllerRuntime
-	receipts   serviceReceiptRecovery
-	store      controllerStateStore
-	retryWait  func(context.Context, time.Duration) error
-	stopReaper *proc.Reaper
-	stopTiming stopControlTiming
+	config               ControllerConfig
+	runtime              controllerRuntime
+	receipts             serviceReceiptRecovery
+	store                controllerStateStore
+	retryWait            func(context.Context, time.Duration) error
+	stopReaper           *proc.Reaper
+	stopRuntimePrepare   func(context.Context, wire.RuntimeClientConfig, trust.PeerRole) (stopRuntimePrepared, error)
+	stopRuntimeProbe     func(int) (proc.Identity, error)
+	stopRuntimeCrashHook func(stopRuntimeCrashPoint) error
 
 	replacementProcesses func(string) ([]proc.Identity, error)
 	replacementNow       func() time.Time

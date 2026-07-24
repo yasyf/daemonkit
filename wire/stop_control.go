@@ -1,44 +1,15 @@
 package wire
 
 import (
-	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
-	"time"
 
-	stopcontract "github.com/yasyf/daemonkit/internal/stopcontrol"
 	"github.com/yasyf/daemonkit/proc"
 )
 
-const (
-	stopControlOp = Op("daemon.control.stop")
-)
+const stopControlOp = Op("daemon.control.stop")
 
-// StopIntent is the launcher-authorized reason for stopping one runtime.
-type StopIntent string
-
-const (
-	// StopIntentUpgrade replaces the incumbent with a newer runtime build.
-	StopIntentUpgrade StopIntent = "upgrade"
-	// StopIntentRestart restarts the same runtime build.
-	StopIntentRestart StopIntent = "restart"
-	// StopIntentUninstall removes the incumbent runtime.
-	StopIntentUninstall StopIntent = "uninstall"
-)
-
-// StopControlConfig identifies one exact runtime and bounds proof of its
-// endpoint and process settlement.
-type StopControlConfig struct {
-	Dial            Dialer
-	WireBuild       string
-	RuntimeProtocol int
-}
-
-// StopResult records the exact process identity and runtime settled by
-// RunStopControl. Stopped is false only when an upgrade authority was not
-// newer than the incumbent.
+// StopResult records the exact process identity and runtime returned by Dispatch.
 type StopResult struct {
 	Process           proc.Identity
 	ProcessGeneration string
@@ -48,7 +19,13 @@ type StopResult struct {
 }
 
 type stopControlRequest struct {
-	Version uint16 `json:"version"`
+	Version          uint16            `json:"version"`
+	OperationID      string            `json:"operation_id"`
+	StopSession      []byte            `json:"stop_session"`
+	PreparationNonce []byte            `json:"preparation_nonce"`
+	Target           stopControlTarget `json:"target"`
+	RuntimeIdentity  RuntimeIdentity   `json:"runtime_identity"`
+	RuntimeProtocol  int               `json:"runtime_protocol"`
 }
 
 type stopControlResponse struct {
@@ -67,95 +44,6 @@ type stopControlTarget struct {
 	Executable        string `json:"executable"`
 	Audit             []byte `json:"audit,omitempty"`
 	ProcessGeneration string `json:"process_generation"`
-}
-
-type stopControlEnvironment struct {
-	probe   func(int) (proc.Identity, error)
-	wait    func(context.Context, time.Duration) error
-	selfPID func() int
-}
-
-// RunStopControl authenticates one exact-role session, commits an orderly
-// shutdown request, and returns only after both endpoint and captured process
-// ownership have settled.
-func RunStopControl(ctx context.Context, config StopControlConfig) (StopResult, error) {
-	return runStopControl(ctx, config, stopControlEnvironment{
-		probe: proc.Probe, wait: waitStopControl, selfPID: os.Getpid,
-	})
-}
-
-func runStopControl(ctx context.Context, config StopControlConfig, env stopControlEnvironment) (StopResult, error) {
-	if config.Dial == nil {
-		return StopResult{}, errors.New("wire: stop control dialer is required")
-	}
-	if config.WireBuild == "" {
-		return StopResult{}, errors.New("wire: stop control build is required")
-	}
-	if config.RuntimeProtocol <= 0 {
-		return StopResult{}, errors.New("wire: stop control protocol is required")
-	}
-	settleCtx, cancel := context.WithTimeout(ctx, stopcontract.ChildSettlementBound)
-	defer cancel()
-	client, err := NewClient(settleCtx, ClientConfig{
-		Dial: config.Dial, WireBuild: config.WireBuild,
-	})
-	if err != nil {
-		return StopResult{}, fmt.Errorf("wire: stop control connect: %w", err)
-	}
-	closed := false
-	//nolint:contextcheck // Client.Close has no context and settles only local session state.
-	defer func() {
-		if !closed {
-			_ = client.Close()
-		}
-	}()
-	payload, err := json.Marshal(stopControlRequest{Version: 1})
-	if err != nil {
-		return StopResult{}, fmt.Errorf("wire: encode stop control request: %w", err)
-	}
-	result, err := client.Call(settleCtx, stopControlOp, "", payload)
-	if err != nil {
-		return StopResult{}, fmt.Errorf("wire: stop control request: %w", err)
-	}
-	if result.Outcome != Delivered {
-		return StopResult{}, fmt.Errorf("wire: stop control rejected: %w", result.Rejection())
-	}
-	if result.Response.Rejected {
-		return StopResult{}, fmt.Errorf("wire: stop control rejected: %w", result.Rejection())
-	}
-	if result.Response.Err != "" {
-		return StopResult{}, fmt.Errorf("wire: stop control failed: %s", result.Response.Err)
-	}
-	var response stopControlResponse
-	if err := decodeStrict(result.Response.Payload, &response); err != nil {
-		return StopResult{}, fmt.Errorf("wire: decode stop control response: %w", err)
-	}
-	if response.Version != 1 || response.RuntimeBuild == "" || response.RuntimeProtocol != config.RuntimeProtocol {
-		return StopResult{}, fmt.Errorf(
-			"wire: stop control identity mismatch: version=%d build=%q protocol=%d",
-			response.Version, response.RuntimeBuild, response.RuntimeProtocol,
-		)
-	}
-	target, err := response.Target.identity()
-	if err != nil {
-		return StopResult{}, fmt.Errorf("wire: stop control target: %w", err)
-	}
-	if target.PID <= 1 || target.PID == env.selfPID() {
-		return StopResult{}, fmt.Errorf("wire: stop control refuses pid %d", target.PID)
-	}
-	_ = client.Close() //nolint:contextcheck // Client.Close has no context.
-	closed = true
-	stop := StopResult{
-		Process: target, ProcessGeneration: response.Target.ProcessGeneration,
-		RuntimeBuild: response.RuntimeBuild, RuntimeProtocol: response.RuntimeProtocol, Stopped: response.Stopped,
-	}
-	if !response.Stopped {
-		return stop, nil
-	}
-	if err := settleStopControl(settleCtx, config.Dial, target, stopcontract.PollInterval, env); err != nil {
-		return StopResult{}, err
-	}
-	return stop, nil
 }
 
 func (t stopControlTarget) identity() (proc.Identity, error) {
@@ -203,59 +91,4 @@ func currentStopControlIdentity() (proc.Identity, error) {
 		return proc.Identity{}, err
 	}
 	return identity, nil
-}
-
-func settleStopControl(
-	ctx context.Context,
-	dial Dialer,
-	identity proc.Identity,
-	poll time.Duration,
-	env stopControlEnvironment,
-) error {
-	endpointGone := false
-	processSettled := false
-	for !endpointGone || !processSettled {
-		if !endpointGone {
-			conn, err := dial(ctx)
-			switch {
-			case err == nil:
-				_ = conn.Close()
-			case provesNoListener(err):
-				endpointGone = true
-			case ctx.Err() != nil:
-				return fmt.Errorf("wire: stop control settle endpoint: %w", ctx.Err())
-			default:
-				return fmt.Errorf("wire: stop control probe endpoint: %w", err)
-			}
-		}
-		if !processSettled {
-			current, err := env.probe(identity.PID)
-			switch {
-			case errors.Is(err, proc.ErrNoProcess):
-				processSettled = true
-			case err != nil:
-				return fmt.Errorf("wire: stop control probe process %d: %w", identity.PID, err)
-			case current.Boot != identity.Boot || current.StartTime != identity.StartTime:
-				processSettled = true
-			}
-		}
-		if endpointGone && processSettled {
-			return nil
-		}
-		if err := env.wait(ctx, poll); err != nil {
-			return fmt.Errorf("wire: stop control settlement: %w", err)
-		}
-	}
-	return nil
-}
-
-func waitStopControl(ctx context.Context, duration time.Duration) error {
-	timer := time.NewTimer(duration)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
 }
