@@ -121,7 +121,7 @@ extension SocketTransportTests {
                 cleanup.add { try? FileManager.default.removeItem(at: directory) }
                 let path = directory.appendingPathComponent("drop-settling-client.sock").path
                 let capture = LifetimeSessionCapture()
-                let server = SocketServer(path: path, wireBuild: "drop-settling-client", trust: .sameEffectiveUser) { request in
+                let server = SocketServer(path: path, wireBuild: "drop-settling-client") { request in
                     await capture.record(request.session)
                     return .terminal(SocketTerminal())
                 }
@@ -130,8 +130,7 @@ extension SocketTransportTests {
                 let settling = LifetimeGate()
                 var client: SocketClient? = try await SocketClient(
                     path: path,
-                    wireBuild: "drop-settling-client",
-                    trust: .sameEffectiveUser
+                    wireBuild: "drop-settling-client"
                 )
                 client?.requestSettlementHook = { await settling.wait() }
                 weak let weakClient = client
@@ -154,7 +153,7 @@ extension SocketTransportTests {
                 let path = directory.appendingPathComponent("drop-streaming-client.sock").path
                 let capture = LifetimeSessionCapture()
                 let chunks = LifetimeChunkSource()
-                let server = SocketServer(path: path, wireBuild: "drop-streaming-client", trust: .sameEffectiveUser) { request in
+                let server = SocketServer(path: path, wireBuild: "drop-streaming-client") { request in
                     await capture.record(request.session)
                     return .stream(SocketResponseStream(
                         nextChunk: { await chunks.next() },
@@ -167,8 +166,7 @@ extension SocketTransportTests {
                 let delivering = LifetimeGate()
                 var client: SocketClient? = try await SocketClient(
                     path: path,
-                    wireBuild: "drop-streaming-client",
-                    trust: .sameEffectiveUser
+                    wireBuild: "drop-streaming-client"
                 )
                 client?.receiveStreamOfferHook = { await delivering.wait() }
                 weak let weakClient = client

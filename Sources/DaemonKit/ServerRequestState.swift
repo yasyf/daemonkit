@@ -131,6 +131,10 @@ actor ServerRequestState {
         try await write()
     }
 
+    func hasSentTerminal() -> Bool {
+        terminalSent
+    }
+
     func waitForTerminalAcknowledgement(timeout: TimeInterval) async throws {
         if terminalAcknowledged {
             return

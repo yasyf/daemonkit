@@ -1,5 +1,46 @@
 import Foundation
 
+/// Transport proof for one raw unary call attempt.
+public enum SocketCallOutcome: Equatable, Sendable {
+    case delivered
+    case preSendFailure
+    case rejected
+    case postSendFailure
+    case deliveryUnknown
+}
+
+/// Result of one raw unary attempt, including its exact delivery proof.
+public struct SocketCallAttempt: @unchecked Sendable {
+    public let outcome: SocketCallOutcome
+    public let terminal: SocketTerminal?
+    public let error: (any Error)?
+
+    init(outcome: SocketCallOutcome, terminal: SocketTerminal? = nil, error: (any Error)? = nil) {
+        self.outcome = outcome
+        self.terminal = terminal
+        self.error = error
+    }
+}
+
+/// The absolute deadline elapsed before a unary response settled.
+public struct SocketCallDeadlineExceededError: Error, Equatable, Sendable {}
+
+private final class SocketAttemptSettlement: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Result<SocketTerminal, any Error>?
+
+    var result: Result<SocketTerminal, any Error>? {
+        lock.withLock { stored }
+    }
+
+    func finish(_ result: Result<SocketTerminal, any Error>) {
+        lock.withLock {
+            guard stored == nil else { return }
+            stored = result
+        }
+    }
+}
+
 extension SocketClient {
     public struct Configuration: Sendable {
         public var maximumFrameBytes: Int
@@ -39,6 +80,38 @@ extension SocketClient {
         core.peerWireBuild
     }
 
+    /// Acquires the authenticated exact runtime identity before lifecycle waiting.
+    public func acquireRuntimeReceipt(
+        expectedRuntimeBuild: String,
+        deadline: Date
+    ) async throws -> RuntimeProcessReceipt {
+        guard deadline > Date() else { throw ServiceSocketClientError.deadlineExceeded }
+        guard !expectedRuntimeBuild.isEmpty else {
+            throw RuntimeReadinessValidationError.invalidResponse("expected runtime build is required")
+        }
+        let terminal = try await call(
+            operation: runtimeReceiptOperation,
+            payload: RuntimeReceiptCodec.encodeRequest(),
+            deadline: deadline
+        )
+        guard terminal.error == nil, !terminal.rejected, let payload = terminal.payload else {
+            throw RuntimeReceiptUnavailableError()
+        }
+        let receipt = try RuntimeReceiptCodec.decodeResponse(payload)
+        guard receipt.runtimeIdentity.runtimeBuild == expectedRuntimeBuild else {
+            throw RuntimeReadinessValidationError.invalidResponse("runtime receipt build mismatch")
+        }
+        return receipt
+    }
+
+    func nextLifecycleSnapshot() async throws -> Data? {
+        try await core.nextLifecycleSnapshot()
+    }
+
+    func waitUntilClosed() async {
+        await core.waitUntilClosed()
+    }
+
     /// Opens a request. Set endInput false when request chunks will follow.
     public func open(
         operation: String,
@@ -68,6 +141,68 @@ extension SocketClient {
         return try await call.response()
     }
 
+    /// Performs one unary attempt and returns the exact transport outcome.
+    public func attempt(
+        operation: String,
+        tenant: String = "",
+        payload: Data = Data(),
+        deadline: Date
+    ) async -> SocketCallAttempt {
+        let call: SocketCall
+        do {
+            call = try await core.openClassified(
+                owner: self,
+                operation: operation,
+                tenant: tenant,
+                payload: payload,
+                endInput: true,
+                deadline: deadline
+            )
+        } catch let failure as SocketOpenFailure {
+            return SocketCallAttempt(outcome: failure.outcome, error: failure.cause)
+        } catch {
+            return SocketCallAttempt(outcome: .preSendFailure, error: error)
+        }
+        let settlement = SocketAttemptSettlement()
+        let response = Task {
+            do {
+                try await settlement.finish(.success(call.response()))
+            } catch {
+                settlement.finish(.failure(error))
+            }
+        }
+        return await withTaskCancellationHandler {
+            while true {
+                if let result = settlement.result {
+                    switch result {
+                    case let .success(terminal):
+                        return SocketCallAttempt(
+                            outcome: terminal.rejected ? .rejected : .delivered,
+                            terminal: terminal
+                        )
+                    case let .failure(error):
+                        return SocketCallAttempt(outcome: .postSendFailure, error: error)
+                    }
+                }
+                if Task.isCancelled {
+                    return SocketCallAttempt(outcome: .postSendFailure, error: CancellationError())
+                }
+                if deadline <= Date() {
+                    response.cancel()
+                    Task { await call.cancel() }
+                    return SocketCallAttempt(
+                        outcome: .postSendFailure,
+                        error: SocketCallDeadlineExceededError()
+                    )
+                }
+                try? await Task.sleep(for: .milliseconds(5))
+            }
+        } onCancel: {
+            response.cancel()
+            Task { await call.cancel() }
+        }
+    }
+
     /// Sends go-away, then closes the session and fails every pending call.
     public func close() async {
         await core.close()
@@ -81,6 +216,11 @@ extension SocketClient {
     var openCommitHook: (@Sendable () async -> Void)? {
         get { core.openCommitHook }
         set { core.openCommitHook = newValue }
+    }
+
+    var requestWriteStartHook: (@Sendable () -> Void)? {
+        get { core.requestWriteStartHook }
+        set { core.requestWriteStartHook = newValue }
     }
 
     var requestSettlementHook: (@Sendable () async -> Void)? {

@@ -44,8 +44,7 @@ extension SocketTransportTests {
                 let server = SocketServer(
                     path: path,
                     wireBuild: "server-test",
-                    configuration: .init(streamQueueDepth: depth),
-                    trust: .sameEffectiveUser
+                    configuration: .init(streamQueueDepth: depth)
                 ) { request in
                     var chunkCount = 0
                     var byteCount = 0
@@ -67,7 +66,7 @@ extension SocketTransportTests {
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try await SocketClient(path: path, wireBuild: "server-test", trust: .sameEffectiveUser)
+                let client = try await SocketClient(path: path, wireBuild: "server-test")
                 cleanup.add { await client.close() }
 
                 let payload = Data(repeating: 0xA5, count: 64 * 1024)
@@ -96,8 +95,7 @@ extension SocketTransportTests {
                 let server = SocketServer(
                     path: path,
                     wireBuild: "server-test",
-                    configuration: .init(maximumActiveRequests: 1, streamQueueDepth: 1),
-                    trust: .sameEffectiveUser
+                    configuration: .init(maximumActiveRequests: 1, streamQueueDepth: 1)
                 ) { request in
                     if request.operation == "upload" {
                         do {
@@ -109,7 +107,7 @@ extension SocketTransportTests {
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try await SocketClient(path: path, wireBuild: "server-test", trust: .sameEffectiveUser)
+                let client = try await SocketClient(path: path, wireBuild: "server-test")
                 cleanup.add { await client.close() }
 
                 let upload = try await client.open(operation: "upload", endInput: false)
@@ -133,8 +131,7 @@ extension SocketTransportTests {
                 let server = SocketServer(
                     path: path,
                     wireBuild: "server-test",
-                    configuration: .init(streamQueueDepth: 1),
-                    trust: .sameEffectiveUser
+                    configuration: .init(streamQueueDepth: 1)
                 ) { request in
                     if request.operation == "upload" {
                         do {
@@ -146,7 +143,7 @@ extension SocketTransportTests {
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try await SocketClient(path: path, wireBuild: "server-test", trust: .sameEffectiveUser)
+                let client = try await SocketClient(path: path, wireBuild: "server-test")
                 cleanup.add { await client.close() }
 
                 let upload = try await client.open(operation: "upload", endInput: false)

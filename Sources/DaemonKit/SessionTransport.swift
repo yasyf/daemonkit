@@ -19,6 +19,7 @@ public enum SessionFrameKind: UInt8, Sendable {
     case goAway
     case window
     case acknowledgment
+    case lifecycle
 }
 
 /// Flags carried by a v1 session frame.
@@ -97,6 +98,95 @@ struct SessionWireIdentity: Codable, Sendable {
     }
 }
 
+struct SessionHandshakeAck: Codable, Sendable {
+    let protocolVersion: UInt16
+    let wireBuild: String
+    let session: Data?
+    let rejected: Bool?
+    let code: String?
+    let reason: String?
+
+    init(
+        protocolVersion: UInt16,
+        wireBuild: String,
+        session: Data? = nil,
+        rejected: Bool? = nil,
+        code: String? = nil,
+        reason: String? = nil
+    ) {
+        self.protocolVersion = protocolVersion
+        self.wireBuild = wireBuild
+        self.session = session
+        self.rejected = rejected
+        self.code = code
+        self.reason = reason
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol"
+        case wireBuild = "wire_build"
+        case session
+        case rejected
+        case code
+        case reason
+    }
+}
+
+enum SessionHandshakeCodec {
+    static func decodeHello(_ data: Data) throws -> SessionWireIdentity {
+        try requireKeys(data, exact: ["protocol", "wire_build"])
+        return try JSONDecoder().decode(SessionWireIdentity.self, from: data)
+    }
+
+    static func decodeAck(_ data: Data) throws -> SessionHandshakeAck {
+        let object = try jsonObject(data)
+        let rejected = object["rejected"] as? Bool ?? false
+        let expected: Set<String> = rejected
+            ? ["protocol", "wire_build", "rejected", "code", "reason"]
+            : ["protocol", "wire_build", "session"]
+        guard Set(object.keys) == expected else {
+            throw SessionTransportError.handshake("invalid acknowledgment fields")
+        }
+        return try JSONDecoder().decode(SessionHandshakeAck.self, from: data)
+    }
+
+    static func encodeSuccess(wireBuild: String, session: Data) throws -> Data {
+        try JSONEncoder().encode(SessionHandshakeAck(
+            protocolVersion: daemonKitSessionProtocolVersion,
+            wireBuild: wireBuild,
+            session: session
+        ))
+    }
+
+    static func encodeRejection(
+        wireBuild: String,
+        code: SocketResponseCode,
+        reason: String
+    ) throws -> Data {
+        try JSONEncoder().encode(SessionHandshakeAck(
+            protocolVersion: daemonKitSessionProtocolVersion,
+            wireBuild: wireBuild,
+            rejected: true,
+            code: code.rawValue,
+            reason: reason
+        ))
+    }
+
+    private static func requireKeys(_ data: Data, exact: Set<String>) throws {
+        let object = try jsonObject(data)
+        guard Set(object.keys) == exact else {
+            throw SessionTransportError.handshake("invalid identity fields")
+        }
+    }
+
+    private static func jsonObject(_ data: Data) throws -> [String: Any] {
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw SessionTransportError.handshake("invalid identity JSON")
+        }
+        return object
+    }
+}
+
 struct SessionSequence: Sendable {
     private var next: UInt32
     private var exhausted = false
@@ -153,6 +243,35 @@ final class SessionFrameCodec: @unchecked Sendable {
     }
 
     func write(_ frame: SessionFrame) throws {
+        let packet = try encodedPacket(frame)
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        try writeAll(packet, deadline: Self.deadline(after: writeTimeout))
+    }
+
+    func write(
+        _ frame: SessionFrame,
+        passing descriptorToPass: Int32,
+        deadline wallDeadline: Date,
+        onDescriptorSent: () -> Void
+    ) throws {
+        guard descriptorToPass >= 0 else {
+            throw SessionTransportError.invalidFrame("invalid passed descriptor")
+        }
+        let packet = try encodedPacket(frame)
+        let remaining = wallDeadline.timeIntervalSinceNow
+        guard remaining > 0 else {
+            throw SessionTransportError.systemCall(operation: "sendmsg", errno: ETIMEDOUT)
+        }
+        let deadline = Self.deadline(after: min(writeTimeout, remaining))
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        let written = try sendPrefix(packet.prefix(4), passing: descriptorToPass, deadline: deadline)
+        onDescriptorSent()
+        try writeAll(Data(packet.dropFirst(written)), deadline: deadline)
+    }
+
+    private func encodedPacket(_ frame: SessionFrame) throws -> Data {
         let body = try Self.encode(frame)
         guard body.count <= maximumFrameBytes else {
             throw SessionTransportError.frameTooLarge(actual: body.count, maximum: maximumFrameBytes)
@@ -160,9 +279,7 @@ final class SessionFrameCodec: @unchecked Sendable {
         var packet = Data()
         packet.appendUInt32(UInt32(body.count))
         packet.append(body)
-        writeLock.lock()
-        defer { writeLock.unlock() }
-        try writeAll(packet, deadline: Self.deadline(after: writeTimeout))
+        return packet
     }
 
     static func encode(_ frame: SessionFrame) throws -> Data {
@@ -232,55 +349,86 @@ final class SessionFrameCodec: @unchecked Sendable {
         try validate(frame)
         return frame
     }
+}
 
+extension SessionFrameCodec {
     private static func validate(_ frame: SessionFrame) throws {
         guard frame.flags.subtracting(.end).isEmpty else {
             throw SessionTransportError.invalidFrame("unknown flags")
         }
         switch frame.kind {
         case .hello, .helloAck:
-            guard frame.flags == .end, frame.id == 0, frame.sequence == 0,
-                  frame.deadlineUnixMilliseconds == 0, frame.operation.isEmpty,
-                  frame.tenant.isEmpty, !frame.payload.isEmpty
-            else { throw SessionTransportError.invalidFrame("handshake frame") }
+            try require(
+                frame.flags == .end && frame.id == 0 && frame.sequence == 0 &&
+                    frame.deadlineUnixMilliseconds == 0 && frame.operation.isEmpty &&
+                    frame.tenant.isEmpty && !frame.payload.isEmpty,
+                "handshake frame"
+            )
         case .request:
-            guard frame.id != 0, frame.sequence == 0, frame.deadlineUnixMilliseconds >= 0,
-                  !frame.operation.isEmpty
-            else { throw SessionTransportError.invalidFrame("request frame") }
+            try require(
+                frame.id != 0 && frame.sequence == 0 && frame.deadlineUnixMilliseconds >= 0 &&
+                    !frame.operation.isEmpty,
+                "request frame"
+            )
         case .response:
-            guard frame.flags == .end, frame.id != 0, frame.sequence == 0,
-                  frame.deadlineUnixMilliseconds == 0, frame.operation.isEmpty,
-                  frame.tenant.isEmpty, !frame.payload.isEmpty
-            else { throw SessionTransportError.invalidFrame("response frame") }
+            try require(
+                frame.flags == .end && frame.id != 0 && frame.sequence == 0 &&
+                    frame.deadlineUnixMilliseconds == 0 && frame.operation.isEmpty &&
+                    frame.tenant.isEmpty && !frame.payload.isEmpty,
+                "response frame"
+            )
         case .cancel:
-            guard frame.flags == .end, frame.id != 0, frame.sequence == 0,
-                  frame.deadlineUnixMilliseconds == 0, frame.operation.isEmpty,
-                  frame.tenant.isEmpty, frame.payload.isEmpty
-            else { throw SessionTransportError.invalidFrame("cancel frame") }
+            try require(
+                frame.flags == .end && frame.id != 0 && frame.sequence == 0 &&
+                    frame.deadlineUnixMilliseconds == 0 && frame.operation.isEmpty &&
+                    frame.tenant.isEmpty && frame.payload.isEmpty,
+                "cancel frame"
+            )
         case .event:
-            guard frame.flags == .end, frame.id == 0, frame.sequence == 0,
-                  frame.deadlineUnixMilliseconds == 0, !frame.operation.isEmpty,
-                  frame.tenant.isEmpty
-            else { throw SessionTransportError.invalidFrame("event frame") }
+            try require(
+                frame.flags == .end && frame.id == 0 && frame.sequence == 0 &&
+                    frame.deadlineUnixMilliseconds == 0 && !frame.operation.isEmpty &&
+                    frame.tenant.isEmpty,
+                "event frame"
+            )
         case .stream:
-            guard frame.id != 0, frame.deadlineUnixMilliseconds == 0,
-                  frame.operation.isEmpty, frame.tenant.isEmpty
-            else { throw SessionTransportError.invalidFrame("stream frame") }
+            try require(
+                frame.id != 0 && frame.deadlineUnixMilliseconds == 0 &&
+                    frame.operation.isEmpty && frame.tenant.isEmpty,
+                "stream frame"
+            )
         case .goAway:
-            guard frame.flags == .end, frame.id == 0, frame.sequence == 0,
-                  frame.deadlineUnixMilliseconds == 0, frame.operation.isEmpty,
-                  frame.tenant.isEmpty, frame.payload.isEmpty
-            else { throw SessionTransportError.invalidFrame("go-away frame") }
+            try require(
+                frame.flags == .end && frame.id == 0 && frame.sequence == 0 &&
+                    frame.deadlineUnixMilliseconds == 0 && frame.operation.isEmpty &&
+                    frame.tenant.isEmpty && frame.payload.isEmpty,
+                "go-away frame"
+            )
         case .window:
-            guard frame.flags.isEmpty, frame.sequence > 0, frame.deadlineUnixMilliseconds == 0,
-                  frame.operation.isEmpty, frame.tenant.isEmpty, frame.payload.isEmpty
-            else { throw SessionTransportError.invalidFrame("window frame") }
+            try require(
+                frame.flags.isEmpty && frame.sequence > 0 && frame.deadlineUnixMilliseconds == 0 &&
+                    frame.operation.isEmpty && frame.tenant.isEmpty && frame.payload.isEmpty,
+                "window frame"
+            )
         case .acknowledgment:
-            guard frame.flags == .end, frame.id != 0, frame.sequence == 0,
-                  frame.deadlineUnixMilliseconds == 0, frame.operation.isEmpty,
-                  frame.tenant.isEmpty, frame.payload.count == 16
-            else { throw SessionTransportError.invalidFrame("acknowledgement frame") }
+            try require(
+                frame.flags == .end && frame.id != 0 && frame.sequence == 0 &&
+                    frame.deadlineUnixMilliseconds == 0 && frame.operation.isEmpty &&
+                    frame.tenant.isEmpty && frame.payload.count == 16,
+                "acknowledgement frame"
+            )
+        case .lifecycle:
+            try require(
+                frame.flags == .end && frame.id == 0 && frame.sequence == 0 &&
+                    frame.deadlineUnixMilliseconds == 0 && frame.operation.isEmpty &&
+                    frame.tenant.isEmpty && !frame.payload.isEmpty,
+                "lifecycle frame"
+            )
         }
+    }
+
+    private static func require(_ condition: @autoclosure () -> Bool, _ reason: String) throws {
+        guard condition() else { throw SessionTransportError.invalidFrame(reason) }
     }
 
     private func readExactly(_ count: Int, deadline: UInt64?) throws -> Data {
@@ -336,6 +484,60 @@ final class SessionFrameCodec: @unchecked Sendable {
                 throw SessionTransportError.truncatedFrame
             }
             offset += written
+        }
+    }
+
+    private func sendPrefix(
+        _ prefix: Data.SubSequence,
+        passing descriptorToPass: Int32,
+        deadline: UInt64?
+    ) throws -> Int {
+        guard prefix.count == 4 else {
+            throw SessionTransportError.invalidFrame("descriptor handoff prefix")
+        }
+        let headerBytes = MemoryLayout<cmsghdr>.size
+        let controlBytes = headerBytes + MemoryLayout<Int32>.size
+        let control = UnsafeMutableRawPointer.allocate(
+            byteCount: controlBytes,
+            alignment: MemoryLayout<cmsghdr>.alignment
+        )
+        defer { control.deallocate() }
+        control.initializeMemory(as: UInt8.self, repeating: 0, count: controlBytes)
+        let header = control.assumingMemoryBound(to: cmsghdr.self)
+        header.pointee.cmsg_len = UInt32(controlBytes)
+        header.pointee.cmsg_level = SOL_SOCKET
+        header.pointee.cmsg_type = SCM_RIGHTS
+        control.advanced(by: headerBytes).storeBytes(of: descriptorToPass, as: Int32.self)
+
+        while true {
+            let written = prefix.withUnsafeBytes { bytes -> Int in
+                var vector = iovec(
+                    iov_base: UnsafeMutableRawPointer(mutating: bytes.baseAddress),
+                    iov_len: bytes.count
+                )
+                return withUnsafeMutablePointer(to: &vector) { vectorPointer in
+                    var message = msghdr()
+                    message.msg_iov = vectorPointer
+                    message.msg_iovlen = 1
+                    message.msg_control = control
+                    message.msg_controllen = UInt32(controlBytes)
+                    return Darwin.sendmsg(descriptor, &message, MSG_NOSIGNAL)
+                }
+            }
+            if written > 0 {
+                return written
+            }
+            if written == 0 {
+                throw SessionTransportError.truncatedFrame
+            }
+            if errno == EINTR {
+                continue
+            }
+            if errno == EAGAIN || errno == EWOULDBLOCK {
+                try waitUntilReady(events: Int16(POLLOUT), operation: "sendmsg", deadline: deadline)
+                continue
+            }
+            throw SessionTransportError.systemCall(operation: "sendmsg", errno: errno)
         }
     }
 
