@@ -332,7 +332,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/yasyf/daemonkit/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/yasyf/daemonkit/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/yasyf/daemonkit/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/yasyf/daemonkit/compare/v0.8.1...v0.9.0
