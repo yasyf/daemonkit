@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-07-23
+
+### Changed
+
+- Swift `BrokerSocketBridge` now requires a lifecycle
+  `RuntimeClientConfiguration` and a distinct, nonempty `handoffRole`. The
+  lifecycle session performs only receipt and readiness preflight; a separate
+  persistent handoff session sends only `daemon.broker-handoff.v1`, pinned to
+  the exact ready-runtime receipt.
+
+### Removed
+
+- The single-role `BrokerSocketBridge` initializer and lifecycle-session
+  handoff path are removed. There is no compatibility API.
+
 ## [0.13.0] - 2026-07-23
 
 ### Fixed
@@ -330,7 +345,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/yasyf/daemonkit/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/yasyf/daemonkit/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/yasyf/daemonkit/compare/v0.10.0...v0.12.0
 [0.10.0]: https://github.com/yasyf/daemonkit/compare/v0.9.0...v0.10.0

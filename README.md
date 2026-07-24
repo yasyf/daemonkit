@@ -21,7 +21,7 @@ go: added github.com/yasyf/daemonkit v<version>
 Add the package to your dependencies and link the `DaemonKit` library product into your app or helper target:
 
 ```swift
-.package(url: "https://github.com/yasyf/daemonkit", exact: "0.13.0"),
+.package(url: "https://github.com/yasyf/daemonkit", exact: "0.14.0"),
 ```
 
 </details>
@@ -76,6 +76,12 @@ One row per package; the Status column is each surface's live state.
 
 The LaunchAgents `service` writes use no socket activation — the daemon binds and flocks its own socket (`proc`); launchd only keeps the process alive. Every `Agent` and `AppKeepAlive` selects `RestartAlways`, `RestartOnFailure`, or `NoRestart`; the policy is rendered directly into the launchd plist. On the Swift side, `DaemonKit` reconciles `SMAppService` login items (opening the Login Items settings pane when the item needs approval), watches snapshot directories, and rides the signed `.app` bundle for a stable bundle + TCC identity.
 
+`BrokerSocketBridge` requires a lifecycle `RuntimeClientConfiguration` and a
+distinct, nonempty `handoffRole`. The lifecycle session is limited to receipt
+and readiness preflight. A separate persistent handoff session sends only
+`daemon.broker-handoff.v1`, pinned to the exact ready-runtime receipt. There is
+no single-role or compatibility initializer.
+
 `deployment.Controller` is the only public signed-application publication
 workflow. A product supplies a complete `deployment.Config` to `Deploy`;
 `Deactivate` durably retires its exact service plan and runtime, `Recover`
@@ -85,7 +91,7 @@ advancing recovery. The canonical product path is
 state, and locks live under
 `$HOME/Applications/.daemonkit-deployment/<Product>`.
 
-Status: v0.13.0 is the hard-cut release line. Protocol and durable-state epochs
+Status: v0.14.0 is the hard-cut release line. Protocol and durable-state epochs
 begin at 1 with exact equality; the API stabilizes at v1.0.0.
 
 Licensed under [PolyForm-Noncommercial-1.0.0](LICENSE).
