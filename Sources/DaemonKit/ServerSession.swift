@@ -8,6 +8,7 @@ final class ServerSession: @unchecked Sendable {
     private let configuration: SocketServer.Configuration
     private let handler: @Sendable (SocketRequest) async -> SocketResponse
     private let runtimeLifecycle: RuntimeLifecycleController?
+    private let controlOperations: Set<String>
     private let shutdownDescriptor: @Sendable () -> Void
     private let codec: SessionFrameCodec
     private let readQueue: DispatchQueue
@@ -29,6 +30,7 @@ final class ServerSession: @unchecked Sendable {
         peer: SocketPeer,
         configuration: SocketServer.Configuration,
         runtimeLifecycle: RuntimeLifecycleController?,
+        controlOperations: Set<String>,
         handler: @escaping @Sendable (SocketRequest) async -> SocketResponse
     ) {
         self.descriptor = descriptor
@@ -37,6 +39,7 @@ final class ServerSession: @unchecked Sendable {
         self.peer = peer
         self.configuration = configuration
         self.runtimeLifecycle = runtimeLifecycle
+        self.controlOperations = controlOperations
         self.handler = handler
         var uuid = UUID().uuid
         generation = withUnsafeBytes(of: &uuid) { Data($0) }
@@ -217,7 +220,11 @@ final class ServerSession: @unchecked Sendable {
             )
             return
         }
-        let admission = try admit(frame, clientWireBuild: identity.wireBuild)
+        let admission = try admit(
+            frame,
+            clientWireBuild: identity.wireBuild,
+            control: controlOperations.contains(frame.operation)
+        )
         guard case let .accepted(state, runtimeAdmission) = admission else {
             guard case let .rejected(code, reason) = admission else { return }
             try await sendRejected(id: frame.id, code: code, reason: reason)
@@ -301,10 +308,11 @@ final class ServerSession: @unchecked Sendable {
 }
 
 private extension ServerSession {
-    private func admit(_ frame: SessionFrame, clientWireBuild: String) throws -> Admission {
+    private func admit(_ frame: SessionFrame, clientWireBuild: String, control: Bool) throws -> Admission {
         let runtimeAdmission: RuntimeAdmissionPin?
         if let runtimeLifecycle {
-            switch runtimeLifecycle.admitBusiness() {
+            let admission = control ? runtimeLifecycle.admitControl() : runtimeLifecycle.admitBusiness()
+            switch admission {
             case let .admitted(pin):
                 runtimeAdmission = pin
             case let .rejected(code, reason):

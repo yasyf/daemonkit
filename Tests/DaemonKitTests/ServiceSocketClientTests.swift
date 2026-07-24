@@ -3,8 +3,73 @@ import Darwin
 import Foundation
 import Testing
 
-let readinessSubscribeOperation = "daemon.control.readiness.subscribe"
+let readinessSubscribeOperation = "test.runtime.readiness.subscribe"
 let readinessSubscribeAck = Data(#"{"protocol":1}"#.utf8)
+
+func serviceTestClient(
+    path: String,
+    wireBuild: String,
+    role: String,
+    noProgressTimeout: TimeInterval,
+    configuration: SocketClient.Configuration = .init(),
+    onProgress: (@Sendable (ReadinessProgress) -> Void)? = nil
+) throws -> ServiceSocketClient {
+    try ServiceSocketClient(
+        path: path,
+        wireBuild: wireBuild,
+        role: role,
+        readinessOperation: readinessSubscribeOperation,
+        noProgressTimeout: noProgressTimeout,
+        configuration: configuration,
+        onProgress: onProgress
+    )
+}
+
+func serviceTestServer(
+    path: String,
+    wireBuild: String,
+    configuration: SocketServer.Configuration = .init(),
+    runtimeLifecycle: RuntimeLifecycleController? = nil,
+    handler: @escaping @Sendable (SocketRequest) async -> SocketResponse
+) -> SocketServer {
+    guard let runtimeLifecycle else {
+        return SocketServer(path: path, wireBuild: wireBuild, configuration: configuration) { request in
+            guard request.operation == readinessSubscribeOperation else {
+                return await handler(request)
+            }
+            return .terminal(SocketTerminal(error: "wire: runtime lifecycle is not configured"))
+        }
+    }
+    return SocketServer(
+        path: path,
+        wireBuild: wireBuild,
+        configuration: configuration,
+        runtimeLifecycle: runtimeLifecycle,
+        controlOperations: [readinessSubscribeOperation]
+    ) { request in
+        guard request.operation == readinessSubscribeOperation else {
+            return await handler(request)
+        }
+        do {
+            try RuntimeReadinessCodec.decodeSubscribeAck(request.payload)
+            guard let session = request.session.implementation else {
+                throw SessionTransportError.disconnected
+            }
+            runtimeLifecycle.register(session)
+            Task {
+                await request.session.waitUntilClosed()
+                runtimeLifecycle.unregister(session)
+            }
+            return try .terminal(SocketTerminal(
+                payload: RuntimeReadinessCodec.encodeSubscribe()
+            ) {
+                runtimeLifecycle.activate(session)
+            })
+        } catch {
+            return .terminal(SocketTerminal(error: String(describing: error)))
+        }
+    }
+}
 
 func genericServiceCall(
     operation: String,
@@ -312,7 +377,7 @@ extension SocketTransportTests {
                 let (lifecycle, activation) = try testStartingRuntimeController()
                 let registered = AsyncLatch()
                 lifecycle.registrationHook = { registered.finish() }
-                let server = SocketServer(
+                let server = serviceTestServer(
                     path: path,
                     wireBuild: "service.v1",
                     runtimeLifecycle: lifecycle
@@ -321,7 +386,7 @@ extension SocketTransportTests {
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try ServiceSocketClient(
+                let client = try serviceTestClient(
                     path: path,
                     wireBuild: "service.v1",
                     role: SessionPeerRole.unprotected,
@@ -356,7 +421,7 @@ extension SocketTransportTests {
                     SocketTerminal(payload: Data("\(index)".utf8))
                 })
                 let lifecycle = try testRuntimeController()
-                let server = SocketServer(
+                let server = serviceTestServer(
                     path: path,
                     wireBuild: "service.v1",
                     runtimeLifecycle: lifecycle
@@ -365,7 +430,7 @@ extension SocketTransportTests {
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try ServiceSocketClient(
+                let client = try serviceTestClient(
                     path: path,
                     wireBuild: "service.v1",
                     role: SessionPeerRole.unprotected,
@@ -399,7 +464,7 @@ extension SocketTransportTests {
                 let gate = OneShotRegistrationGate()
                 let lifecycle = try testRuntimeController()
                 lifecycle.registrationHook = { gate.register() }
-                let server = SocketServer(
+                let server = serviceTestServer(
                     path: path,
                     wireBuild: "service.v1",
                     runtimeLifecycle: lifecycle
@@ -411,7 +476,7 @@ extension SocketTransportTests {
                     gate.release()
                     await server.stop()
                 }
-                let client = try ServiceSocketClient(
+                let client = try serviceTestClient(
                     path: path,
                     wireBuild: "service.v1",
                     role: SessionPeerRole.unprotected,
@@ -456,7 +521,7 @@ extension SocketTransportTests {
                 let registered = AsyncLatch()
                 oldLifecycle.registrationHook = { registered.finish() }
                 let successorLifecycle = try testRuntimeController(generation: testOwnerGeneration(2))
-                let oldServer = SocketServer(
+                let oldServer = serviceTestServer(
                     path: path,
                     wireBuild: "service.v1",
                     configuration: .init(writeTimeout: 0.05),
@@ -465,7 +530,7 @@ extension SocketTransportTests {
                     Issue.record("draining runtime dispatched business request")
                     return .terminal(SocketTerminal())
                 }
-                let successorServer = SocketServer(
+                let successorServer = serviceTestServer(
                     path: path,
                     wireBuild: "service.v1",
                     runtimeLifecycle: successorLifecycle
@@ -477,7 +542,7 @@ extension SocketTransportTests {
                     await oldServer.stop()
                     await successorServer.stop()
                 }
-                let client = try ServiceSocketClient(
+                let client = try serviceTestClient(
                     path: path,
                     wireBuild: "service.v1",
                     role: SessionPeerRole.unprotected,
@@ -511,7 +576,7 @@ extension SocketTransportTests {
                     SocketTerminal(payload: Data(#""ready""#.utf8)),
                 ])
                 let lifecycle = try testRuntimeController()
-                let server = SocketServer(
+                let server = serviceTestServer(
                     path: path,
                     wireBuild: "service.v1",
                     runtimeLifecycle: lifecycle
@@ -520,7 +585,7 @@ extension SocketTransportTests {
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try ServiceSocketClient(
+                let client = try serviceTestClient(
                     path: path,
                     wireBuild: "service.v1",
                     role: SessionPeerRole.unprotected,
@@ -543,13 +608,13 @@ extension SocketTransportTests {
                 let directory = try shortSocketDir()
                 cleanup.add { try? FileManager.default.removeItem(at: directory) }
                 let path = directory.appendingPathComponent("s.sock").path
-                let server = SocketServer(path: path, wireBuild: "service.v1") { _ in
+                let server = serviceTestServer(path: path, wireBuild: "service.v1") { _ in
                     Issue.record("business request dispatched without readiness")
                     return .terminal(SocketTerminal())
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try ServiceSocketClient(
+                let client = try serviceTestClient(
                     path: path,
                     wireBuild: "service.v1",
                     role: SessionPeerRole.unprotected,
@@ -587,7 +652,7 @@ extension SocketTransportTests {
                     SocketTerminal(rejected: true, reason: "fence mismatch"),
                 ])
                 let lifecycle = try testRuntimeController()
-                let server = SocketServer(
+                let server = serviceTestServer(
                     path: path,
                     wireBuild: "service.v1",
                     runtimeLifecycle: lifecycle
@@ -596,7 +661,7 @@ extension SocketTransportTests {
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try ServiceSocketClient(
+                let client = try serviceTestClient(
                     path: path,
                     wireBuild: "service.v1",
                     role: SessionPeerRole.unprotected,
@@ -621,7 +686,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
         let directory = try shortSocketDir()
         defer { try? FileManager.default.removeItem(at: directory) }
         let path = directory.appendingPathComponent("missing.sock").path
-        let deadlineClient = try ServiceSocketClient(
+        let deadlineClient = try serviceTestClient(
             path: path,
             wireBuild: "service.v1",
             role: SessionPeerRole.unprotected,
@@ -634,7 +699,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
             ))
         }
 
-        let canceledClient = try ServiceSocketClient(
+        let canceledClient = try serviceTestClient(
             path: path,
             wireBuild: "service.v1",
             role: SessionPeerRole.unprotected,
@@ -653,7 +718,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
     }
 
     @Test func expiredDeadlineWinsBeforeOperationAndIdentityValidation() async throws {
-        let client = try ServiceSocketClient(
+        let client = try serviceTestClient(
             path: "/definitely/missing/daemonkit.sock",
             wireBuild: "service.v1",
             role: SessionPeerRole.unprotected,
@@ -673,13 +738,13 @@ extension SocketTransportTests.ServiceSocketClientTests {
             let directory = try shortSocketDir()
             cleanup.add { try? FileManager.default.removeItem(at: directory) }
             let path = directory.appendingPathComponent("s.sock").path
-            let server = SocketServer(path: path, wireBuild: "other.v1") { _ in
+            let server = serviceTestServer(path: path, wireBuild: "other.v1") { _ in
                 Issue.record("mismatched build dispatched")
                 return .terminal(SocketTerminal())
             }
             try await server.start()
             cleanup.add { await server.stop() }
-            let client = try ServiceSocketClient(
+            let client = try serviceTestClient(
                 path: path,
                 wireBuild: "service.v1",
                 role: SessionPeerRole.unprotected,
@@ -705,7 +770,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
             cleanup.add { try? FileManager.default.removeItem(at: directory) }
             let path = directory.appendingPathComponent("s.sock").path
             let lifecycle = try testRuntimeController()
-            let server = SocketServer(
+            let server = serviceTestServer(
                 path: path,
                 wireBuild: "service.v1",
                 configuration: .init(maximumSessions: 1),
@@ -721,7 +786,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
                 role: SessionPeerRole.unprotected
             )
             cleanup.add { await holder.close() }
-            let client = try ServiceSocketClient(
+            let client = try serviceTestClient(
                 path: path,
                 wireBuild: "service.v1",
                 role: SessionPeerRole.unprotected,
@@ -752,7 +817,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
             let directory = try shortSocketDir()
             cleanup.add { try? FileManager.default.removeItem(at: directory) }
             let path = directory.appendingPathComponent("s.sock").path
-            let server = SocketServer(
+            let server = serviceTestServer(
                 path: path,
                 wireBuild: "service.v1",
                 configuration: .init(maximumSessions: 1)
@@ -799,7 +864,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
             cleanup.add { try? FileManager.default.removeItem(at: directory) }
             let path = directory.appendingPathComponent("s.sock").path
             let lifecycle = try testRuntimeController()
-            let server = SocketServer(
+            let server = serviceTestServer(
                 path: path,
                 wireBuild: "service.v1",
                 runtimeLifecycle: lifecycle
@@ -808,7 +873,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
             }
             try await server.start()
             cleanup.add { await server.stop() }
-            let client = try ServiceSocketClient(
+            let client = try serviceTestClient(
                 path: path,
                 wireBuild: "service.v1",
                 role: SessionPeerRole.unprotected,

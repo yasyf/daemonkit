@@ -161,6 +161,7 @@ public actor ServiceSocketClient {
     private let path: String
     private let wireBuild: String
     private let role: String
+    private let readinessOperation: String
     private let configuration: SocketClient.Configuration
     private let noProgressTimeout: TimeInterval
     private let progressHandler: (@Sendable (ReadinessProgress) -> Void)?
@@ -197,14 +198,36 @@ public actor ServiceSocketClient {
         configuration: SocketClient.Configuration = .init(),
         onProgress: (@Sendable (ReadinessProgress) -> Void)? = nil
     ) throws {
+        try self.init(
+            path: path,
+            wireBuild: wireBuild,
+            role: role,
+            readinessOperation: runtimeReadinessSubscribeOperation,
+            noProgressTimeout: noProgressTimeout,
+            configuration: configuration,
+            onProgress: onProgress
+        )
+    }
+
+    init(
+        path: String,
+        wireBuild: String,
+        role: String,
+        readinessOperation: String,
+        noProgressTimeout: TimeInterval,
+        configuration: SocketClient.Configuration = .init(),
+        onProgress: (@Sendable (ReadinessProgress) -> Void)? = nil
+    ) throws {
         guard !wireBuild.isEmpty else { throw SessionTransportError.handshake("empty wireBuild") }
         guard !role.isEmpty else { throw SessionTransportError.handshake("empty role") }
+        guard !readinessOperation.isEmpty else { throw SessionTransportError.invalidFrame("empty readiness operation") }
         guard noProgressTimeout.isFinite, noProgressTimeout > 0 else {
             throw RuntimeReadinessValidationError.invalidResponse("positive no-progress timeout is required")
         }
         self.path = path
         self.wireBuild = wireBuild
         self.role = role
+        self.readinessOperation = readinessOperation
         self.noProgressTimeout = noProgressTimeout
         self.configuration = configuration
         progressHandler = onProgress
@@ -301,7 +324,7 @@ public actor ServiceSocketClient {
                 }
                 progress.pin(receipt.runtimeIdentity)
                 let request = ServiceSocketCall(
-                    operation: runtimeReadinessSubscribeOperation,
+                    operation: readinessOperation,
                     runtimeTarget: .exact(receipt.runtimeIdentity),
                     deadline: deadline
                 )
@@ -534,7 +557,7 @@ private extension ServiceSocketClient {
     ) async throws {
         let payload = try RuntimeReadinessCodec.encodeSubscribe()
         let attempt = try await current.1.attempt(
-            operation: runtimeReadinessSubscribeOperation,
+            operation: readinessOperation,
             payload: payload,
             deadline: effectiveDeadline(deadline, progress: progress)
         )

@@ -130,6 +130,7 @@ final class SocketServer: @unchecked Sendable {
     private let wireBuild: String
     private let configuration: Configuration
     private let runtimeLifecycle: RuntimeLifecycleController?
+    private let controlOperations: Set<String>
     private let handler: @Sendable (SocketRequest) async -> SocketResponse
     private let acceptQueue = DispatchQueue(label: "com.yasyf.daemonkit.SocketServer.accept")
     private let controlQueue = DispatchQueue(label: "com.yasyf.daemonkit.SocketServer.control")
@@ -159,6 +160,7 @@ final class SocketServer: @unchecked Sendable {
         self.wireBuild = wireBuild
         self.configuration = configuration
         runtimeLifecycle = nil
+        controlOperations = []
         self.handler = handler
     }
 
@@ -167,12 +169,14 @@ final class SocketServer: @unchecked Sendable {
         wireBuild: String,
         configuration: Configuration = .init(),
         runtimeLifecycle: RuntimeLifecycleController,
+        controlOperations: Set<String> = [],
         handler: @escaping @Sendable (SocketRequest) async -> SocketResponse
     ) {
         self.path = path
         self.wireBuild = wireBuild
         self.configuration = configuration
         self.runtimeLifecycle = runtimeLifecycle
+        self.controlOperations = controlOperations
         self.handler = handler
     }
 }
@@ -573,6 +577,7 @@ extension SocketServer {
                 peer: peer,
                 configuration: configuration,
                 runtimeLifecycle: runtimeLifecycle,
+                controlOperations: controlOperations,
                 handler: handler
             )
             insert(session, descriptor: descriptor)

@@ -12,7 +12,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
             let release = AsyncLatch()
             let hangingPayload = Data(#""hang""#.utf8)
             let lifecycle = try testRuntimeController()
-            let server = SocketServer(
+            let server = serviceTestServer(
                 path: path,
                 wireBuild: "service.v1",
                 runtimeLifecycle: lifecycle
@@ -24,7 +24,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
             }
             try await server.start()
             cleanup.add { await server.stop() }
-            let client = try ServiceSocketClient(
+            let client = try serviceTestClient(
                 path: path,
                 wireBuild: "service.v1",
                 role: SessionPeerRole.unprotected,
@@ -85,7 +85,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
                 }
             }
         }
-        let client = try ServiceSocketClient(
+        let client = try serviceTestClient(
             path: path,
             wireBuild: "service.v1",
             role: SessionPeerRole.unprotected,
@@ -167,7 +167,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
                 ))
             }
         }
-        let client = try ServiceSocketClient(
+        let client = try serviceTestClient(
             path: path,
             wireBuild: "service.v1",
             role: SessionPeerRole.unprotected,
@@ -201,7 +201,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
             let directory = try shortSocketDir()
             cleanup.add { try? FileManager.default.removeItem(at: directory) }
             let path = directory.appendingPathComponent("s.sock").path
-            let server = SocketServer(path: path, wireBuild: "service.v1") { _ in
+            let server = serviceTestServer(path: path, wireBuild: "service.v1") { _ in
                 Issue.record("classified raw attempt dispatched")
                 return .terminal(SocketTerminal())
             }
@@ -241,14 +241,14 @@ extension SocketTransportTests.ServiceSocketClientTests {
             let takeover = UnknownDeliveryTakeoverSequence()
             let oldLifecycle = try testRuntimeController()
             let successorLifecycle = try testRuntimeController(generation: testOwnerGeneration(2))
-            let oldServer = SocketServer(
+            let oldServer = serviceTestServer(
                 path: path,
                 wireBuild: "service.v1",
                 runtimeLifecycle: oldLifecycle
             ) {
                 await takeover.disconnect($0)
             }
-            let successorServer = SocketServer(
+            let successorServer = serviceTestServer(
                 path: path,
                 wireBuild: "service.v1",
                 runtimeLifecycle: successorLifecycle
@@ -261,7 +261,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
                 await oldServer.stop()
                 await successorServer.stop()
             }
-            let client = try ServiceSocketClient(
+            let client = try serviceTestClient(
                 path: path,
                 wireBuild: "service.v1",
                 role: SessionPeerRole.unprotected,
@@ -297,7 +297,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
                 SocketTerminal(rejected: true, code: .buildMismatch, reason: "wrong build"),
             ])
             let lifecycle = try testRuntimeController()
-            let server = SocketServer(
+            let server = serviceTestServer(
                 path: path,
                 wireBuild: "service.v1",
                 runtimeLifecycle: lifecycle
@@ -306,7 +306,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
             }
             try await server.start()
             cleanup.add { await server.stop() }
-            let client = try ServiceSocketClient(
+            let client = try serviceTestClient(
                 path: path,
                 wireBuild: "service.v1",
                 role: SessionPeerRole.unprotected,
@@ -344,7 +344,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
             let path = directory.appendingPathComponent("s.sock").path
             let responses = ServiceCancellationSequence()
             let lifecycle = try testRuntimeController()
-            let server = SocketServer(
+            let server = serviceTestServer(
                 path: path,
                 wireBuild: "service.v1",
                 runtimeLifecycle: lifecycle
@@ -353,7 +353,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
             }
             try await server.start()
             cleanup.add { await server.stop() }
-            let client = try ServiceSocketClient(
+            let client = try serviceTestClient(
                 path: path,
                 wireBuild: "service.v1",
                 role: SessionPeerRole.unprotected,
@@ -407,7 +407,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
                     payload: lifecyclePayload(state, sequence: 2)
                 ))
             } operation: { path in
-                let client = try ServiceSocketClient(
+                let client = try serviceTestClient(
                     path: path,
                     wireBuild: "service.v1",
                     role: SessionPeerRole.unprotected,
@@ -477,7 +477,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
             responseGate.block()
         } operation: { path in
             defer { responseGate.unblock() }
-            let client = try ServiceSocketClient(
+            let client = try serviceTestClient(
                 path: path,
                 wireBuild: "service.v1",
                 role: SessionPeerRole.unprotected,
@@ -547,7 +547,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
             closeGate.block()
         } operation: { path in
             defer { closeGate.unblock() }
-            let client = try ServiceSocketClient(
+            let client = try serviceTestClient(
                 path: path,
                 wireBuild: "service.v1",
                 role: SessionPeerRole.unprotected,
