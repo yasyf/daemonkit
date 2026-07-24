@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -88,6 +89,54 @@ func TestRuntimeClaimAndRecoveryGateAdmission(t *testing.T) {
 	defer cancel()
 	if err := claim.Close(ctx); err != nil {
 		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestRuntimeClaimReleaseSettlesFailedRecoveryExactlyOnce(t *testing.T) {
+	pool, err := NewPool(workerTestConfig(), workerTestReaper(t))
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	claim, err := pool.ClaimRuntime()
+	if err != nil {
+		t.Fatalf("ClaimRuntime: %v", err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := claim.Recover(canceled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Recover canceled = %v", err)
+	}
+
+	const callers = 32
+	start := make(chan struct{})
+	errs := make(chan error, callers)
+	var group sync.WaitGroup
+	group.Add(callers)
+	for range callers {
+		go func() {
+			defer group.Done()
+			<-start
+			errs <- claim.Release(context.Background())
+		}()
+	}
+	close(start)
+	group.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent Release: %v", err)
+		}
+	}
+	if err := claim.Release(canceled); err != nil {
+		t.Fatalf("idempotent Release with canceled context: %v", err)
+	}
+
+	next, err := pool.ClaimRuntime()
+	if err != nil {
+		t.Fatalf("ClaimRuntime after failed recovery release: %v", err)
+	}
+	if err := next.Release(context.Background()); err != nil {
+		t.Fatalf("Release unrecovered claim: %v", err)
 	}
 }
 

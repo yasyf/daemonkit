@@ -292,12 +292,27 @@ func (c *RuntimeClaim) RunVerifier(ctx context.Context, request CommandRequest) 
 	return c.verifier.Run(ctx, request)
 }
 
-// Release abandons one successfully recovered claim before activation.
+// Release abandons one unactivated claim.
 func (c *RuntimeClaim) Release(ctx context.Context) error {
+	if c == nil {
+		return ErrRuntimeOwnership
+	}
+	c.mu.Lock()
+	released := c.released
+	c.mu.Unlock()
+	if released {
+		return nil
+	}
 	if err := c.acquire(ctx); err != nil {
 		return errors.Join(ErrRuntimeOwnership, err)
 	}
 	defer c.releaseLifecycle()
+	c.mu.Lock()
+	released = c.released
+	c.mu.Unlock()
+	if released {
+		return nil
+	}
 	if !c.current(false) || !c.canRelease() {
 		return ErrRuntimeOwnership
 	}
@@ -351,7 +366,7 @@ func (c *RuntimeClaim) current(requireActivated bool) bool {
 
 func (c *RuntimeClaim) canRelease() bool {
 	c.mu.Lock()
-	valid := c.recovered && !c.activated && !c.released && c.terminal == nil
+	valid := !c.activated && !c.released && c.terminal == nil
 	c.mu.Unlock()
 	if !valid {
 		return false
