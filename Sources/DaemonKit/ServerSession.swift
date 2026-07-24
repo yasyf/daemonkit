@@ -74,12 +74,12 @@ final class ServerSession: @unchecked Sendable {
 
     func run() async throws {
         do {
-            let clientWireBuild = try await handshake()
+            let identity = try await handshake()
             while true {
                 let frame = try await read()
                 switch frame.kind {
                 case .request:
-                    try await receiveRequest(frame, clientWireBuild: clientWireBuild)
+                    try await receiveRequest(frame, identity: identity)
                 case .cancel:
                     try await receiveCancel(frame)
                 case .stream:
@@ -144,7 +144,6 @@ final class ServerSession: @unchecked Sendable {
         }
         closed = true
         lock.unlock()
-        runtimeLifecycle?.unregister(self)
         lifecycle.close()
         lifecyclePublisher.finish()
         writer.abort()
@@ -164,7 +163,7 @@ final class ServerSession: @unchecked Sendable {
         }
     }
 
-    private func handshake() async throws -> String {
+    private func handshake() async throws -> SessionHelloIdentity {
         let frame = try await read(timeout: configuration.handshakeTimeout)
         guard frame.kind == .hello, frame.flags == .end, frame.id == 0,
               frame.sequence == 0, frame.operation.isEmpty, frame.tenant.isEmpty
@@ -178,6 +177,9 @@ final class ServerSession: @unchecked Sendable {
         guard !identity.wireBuild.isEmpty else {
             throw SessionTransportError.handshake("empty wireBuild")
         }
+        guard !identity.role.isEmpty else {
+            throw SessionTransportError.handshake("empty role")
+        }
         guard identity.wireBuild == serverWireBuild else {
             let payload = try SessionHandshakeCodec.encodeRejection(
                 wireBuild: serverWireBuild,
@@ -189,38 +191,7 @@ final class ServerSession: @unchecked Sendable {
         }
         let payload = try SessionHandshakeCodec.encodeSuccess(wireBuild: serverWireBuild, session: generation)
         try await write(SessionFrame(kind: .helloAck, flags: .end, payload: payload))
-        return identity.wireBuild
-    }
-
-    private func readinessSubscriptionResponse(_ request: SocketRequest) -> SocketResponse {
-        guard let runtimeLifecycle else {
-            return .terminal(SocketTerminal(error: "wire: runtime lifecycle is not configured"))
-        }
-        do {
-            try RuntimeReadinessCodec.decodeSubscribeAck(request.payload)
-            runtimeLifecycle.register(self)
-            let acknowledgment = try RuntimeReadinessCodec.encodeSubscribe()
-            return .terminal(SocketTerminal(payload: acknowledgment) { [weak self, runtimeLifecycle] in
-                guard let self else { return }
-                runtimeLifecycle.activate(self)
-            })
-        } catch {
-            return .terminal(SocketTerminal(error: String(describing: error)))
-        }
-    }
-
-    private func runtimeReceiptResponse(_ request: SocketRequest) -> SocketResponse {
-        guard let runtimeLifecycle else {
-            return .terminal(SocketTerminal(error: "wire: runtime receipt unavailable"))
-        }
-        do {
-            try RuntimeReceiptCodec.decodeRequest(request.payload)
-            return try .terminal(SocketTerminal(
-                payload: RuntimeReceiptCodec.encodeResponse(runtimeLifecycle.runtimeIdentity)
-            ))
-        } catch {
-            return .terminal(SocketTerminal(error: String(describing: error)))
-        }
+        return identity
     }
 
     private func read(timeout: TimeInterval = 0) async throws -> SessionFrame {
@@ -234,18 +205,19 @@ final class ServerSession: @unchecked Sendable {
         case rejected(code: SocketResponseCode, reason: String)
     }
 
-    private func receiveRequest(_ frame: SessionFrame, clientWireBuild: String) async throws {
+    private func receiveRequest(_ frame: SessionFrame, identity: SessionHelloIdentity) async throws {
         guard frame.id != 0, !frame.operation.isEmpty, frame.sequence == 0 else {
             throw SessionTransportError.invalidFrame("request")
         }
-        if frame.operation == runtimeReceiptOperation ||
-            frame.operation == runtimeReadinessSubscribeOperation
-        {
-            guard frame.flags == .end, frame.tenant.isEmpty else {
-                throw SessionTransportError.invalidFrame("runtime control request")
-            }
+        if frame.operation.hasPrefix("daemon.") {
+            try await sendRejected(
+                id: frame.id,
+                code: .permissionDenied,
+                reason: "wire: Swift sessions cannot authorize protected daemonkit operations"
+            )
+            return
         }
-        let admission = try admit(frame, clientWireBuild: clientWireBuild)
+        let admission = try admit(frame, clientWireBuild: identity.wireBuild)
         guard case let .accepted(state, runtimeAdmission) = admission else {
             guard case let .rejected(code, reason) = admission else { return }
             try await sendRejected(id: frame.id, code: code, reason: reason)
@@ -274,19 +246,14 @@ final class ServerSession: @unchecked Sendable {
             payload: frame.payload,
             chunks: chunks,
             peer: peer,
-            peerWireBuild: clientWireBuild,
+            peerWireBuild: identity.wireBuild,
+            peerRole: identity.role,
             session: publicSession,
             runtimeAdmission: runtimeAdmission
         )
         let task = Task { [weak self] in
             guard let self else { return }
-            var response: SocketResponse = if request.operation == runtimeReceiptOperation {
-                runtimeReceiptResponse(request)
-            } else if request.operation == runtimeReadinessSubscribeOperation {
-                readinessSubscriptionResponse(request)
-            } else {
-                await handler(request)
-            }
+            var response = await handler(request)
             if let transportError = await state.error() {
                 await cancelAndSettle(response)
                 response = .terminal(SocketTerminal(error: String(describing: transportError)))
@@ -335,21 +302,8 @@ final class ServerSession: @unchecked Sendable {
 
 private extension ServerSession {
     private func admit(_ frame: SessionFrame, clientWireBuild: String) throws -> Admission {
-        let reserved = frame.operation == runtimeReceiptOperation ||
-            frame.operation == runtimeReadinessSubscribeOperation
         let runtimeAdmission: RuntimeAdmissionPin?
-        if reserved {
-            if let runtimeLifecycle {
-                switch runtimeLifecycle.admitControl() {
-                case .admitted:
-                    runtimeAdmission = nil
-                case let .rejected(code, reason):
-                    return .rejected(code: code, reason: reason)
-                }
-            } else {
-                runtimeAdmission = nil
-            }
-        } else if let runtimeLifecycle {
+        if let runtimeLifecycle {
             switch runtimeLifecycle.admitBusiness() {
             case let .admitted(pin):
                 runtimeAdmission = pin

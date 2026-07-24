@@ -324,6 +324,7 @@ extension SocketTransportTests {
                 let client = try ServiceSocketClient(
                     path: path,
                     wireBuild: "service.v1",
+                    role: SessionPeerRole.unprotected,
                     noProgressTimeout: 1
                 )
                 cleanup.add { await client.close() }
@@ -367,6 +368,7 @@ extension SocketTransportTests {
                 let client = try ServiceSocketClient(
                     path: path,
                     wireBuild: "service.v1",
+                    role: SessionPeerRole.unprotected,
                     noProgressTimeout: 1
                 )
                 cleanup.add { await client.close() }
@@ -412,6 +414,7 @@ extension SocketTransportTests {
                 let client = try ServiceSocketClient(
                     path: path,
                     wireBuild: "service.v1",
+                    role: SessionPeerRole.unprotected,
                     noProgressTimeout: 1
                 )
                 cleanup.add { await client.close() }
@@ -477,6 +480,7 @@ extension SocketTransportTests {
                 let client = try ServiceSocketClient(
                     path: path,
                     wireBuild: "service.v1",
+                    role: SessionPeerRole.unprotected,
                     noProgressTimeout: 1
                 )
                 cleanup.add { await client.close() }
@@ -519,6 +523,7 @@ extension SocketTransportTests {
                 let client = try ServiceSocketClient(
                     path: path,
                     wireBuild: "service.v1",
+                    role: SessionPeerRole.unprotected,
                     noProgressTimeout: 1
                 )
                 cleanup.add { await client.close() }
@@ -547,6 +552,7 @@ extension SocketTransportTests {
                 let client = try ServiceSocketClient(
                     path: path,
                     wireBuild: "service.v1",
+                    role: SessionPeerRole.unprotected,
                     noProgressTimeout: 1
                 )
 
@@ -593,6 +599,7 @@ extension SocketTransportTests {
                 let client = try ServiceSocketClient(
                     path: path,
                     wireBuild: "service.v1",
+                    role: SessionPeerRole.unprotected,
                     noProgressTimeout: 1
                 )
                 cleanup.add { await client.close() }
@@ -617,6 +624,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
         let deadlineClient = try ServiceSocketClient(
             path: path,
             wireBuild: "service.v1",
+            role: SessionPeerRole.unprotected,
             noProgressTimeout: 1
         )
         await #expect(throws: ServiceSocketClientError.deadlineExceeded) {
@@ -629,6 +637,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
         let canceledClient = try ServiceSocketClient(
             path: path,
             wireBuild: "service.v1",
+            role: SessionPeerRole.unprotected,
             noProgressTimeout: 1
         )
         let task = Task {
@@ -647,6 +656,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
         let client = try ServiceSocketClient(
             path: "/definitely/missing/daemonkit.sock",
             wireBuild: "service.v1",
+            role: SessionPeerRole.unprotected,
             noProgressTimeout: 1
         )
         await #expect(throws: ServiceSocketClientError.deadlineExceeded) {
@@ -672,6 +682,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
             let client = try ServiceSocketClient(
                 path: path,
                 wireBuild: "service.v1",
+                role: SessionPeerRole.unprotected,
                 noProgressTimeout: 1
             )
             cleanup.add { await client.close() }
@@ -706,12 +717,14 @@ extension SocketTransportTests.ServiceSocketClientTests {
             cleanup.add { await server.stop() }
             let holder = try await SocketClient(
                 path: path,
-                wireBuild: "service.v1"
+                wireBuild: "service.v1",
+                role: SessionPeerRole.unprotected
             )
             cleanup.add { await holder.close() }
             let client = try ServiceSocketClient(
                 path: path,
                 wireBuild: "service.v1",
+                role: SessionPeerRole.unprotected,
                 noProgressTimeout: 1
             )
             cleanup.add { await client.close() }
@@ -750,7 +763,8 @@ extension SocketTransportTests.ServiceSocketClientTests {
             cleanup.add { await server.stop() }
             let holder = try await SocketClient(
                 path: path,
-                wireBuild: "service.v1"
+                wireBuild: "service.v1",
+                role: SessionPeerRole.unprotected
             )
             cleanup.add { await holder.close() }
 
@@ -760,7 +774,8 @@ extension SocketTransportTests.ServiceSocketClientTests {
             )) {
                 _ = try await SocketClient(
                     path: path,
-                    wireBuild: "other.v1"
+                    wireBuild: "other.v1",
+                    role: SessionPeerRole.unprotected
                 )
             }
         }
@@ -796,6 +811,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
             let client = try ServiceSocketClient(
                 path: path,
                 wireBuild: "service.v1",
+                role: SessionPeerRole.unprotected,
                 noProgressTimeout: 1,
                 configuration: .init(maximumFrameBytes: 512)
             )

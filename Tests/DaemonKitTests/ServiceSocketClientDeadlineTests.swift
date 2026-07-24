@@ -27,6 +27,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
             let client = try ServiceSocketClient(
                 path: path,
                 wireBuild: "service.v1",
+                role: SessionPeerRole.unprotected,
                 noProgressTimeout: 1,
                 configuration: .init(cancellationSettlementTimeout: 2)
             )
@@ -87,6 +88,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
         let client = try ServiceSocketClient(
             path: path,
             wireBuild: "service.v1",
+            role: SessionPeerRole.unprotected,
             noProgressTimeout: 1,
             configuration: .init(handshakeTimeout: 5)
         )
@@ -168,6 +170,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
         let client = try ServiceSocketClient(
             path: path,
             wireBuild: "service.v1",
+            role: SessionPeerRole.unprotected,
             noProgressTimeout: 1
         )
         let expected = SessionTransportError.invalidFrame("response fields")
@@ -206,7 +209,8 @@ extension SocketTransportTests.ServiceSocketClientTests {
             cleanup.add { await server.stop() }
             let client = try await SocketClient(
                 path: path,
-                wireBuild: "service.v1"
+                wireBuild: "service.v1",
+                role: SessionPeerRole.unprotected
             )
             cleanup.add { await client.close() }
 
@@ -260,6 +264,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
             let client = try ServiceSocketClient(
                 path: path,
                 wireBuild: "service.v1",
+                role: SessionPeerRole.unprotected,
                 noProgressTimeout: 1
             )
             cleanup.add { await client.close() }
@@ -304,6 +309,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
             let client = try ServiceSocketClient(
                 path: path,
                 wireBuild: "service.v1",
+                role: SessionPeerRole.unprotected,
                 noProgressTimeout: 1
             )
 
@@ -350,6 +356,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
             let client = try ServiceSocketClient(
                 path: path,
                 wireBuild: "service.v1",
+                role: SessionPeerRole.unprotected,
                 noProgressTimeout: 1
             )
             cleanup.add { await client.close() }
@@ -403,6 +410,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
                 let client = try ServiceSocketClient(
                     path: path,
                     wireBuild: "service.v1",
+                    role: SessionPeerRole.unprotected,
                     noProgressTimeout: 1
                 )
                 do {
@@ -472,6 +480,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
             let client = try ServiceSocketClient(
                 path: path,
                 wireBuild: "service.v1",
+                role: SessionPeerRole.unprotected,
                 noProgressTimeout: 1
             )
             _ = try await client.acquireReadyRuntime(
@@ -510,7 +519,8 @@ extension SocketTransportTests.ServiceSocketClientTests {
             } operation: { path in
                 let client = try await SocketClient(
                     path: path,
-                    wireBuild: "service.v1"
+                    wireBuild: "service.v1",
+                    role: SessionPeerRole.unprotected
                 )
                 await client.waitUntilClosed()
                 await #expect(throws: SessionTransportError.disconnected) {
@@ -540,6 +550,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
             let client = try ServiceSocketClient(
                 path: path,
                 wireBuild: "service.v1",
+                role: SessionPeerRole.unprotected,
                 noProgressTimeout: 1
             )
             let expected = RuntimeReadinessValidationError.invalidResponse("readiness event fields")

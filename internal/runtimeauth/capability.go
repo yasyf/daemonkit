@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	peeridentity "github.com/yasyf/daemonkit/peer"
+	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/worker"
 )
 
@@ -26,8 +27,9 @@ type PeerFencePermit struct {
 	Rollback func()
 }
 
-// PeerFence provisionally verifies one exact armed child identity.
-type PeerFence func(context.Context, peeridentity.Identity) (*PeerFencePermit, error)
+// PeerFence provisionally verifies one exact armed child identity and its
+// explicitly requested session role.
+type PeerFence func(context.Context, peeridentity.Identity, trust.PeerRole) (*PeerFencePermit, error)
 
 type stopControlToken struct{}
 

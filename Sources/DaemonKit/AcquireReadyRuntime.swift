@@ -8,6 +8,7 @@ public func acquireReadyRuntime(
     let client = try ServiceSocketClient(
         path: configuration.path,
         wireBuild: configuration.wireBuild,
+        role: configuration.role,
         noProgressTimeout: configuration.noProgressTimeout,
         configuration: configuration.socket,
         onProgress: configuration.onProgress

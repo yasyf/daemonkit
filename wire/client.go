@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/yasyf/daemonkit/trust"
 )
 
 var (
@@ -98,6 +100,7 @@ type Dialer func(ctx context.Context) (net.Conn, error)
 type ClientConfig struct {
 	Dial                    Dialer
 	WireBuild               string
+	Role                    trust.PeerRole
 	Ladder                  Ladder
 	MaxFrame                int
 	OutboundQueue           int
@@ -245,7 +248,7 @@ func newClientWithLifecycleValidator(
 		_ = conn.Close()
 		return nil, err
 	}
-	peer, err := clientHandshake(codec, config.WireBuild)
+	peer, err := clientHandshake(codec, config.WireBuild, config.Role)
 	if err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -299,6 +302,9 @@ func validateClientConfig(config ClientConfig) (clientParameters, error) {
 	}
 	if config.WireBuild == "" {
 		return clientParameters{}, errors.New("wire: WireBuild is required")
+	}
+	if config.Role == "" {
+		return clientParameters{}, errors.New("wire: Role is required")
 	}
 	streamCap := positiveOr(config.StreamQueue, defaultStreamQueue)
 	eventCap := positiveOr(config.EventQueue, defaultStreamQueue)
@@ -705,8 +711,8 @@ func (c *Client) close(parent context.Context) error {
 	return c.closeErr
 }
 
-func clientHandshake(codec *Codec, wireBuild string) (WireIdentity, error) {
-	payload, err := json.Marshal(handshakeIdentity{Protocol: ProtocolVersion, WireBuild: wireBuild})
+func clientHandshake(codec *Codec, wireBuild string, role trust.PeerRole) (WireIdentity, error) {
+	payload, err := json.Marshal(handshakeIdentity{Protocol: ProtocolVersion, WireBuild: wireBuild, Role: role})
 	if err != nil {
 		return WireIdentity{}, err
 	}

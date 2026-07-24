@@ -102,11 +102,13 @@ public final class SocketClient: @unchecked Sendable {
     public init(
         path: String,
         wireBuild: String,
+        role: String,
         configuration: Configuration = .init()
     ) async throws {
         core = try await SocketClientCore(
             path: path,
             wireBuild: wireBuild,
+            role: role,
             configuration: configuration
         )
     }
@@ -174,9 +176,11 @@ final class SocketClientCore: @unchecked Sendable {
     init(
         path: String,
         wireBuild: String,
+        role: String,
         configuration: SocketClient.Configuration
     ) async throws {
         guard !wireBuild.isEmpty else { throw SessionTransportError.handshake("empty wireBuild") }
+        guard !role.isEmpty else { throw SessionTransportError.handshake("empty role") }
         guard configuration.maximumFrameBytes > 0,
               (1 ... Int(UInt32.max)).contains(configuration.streamQueueDepth),
               (1 ... Int(UInt32.max)).contains(configuration.eventQueueDepth),
@@ -190,6 +194,7 @@ final class SocketClientCore: @unchecked Sendable {
         let bootstrap = try await Self.bootstrap(
             path: path,
             wireBuild: wireBuild,
+            role: role,
             configuration: configuration
         )
         self.configuration = configuration
@@ -501,11 +506,13 @@ extension SocketClientCore {
     private static func handshake(
         codec: SessionFrameCodec,
         wireBuild: String,
+        role: String,
         timeout: TimeInterval
     ) throws -> SessionWireIdentity {
-        let payload = try JSONEncoder().encode(SessionWireIdentity(
+        let payload = try JSONEncoder().encode(SessionHelloIdentity(
             protocolVersion: daemonKitSessionProtocolVersion,
-            wireBuild: wireBuild
+            wireBuild: wireBuild,
+            role: role
         ))
         try codec.write(SessionFrame(kind: .hello, flags: .end, payload: payload))
         let response = try codec.read(timeout: timeout)
@@ -602,6 +609,7 @@ private extension SocketClientCore {
     private static func bootstrap(
         path: String,
         wireBuild: String,
+        role: String,
         configuration: SocketClient.Configuration
     ) async throws -> Bootstrap {
         let owner = OwnedDescriptor()
@@ -627,7 +635,12 @@ private extension SocketClientCore {
                 )
                 writer = sessionWriter
                 let identity = try await readQueue.performIO {
-                    try handshake(codec: codec, wireBuild: wireBuild, timeout: configuration.handshakeTimeout)
+                    try handshake(
+                        codec: codec,
+                        wireBuild: wireBuild,
+                        role: role,
+                        timeout: configuration.handshakeTimeout
+                    )
                 }
                 guard let session = identity.session, session.count == 16 else {
                     throw SessionTransportError.handshake("invalid session generation")

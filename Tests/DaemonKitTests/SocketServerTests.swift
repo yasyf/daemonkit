@@ -74,6 +74,18 @@ private actor PullChunks {
 extension SocketTransportTests {
     @Suite(.timeLimit(.minutes(1)))
     struct SocketServerTests {
+        @Test func helloSchemaRequiresAndPreservesExactRole() throws {
+            let encoded = Data(
+                #"{"protocol":1,"wire_build":"suite.v1","role":"readiness-controller.v1"}"#.utf8
+            )
+            let identity = try SessionHandshakeCodec.decodeHello(encoded)
+            #expect(identity.role == "readiness-controller.v1")
+            let missing = Data(#"{"protocol":1,"wire_build":"suite.v1"}"#.utf8)
+            #expect(throws: SessionTransportError.self) {
+                _ = try SessionHandshakeCodec.decodeHello(missing)
+            }
+        }
+
         @Test func frameV1MatchesSharedGoGolden() throws {
             let repository = URL(fileURLWithPath: #filePath)
                 .deletingLastPathComponent()
@@ -147,9 +159,10 @@ extension SocketTransportTests {
                         throw SessionTransportError.systemCall(operation: "connect", errno: errno)
                     }
                     let codec = SessionFrameCodec(descriptor: descriptor)
-                    let hello = try JSONEncoder().encode(SessionWireIdentity(
+                    let hello = try JSONEncoder().encode(SessionHelloIdentity(
                         protocolVersion: daemonKitSessionProtocolVersion,
-                        wireBuild: "interop.v1"
+                        wireBuild: "interop.v1",
+                        role: SessionPeerRole.unprotected
                     ))
                     try codec.write(SessionFrame(kind: .hello, flags: .end, payload: hello))
                     let acknowledgment = try codec.read(timeout: 1)
@@ -201,6 +214,7 @@ extension SocketTransportTests {
             let client = try await SocketClient(
                 path: path,
                 wireBuild: "interop.v1",
+                role: SessionPeerRole.unprotected,
                 configuration: .init(writeTimeout: 1)
             )
             await client.close()
@@ -226,7 +240,8 @@ extension SocketTransportTests {
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try await SocketClient(path: path, wireBuild: "server-test")
+                let client = try await SocketClient(path: path, wireBuild: "server-test",
+                role: SessionPeerRole.unprotected)
                 cleanup.add { await client.close() }
                 #expect(client.peerWireBuild == "server-test")
 
@@ -278,6 +293,7 @@ extension SocketTransportTests.SocketServerTests {
             let client = try await SocketClient(
                 path: path,
                 wireBuild: "server-test",
+                role: SessionPeerRole.unprotected,
                 configuration: .init(handshakeTimeout: 0.1)
             )
             cleanup.add { await client.close() }
@@ -344,6 +360,7 @@ extension SocketTransportTests.SocketServerTests {
             let client = try await SocketClient(
                 path: path,
                 wireBuild: "server-test",
+                role: SessionPeerRole.unprotected,
                 configuration: .init(cancellationSettlementTimeout: 0.05)
             )
             cleanup.add { await client.close() }
@@ -379,7 +396,8 @@ extension SocketTransportTests.SocketServerTests {
             }
             try await server.start()
             cleanup.add { await server.stop() }
-            let client = try await SocketClient(path: path, wireBuild: "server-test")
+            let client = try await SocketClient(path: path, wireBuild: "server-test",
+            role: SessionPeerRole.unprotected)
             cleanup.add { await client.close() }
             let call = try await client.open(operation: "collect", endInput: false)
             try await call.sendChunk(Data("one".utf8))
@@ -406,7 +424,8 @@ extension SocketTransportTests.SocketServerTests {
                 server: "new-build",
                 client: "old-build"
             )) {
-                _ = try await SocketClient(path: path, wireBuild: "old-build")
+                _ = try await SocketClient(path: path, wireBuild: "old-build",
+                role: SessionPeerRole.unprotected)
             }
         }
     }

@@ -151,6 +151,7 @@ public final class BrokerSocketBridge: @unchecked Sendable {
         client = try ServiceSocketClient(
             path: daemon.path,
             wireBuild: daemon.wireBuild,
+            role: daemon.role,
             noProgressTimeout: daemon.noProgressTimeout,
             configuration: daemon.socket,
             onProgress: daemon.onProgress

@@ -100,17 +100,19 @@ func (r *Runtime) ReadyOnlyListener() ReadyOnlyListener {
 	return ReadyOnlyListener{runtime: r, generation: r.controllerGeneration}
 }
 
-// ArmChild reserves one exact Ready-only peer fence without dispatching the child.
-func (l ReadyOnlyListener) ArmChild(receipt proc.ProcessReceipt) (*ChildFence, error) {
+// ArmChild reserves one exact Ready-only peer fence for the requested role
+// without dispatching the child.
+func (l ReadyOnlyListener) ArmChild(receipt proc.ProcessReceipt, role trust.PeerRole) (*ChildFence, error) {
 	r := l.runtime
-	if r == nil || !receipt.Prepared() || !receipt.RequiresPeerFence() || !r.cfg.Children.OwnsReceipt(receipt) {
+	if r == nil || role == "" || role == trust.UnprotectedRole || !receipt.Prepared() ||
+		!receipt.RequiresPeerFence() || !r.cfg.Children.OwnsReceipt(receipt) {
 		return nil, ErrUnfenceable
 	}
 	signature, ok := receipt.ExpectedSignature()
 	if !ok || signature == (proc.SignatureDigest{}) || receipt.RequestDigest() == (proc.SpawnRequestDigest{}) {
 		return nil, ErrUnfenceable
 	}
-	role, requirement, ok := r.fenceRequirement(signature)
+	requirement, ok := r.fenceRequirement(role, signature)
 	if !ok {
 		return nil, ErrUnfenceable
 	}
@@ -140,31 +142,20 @@ func (l ReadyOnlyListener) ArmChild(receipt proc.ProcessReceipt) (*ChildFence, e
 	return &ChildFence{listener: l, key: key, state: state}, nil
 }
 
-func (r *Runtime) fenceRequirement(signature proc.SignatureDigest) (trust.PeerRole, trust.Requirement, bool) {
-	var matched trust.PeerRole
-	var requirement trust.Requirement
-	for _, role := range r.trustPolicy.RoleNames() {
-		digest, ok := r.trustPolicy.SignatureDigest(role)
-		if !ok || digest != signature {
-			continue
-		}
-		if matched != "" {
-			return "", trust.Requirement{}, false
-		}
-		candidate, ok := r.trustPolicy.Requirement(role)
-		if !ok {
-			return "", trust.Requirement{}, false
-		}
-		matched, requirement = role, candidate
+func (r *Runtime) fenceRequirement(role trust.PeerRole, signature proc.SignatureDigest) (trust.Requirement, bool) {
+	expected, ok := r.trustPolicy.SignatureDigest(role)
+	if !ok || expected != signature {
+		return trust.Requirement{}, false
 	}
-	if matched == "" {
-		return "", trust.Requirement{}, false
+	requirement, ok := r.trustPolicy.Requirement(role)
+	if !ok {
+		return trust.Requirement{}, false
 	}
-	controlOnly := r.trustPolicy.AllowsStop(matched) || r.trustPolicy.AllowsReceipt(matched) || r.trustPolicy.AllowsReadiness(matched)
-	if controlOnly && !r.trustPolicy.AllowsHandoff(matched) {
-		return "", trust.Requirement{}, false
+	controlOnly := r.trustPolicy.AllowsStop(role) || r.trustPolicy.AllowsReceipt(role) || r.trustPolicy.AllowsReadiness(role)
+	if controlOnly && !r.trustPolicy.AllowsHandoff(role) {
+		return trust.Requirement{}, false
 	}
-	return matched, requirement, true
+	return requirement, true
 }
 
 // Start releases the exact prepared child and waits for its first exact authenticated session.
@@ -222,7 +213,11 @@ func (f *ChildFence) Start(ctx context.Context, child *proc.PreparedChild) (*Tru
 	}
 }
 
-func (r *Runtime) matchChildFence(ctx context.Context, peer peeridentity.Identity) (*runtimeauth.PeerFencePermit, error) {
+func (r *Runtime) matchChildFence(
+	ctx context.Context,
+	peer peeridentity.Identity,
+	role trust.PeerRole,
+) (*runtimeauth.PeerFencePermit, error) {
 	identity := peer.ProcessIdentity()
 	r.mu.Lock()
 	key, state := r.lookupChildFenceLocked(identity)
@@ -234,7 +229,7 @@ func (r *Runtime) matchChildFence(ctx context.Context, peer peeridentity.Identit
 		r.mu.Unlock()
 		return nil, ErrFenceClosed
 	}
-	if !state.dispatching || identity.Executable != state.executable {
+	if !state.dispatching || identity.Executable != state.executable || role != state.role {
 		r.mu.Unlock()
 		return nil, r.revokeAndStopFence(ctx, key, state, ErrFenceMismatch)
 	}

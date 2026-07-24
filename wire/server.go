@@ -381,24 +381,39 @@ func (s *Server) accept(ctx context.Context, admit, admitProtected daemonAdmissi
 			s.rejectHandshake(ctx, conn, ResponseCodePeerUntrusted, ErrUntrustedPeer)
 			continue
 		}
+		codec := NewCodec(conn)
+		codec.MaxFrame = s.maxFrame()
+		if err := codec.SetDeadline(earlierDeadline(ctx, s.handshakeTimeout())); err != nil {
+			_ = conn.Close()
+			continue
+		}
+		identity, err := s.readClientHello(codec)
+		if err != nil {
+			code := ResponseCodePeerUntrusted
+			if errors.Is(err, ErrBuildMismatch) {
+				code = ResponseCodeBuildMismatch
+			}
+			s.rejectHandshakeCodec(conn, codec, code, err)
+			continue
+		}
 		peer, err := PeerFromConn(unix)
 		if err != nil {
-			s.rejectHandshake(ctx, conn, ResponseCodePeerUntrusted, ErrUntrustedPeer)
+			s.rejectHandshakeCodec(conn, codec, ResponseCodePeerUntrusted, ErrUntrustedPeer)
 			s.Log.Debug("wire: reject unidentified peer", "err", err)
 			continue
 		}
 		verifyCtx, cancelVerify := context.WithTimeout(ctx, s.peerVerificationTimeout())
-		role, protected, err := s.verifyPeer(verifyCtx, peer)
+		role, protected, err := s.verifyPeer(verifyCtx, peer, identity.Role)
 		if err != nil {
 			cancelVerify()
-			s.rejectHandshake(ctx, conn, ResponseCodePeerUntrusted, ErrUntrustedPeer)
+			s.rejectHandshakeCodec(conn, codec, ResponseCodePeerUntrusted, ErrUntrustedPeer)
 			s.Log.Debug("wire: reject untrusted peer", "err", err)
 			continue
 		}
-		fencePermit, err := peerFence(verifyCtx, peer)
+		fencePermit, err := peerFence(verifyCtx, peer, role)
 		cancelVerify()
 		if err != nil {
-			s.rejectHandshake(ctx, conn, ResponseCodePeerUntrusted, ErrUntrustedPeer)
+			s.rejectHandshakeCodec(conn, codec, ResponseCodePeerUntrusted, ErrUntrustedPeer)
 			s.Log.Debug("wire: reject child peer fence", "err", err)
 			continue
 		}
@@ -407,26 +422,28 @@ func (s *Server) accept(ctx context.Context, admit, admitProtected daemonAdmissi
 			if fencePermit != nil {
 				fencePermit.Rollback()
 			}
-			s.rejectHandshake(ctx, conn, ResponseCodeSessionCapacity, ErrSessionCapacity)
+			s.rejectHandshakeCodec(conn, codec, ResponseCodeSessionCapacity, ErrSessionCapacity)
 			continue
 		}
 		s.sessionWG.Add(1)
-		go func(conn net.Conn, peer Peer, role trust.PeerRole, protected bool, capacity sessionCapacity, fencePermit *runtimeauth.PeerFencePermit) {
+		go func(conn net.Conn, codec *Codec, identity handshakeIdentity, peer Peer, role trust.PeerRole, protected bool, capacity sessionCapacity, fencePermit *runtimeauth.PeerFencePermit) {
 			releaseCapacity := sync.OnceFunc(func() { s.releaseSessionCapacity(capacity) })
 			defer func() {
 				releaseCapacity()
 				s.sessionWG.Done()
 			}()
-			if err := s.serveConn(ctx, conn, peer, role, protected, admit, admitProtected, releaseCapacity, fencePermit); err != nil && !isDisconnect(err) {
+			if err := s.serveConn(ctx, conn, codec, identity, peer, role, protected, admit, admitProtected, releaseCapacity, fencePermit); err != nil && !isDisconnect(err) {
 				s.Log.Debug("wire: session ended", "err", err)
 			}
-		}(conn, peer, role, protected, capacity, fencePermit)
+		}(conn, codec, identity, peer, role, protected, capacity, fencePermit)
 	}
 }
 
 func (s *Server) serveConn(
 	ctx context.Context,
 	conn net.Conn,
+	codec *Codec,
+	identity handshakeIdentity,
 	peer Peer,
 	role trust.PeerRole,
 	protected bool,
@@ -440,12 +457,7 @@ func (s *Server) serveConn(
 	defer conn.Close()
 	stopContext := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stopContext()
-	codec := NewCodec(conn)
-	codec.MaxFrame = s.maxFrame()
-	if err := codec.SetDeadline(earlierDeadline(ctx, s.handshakeTimeout())); err != nil {
-		return err
-	}
-	identity, generation, err := s.serverHandshake(codec)
+	generation, err := s.completeHandshake(codec)
 	if err != nil {
 		return err
 	}
@@ -494,46 +506,47 @@ func (s *Server) serveConn(
 	return err
 }
 
-func (s *Server) serverHandshake(codec *Codec) (handshakeIdentity, []byte, error) {
+func (s *Server) readClientHello(codec *Codec) (handshakeIdentity, error) {
 	frame, err := codec.ReadFrame()
 	if err != nil {
-		return handshakeIdentity{}, nil, fmt.Errorf("%w: %w", ErrHandshake, err)
+		return handshakeIdentity{}, fmt.Errorf("%w: %w", ErrHandshake, err)
 	}
 	if frame.Kind != FrameHello || frame.ID != 0 || frame.Sequence != 0 || frame.Flags != FlagEnd || frame.Op != "" || frame.Tenant != "" {
-		return handshakeIdentity{}, nil, fmt.Errorf("%w: invalid hello frame", ErrHandshake)
+		return handshakeIdentity{}, fmt.Errorf("%w: invalid hello frame", ErrHandshake)
 	}
 	var identity handshakeIdentity
 	if err := decodeStrict(frame.Payload, &identity); err != nil {
-		return handshakeIdentity{}, nil, fmt.Errorf("%w: identity: %w", ErrHandshake, err)
+		return handshakeIdentity{}, fmt.Errorf("%w: identity: %w", ErrHandshake, err)
 	}
 	if identity.Protocol != ProtocolVersion {
-		return handshakeIdentity{}, nil, fmt.Errorf("%w: identity got %d", ErrProtocolVersion, identity.Protocol)
+		return handshakeIdentity{}, fmt.Errorf("%w: identity got %d", ErrProtocolVersion, identity.Protocol)
 	}
 	if identity.WireBuild == "" {
-		return handshakeIdentity{}, nil, fmt.Errorf("%w: empty wire build", ErrHandshake)
+		return handshakeIdentity{}, fmt.Errorf("%w: empty wire build", ErrHandshake)
+	}
+	if identity.Role == "" {
+		return handshakeIdentity{}, fmt.Errorf("%w: empty peer role", ErrHandshake)
 	}
 	if len(identity.Session) != 0 {
-		return handshakeIdentity{}, nil, fmt.Errorf("%w: client supplied a session generation", ErrHandshake)
+		return handshakeIdentity{}, fmt.Errorf("%w: client supplied a session generation", ErrHandshake)
 	}
 	if identity.WireBuild != s.WireBuild {
-		if err := s.writeHandshakeAck(codec, handshakeAck{
-			Protocol: ProtocolVersion, WireBuild: s.WireBuild, Rejected: true,
-			Code: ResponseCodeBuildMismatch, Reason: ErrBuildMismatch.Error(),
-		}); err != nil {
-			return handshakeIdentity{}, nil, fmt.Errorf("%w: reject build: %w", ErrHandshake, err)
-		}
-		return handshakeIdentity{}, nil, ErrBuildMismatch
+		return handshakeIdentity{}, ErrBuildMismatch
 	}
+	return identity, nil
+}
+
+func (s *Server) completeHandshake(codec *Codec) ([]byte, error) {
 	generation := make([]byte, sessionGenerationBytes)
 	if _, err := rand.Read(generation); err != nil {
-		return handshakeIdentity{}, nil, fmt.Errorf("%w: generate session: %w", ErrHandshake, err)
+		return nil, fmt.Errorf("%w: generate session: %w", ErrHandshake, err)
 	}
 	if err := s.writeHandshakeAck(codec, handshakeAck{
 		Protocol: ProtocolVersion, WireBuild: s.WireBuild, Session: generation,
 	}); err != nil {
-		return handshakeIdentity{}, nil, fmt.Errorf("%w: acknowledge: %w", ErrHandshake, err)
+		return nil, fmt.Errorf("%w: acknowledge: %w", ErrHandshake, err)
 	}
-	return identity, generation, nil
+	return generation, nil
 }
 
 func (s *Server) rejectHandshake(ctx context.Context, conn net.Conn, code ResponseCode, cause error) {
@@ -543,6 +556,14 @@ func (s *Server) rejectHandshake(ctx context.Context, conn net.Conn, code Respon
 	if err := codec.SetDeadline(earlierDeadline(ctx, s.handshakeTimeout())); err != nil {
 		return
 	}
+	_ = s.writeHandshakeAck(codec, handshakeAck{
+		Protocol: ProtocolVersion, WireBuild: s.WireBuild, Rejected: true,
+		Code: code, Reason: cause.Error(),
+	})
+}
+
+func (s *Server) rejectHandshakeCodec(conn net.Conn, codec *Codec, code ResponseCode, cause error) {
+	defer conn.Close()
 	_ = s.writeHandshakeAck(codec, handshakeAck{
 		Protocol: ProtocolVersion, WireBuild: s.WireBuild, Rejected: true,
 		Code: code, Reason: cause.Error(),
@@ -763,32 +784,30 @@ func (s *Server) closeSessions() {
 	}
 }
 
-func (s *Server) verifyPeer(ctx context.Context, peer Peer) (trust.PeerRole, bool, error) {
+func (s *Server) verifyPeer(ctx context.Context, peer Peer, role trust.PeerRole) (trust.PeerRole, bool, error) {
 	if err := s.verifyOrdinaryPeer(ctx, peer); err != nil {
 		return "", false, err
 	}
-	var matched trust.PeerRole
-	for _, role := range s.trustPolicy.RoleNames() {
-		requirement, ok := s.trustPolicy.Requirement(role)
-		if !ok {
-			return "", false, errors.New("wire: compiled trust role is absent")
+	if role == trust.UnprotectedRole {
+		if !s.trustPolicy.AllowsUnprotected() {
+			return "", false, ErrUntrustedPeer
 		}
-		verifier := trust.ProcessVerifier{
-			Runner: s.trustWorkers, Executable: s.trustExecutable,
-			Policy: trust.Policy{Requirement: &requirement},
-		}
-		if err := verifier.Check(ctx, peer); err == nil {
-			if matched != "" {
-				return "", false, trust.ErrAmbiguousRole
-			}
-			matched = role
-		} else if !errors.Is(err, trust.ErrUntrustedPeer) {
-			return "", false, err
-		}
+		return role, false, nil
 	}
-	protected := s.trustPolicy.AllowsStop(matched) || s.trustPolicy.AllowsReceipt(matched) ||
-		s.trustPolicy.AllowsReadiness(matched) || s.trustPolicy.AllowsHandoff(matched)
-	return matched, protected, nil
+	requirement, ok := s.trustPolicy.Requirement(role)
+	if !ok {
+		return "", false, ErrUntrustedPeer
+	}
+	verifier := trust.ProcessVerifier{
+		Runner: s.trustWorkers, Executable: s.trustExecutable,
+		Policy: trust.Policy{Requirement: &requirement},
+	}
+	if err := verifier.Check(ctx, peer); err != nil {
+		return "", false, err
+	}
+	protected := s.trustPolicy.AllowsStop(role) || s.trustPolicy.AllowsReceipt(role) ||
+		s.trustPolicy.AllowsReadiness(role) || s.trustPolicy.AllowsHandoff(role)
+	return role, protected, nil
 }
 
 func (s *Server) verifyOrdinaryPeer(ctx context.Context, peer Peer) error {

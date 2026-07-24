@@ -66,7 +66,8 @@ extension SocketTransportTests {
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try await SocketClient(path: path, wireBuild: "server-test")
+                let client = try await SocketClient(path: path, wireBuild: "server-test",
+                role: SessionPeerRole.unprotected)
                 cleanup.add { await client.close() }
 
                 let payload = Data(repeating: 0xA5, count: 64 * 1024)
@@ -107,7 +108,8 @@ extension SocketTransportTests {
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try await SocketClient(path: path, wireBuild: "server-test")
+                let client = try await SocketClient(path: path, wireBuild: "server-test",
+                role: SessionPeerRole.unprotected)
                 cleanup.add { await client.close() }
 
                 let upload = try await client.open(operation: "upload", endInput: false)
@@ -143,7 +145,8 @@ extension SocketTransportTests {
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try await SocketClient(path: path, wireBuild: "server-test")
+                let client = try await SocketClient(path: path, wireBuild: "server-test",
+                role: SessionPeerRole.unprotected)
                 cleanup.add { await client.close() }
 
                 let upload = try await client.open(operation: "upload", endInput: false)

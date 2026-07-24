@@ -130,7 +130,8 @@ extension SocketTransportTests {
                 let settling = LifetimeGate()
                 var client: SocketClient? = try await SocketClient(
                     path: path,
-                    wireBuild: "drop-settling-client"
+                    wireBuild: "drop-settling-client",
+                    role: SessionPeerRole.unprotected
                 )
                 client?.requestSettlementHook = { await settling.wait() }
                 weak let weakClient = client
@@ -166,7 +167,8 @@ extension SocketTransportTests {
                 let delivering = LifetimeGate()
                 var client: SocketClient? = try await SocketClient(
                     path: path,
-                    wireBuild: "drop-streaming-client"
+                    wireBuild: "drop-streaming-client",
+                    role: SessionPeerRole.unprotected
                 )
                 client?.receiveStreamOfferHook = { await delivering.wait() }
                 weak let weakClient = client

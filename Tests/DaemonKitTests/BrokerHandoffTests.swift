@@ -407,6 +407,7 @@ extension SocketTransportTests.BrokerHandoffTests {
             daemon: RuntimeClientConfiguration(
                 path: path + ".daemon",
                 wireBuild: "suite.v1",
+                role: SessionPeerRole.unprotected,
                 noProgressTimeout: 1
             ),
             expectedRuntimeBuild: "app.v1"

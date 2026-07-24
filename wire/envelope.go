@@ -6,6 +6,7 @@ import (
 	"errors"
 
 	"github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/trust"
 )
 
 const sessionGenerationBytes = 16
@@ -50,9 +51,10 @@ type WireIdentity struct {
 }
 
 type handshakeIdentity struct {
-	Protocol  uint16 `json:"protocol"`
-	WireBuild string `json:"wire_build"`
-	Session   []byte `json:"session,omitempty"`
+	Protocol  uint16         `json:"protocol"`
+	WireBuild string         `json:"wire_build"`
+	Role      trust.PeerRole `json:"role"`
+	Session   []byte         `json:"session,omitempty"`
 }
 
 type handshakeAck struct {

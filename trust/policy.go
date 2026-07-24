@@ -29,13 +29,14 @@ var ErrUntrustedPeer = errors.New("trust: untrusted peer")
 // no code-identity verifier is available — never a downgrade to UID-only.
 var ErrNoVerifier = errors.New("trust: no code-identity verifier for a configured requirement")
 
-// ErrAmbiguousRole means a peer satisfied more than one protected role.
-var ErrAmbiguousRole = errors.New("trust: peer satisfies multiple protected roles")
-
 const appGroupsEntitlement = "com.apple.security.application-groups"
 
 // PeerRole names one exact signed peer authority.
 type PeerRole string
+
+// UnprotectedRole is the daemonkit-sealed role for same-UID sessions with no
+// signed or private-control authority.
+const UnprotectedRole PeerRole = "daemonkit.unprotected.v1"
 
 // PolicyDigest is the canonical identity of one complete compiled trust policy.
 type PolicyDigest [sha256.Size]byte
@@ -176,25 +177,27 @@ type Policy struct {
 //
 //nolint:revive // The exact public name distinguishes the compiled policy from per-peer Policy.
 type TrustPolicyConfig struct {
-	ExpectedUID    int
-	Roles          map[PeerRole]Requirement
-	StopRoles      []PeerRole
-	ReceiptRoles   []PeerRole
-	ReadinessRoles []PeerRole
-	HandoffRoles   []PeerRole
+	ExpectedUID      int
+	Roles            map[PeerRole]Requirement
+	AllowUnprotected bool
+	StopRoles        []PeerRole
+	ReceiptRoles     []PeerRole
+	ReadinessRoles   []PeerRole
+	HandoffRoles     []PeerRole
 }
 
 // TrustPolicy is an immutable compiled runtime trust policy.
 //
 //nolint:revive // The exact public name distinguishes runtime authority from per-peer Policy.
 type TrustPolicy struct {
-	expectedUID    int
-	roles          map[PeerRole]Requirement
-	roleNames      []PeerRole
-	stopRoles      map[PeerRole]struct{}
-	receiptRoles   map[PeerRole]struct{}
-	readinessRoles map[PeerRole]struct{}
-	handoffRoles   map[PeerRole]struct{}
+	expectedUID      int
+	roles            map[PeerRole]Requirement
+	roleNames        []PeerRole
+	allowUnprotected bool
+	stopRoles        map[PeerRole]struct{}
+	receiptRoles     map[PeerRole]struct{}
+	readinessRoles   map[PeerRole]struct{}
+	handoffRoles     map[PeerRole]struct{}
 }
 
 // NewTrustPolicy validates and deep-copies a complete runtime trust policy.
@@ -202,33 +205,38 @@ func NewTrustPolicy(config TrustPolicyConfig) (TrustPolicy, error) {
 	if config.ExpectedUID != os.Geteuid() {
 		return TrustPolicy{}, fmt.Errorf("trust: expected UID %d must equal effective UID %d", config.ExpectedUID, os.Geteuid())
 	}
-	if len(config.Roles) == 0 {
-		return TrustPolicy{}, errors.New("trust: at least one protected role is required")
-	}
 	policy := TrustPolicy{
-		expectedUID:    config.ExpectedUID,
-		roles:          make(map[PeerRole]Requirement, len(config.Roles)),
-		stopRoles:      make(map[PeerRole]struct{}, len(config.StopRoles)),
-		receiptRoles:   make(map[PeerRole]struct{}, len(config.ReceiptRoles)),
-		readinessRoles: make(map[PeerRole]struct{}, len(config.ReadinessRoles)),
-		handoffRoles:   make(map[PeerRole]struct{}, len(config.HandoffRoles)),
+		expectedUID:      config.ExpectedUID,
+		roles:            make(map[PeerRole]Requirement, len(config.Roles)),
+		allowUnprotected: config.AllowUnprotected,
+		stopRoles:        make(map[PeerRole]struct{}, len(config.StopRoles)),
+		receiptRoles:     make(map[PeerRole]struct{}, len(config.ReceiptRoles)),
+		readinessRoles:   make(map[PeerRole]struct{}, len(config.ReadinessRoles)),
+		handoffRoles:     make(map[PeerRole]struct{}, len(config.HandoffRoles)),
 	}
-	digests := make(map[codeidentity.PolicyDigest]PeerRole, len(config.Roles))
+	if len(config.Roles) == 0 {
+		if !config.AllowUnprotected {
+			return TrustPolicy{}, errors.New("trust: at least one protected role or explicit unprotected mode is required")
+		}
+		if len(config.StopRoles) != 0 || len(config.ReceiptRoles) != 0 ||
+			len(config.ReadinessRoles) != 0 || len(config.HandoffRoles) != 0 {
+			return TrustPolicy{}, errors.New("trust: unprotected-only policy cannot declare protected authority")
+		}
+		return policy, nil
+	}
 	for role, requirement := range config.Roles {
 		if strings.TrimSpace(string(role)) == "" {
 			return TrustPolicy{}, errors.New("trust: protected role is empty")
 		}
+		if role == UnprotectedRole {
+			return TrustPolicy{}, fmt.Errorf("trust: role %q is reserved by daemonkit", role)
+		}
 		if err := requirement.validate(); err != nil {
 			return TrustPolicy{}, fmt.Errorf("trust: role %q: %w", role, err)
 		}
-		digest, err := requirement.ValidationDigest()
-		if err != nil {
+		if _, err := requirement.ValidationDigest(); err != nil {
 			return TrustPolicy{}, fmt.Errorf("trust: role %q digest: %w", role, err)
 		}
-		if prior, exists := digests[digest]; exists {
-			return TrustPolicy{}, fmt.Errorf("trust: roles %q and %q have equivalent requirements", prior, role)
-		}
-		digests[digest] = role
 		policy.roles[role] = cloneRequirement(requirement)
 		policy.roleNames = append(policy.roleNames, role)
 	}
@@ -308,8 +316,18 @@ func cloneRequirement(source Requirement) Requirement {
 
 // Validate rejects the zero value; constructed policies are already valid.
 func (p TrustPolicy) Validate() error {
-	if len(p.roles) == 0 || len(p.stopRoles) == 0 || len(p.receiptRoles) == 0 || len(p.readinessRoles) == 0 || p.handoffRoles == nil {
+	if p.roles == nil || p.stopRoles == nil || p.receiptRoles == nil || p.readinessRoles == nil || p.handoffRoles == nil {
 		return errors.New("trust: policy was not constructed by NewTrustPolicy")
+	}
+	if len(p.roles) == 0 {
+		if !p.allowUnprotected || len(p.stopRoles) != 0 || len(p.receiptRoles) != 0 ||
+			len(p.readinessRoles) != 0 || len(p.handoffRoles) != 0 {
+			return errors.New("trust: invalid unprotected-only policy")
+		}
+		return nil
+	}
+	if len(p.stopRoles) == 0 || len(p.receiptRoles) == 0 || len(p.readinessRoles) == 0 {
+		return errors.New("trust: protected policy is missing required authority")
 	}
 	return nil
 }
@@ -319,6 +337,10 @@ func (p TrustPolicy) ExpectedUID() int { return p.expectedUID }
 
 // RoleNames returns the canonical protected-role order.
 func (p TrustPolicy) RoleNames() []PeerRole { return append([]PeerRole(nil), p.roleNames...) }
+
+// AllowsUnprotected reports whether the sealed same-UID role may open a
+// session. It never grants signed or private-control authority.
+func (p TrustPolicy) AllowsUnprotected() bool { return p.allowUnprotected }
 
 // Requirement returns a deep copy of one compiled role requirement.
 func (p TrustPolicy) Requirement(role PeerRole) (Requirement, bool) {
@@ -366,6 +388,11 @@ func (p TrustPolicy) ValidationDigest() (PolicyDigest, error) {
 	var uid [8]byte
 	binary.BigEndian.PutUint64(uid[:], uint64(p.expectedUID)) //nolint:gosec // Validation pins a nonnegative effective UID.
 	_, _ = h.Write(uid[:])
+	if p.allowUnprotected {
+		_, _ = h.Write([]byte{1})
+	} else {
+		_, _ = h.Write([]byte{0})
+	}
 	for _, role := range p.roleNames {
 		writeDigestString(h, string(role))
 		requirement, ok := p.roles[role]

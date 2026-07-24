@@ -12,6 +12,7 @@ import (
 	"github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/internal/spawnedsession"
 	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/trust"
 )
 
 // SessionLimits is one exact, bounded spawned-session resource policy.
@@ -70,8 +71,23 @@ func RunSpawnedSession(ctx context.Context, config SpawnedSessionConfig) error {
 	}
 	server.startWorkers(workers)
 	defer server.stopWorkers()
+	codec := NewCodec(opened.Conn)
+	codec.MaxFrame = server.maxFrame()
+	if err := codec.SetDeadline(earlierDeadline(ctx, server.handshakeTimeout())); err != nil {
+		_ = opened.Conn.Close()
+		return err
+	}
+	identity, err := server.readClientHello(codec)
+	if err != nil {
+		_ = opened.Conn.Close()
+		return err
+	}
+	if identity.Role != trust.UnprotectedRole {
+		_ = opened.Conn.Close()
+		return errors.New("wire: spawned session requires daemonkit's unprotected role")
+	}
 	return server.serveConn(
-		ctx, opened.Conn, peer, "", false,
+		ctx, opened.Conn, codec, identity, peer, trust.UnprotectedRole, false,
 		staticAdmission, staticAdmission, func() {}, nil,
 	)
 }
@@ -98,7 +114,7 @@ func NewSpawnedClient(ctx context.Context, config SpawnedClientConfig) (*Spawned
 		return conn, nil
 	}
 	client, err := newClient(ctx, ClientConfig{
-		Dial: dial, WireBuild: config.WireBuild, Ladder: config.Ladder,
+		Dial: dial, WireBuild: config.WireBuild, Role: trust.UnprotectedRole, Ladder: config.Ladder,
 		MaxFrame:                config.Limits.MaxFrame,
 		OutboundQueue:           config.Limits.OutboundQueue,
 		StreamQueue:             config.Limits.StreamQueue,

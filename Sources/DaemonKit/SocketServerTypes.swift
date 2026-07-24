@@ -35,6 +35,8 @@ struct SocketRequest: Sendable {
     let chunks: SocketChunkStream
     let peer: SocketPeer
     let peerWireBuild: String
+    /// The untrusted Hello claim; Swift never grants authority from it.
+    let peerRole: String
     let session: SocketSession
     let runtimeAdmission: RuntimeAdmissionPin?
 }

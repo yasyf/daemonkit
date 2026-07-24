@@ -203,6 +203,7 @@ extension SocketTransportTests {
                 _ = try await SocketClient(
                     path: "/tmp/never-connect.sock",
                     wireBuild: "invalid",
+                    role: SessionPeerRole.unprotected,
                     configuration: .init(maximumFrameBytes: 0)
                 )
             }
@@ -210,7 +211,15 @@ extension SocketTransportTests {
                 _ = try await SocketClient(
                     path: "/tmp/never-connect.sock",
                     wireBuild: "invalid",
+                    role: SessionPeerRole.unprotected,
                     configuration: .init(handshakeTimeout: .infinity)
+                )
+            }
+            await #expect(throws: SessionTransportError.self) {
+                _ = try await SocketClient(
+                    path: "/tmp/never-connect.sock",
+                    wireBuild: "invalid",
+                    role: ""
                 )
             }
             let server = SocketServer(
@@ -235,7 +244,8 @@ extension SocketTransportTests {
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try await SocketClient(path: path, wireBuild: "expired")
+                let client = try await SocketClient(path: path, wireBuild: "expired",
+                role: SessionPeerRole.unprotected)
                 cleanup.add { await client.close() }
                 let terminal = try await client.call(
                     operation: "expired",
@@ -257,7 +267,8 @@ extension SocketTransportTests {
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try await SocketClient(path: path, wireBuild: "strict")
+                let client = try await SocketClient(path: path, wireBuild: "strict",
+                role: SessionPeerRole.unprotected)
                 cleanup.add { await client.close() }
                 let payload = Data(#"{"strict":true}"#.utf8)
                 let response = try await client.call(operation: "echo", payload: payload)
@@ -337,7 +348,8 @@ extension SocketTransportTests {
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try await SocketClient(path: path, wireBuild: "open-cancel")
+                let client = try await SocketClient(path: path, wireBuild: "open-cancel",
+                role: SessionPeerRole.unprotected)
                 cleanup.add { await client.close() }
                 let gate = AsyncGate()
                 client.openCommitHook = { await gate.wait() }
@@ -374,7 +386,8 @@ extension SocketTransportTests {
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try await SocketClient(path: path, wireBuild: "response-cancel")
+                let client = try await SocketClient(path: path, wireBuild: "response-cancel",
+                role: SessionPeerRole.unprotected)
                 cleanup.add { await client.close() }
                 let call = try await client.open(operation: "wait")
                 await handlerGate.waitUntilEntered()
@@ -403,7 +416,8 @@ extension SocketTransportTests {
                 cleanup.add { await server.stop() }
                 let client = try await SocketClient(
                     path: path,
-                    wireBuild: "terminal-settlement"
+                    wireBuild: "terminal-settlement",
+                    role: SessionPeerRole.unprotected
                 )
                 cleanup.add { await client.close() }
                 let call = try await client.open(operation: "terminal", endInput: false)
@@ -445,7 +459,8 @@ extension SocketTransportTests {
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try await SocketClient(path: path, wireBuild: "send-settlement")
+                let client = try await SocketClient(path: path, wireBuild: "send-settlement",
+                role: SessionPeerRole.unprotected)
                 cleanup.add { await client.close() }
                 let sendGate = AsyncGate()
                 let drainWaiting = CompletionProbe()
@@ -510,7 +525,8 @@ extension SocketTransportTests {
                 cleanup.add { await server.stop() }
                 let client = try await SocketClient(
                     path: path,
-                    wireBuild: "stream-commit-cancel"
+                    wireBuild: "stream-commit-cancel",
+                    role: SessionPeerRole.unprotected
                 )
                 cleanup.add { await client.close() }
                 let committing = OneShotGate()
@@ -540,7 +556,8 @@ extension SocketTransportTests {
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try await SocketClient(path: path, wireBuild: "close-settlement")
+                let client = try await SocketClient(path: path, wireBuild: "close-settlement",
+                role: SessionPeerRole.unprotected)
                 cleanup.add { await client.close() }
                 let settling = AsyncGate()
                 let coAwaiting = AsyncGate()
@@ -586,7 +603,8 @@ extension SocketTransportTests {
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try await SocketClient(path: path, wireBuild: "stream-cancel")
+                let client = try await SocketClient(path: path, wireBuild: "stream-cancel",
+                role: SessionPeerRole.unprotected)
                 cleanup.add { await client.close() }
                 let delivering = AsyncGate()
                 client.receiveStreamOfferHook = { await delivering.wait() }
@@ -619,7 +637,8 @@ extension SocketTransportTests {
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try await SocketClient(path: path, wireBuild: "duplex-cancel")
+                let client = try await SocketClient(path: path, wireBuild: "duplex-cancel",
+                role: SessionPeerRole.unprotected)
                 cleanup.add { await client.close() }
                 let sending = AsyncGate()
                 let delivering = AsyncGate()
@@ -663,6 +682,7 @@ extension SocketTransportTests {
                 let client = try await SocketClient(
                     path: path,
                     wireBuild: "timeout-race",
+                    role: SessionPeerRole.unprotected,
                     configuration: .init(cancellationSettlementTimeout: 0.001)
                 )
                 cleanup.add { await client.close() }
@@ -721,7 +741,8 @@ extension SocketTransportTests {
                 }
                 try await server.start()
                 cleanup.add { await server.stop() }
-                let client = try await SocketClient(path: path, wireBuild: "credit-settlement")
+                let client = try await SocketClient(path: path, wireBuild: "credit-settlement",
+                role: SessionPeerRole.unprotected)
                 cleanup.add { await client.close() }
                 let admissions = InvocationProbe()
                 client.requestSendAdmissionHook = { await admissions.record() }
@@ -935,6 +956,7 @@ extension SocketTransportTests {
                 try await SocketClient(
                     path: path,
                     wireBuild: "handshake",
+                    role: SessionPeerRole.unprotected,
                     configuration: .init(handshakeTimeout: 5)
                 )
             }
@@ -978,6 +1000,7 @@ extension SocketTransportTests {
                 var client: SocketClient? = try await SocketClient(
                     path: path,
                     wireBuild: "drop-client",
+                    role: SessionPeerRole.unprotected,
                     configuration: .init(cancellationSettlementTimeout: 3600)
                 )
                 weak let weakClient = client

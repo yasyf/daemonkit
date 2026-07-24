@@ -164,7 +164,7 @@ func trustPolicyRequirement(identifier string) Requirement {
 
 func trustPolicyConfig() TrustPolicyConfig {
 	return TrustPolicyConfig{
-		ExpectedUID: os.Geteuid(),
+		ExpectedUID: os.Geteuid(), AllowUnprotected: true,
 		Roles: map[PeerRole]Requirement{
 			"stop":      trustPolicyRequirement("com.yasyf.daemonkit.stop"),
 			"lifecycle": trustPolicyRequirement("com.yasyf.daemonkit.lifecycle"),
@@ -172,6 +172,110 @@ func trustPolicyConfig() TrustPolicyConfig {
 		},
 		StopRoles: []PeerRole{"stop"}, ReceiptRoles: []PeerRole{"lifecycle"},
 		ReadinessRoles: []PeerRole{"lifecycle"}, HandoffRoles: []PeerRole{"broker"},
+	}
+}
+
+func TestTrustPolicyAllowsEquivalentRequirementsAcrossExplicitRoles(t *testing.T) {
+	config := trustPolicyConfig()
+	config.Roles["readiness-2"] = config.Roles["lifecycle"]
+	config.ReadinessRoles = []PeerRole{"lifecycle", "readiness-2"}
+	policy, err := NewTrustPolicy(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, ok := policy.Requirement("lifecycle")
+	if !ok {
+		t.Fatal("lifecycle role is absent")
+	}
+	second, ok := policy.Requirement("readiness-2")
+	if !ok {
+		t.Fatal("second readiness role is absent")
+	}
+	firstDigest, err := first.ValidationDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondDigest, err := second.ValidationDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstDigest != secondDigest {
+		t.Fatalf("equivalent role requirements differ: %x != %x", firstDigest, secondDigest)
+	}
+	if !policy.AllowsReadiness("lifecycle") || !policy.AllowsReadiness("readiness-2") {
+		t.Fatal("explicit readiness roles lost authority")
+	}
+}
+
+func TestTrustPolicySealsUnprotectedRoleAndDigest(t *testing.T) {
+	config := trustPolicyConfig()
+	allowed, err := NewTrustPolicy(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !allowed.AllowsUnprotected() {
+		t.Fatal("configured unprotected role was not allowed")
+	}
+	if allowed.AllowsStop(UnprotectedRole) || allowed.AllowsReceipt(UnprotectedRole) ||
+		allowed.AllowsReadiness(UnprotectedRole) || allowed.AllowsHandoff(UnprotectedRole) {
+		t.Fatal("unprotected role gained private authority")
+	}
+	allowedDigest, err := allowed.ValidationDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.AllowUnprotected = false
+	denied, err := NewTrustPolicy(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deniedDigest, err := denied.ValidationDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allowedDigest == deniedDigest {
+		t.Fatal("unprotected-session policy did not affect validation digest")
+	}
+	config = trustPolicyConfig()
+	config.Roles[UnprotectedRole] = trustPolicyRequirement("com.yasyf.daemonkit.fake-unprotected")
+	if _, err := NewTrustPolicy(config); err == nil {
+		t.Fatal("consumer-defined unprotected role succeeded")
+	}
+}
+
+func TestTrustPolicyAllowsExplicitUnprotectedOnlyMode(t *testing.T) {
+	policy, err := NewTrustPolicy(TrustPolicyConfig{
+		ExpectedUID: os.Geteuid(), AllowUnprotected: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := policy.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if !policy.AllowsUnprotected() || len(policy.RoleNames()) != 0 {
+		t.Fatalf("unprotected-only policy = allow:%t roles:%v", policy.AllowsUnprotected(), policy.RoleNames())
+	}
+	if policy.AllowsStop(UnprotectedRole) || policy.AllowsReceipt(UnprotectedRole) ||
+		policy.AllowsReadiness(UnprotectedRole) || policy.AllowsHandoff(UnprotectedRole) {
+		t.Fatal("unprotected-only policy gained protected authority")
+	}
+	if digest, err := policy.ValidationDigest(); err != nil || digest == (PolicyDigest{}) {
+		t.Fatalf("validation digest = %x, %v", digest, err)
+	}
+	for name, mutate := range map[string]func(*TrustPolicyConfig){
+		"stop":      func(c *TrustPolicyConfig) { c.StopRoles = []PeerRole{"fake"} },
+		"receipt":   func(c *TrustPolicyConfig) { c.ReceiptRoles = []PeerRole{"fake"} },
+		"readiness": func(c *TrustPolicyConfig) { c.ReadinessRoles = []PeerRole{"fake"} },
+		"handoff":   func(c *TrustPolicyConfig) { c.HandoffRoles = []PeerRole{"fake"} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			config := TrustPolicyConfig{ExpectedUID: os.Geteuid(), AllowUnprotected: true}
+			mutate(&config)
+			if _, err := NewTrustPolicy(config); err == nil {
+				t.Fatal("unprotected-only policy accepted protected authority")
+			}
+		})
 	}
 }
 

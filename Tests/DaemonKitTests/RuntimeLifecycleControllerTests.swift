@@ -148,7 +148,8 @@ extension SocketTransportTests {
 
                 let client = try await SocketClient(
                     path: path,
-                    wireBuild: "service.v1"
+                    wireBuild: "service.v1",
+                    role: SessionPeerRole.unprotected
                 )
                 cleanup.add { await client.close() }
                 let before = try await client.call(
@@ -209,7 +210,8 @@ extension SocketTransportTests {
                 try activation.commitReady(slot.stage(activation, value: "stable"))
                 let client = try await SocketClient(
                     path: path,
-                    wireBuild: "service.v1"
+                    wireBuild: "service.v1",
+                    role: SessionPeerRole.unprotected
                 )
                 cleanup.add { await client.close() }
 
@@ -352,7 +354,7 @@ extension SocketTransportTests {
 }
 
 extension SocketTransportTests.RuntimeLifecycleControllerTests {
-    @Test func readinessSubscriberObservesUnexpectedReadyFailureBeforeEOF() async throws {
+    @Test func swiftServerRejectsProtectedReadinessBeforeHandler() async throws {
         try await withAsyncCleanup { cleanup in
             let directory = try shortSocketDir()
             cleanup.add { try? FileManager.default.removeItem(at: directory) }
@@ -365,36 +367,20 @@ extension SocketTransportTests.RuntimeLifecycleControllerTests {
                 handler: RuntimeHandlerSpec { request in await handler.handle(request) }
             )
             cleanup.add { try? await runtime.shutdown(deadline: Date().addingTimeInterval(2)) }
-            let slot: RuntimePublicationSlot<String> = runtime.newPublicationSlot()
-            let activation = try await runtime.begin(deadline: Date().addingTimeInterval(2))
-            try activation.commitReady(slot.stage(activation, value: "ready"))
-
-            let failedObserved = AsyncLatch()
-            let client = try ServiceSocketClient(
+            _ = try await runtime.begin(deadline: Date().addingTimeInterval(2))
+            let client = try await SocketClient(
                 path: path,
                 wireBuild: "service.v1",
-                noProgressTimeout: 1,
-                onProgress: { progress in
-                    if progress.state == .failed {
-                        failedObserved.finish()
-                    }
-                }
+                role: "readiness-controller.v1"
             )
             cleanup.add { await client.close() }
-            _ = try await client.acquireReadyRuntime(
-                expectedRuntimeBuild: "app.v1",
+            let terminal = try await client.call(
+                operation: runtimeReadinessSubscribeOperation,
+                payload: RuntimeReadinessCodec.encodeSubscribe(),
                 deadline: Date().addingTimeInterval(2)
             )
-
-            runtime.controller.markServerTerminal(TestUnexpectedServerFailure.failed)
-            try await failedObserved.wait(deadline: Date().addingTimeInterval(1))
-            await #expect(throws: RuntimeFailedError.self) {
-                try await client.call(ServiceSocketCall(
-                    operation: "must-not-dispatch",
-                    runtimeTarget: .exact(self.identity),
-                    deadline: Date().addingTimeInterval(1)
-                ))
-            }
+            #expect(terminal.rejected)
+            #expect(terminal.code == .permissionDenied)
             #expect(await handler.snapshot().isEmpty)
         }
     }
@@ -656,7 +642,8 @@ extension SocketTransportTests.RuntimeLifecycleControllerTests {
             try activation.commitReady(slot.stage(activation, value: "lease"))
             let client = try await SocketClient(
                 path: path,
-                wireBuild: "service.v1"
+                wireBuild: "service.v1",
+                role: SessionPeerRole.unprotected
             )
             cleanup.add { await client.close() }
 
@@ -687,7 +674,8 @@ extension SocketTransportTests.RuntimeLifecycleControllerTests {
             cleanup.add { await server.stop() }
             let client = try await SocketClient(
                 path: path,
-                wireBuild: "service.v1"
+                wireBuild: "service.v1",
+                role: SessionPeerRole.unprotected
             )
             cleanup.add { await client.close() }
 
@@ -715,7 +703,8 @@ extension SocketTransportTests.RuntimeLifecycleControllerTests {
         try activation.commitReady(slot.stage(activation, value: "retained"))
         let client = try await SocketClient(
             path: path,
-            wireBuild: "service.v1"
+            wireBuild: "service.v1",
+            role: SessionPeerRole.unprotected
         )
         let call = Task {
             try await client.call(operation: "hang", deadline: Date().addingTimeInterval(2))
@@ -745,7 +734,7 @@ extension SocketTransportTests.RuntimeLifecycleControllerTests {
         _ = await call.result
     }
 
-    @Test func runtimeControlsAreReservedAndNeverReachProductHandler() async throws {
+    @Test func swiftServerHasNoProtectedRuntimeReceiptHandler() async throws {
         try await withAsyncCleanup { cleanup in
             let directory = try shortSocketDir()
             cleanup.add { try? FileManager.default.removeItem(at: directory) }
@@ -761,14 +750,16 @@ extension SocketTransportTests.RuntimeLifecycleControllerTests {
             _ = try await runtime.begin(deadline: Date().addingTimeInterval(2))
             let client = try await SocketClient(
                 path: path,
-                wireBuild: "service.v1"
+                wireBuild: "service.v1",
+                role: SessionPeerRole.unprotected
             )
             cleanup.add { await client.close() }
-            let receipt = try await client.acquireRuntimeReceipt(
-                expectedRuntimeBuild: "app.v1",
-                deadline: Date().addingTimeInterval(1)
-            )
-            #expect(receipt.runtimeIdentity == identity)
+            await #expect(throws: RuntimeReceiptUnavailableError.self) {
+                _ = try await client.acquireRuntimeReceipt(
+                    expectedRuntimeBuild: "app.v1",
+                    deadline: Date().addingTimeInterval(1)
+                )
+            }
             #expect(await handler.snapshot().isEmpty)
         }
     }

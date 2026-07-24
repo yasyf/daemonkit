@@ -7,6 +7,12 @@ public let daemonKitSessionProtocolVersion: UInt16 = 1
 /// Default maximum encoded frame body: 4 MiB.
 public let daemonKitDefaultMaximumFrameBytes = 4 * 1024 * 1024
 
+/// Roles reserved by daemonkit's session protocol.
+public enum SessionPeerRole {
+    /// A same-UID session with no protected or lifecycle authority.
+    public static let unprotected = "daemonkit.unprotected.v1"
+}
+
 /// A v1 session frame kind.
 public enum SessionFrameKind: UInt8, Sendable {
     case hello = 1
@@ -98,6 +104,18 @@ struct SessionWireIdentity: Codable, Sendable {
     }
 }
 
+struct SessionHelloIdentity: Codable, Sendable {
+    let protocolVersion: UInt16
+    let wireBuild: String
+    let role: String
+
+    enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol"
+        case wireBuild = "wire_build"
+        case role
+    }
+}
+
 struct SessionHandshakeAck: Codable, Sendable {
     let protocolVersion: UInt16
     let wireBuild: String
@@ -133,9 +151,9 @@ struct SessionHandshakeAck: Codable, Sendable {
 }
 
 enum SessionHandshakeCodec {
-    static func decodeHello(_ data: Data) throws -> SessionWireIdentity {
-        try requireKeys(data, exact: ["protocol", "wire_build"])
-        return try JSONDecoder().decode(SessionWireIdentity.self, from: data)
+    static func decodeHello(_ data: Data) throws -> SessionHelloIdentity {
+        try requireKeys(data, exact: ["protocol", "wire_build", "role"])
+        return try JSONDecoder().decode(SessionHelloIdentity.self, from: data)
     }
 
     static func decodeAck(_ data: Data) throws -> SessionHandshakeAck {

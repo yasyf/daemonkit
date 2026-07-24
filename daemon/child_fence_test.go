@@ -30,7 +30,7 @@ func newChildFenceFixture(t *testing.T) *childFenceFixture {
 		ExpectedUID: os.Geteuid(),
 		Roles: map[trust.PeerRole]trust.Requirement{
 			"stop": requirement("com.yasyf.daemonkit.test.stop"), "lifecycle": requirement("com.yasyf.daemonkit.test.lifecycle"),
-			"product": requirement("com.yasyf.daemonkit.test.product"),
+			"product": requirement("com.yasyf.daemonkit.test.product"), "product-alias": requirement("com.yasyf.daemonkit.test.product"),
 		},
 		StopRoles: []trust.PeerRole{"stop"}, ReceiptRoles: []trust.PeerRole{"lifecycle"}, ReadinessRoles: []trust.PeerRole{"lifecycle"},
 	})
@@ -75,7 +75,7 @@ func newChildFenceFixture(t *testing.T) *childFenceFixture {
 		childFenceTimeout:  25 * time.Millisecond,
 		childFenceVerifier: func(ctx context.Context, _ peeridentity.Identity, _ trust.Requirement) error { return ctx.Err() },
 	}
-	fence, err := runtime.ReadyOnlyListener().ArmChild(receipt)
+	fence, err := runtime.ReadyOnlyListener().ArmChild(receipt, "product")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,6 +87,40 @@ func newChildFenceFixture(t *testing.T) *childFenceFixture {
 		_ = manager.Shutdown(ctx)
 	})
 	return fixture
+}
+
+func TestChildFenceSelectsExactRoleWithEquivalentRequirements(t *testing.T) {
+	fixture := newChildFenceFixture(t)
+	if fixture.fence.state.role != "product" {
+		t.Fatalf("selected role = %q", fixture.fence.state.role)
+	}
+	if _, err := fixture.runtime.ReadyOnlyListener().ArmChild(fixture.receipt, "lifecycle"); !errors.Is(err, ErrUnfenceable) {
+		t.Fatalf("mismatched signature role = %v", err)
+	}
+	if _, err := fixture.runtime.ReadyOnlyListener().ArmChild(fixture.receipt, "product-alias"); !errors.Is(err, ErrFenceClosed) {
+		t.Fatalf("second exact-role fence = %v", err)
+	}
+}
+
+func TestChildFenceRejectsEquivalentButUnselectedHelloRole(t *testing.T) {
+	fixture := newChildFenceFixture(t)
+	fixture.runtime.childFenceVerifier = func(context.Context, peeridentity.Identity, trust.Requirement) error { return nil }
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	started := make(chan error, 1)
+	go func() { _, err := fixture.fence.Start(ctx, fixture.child); started <- err }()
+	waitChildFenceDispatch(t, fixture)
+	identity := fixture.receipt.ProcessIdentity()
+	_, err := fixture.runtime.matchChildFence(ctx, peeridentity.Identity{
+		PID: identity.PID, StartTime: identity.StartTime, Boot: identity.Boot, Comm: identity.Comm,
+		Executable: fixture.receipt.ExpectedExecutable(),
+	}, "product-alias")
+	if !errors.Is(err, ErrFenceMismatch) {
+		t.Fatalf("unselected role match = %v", err)
+	}
+	if err := <-started; err == nil {
+		t.Fatal("fenced child authenticated under an unselected equivalent role")
+	}
 }
 
 func waitChildFenceDispatch(t *testing.T, fixture *childFenceFixture) {
@@ -112,7 +146,7 @@ func TestChildFenceMismatchDoesNotReenterRuntimeLock(t *testing.T) {
 	go func() {
 		_, err := runtime.matchChildFence(context.Background(), peeridentity.Identity{
 			PID: 42, StartTime: "start", Boot: "boot", Executable: "/unexpected",
-		})
+		}, "product")
 		done <- err
 	}()
 	select {
@@ -151,7 +185,7 @@ func TestChildFenceAdmissionRollbackCannotAuthenticateStart(t *testing.T) {
 	permit, err := fixture.runtime.matchChildFence(ctx, peeridentity.Identity{
 		PID: identity.PID, StartTime: identity.StartTime, Boot: identity.Boot, Comm: identity.Comm,
 		Executable: fixture.receipt.ExpectedExecutable(),
-	})
+	}, "product")
 	if err != nil || permit == nil {
 		t.Fatalf("provisional match = %v, %v", permit, err)
 	}
@@ -172,7 +206,7 @@ func TestChildFenceMismatchSettlementFailureIsRuntimeFatal(t *testing.T) {
 	_, err := fixture.runtime.matchChildFence(ctx, peeridentity.Identity{
 		PID: identity.PID, StartTime: identity.StartTime, Boot: identity.Boot, Comm: identity.Comm,
 		Executable: fixture.receipt.ExpectedExecutable(),
-	})
+	}, "product")
 	if !errors.Is(err, context.Canceled) || !errors.Is(err, proc.ErrChildSettlementIncomplete) {
 		t.Fatalf("mismatch settlement error = %v", err)
 	}
