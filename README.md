@@ -105,7 +105,7 @@ candidate path, swap the installed app, inspect private JSON, or remove the
 canonical app. Exact v1 receipts, service state, and locks live beside the app
 under `.daemonkit-deployment/<Product>`.
 
-Status: v0.17.0 is the hard-cut release line. Protocol and durable-state epochs
+Status: v0.17.2 is the hard-cut release line. Protocol and durable-state epochs
 begin at 1 with exact equality; the API stabilizes at v1.0.0.
 
 Licensed under [PolyForm-Noncommercial-1.0.0](LICENSE).
