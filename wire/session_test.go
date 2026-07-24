@@ -1229,7 +1229,7 @@ func TestGoAwayInterruptsBlockedWriterAndSettlesEveryAdmission(t *testing.T) {
 	var active atomic.Int32
 	server := &wire.Server{
 		WireBuild: "server-test", MaxFrame: maxFrame, Workers: requests, Backlog: requests,
-		InboundQueue: requests + 1, OutboundQueue: requests + 1,
+		InboundQueue: requests + 1, OutboundQueue: requests + 1, WriteTimeout: 50 * time.Millisecond,
 	}
 	server.RegisterConcurrent("large", func(context.Context, wire.Request) (any, error) {
 		return strings.Repeat("x", 1<<20), nil

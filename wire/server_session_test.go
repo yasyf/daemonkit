@@ -43,6 +43,21 @@ func (c *partialFrameWriteConn) Close() error {
 	return c.Conn.Close()
 }
 
+type gatedCompleteFrameWriteConn struct {
+	net.Conn
+	writes  atomic.Int32
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (c *gatedCompleteFrameWriteConn) Write(payload []byte) (int, error) {
+	if c.writes.Add(1) == 2 {
+		close(c.entered)
+		<-c.release
+	}
+	return c.Conn.Write(payload)
+}
+
 func TestServeSessionRoundTripGoAwayAndJoin(t *testing.T) {
 	server := &Server{WireBuild: "session-test"}
 	server.RegisterConcurrent("echo", func(_ context.Context, request Request) (any, error) {
@@ -79,7 +94,7 @@ func TestServeSessionRoundTripGoAwayAndJoin(t *testing.T) {
 
 func TestServeSessionGoAwayRejectsPartialFrameAcknowledgement(t *testing.T) {
 	var active atomic.Int32
-	server := &Server{WireBuild: "session-test"}
+	server := &Server{WireBuild: "session-test", WriteTimeout: 50 * time.Millisecond}
 	server.RegisterConcurrent("large", func(context.Context, Request) (any, error) {
 		return strings.Repeat("x", 1<<20), nil
 	})
@@ -115,6 +130,60 @@ func TestServeSessionGoAwayRejectsPartialFrameAcknowledgement(t *testing.T) {
 	if got := active.Load(); got != 0 {
 		t.Fatalf("active admissions = %d, want 0", got)
 	}
+}
+
+func TestServeSessionGoAwayWaitsForTransientCompleteWriteAndAdmission(t *testing.T) {
+	sessions := make(chan *AcceptedSession, 1)
+	handlerEntered := make(chan struct{})
+	handlerRelease := make(chan struct{})
+	var releaseHandler sync.Once
+	t.Cleanup(func() { releaseHandler.Do(func() { close(handlerRelease) }) })
+	server := &Server{WireBuild: "session-test"}
+	server.RegisterControl("block", func(ctx context.Context, request Request) (any, error) {
+		sessions <- request.Session
+		close(handlerEntered)
+		<-handlerRelease
+		return nil, ctx.Err()
+	})
+	clientConn, rawServerConn := net.Pipe()
+	serverConn := &gatedCompleteFrameWriteConn{
+		Conn: rawServerConn, entered: make(chan struct{}), release: make(chan struct{}),
+	}
+	var releaseWrite sync.Once
+	t.Cleanup(func() { releaseWrite.Do(func() { close(serverConn.release) }) })
+	identity := currentSessionIdentity(t)
+	done := make(chan error, 1)
+	go func() {
+		done <- server.ServeSession(
+			context.Background(), serverConn, identity,
+			func() error { return nil }, allowSession, allowSession,
+		)
+	}()
+	client := newExistingSessionClient(t, clientConn)
+	if _, err := client.Open(context.Background(), "block", "", nil, true); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	session := <-sessions
+	<-handlerEntered
+	<-serverConn.entered
+	closed := make(chan error, 1)
+	go func() { closed <- client.Close() }()
+	select {
+	case <-session.Disconnected():
+	case <-time.After(time.Second):
+		t.Fatal("Disconnected waited for transient complete write")
+	}
+	releaseWrite.Do(func() { close(serverConn.release) })
+	select {
+	case err := <-closed:
+		t.Fatalf("client Close returned before blocked admission settled: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseHandler.Do(func() { close(handlerRelease) })
+	if err := <-closed; err != nil {
+		t.Fatalf("client Close: %v", err)
+	}
+	awaitSessionServer(t, done)
 }
 
 func TestServeSessionPropagatesCancellationAndJoinsHandlers(t *testing.T) {

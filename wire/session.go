@@ -83,7 +83,10 @@ type session struct {
 	closeOnce      sync.Once
 	disconnectOnce sync.Once
 	peerGoAway     atomic.Bool
-	writerState    atomic.Uint32
+
+	writerStateMu   sync.Mutex
+	writerState     uint32
+	activeWriteDone chan struct{}
 }
 
 type sessionOutbound struct {
@@ -133,14 +136,16 @@ func (s *session) run(ctx context.Context, releaseCapacity func()) error {
 	err := s.readLoop(ctx)
 	if errors.Is(err, errPeerGoAway) {
 		s.peerGoAway.Store(true)
-		if !s.writerState.CompareAndSwap(writerIdle, writerDraining) {
-			_ = s.conn.Close()
-		}
+		activeWrite := s.beginWriterDrain()
 		s.stop()
+		interruptDone := s.interruptActiveWrite(activeWrite)
 		s.closeRequestInputs()
 		s.requestWG.Wait()
 		close(s.requestsDone)
 		s.writerWG.Wait()
+		if interruptDone != nil {
+			<-interruptDone
+		}
 		releaseCapacity()
 		if s.writerErr != nil {
 			_ = s.conn.Close()
@@ -193,6 +198,60 @@ func (s *session) stop() {
 	})
 }
 
+func (s *session) beginWrite() (chan struct{}, bool) {
+	s.writerStateMu.Lock()
+	defer s.writerStateMu.Unlock()
+	if s.writerState != writerIdle {
+		return nil, false
+	}
+	done := make(chan struct{})
+	s.writerState = writerActive
+	s.activeWriteDone = done
+	return done, true
+}
+
+func (s *session) finishWrite(done chan struct{}) {
+	s.writerStateMu.Lock()
+	defer s.writerStateMu.Unlock()
+	if s.activeWriteDone != done {
+		panic("wire: writer completion identity mismatch")
+	}
+	s.activeWriteDone = nil
+	if s.writerState == writerActive {
+		s.writerState = writerIdle
+	}
+	close(done)
+}
+
+func (s *session) beginWriterDrain() <-chan struct{} {
+	s.writerStateMu.Lock()
+	defer s.writerStateMu.Unlock()
+	s.writerState = writerDraining
+	return s.activeWriteDone
+}
+
+func (s *session) interruptActiveWrite(active <-chan struct{}) <-chan struct{} {
+	if active == nil {
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		timer := time.NewTimer(s.server.writeTimeout())
+		defer timer.Stop()
+		select {
+		case <-active:
+		case <-timer.C:
+			select {
+			case <-active:
+			default:
+				_ = s.conn.Close()
+			}
+		}
+	}()
+	return done
+}
+
 func (s *session) writeLoop() {
 	defer s.writerWG.Done()
 	defer close(s.writerDone)
@@ -225,7 +284,8 @@ func (s *session) writeLoop() {
 			if outgoing.beforeWrite != nil {
 				outgoing.beforeWrite()
 			}
-			if !s.writerState.CompareAndSwap(writerIdle, writerActive) {
+			writeDone, ok := s.beginWrite()
+			if !ok {
 				err := s.ctx.Err()
 				if err == nil {
 					err = context.Canceled
@@ -237,7 +297,7 @@ func (s *session) writeLoop() {
 				continue
 			}
 			err := s.codec.WriteFrame(outgoing.frame)
-			s.writerState.Store(writerIdle)
+			s.finishWrite(writeDone)
 			if outgoing.done != nil {
 				outgoing.done <- err
 			}
