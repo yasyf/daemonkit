@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"errors"
-	"fmt"
 )
 
 var (
@@ -134,44 +133,28 @@ func (s *PublicationSlot[T]) Stage(activation Activation, value T) (Publication,
 	return publication, nil
 }
 
-// Load returns the committed value only while the same controller is Ready.
-func (s *PublicationSlot[T]) Load() (T, bool) {
+// Acquire pins the committed value in the Runtime admission lane until release.
+func (s *PublicationSlot[T]) Acquire() (T, func(), error) {
 	var zero T
 	if s == nil || s.core == nil {
-		return zero, false
+		return zero, nil, ErrPublicationUnavailable
 	}
 	core := s.core
+	publication, release, err := core.runtime.admitReady()
+	if err != nil {
+		return zero, nil, err
+	}
 	core.lifecycle.mu.Lock()
-	defer core.lifecycle.mu.Unlock()
-	if core.lifecycle.fatal != nil || core.lifecycle.progress.State != LifecycleReady || !core.publishedSet {
-		return zero, false
+	if publication.core != core || publication.token != s.token || publication.generation != core.generation ||
+		publication.stage != core.publishedStage || publication.lease == nil || !publication.lease.alive ||
+		!core.publishedSet {
+		core.lifecycle.mu.Unlock()
+		release()
+		panic("daemon: admitted publication changed before acquisition")
 	}
-	boxed, ok := core.published.(publicationValue[T])
-	if !ok {
-		panic(fmt.Sprintf("daemon: publication value has type %T", core.published))
-	}
-	return boxed.value, true
-}
-
-// LoadPinned returns the value captured by one already-admitted request. It
-// remains valid through Draining and becomes invalid at final settlement.
-func (s *PublicationSlot[T]) LoadPinned(publication Publication) (T, bool) {
-	var zero T
-	if s == nil || s.core == nil || publication.core != s.core || publication.token != s.token || publication.lease == nil {
-		return zero, false
-	}
-	core := s.core
-	core.lifecycle.mu.Lock()
-	defer core.lifecycle.mu.Unlock()
-	if core.lifecycle.fatal != nil || publication.generation != core.generation ||
-		publication.stage != core.publishedStage || !publication.lease.alive || !core.publishedSet {
-		return zero, false
-	}
-	boxed, ok := core.published.(publicationValue[T])
-	if !ok {
-		panic(fmt.Sprintf("daemon: publication value has type %T", core.published))
-	}
-	return boxed.value, true
+	boxed := core.published.(publicationValue[T])
+	core.lifecycle.mu.Unlock()
+	return boxed.value, release, nil
 }
 
 func (p *publicationCore) invalidateStagedLocked() {
