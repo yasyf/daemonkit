@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Protected runtime controls are exact unary calls with an empty tenant and
   are rejected before product dispatch when their framing is incomplete.
+- A session owns at most one readiness subscription. Duplicate registration is
+  rejected with `SocketResponseCode.readinessSubscriptionExists`; the service
+  client retires that session and reconnects instead of replacing an active or
+  terminal-settlement owner.
 - Trust is evaluated against the peer's effective UID before a session can
   reserve capacity or send application bytes.
 - Shutdown has one deadline-independent settlement task. A caller deadline can
