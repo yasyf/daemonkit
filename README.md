@@ -95,8 +95,8 @@ no single-role or compatibility initializer.
 an application. The old signed helper first calls `DeactivateInstalled` and
 proves its activation receipt and services are absent. Packaging then replaces
 and verifies the fixed app. The new helper calls `ActivateInstalled` with a
-caller-persisted operation ID, canonical full app path, exact artifact and
-entitlement digests, code identity, service plan, and readiness proof. Exact v1
+sealed `AttestInstalled` result, exact service plan, build, policy, and readiness
+proof. Daemonkit generates and persists each 64-hex operation ID. Exact v1
 receipts, service state, and locks live beside the app under
 `.daemonkit-deployment/<Product>`; `StatusInstalled` reports a matching app with
 no receipt as `verified_unactivated`.

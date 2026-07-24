@@ -3,6 +3,7 @@ package deployment
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -62,12 +63,14 @@ func (s *activationServices) Close(context.Context) error {
 }
 
 type activationFixture struct {
-	controller   *Controller
-	services     *activationServices
-	config       ActivateInstalledConfig
-	appPath      string
-	readiness    int
-	entitlements SHA256
+	controller      *Controller
+	services        *activationServices
+	config          ActivateInstalledConfig
+	spec            InstalledSpec
+	appPath         string
+	readiness       int
+	entitlements    SHA256
+	setEntitlements func(SHA256)
 }
 
 func newActivationFixture(t *testing.T) *activationFixture {
@@ -88,11 +91,8 @@ func newActivationFixture(t *testing.T) *activationFixture {
 	if err := os.WriteFile(filepath.Join(appPath, "Contents", "Info.plist"), []byte(info), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	bundleDigest, err := bundleTreeDigest(appPath)
-	if err != nil {
-		t.Fatal(err)
-	}
 	entitlements := SHA256{1}
+	verifiedEntitlements := entitlements
 	plan, err := service.NewPlan([]service.Agent{{
 		Label: "com.example.helper", Program: program,
 		LogPath: filepath.Join(root, "helper.log"), RestartPolicy: service.RestartAlways,
@@ -103,8 +103,13 @@ func newActivationFixture(t *testing.T) *activationFixture {
 	services := &activationServices{}
 	controller := New()
 	controller.verifier = activationVerifier(func(context.Context, string, string) (signatureAttestation, error) {
-		return signatureAttestation{CDHash: "0123456789abcdef0123456789abcdef01234567", EntitlementsDigest: entitlements}, nil
+		return signatureAttestation{CDHash: "0123456789abcdef0123456789abcdef01234567", EntitlementsDigest: verifiedEntitlements}, nil
 	})
+	operation := 0
+	controller.operationID = func() (string, error) {
+		operation++
+		return fmt.Sprintf("%064x", operation), nil
+	}
 	controller.openService = func(_ context.Context, config service.ControllerConfig) (serviceController, error) {
 		services.config = config
 		if err := os.WriteFile(config.StatePath, []byte("state"), 0o600); err != nil {
@@ -117,12 +122,18 @@ func newActivationFixture(t *testing.T) *activationFixture {
 	}
 	fixture := &activationFixture{
 		controller: controller, services: services, appPath: appPath, entitlements: entitlements,
+		setEntitlements: func(value SHA256) { verifiedEntitlements = value },
+	}
+	fixture.spec = InstalledSpec{
+		AppPath: appPath, Version: "1.0.0",
+		Identity: codeidentity.CodeIdentity{TeamID: "ABCDE12345", SigningIdentifier: "com.example.Helper"},
+	}
+	attestation, err := controller.AttestInstalled(t.Context(), fixture.spec)
+	if err != nil {
+		t.Fatal(err)
 	}
 	fixture.config = ActivateInstalledConfig{
-		OperationID: "00000000000000000000000000000001", AppPath: appPath, Version: "1.0.0",
-		Identity:     codeidentity.CodeIdentity{TeamID: "ABCDE12345", SigningIdentifier: "com.example.Helper"},
-		BundleDigest: bundleDigest, EntitlementsDigest: entitlements, ConsumerBuild: "consumer-v1",
-		PolicyDigest: SHA256{2}, Plan: plan,
+		Expected: attestation, ConsumerBuild: "consumer-v1", PolicyDigest: SHA256{2}, Plan: plan,
 		Readiness: func(context.Context, InstalledOperation) (ReadinessProof, error) {
 			fixture.readiness++
 			return NewReadinessProof("runtime-v1", proc.OwnerGeneration{1}, SHA256{3})
@@ -133,12 +144,15 @@ func newActivationFixture(t *testing.T) *activationFixture {
 
 func TestStatusInstalledReportsVerifiedUnactivatedWithoutWrites(t *testing.T) {
 	fixture := newActivationFixture(t)
-	status, err := fixture.controller.StatusInstalled(t.Context(), fixture.config)
+	status, err := fixture.controller.StatusInstalled(t.Context(), fixture.spec)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if status.State() != InstalledVerifiedUnactivated {
 		t.Fatalf("state = %q", status.State())
+	}
+	if !reflect.DeepEqual(status.Attestation(), fixture.config.Expected) {
+		t.Fatal("status did not return the exact attestation")
 	}
 	paths := deploymentPathsForApp(fixture.appPath)
 	if _, err := os.Lstat(paths.metadataDir); !errors.Is(err, os.ErrNotExist) {
@@ -167,7 +181,7 @@ func TestActivateInstalledIsExactAndLostResponseIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if replayed.OperationID() != fixture.config.OperationID || !replayed.Active() || fixture.readiness != 2 {
+	if replayed.OperationID() != first.OperationID || len(replayed.OperationID()) != 64 || !replayed.Active() || fixture.readiness != 2 {
 		t.Fatalf("replay = %#v, readiness = %d", replayed, fixture.readiness)
 	}
 	second, err := readActivation(deploymentPathsForApp(fixture.appPath).activation)
@@ -200,7 +214,7 @@ func TestActivateInstalledCrashCheckpointsReplayExactly(t *testing.T) {
 			}
 			fixture.controller.failpoint = nil
 			result, err := fixture.controller.ActivateInstalled(t.Context(), fixture.config)
-			if err != nil || !result.Active() || result.OperationID() != fixture.config.OperationID {
+			if err != nil || !result.Active() || result.OperationID() != receipt.OperationID {
 				t.Fatalf("replay = %#v, %v", result, err)
 			}
 		})
@@ -226,52 +240,86 @@ func TestActivateInstalledRollbackNeverDeletesPackagedApp(t *testing.T) {
 	}
 }
 
-func TestActivateInstalledRejectsOperationConfigAndInodeDrift(t *testing.T) {
+func TestActivateInstalledRejectsConfigBytesEntitlementsAndInodeDrift(t *testing.T) {
 	fixture := newActivationFixture(t)
-	if _, err := fixture.controller.ActivateInstalled(t.Context(), fixture.config); err != nil {
+	active, err := fixture.controller.ActivateInstalled(t.Context(), fixture.config)
+	if err != nil {
 		t.Fatal(err)
 	}
-	changedOperation := fixture.config
-	changedOperation.OperationID = "00000000000000000000000000000002"
-	if _, err := fixture.controller.ActivateInstalled(t.Context(), changedOperation); !errors.Is(err, ErrInstallConflict) {
-		t.Fatalf("operation conflict = %v", err)
+	if len(active.OperationID()) != 64 {
+		t.Fatalf("operation ID = %q", active.OperationID())
 	}
 	changedPolicy := fixture.config
 	changedPolicy.PolicyDigest = SHA256{9}
 	if _, err := fixture.controller.ActivateInstalled(t.Context(), changedPolicy); !errors.Is(err, ErrInstallConflict) {
 		t.Fatalf("policy conflict = %v", err)
 	}
+	program := filepath.Join(fixture.appPath, "Contents", "MacOS", "Helper")
+	if err := os.WriteFile(program, []byte("changed"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.controller.ActivateInstalled(t.Context(), fixture.config); !errors.Is(err, ErrInstallConflict) {
+		t.Fatalf("changed bytes = %v", err)
+	}
+	if err := os.WriteFile(program, []byte("helper"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fixture.setEntitlements(SHA256{9})
+	if _, err := fixture.controller.ActivateInstalled(t.Context(), fixture.config); !errors.Is(err, ErrInstallConflict) {
+		t.Fatalf("changed entitlements = %v", err)
+	}
+	fixture.setEntitlements(fixture.entitlements)
 	prior := fixture.appPath + ".prior"
 	if err := os.Rename(fixture.appPath, prior); err != nil {
 		t.Fatal(err)
 	}
 	copyDirectory(t, prior, fixture.appPath)
-	if _, err := fixture.controller.StatusInstalled(t.Context(), fixture.config); !errors.Is(err, ErrInstallConflict) {
+	if _, err := fixture.controller.StatusInstalled(t.Context(), fixture.spec); !errors.Is(err, ErrInstallConflict) {
 		t.Fatalf("inode drift = %v", err)
+	}
+}
+
+func TestActivationStateRejectsLegacyShortOperationID(t *testing.T) {
+	fixture := newActivationFixture(t)
+	if _, err := fixture.controller.ActivateInstalled(t.Context(), fixture.config); err != nil {
+		t.Fatal(err)
+	}
+	path := deploymentPathsForApp(fixture.appPath).activation
+	receipt, err := readActivation(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt.OperationID = "00000000000000000000000000000001"
+	if err := writeJSONDurable(path, receipt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readActivation(path); !errors.Is(err, ErrInstallState) {
+		t.Fatalf("legacy operation ID = %v", err)
 	}
 }
 
 func TestDeactivateInstalledRequiresReceiptAndEnforcesUpgradeOrder(t *testing.T) {
 	fixture := newActivationFixture(t)
 	deactivate := DeactivateInstalledConfig{
-		OperationID: "00000000000000000000000000000009", AppPath: fixture.appPath,
-		Identity: fixture.config.Identity, ConsumerBuild: fixture.config.ConsumerBuild,
-		PolicyDigest: fixture.config.PolicyDigest,
+		ConsumerBuild: fixture.config.ConsumerBuild,
+		PolicyDigest:  fixture.config.PolicyDigest,
 		RuntimeQuiesce: func(context.Context, RuntimeStopper, DeactivateInstalledOperation) (RuntimeProof, error) {
 			return NewRuntimeProof(true, proc.OwnerGeneration{}, SHA256{8})
 		},
 	}
-	if _, err := fixture.controller.DeactivateInstalled(t.Context(), deactivate); !errors.Is(err, ErrInstallConflict) {
+	if _, err := fixture.controller.DeactivateInstalled(t.Context(), deactivate); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("deactivate without receipt = %v", err)
 	}
-	if _, err := fixture.controller.ActivateInstalled(t.Context(), fixture.config); err != nil {
+	active, err := fixture.controller.ActivateInstalled(t.Context(), fixture.config)
+	if err != nil {
 		t.Fatal(err)
 	}
+	deactivate.Expected = active
 	removed, err := fixture.controller.DeactivateInstalled(t.Context(), deactivate)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if removed.OperationID() != deactivate.OperationID || !removed.RuntimeProof().Absent() {
+	if len(removed.OperationID()) != 64 || removed.OperationID() == active.OperationID() || !removed.RuntimeProof().Absent() {
 		t.Fatalf("deactivation = %#v", removed)
 	}
 	paths := deploymentPathsForApp(fixture.appPath)
@@ -291,15 +339,18 @@ func TestDeactivateInstalledRequiresReceiptAndEnforcesUpgradeOrder(t *testing.T)
 		t.Fatal(err)
 	}
 	copyDirectory(t, fixture.appPath+".old", fixture.appPath)
-	newDigest, err := bundleTreeDigest(fixture.appPath)
+	nextAttestation, err := fixture.controller.AttestInstalled(t.Context(), fixture.spec)
 	if err != nil {
 		t.Fatal(err)
 	}
 	next := fixture.config
-	next.OperationID = "0000000000000000000000000000000a"
-	next.BundleDigest = newDigest
-	if _, err := fixture.controller.ActivateInstalled(t.Context(), next); err != nil {
+	next.Expected = nextAttestation
+	nextActive, err := fixture.controller.ActivateInstalled(t.Context(), next)
+	if err != nil {
 		t.Fatalf("new packaged generation activation: %v", err)
+	}
+	if nextActive.OperationID() == active.OperationID() {
+		t.Fatal("new packaged generation reused the prior operation ID")
 	}
 }
 

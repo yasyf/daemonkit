@@ -86,6 +86,7 @@ type serviceFactory func(context.Context, service.ControllerConfig) (serviceCont
 type Controller struct {
 	verifier    verifier
 	openService serviceFactory
+	operationID func() (string, error)
 	failpoint   func(string) error
 }
 
@@ -96,6 +97,7 @@ func New() *Controller {
 		openService: func(ctx context.Context, config service.ControllerConfig) (serviceController, error) {
 			return service.NewController(ctx, config)
 		},
+		operationID: newOperationID,
 	}
 }
 
@@ -242,12 +244,11 @@ func writeDigestField(h hash.Hash, value string) {
 	_, _ = h.Write([]byte(value))
 }
 
-func attestInstalled(
+func inspectInstalled(
 	ctx context.Context,
 	verifier verifier,
 	appPath, version string,
 	identity codeidentity.CodeIdentity,
-	wantBundle, wantEntitlements SHA256,
 ) (storedGeneration, error) {
 	if err := validateCanonicalAppPath(appPath); err != nil {
 		return storedGeneration{}, err
@@ -263,9 +264,6 @@ func attestInstalled(
 	if !validCDHash(signature.CDHash) {
 		return storedGeneration{}, errors.New("deployment: verifier returned invalid CDHash")
 	}
-	if signature.EntitlementsDigest != wantEntitlements {
-		return storedGeneration{}, fmt.Errorf("%w: entitlement digest got %s want %s", ErrInstallConflict, signature.EntitlementsDigest, wantEntitlements)
-	}
 	gotVersion, err := bundle.ShortVersion(appPath)
 	if err != nil {
 		return storedGeneration{}, fmt.Errorf("deployment: read bundle version: %w", err)
@@ -277,9 +275,6 @@ func attestInstalled(
 	if err != nil {
 		return storedGeneration{}, err
 	}
-	if digest != wantBundle {
-		return storedGeneration{}, fmt.Errorf("%w: bundle digest got %s want %s", ErrInstallConflict, digest, wantBundle)
-	}
 	id, err := identifyPath(appPath)
 	if err != nil {
 		return storedGeneration{}, fmt.Errorf("deployment: identify canonical app: %w", err)
@@ -287,13 +282,13 @@ func attestInstalled(
 	return storedGeneration{
 		Path: appPath, Version: version, TeamID: identity.TeamID,
 		SigningIdentifier: identity.SigningIdentifier, DesignatedRequirement: requirement,
-		CDHash: strings.ToLower(signature.CDHash), EntitlementsDigest: wantEntitlements.String(),
-		BundleDigest: wantBundle.String(), FileID: id,
+		CDHash: strings.ToLower(signature.CDHash), EntitlementsDigest: signature.EntitlementsDigest.String(),
+		BundleDigest: digest.String(), FileID: id,
 	}, nil
 }
 
 func newOperationID() (string, error) {
-	var raw [16]byte
+	var raw [32]byte
 	if _, err := rand.Read(raw[:]); err != nil {
 		return "", fmt.Errorf("deployment: generate operation id: %w", err)
 	}
@@ -301,7 +296,7 @@ func newOperationID() (string, error) {
 }
 
 func validOperationID(value string) bool {
-	if len(value) != 32 {
+	if len(value) != 64 || strings.ToLower(value) != value {
 		return false
 	}
 	_, err := hex.DecodeString(value)

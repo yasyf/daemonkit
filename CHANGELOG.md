@@ -11,12 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `deployment.ActivateInstalled` activates only a caller-packaged app at one
-  canonical full path. Its schema-v1 receipt seals the caller-persisted
+  canonical full path. Its schema-v1 receipt seals daemonkit's fresh 64-hex
   operation ID, exact build and policy, bundle and entitlement digests, Team
   ID, signing identifier, designated requirement, CDHash, inode, service plan,
   and operation-bound readiness proof before reporting active.
 - `StatusInstalled` distinguishes an exactly verified but unactivated app from
-  prepared and active receipts. `DeactivateInstalled` requires exact receipt
+  prepared and active receipts. `AttestInstalled` returns the read-only signed
+  bundle, entitlement, tree, and file-identity facts consumed by activation.
+  `DeactivateInstalled` requires exact receipt
   ownership, quiesces through a request-scoped runtime stopper, removes only
   receipt and service state, and leaves the packaged app untouched.
 - Swift `StaticSessionServiceRuntime<Request, Response>` owns one typed,

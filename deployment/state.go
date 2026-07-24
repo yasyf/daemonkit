@@ -79,6 +79,7 @@ type deactivationReceiptWire struct {
 	Identity              string              `json:"identity"`
 	Schema                int                 `json:"schema"`
 	OperationID           string              `json:"operation_id"`
+	ActivationOperationID string              `json:"activation_operation_id"`
 	ConsumerBuild         string              `json:"consumer_build"`
 	PolicyDigest          string              `json:"policy_digest"`
 	ActivationFingerprint string              `json:"activation_fingerprint"`
@@ -189,7 +190,7 @@ func (receipt activationReceiptWire) validate() error {
 
 func (receipt deactivationReceiptWire) validate() error {
 	if receipt.Identity != deactivationIdentity || receipt.Schema != activationSchema ||
-		!validOperationID(receipt.OperationID) || receipt.ConsumerBuild == "" ||
+		!validOperationID(receipt.OperationID) || !validOperationID(receipt.ActivationOperationID) || receipt.ConsumerBuild == "" ||
 		!validDigestString(receipt.PolicyDigest) || receipt.ActivationFingerprint == "" {
 		return ErrInstallState
 	}
