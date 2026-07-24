@@ -146,6 +146,11 @@ func (b *archiveBudget) admit(declaredSize int64) error {
 	if declaredSize < 0 {
 		return fmt.Errorf("%w: negative declared size", ErrUnsafeArchive)
 	}
+	// Reject an oversize entry before accumulating, so the running sum cannot
+	// overflow negative and silently disable the gate for the rest of the archive.
+	if declaredSize > b.maxBytes {
+		return fmt.Errorf("%w: declared size exceeds decompression budget", ErrUnsafeArchive)
+	}
 	if b.declared += declaredSize; b.declared > b.maxBytes {
 		return fmt.Errorf("%w: declared size exceeds decompression budget", ErrUnsafeArchive)
 	}

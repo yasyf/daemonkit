@@ -6,10 +6,33 @@ import (
 	"compress/gzip"
 	"context"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestArchiveBudgetRejectsOversizeEntry(t *testing.T) {
+	for _, size := range []int64{1001, math.MaxInt64} {
+		b := archiveBudget{remaining: 1000, maxBytes: 1000}
+		if err := b.admit(size); !errors.Is(err, ErrUnsafeArchive) {
+			t.Fatalf("admit(%d) with maxBytes 1000 = %v, want ErrUnsafeArchive", size, err)
+		}
+	}
+}
+
+func TestArchiveBudgetAccumulationDoesNotOverflow(t *testing.T) {
+	b := archiveBudget{remaining: 4 << 30, maxBytes: 4 << 30}
+	if err := b.admit(4 << 30); err != nil {
+		t.Fatalf("admit(maxBytes) = %v, want nil", err)
+	}
+	if err := b.admit(math.MaxInt64); !errors.Is(err, ErrUnsafeArchive) {
+		t.Fatalf("admit(MaxInt64) after a near-full budget = %v, want ErrUnsafeArchive", err)
+	}
+	if b.declared < 0 {
+		t.Fatalf("declared sum wrapped negative: %d", b.declared)
+	}
+}
 
 func TestSafeJoinRejectsEscape(t *testing.T) {
 	dest := t.TempDir()
