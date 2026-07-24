@@ -309,17 +309,21 @@ func claimSpawnedSessionIdentity(ctx context.Context, fd int) (SpawnedSessionIde
 	unix.CloseOnExec(fd)
 	kind, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TYPE)
 	if err != nil || kind != unix.SOCK_STREAM {
+		_ = unix.Close(fd)
 		return SpawnedSessionIdentity{}, errors.Join(ErrSpawnedSessionIdentity, err)
 	}
 	address, err := unix.Getsockname(fd)
 	if err != nil {
+		_ = unix.Close(fd)
 		return SpawnedSessionIdentity{}, errors.Join(ErrSpawnedSessionIdentity, err)
 	}
 	if _, ok := address.(*unix.SockaddrUnix); !ok {
+		_ = unix.Close(fd)
 		return SpawnedSessionIdentity{}, ErrSpawnedSessionIdentity
 	}
 	file := os.NewFile(uintptr(fd), "daemonkit-spawned-session")
 	if file == nil {
+		_ = unix.Close(fd)
 		return SpawnedSessionIdentity{}, ErrSpawnedSessionIdentity
 	}
 	conn, err := net.FileConn(file)

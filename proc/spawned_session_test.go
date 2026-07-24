@@ -38,6 +38,22 @@ func TestSpawnedSessionSocketpairIsUnixStreamAndCloseOnExec(t *testing.T) {
 	}
 }
 
+func TestSpawnedSessionRejectsAndClosesForeignInheritedDescriptor(t *testing.T) {
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer read.Close()
+	defer write.Close()
+	fd := int(read.Fd())
+	if _, err := claimSpawnedSessionIdentity(context.Background(), fd); !errors.Is(err, ErrSpawnedSessionIdentity) {
+		t.Fatalf("foreign descriptor claim = %v, want identity mismatch", err)
+	}
+	if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
+		t.Fatalf("foreign descriptor remained open: %v", err)
+	}
+}
+
 func TestSpawnedSessionManagerExchangeAndOneShotClaims(t *testing.T) {
 	manager, _ := newManagerTest(t, 1)
 	self, err := spawnedCurrentIdentity()

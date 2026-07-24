@@ -32,7 +32,7 @@ func CloseInheritedFDs() error {
 		if err != nil || fd < 3 {
 			continue
 		}
-		// ReadDir's own transient fd reads EBADF here and is skipped.
+		// The closed enumeration descriptor reads EBADF here and is skipped.
 		flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
 		if err != nil || flags&unix.FD_CLOEXEC != 0 {
 			continue
