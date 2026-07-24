@@ -328,6 +328,7 @@ type recSignaler struct {
 	sent     []signalCall
 	delegate signaler
 	err      error
+	errs     []error
 }
 
 type cancelSignaler struct {
@@ -358,11 +359,16 @@ type signalCall struct {
 func (r *recSignaler) signal(pid int, sig syscall.Signal) error {
 	r.mu.Lock()
 	r.sent = append(r.sent, signalCall{pid, sig})
+	call := len(r.sent) - 1
+	err := r.err
+	if call < len(r.errs) {
+		err = r.errs[call]
+	}
 	r.mu.Unlock()
 	if r.delegate != nil {
 		return r.delegate.signal(pid, sig)
 	}
-	return r.err
+	return err
 }
 
 func (r *recSignaler) calls() []signalCall {
@@ -1026,6 +1032,84 @@ func TestReapSignalsProcessGroup(t *testing.T) {
 	got := sig.calls()
 	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
 		t.Fatalf("signals = %v, want %v", got, want)
+	}
+}
+
+func TestReapAcceptsDeniedGroupSignalOnlyAfterExactSessionAbsence(t *testing.T) {
+	store := &memStore{}
+	record := matchingGroupRecord(4142, "old-gen")
+	mustAdd(t, store, record)
+	info := groupInfo(record.PID, record.StartTime, record.Comm)
+	member := groupMember{pid: record.PID, info: info}
+	prober := &fakeProber{info: info, memberSets: [][]groupMember{{member}, nil}}
+	signals := &recSignaler{err: syscall.EPERM}
+	reaper := &Reaper{
+		Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: signals,
+	}
+
+	if err := reaper.Reap(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if store.len() != 0 {
+		t.Fatalf("store size = %d, want absent session record removed", store.len())
+	}
+	if got := signals.calls(); !slices.Equal(got, []signalCall{{pid: -record.PID, sig: syscall.SIGTERM}}) {
+		t.Fatalf("signals = %v, want one denied SIGTERM", got)
+	}
+	result, err := reaper.ReapReceipts(t.Context(), RecoveryTaskID, ReapReceiptCursor{}, ReapReceiptPageLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Receipts) != 1 || result.Receipts[0].Outcome != ReapAbsent {
+		t.Fatalf("Reap receipt = %+v, want exact absence", result)
+	}
+}
+
+func TestReapDeniedGroupSignalRetainsLiveSessionAuthority(t *testing.T) {
+	store := &memStore{}
+	record := matchingGroupRecord(4143, "old-gen")
+	mustAdd(t, store, record)
+	info := groupInfo(record.PID, record.StartTime, record.Comm)
+	member := groupMember{pid: record.PID, info: info}
+	prober := &fakeProber{info: info, members: []groupMember{member}}
+	signals := &recSignaler{err: syscall.EPERM}
+	reaper := &Reaper{
+		Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: signals,
+	}
+
+	if err := reaper.Reap(t.Context()); !errors.Is(err, syscall.EPERM) {
+		t.Fatalf("Reap error = %v, want EPERM", err)
+	}
+	if store.len() != 1 {
+		t.Fatalf("store size = %d, want unresolved session record retained", store.len())
+	}
+}
+
+func TestReapAcceptsDeniedKillOnlyAfterExactSessionAbsence(t *testing.T) {
+	store := &memStore{}
+	record := matchingGroupRecord(4144, "old-gen")
+	mustAdd(t, store, record)
+	info := groupInfo(record.PID, record.StartTime, record.Comm)
+	member := groupMember{pid: record.PID, info: info}
+	prober := &fakeProber{info: info, memberSets: [][]groupMember{{member}, {member}, nil}}
+	signals := &recSignaler{errs: []error{nil, syscall.EPERM}}
+	reaper := &Reaper{
+		Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: signals,
+		clock: newFakeClock(),
+	}
+
+	if err := reaper.Reap(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	want := []signalCall{
+		{pid: -record.PID, sig: syscall.SIGTERM},
+		{pid: -record.PID, sig: syscall.SIGKILL},
+	}
+	if got := signals.calls(); !slices.Equal(got, want) {
+		t.Fatalf("signals = %v, want %v", got, want)
+	}
+	if store.len() != 0 {
+		t.Fatalf("store size = %d, want settled session record removed", store.len())
 	}
 }
 

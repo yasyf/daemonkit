@@ -879,8 +879,12 @@ func (r *Reaper) reapGroupOutcome(
 	if len(members) == 0 {
 		return true, ReapAbsent, nil
 	}
-	if _, err := r.signalSessionGroups(members, syscall.SIGTERM); err != nil {
+	settled, err := r.signalVerifiedSessionGroups(rec, members, syscall.SIGTERM)
+	if err != nil {
 		return false, 0, err
+	}
+	if settled {
+		return true, ReapAbsent, nil
 	}
 	select {
 	case <-ctx.Done():
@@ -931,8 +935,12 @@ func (r *Reaper) awaitGroupSettlement(ctx context.Context, rec Record) (bool, er
 		if !clock.Now().Before(deadline) {
 			return false, errors.New("killed process group remained live through settlement deadline")
 		}
-		if _, err := r.signalSessionGroups(members, syscall.SIGKILL); err != nil {
+		settled, err := r.signalVerifiedSessionGroups(rec, members, syscall.SIGKILL)
+		if err != nil {
 			return false, err
+		}
+		if settled {
+			return true, nil
 		}
 		select {
 		case <-ctx.Done():
@@ -940,6 +948,28 @@ func (r *Reaper) awaitGroupSettlement(ctx context.Context, rec Record) (bool, er
 		case <-clock.After(settlementPollInterval):
 		}
 	}
+}
+
+func (r *Reaper) signalVerifiedSessionGroups(
+	rec Record,
+	members []groupMember,
+	signal syscall.Signal,
+) (bool, error) {
+	if _, err := r.signalSessionGroups(members, signal); err != nil {
+		if !errors.Is(err, syscall.EPERM) {
+			return false, err
+		}
+		// Darwin may deny killpg after the verified group exits; only a fresh exact absence proof settles it.
+		remaining, verifyErr := r.verifiedGroupMembers(rec)
+		if verifyErr != nil {
+			return false, errors.Join(err, fmt.Errorf("revalidate dedicated session after denied signal: %w", verifyErr))
+		}
+		if len(remaining) != 0 {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 func (r *Reaper) verifiedGroupMembers(rec Record) ([]groupMember, error) {
