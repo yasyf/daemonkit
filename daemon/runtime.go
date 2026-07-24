@@ -65,6 +65,7 @@ type Runtime struct {
 	serverLive           bool
 	serverTerminal       bool
 	startupFailure       error
+	productSettlement    *productSettlementState
 	workerClaim          *worker.RuntimeClaim
 	workerActivated      bool
 	childrenClaimed      bool
@@ -158,7 +159,9 @@ func (r *Runtime) Health(ctx context.Context) (Health, error) {
 	if fatal != nil {
 		healthStatus = HealthStatus{State: StateFailed, Detail: []byte(fatal.Error())}
 	}
-	busy := r.lifecycle.inflight > 0 || len(r.lifecycle.activities) > 0 ||
+	productBusy := r.productSettlement != nil && !r.productSettlement.completed &&
+		r.productSettlement.ctx.Err() != nil
+	busy := r.lifecycle.inflight > 0 || len(r.lifecycle.activities) > 0 || productBusy ||
 		r.cfg.Workers.Active() > 0 || r.cfg.Children.Active() > 0
 	r.lifecycle.mu.Unlock()
 	ready := progress.State == LifecycleReady && fatal == nil
@@ -974,6 +977,15 @@ func (r *Runtime) shutdown(
 	if err := r.settleAdmission(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("daemon: settle admission: %w", err))
 		settled = false
+	}
+	if err := r.settleProduct(ctx); err != nil {
+		cause := errors.Join(ErrShutdownIncomplete, fmt.Errorf("daemon: settle product: %w", err))
+		errs = append(errs, cause)
+		r.lifecycle.mu.Lock()
+		r.lifecycle.setFatalLocked(cause)
+		r.lifecycle.mu.Unlock()
+		r.retainOwnership(listener, lock)
+		return errors.Join(errs...)
 	}
 	if err := r.workerClaim.Close(ctx); err != nil {
 		errs = append(errs, errors.Join(ErrShutdownIncomplete, fmt.Errorf("daemon: settle workers: %w", err)))

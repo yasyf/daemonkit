@@ -27,3 +27,12 @@ var ErrSessionServerStopped = errors.New("daemon: session server stopped unexpec
 
 // ErrShutdownIncomplete requires process exit with retained owned state.
 var ErrShutdownIncomplete = errors.New("daemon: shutdown incomplete")
+
+// ErrProductSettlementUnavailable means this activation cannot issue a settlement claim.
+var ErrProductSettlementUnavailable = errors.New("daemon: product settlement is unavailable")
+
+// ErrProductSettlementActive means completion was attempted before generation cancellation.
+var ErrProductSettlementActive = errors.New("daemon: product settlement generation is active")
+
+// ErrProductSettlementStale means a settlement claim is expired, completed, or foreign.
+var ErrProductSettlementStale = errors.New("daemon: product settlement is stale")
