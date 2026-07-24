@@ -440,6 +440,10 @@ func (c *Controller) verify(ctx context.Context, agent Agent) (bool, error) {
 		}
 		return false, fmt.Errorf("launchctl print: %w: %s", err, strings.TrimSpace(out))
 	}
+	out, err = c.launchctl(ctx, "enable", serviceTarget(agent.Label))
+	if err != nil {
+		return false, fmt.Errorf("launchctl enable: %w: %s", err, strings.TrimSpace(out))
+	}
 	return true, nil
 }
 

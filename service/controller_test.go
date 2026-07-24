@@ -398,7 +398,7 @@ func TestControllerRecoveryVerifiesExactAgentWithoutRelaunch(t *testing.T) {
 	}
 	var events []string
 	run := launchctlStub(func(args []string) (string, error) {
-		if args[0] != "print" {
+		if args[0] != "print" && args[0] != "enable" {
 			return "", fmt.Errorf("unexpected launchctl mutation: %v", args)
 		}
 		return "loaded", nil
@@ -410,6 +410,7 @@ func TestControllerRecoveryVerifiesExactAgentWithoutRelaunch(t *testing.T) {
 	_ = controller
 	want := []string{
 		"recover", "load", "run:print " + serviceTarget(agent.Label),
+		"run:enable " + serviceTarget(agent.Label),
 		fmt.Sprintf("recover-receipts:%d", proc.RecoveryService),
 		fmt.Sprintf("recover-receipts:%d", proc.RecoveryStopControl),
 	}
@@ -772,7 +773,10 @@ func TestControllerSameSetVerifiesAndRepairsDrift(t *testing.T) {
 	if err := controller.Converge(context.Background(), []Agent{agent}); err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"run:print " + serviceTarget(agent.Label)}; !reflect.DeepEqual(events, want) {
+	if want := []string{
+		"run:print " + serviceTarget(agent.Label),
+		"run:enable " + serviceTarget(agent.Label),
+	}; !reflect.DeepEqual(events, want) {
 		t.Fatalf("exact-state events = %v, want %v", events, want)
 	}
 	path, err := agent.PlistPath()
@@ -788,6 +792,79 @@ func TestControllerSameSetVerifiesAndRepairsDrift(t *testing.T) {
 	}
 	if len(events) == 0 || events[0] != "run:bootout "+serviceTarget(agent.Label) {
 		t.Fatalf("missing-plist events = %v, want reinstall", events)
+	}
+}
+
+func TestControllerVerifyEnablesExactLoadedAgentForRelaunch(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	agent := controllerAgent(t, "com.example.verify-disabled")
+	disabled := false
+	var calls [][]string
+	run := launchctlStub(func(args []string) (string, error) {
+		calls = append(calls, append([]string(nil), args...))
+		switch args[0] {
+		case "bootout":
+			return "not loaded", launchctlExit(launchctlNotLoadedExit)
+		case "enable":
+			disabled = false
+		}
+		return "", nil
+	})
+	controller, _, _, _ := newTestController(t, controllerState{
+		Desired: map[string]Agent{agent.Label: agent}, Applied: map[string]Agent{agent.Label: agent},
+	}, run, nil)
+	disabled = true
+	calls = nil
+
+	if err := controller.Converge(context.Background(), []Agent{agent}); err != nil {
+		t.Fatalf("Converge() = %v", err)
+	}
+	want := [][]string{
+		{"print", serviceTarget(agent.Label)},
+		{"enable", serviceTarget(agent.Label)},
+	}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("launchctl calls = %v, want %v", calls, want)
+	}
+	if disabled {
+		t.Fatal("exact loaded agent remains disabled after convergence")
+	}
+}
+
+func TestControllerVerifyEnableFailureIsNotConverged(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	agent := controllerAgent(t, "com.example.verify-enable-failure")
+	errEnable := launchctlExit(77)
+	failEnable := false
+	var calls [][]string
+	run := launchctlStub(func(args []string) (string, error) {
+		calls = append(calls, append([]string(nil), args...))
+		switch args[0] {
+		case "bootout":
+			return "not loaded", launchctlExit(launchctlNotLoadedExit)
+		case "enable":
+			if failEnable {
+				return "denied", errEnable
+			}
+		}
+		return "", nil
+	})
+	controller, _, _, _ := newTestController(t, controllerState{
+		Desired: map[string]Agent{agent.Label: agent}, Applied: map[string]Agent{agent.Label: agent},
+	}, run, nil)
+	failEnable = true
+	calls = nil
+
+	err := controller.Converge(context.Background(), []Agent{agent})
+	if !errors.Is(err, errEnable) || !strings.Contains(err.Error(), "verify agent") {
+		t.Fatalf("Converge() = %v, want enable verification failure", err)
+	}
+	want := [][]string{
+		{"print", serviceTarget(agent.Label)},
+		{"enable", serviceTarget(agent.Label)},
+	}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("launchctl calls = %v, want %v", calls, want)
 	}
 }
 
