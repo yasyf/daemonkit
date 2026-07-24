@@ -11,7 +11,7 @@ import (
 )
 
 func TestRuntimeStopControlStoreConsumesControllerAuthority(t *testing.T) {
-	executable, location := runtimeAppFixture(t)
+	executable, app := runtimeAppFixture(t)
 	prior := runtimeExecutable
 	runtimeExecutable = func() (string, error) { return executable, nil }
 	t.Cleanup(func() { runtimeExecutable = prior })
@@ -19,7 +19,7 @@ func TestRuntimeStopControlStoreConsumesControllerAuthority(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	controllerStore := &proc.FileStore{Path: deploymentPathsForLocation(location).serviceProcess}
+	controllerStore := &proc.FileStore{Path: deploymentPathsForApp(app).serviceProcess}
 	identity, err := proc.CurrentIdentity()
 	if err != nil {
 		t.Fatal(err)

@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/deployment"
 	"github.com/yasyf/daemonkit/proc"
 )
 
@@ -122,17 +121,12 @@ type options struct {
 	httpClient  *http.Client
 	githubToken string
 	uv          string
-	signedApp   *deployment.Config
-	deployer    deployer
 }
 
 func buildOptions(opts []Option) options {
 	var o options
 	for _, opt := range opts {
 		opt(&o)
-	}
-	if o.deployer == nil {
-		o.deployer = realDeployer{}
 	}
 	return o
 }
@@ -159,13 +153,6 @@ func WithGitHubToken(token string) Option { return func(o *options) { o.githubTo
 
 // WithUV overrides the uv executable used by the python-tool backend.
 func WithUV(path string) Option { return func(o *options) { o.uv = path } }
-
-// WithSignedAppDeploy supplies the product deployment inputs for a signed-app
-// installed into a caller-managed directory. Absent it, a signed-app resolves
-// attest-only. base.Release, Dir, and AppName are filled from the descriptor.
-func WithSignedAppDeploy(base deployment.Config) Option {
-	return func(o *options) { o.signedApp = &base }
-}
 
 type cacheMeta struct {
 	Name      string    `json:"name"`

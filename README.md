@@ -75,7 +75,7 @@ One row per package; the Status column is each surface's live state.
 | `version` | Release/dev version taxonomy, newest-wins skew | Landed |
 | `paths` | The `~/<app>` state layout: daemon socket, HTTP handshake file, per-subject artifacts, start lock, sqlite database, daemon log, turn-snapshot scratch dirs | Landed |
 | `bundle` | Info.plist reads, stable `.app` path conventions | Landed |
-| `deployment` | Exact signed-application publication, service-plan fencing, durable recovery, deactivation, and status | Landed |
+| `deployment` | Exact activation and deactivation of a caller-packaged fixed signed app | Landed |
 | `wire` | Exact-v1 persistent business transport, generation-aware service clients, typed product observations, receipt-authenticated stop control, and the sole composed daemon runtime constructor | Landed |
 | `trust` | Codesign peer verification (audit-token designated requirements) | Landed |
 | `daemon` | Opaque process runtime, readiness, ordered shutdown, skew observation, embedded processes, and idle exit | Landed |
@@ -91,14 +91,15 @@ and readiness preflight. A separate persistent handoff session sends only
 `daemon.broker-handoff.v1`, pinned to the exact ready-runtime receipt. There is
 no single-role or compatibility initializer.
 
-`deployment.Controller` is the only public signed-application publication
-workflow. A product supplies a complete `deployment.Config` to `Deploy`;
-`Deactivate` durably retires its exact service plan and runtime, `Recover`
-settles an interrupted transaction, and `Status` observes state without
-advancing recovery. The canonical product path is
-`$HOME/Applications/<Product>.app`; exact v1 receipts, transactions, service
-state, and locks live under
-`$HOME/Applications/.daemonkit-deployment/<Product>`.
+`deployment.Controller` never downloads, stages, replaces, adopts, or deletes
+an application. The old signed helper first calls `DeactivateInstalled` and
+proves its activation receipt and services are absent. Packaging then replaces
+and verifies the fixed app. The new helper calls `ActivateInstalled` with a
+caller-persisted operation ID, canonical full app path, exact artifact and
+entitlement digests, code identity, service plan, and readiness proof. Exact v1
+receipts, service state, and locks live beside the app under
+`.daemonkit-deployment/<Product>`; `StatusInstalled` reports a matching app with
+no receipt as `verified_unactivated`.
 
 Status: v0.15.0 is the hard-cut release line. Protocol and durable-state epochs
 begin at 1 with exact equality; the API stabilizes at v1.0.0.

@@ -10,6 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `deployment.ActivateInstalled` activates only a caller-packaged app at one
+  canonical full path. Its schema-v1 receipt seals the caller-persisted
+  operation ID, exact build and policy, bundle and entitlement digests, Team
+  ID, signing identifier, designated requirement, CDHash, inode, service plan,
+  and operation-bound readiness proof before reporting active.
+- `StatusInstalled` distinguishes an exactly verified but unactivated app from
+  prepared and active receipts. `DeactivateInstalled` requires exact receipt
+  ownership, quiesces through a request-scoped runtime stopper, removes only
+  receipt and service state, and leaves the packaged app untouched.
 - Swift `StaticSessionServiceRuntime<Request, Response>` owns one typed,
   same-EUID service generation from listener acquisition through Ready,
   draining, request settlement, unlink, and retained terminal result.
@@ -35,6 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- `Deploy`, `Recover`, staged replacement, artifact-driven signed-app
+  publication, and `WithSignedAppDeploy` are removed. Packaging owns app bytes;
+  daemonkit owns activation only, with no compatibility or adoption path.
 - Swift consumers no longer construct public raw `SocketServer`,
   `SocketRequest`, or `SocketResponse` service loops. There is no compatibility
   wrapper for the deleted public server surface.

@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func runtimeAppFixture(t *testing.T) (string, stateLocation) {
+func runtimeAppFixture(t *testing.T) (string, string) {
 	t.Helper()
 	dir, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -21,11 +21,11 @@ func runtimeAppFixture(t *testing.T) (string, stateLocation) {
 	if err := os.WriteFile(executable, []byte("helper"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	return executable, stateLocation{Dir: dir, AppName: "Helper"}
+	return executable, app
 }
 
 func TestRuntimeStopControlStoreDerivesExactAppWithoutCreatingState(t *testing.T) {
-	executable, location := runtimeAppFixture(t)
+	executable, app := runtimeAppFixture(t)
 	prior := runtimeExecutable
 	runtimeExecutable = func() (string, error) { return executable, nil }
 	t.Cleanup(func() { runtimeExecutable = prior })
@@ -34,10 +34,10 @@ func TestRuntimeStopControlStoreDerivesExactAppWithoutCreatingState(t *testing.T
 		t.Fatal(err)
 	}
 	_ = store
-	if store.Path != deploymentPathsForLocation(location).serviceProcess {
+	if store.Path != deploymentPathsForApp(app).serviceProcess {
 		t.Fatalf("store = %#v", store)
 	}
-	if _, err := os.Lstat(filepath.Join(location.Dir, ".daemonkit-deployment")); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Lstat(filepath.Join(filepath.Dir(app), ".daemonkit-deployment")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("store lookup created state: %v", err)
 	}
 }

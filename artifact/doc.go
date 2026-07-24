@@ -26,13 +26,10 @@
 // digest is carried. A second resolution returns the existing environment
 // offline.
 //
-// SignedApp delegates to the deployment package. For a caller-managed directory
-// with a WithSignedAppDeploy base config it publishes the exact signed app
-// through deployment.Controller (this package never reimplements that workflow).
-// For a TCC-bound install such as /Applications it is attest-only: it verifies
-// the app exists and — for a static descriptor — that its version matches, and
-// otherwise returns a ManualUpgradeError the caller renders as a
-// "brew upgrade --cask" handoff.
+// SignedApp is attest-only. It verifies the app exists and — for a static
+// descriptor — that its version matches, and otherwise returns a
+// ManualUpgradeError the caller renders as a "brew upgrade --cask" handoff.
+// Packaging and deployment activation are explicit consumer operations.
 //
 // # Version source and the supply-chain rule
 //
