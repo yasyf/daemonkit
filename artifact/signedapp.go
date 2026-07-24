@@ -34,7 +34,10 @@ func (s Store) resolveSignedApp(ctx context.Context, desc *Descriptor, version s
 }
 
 func attestSignedApp(desc *Descriptor, version, exec string) (string, error) {
-	appPath := bundle.AppPath(desc.App.Dir, desc.App.AppName)
+	appPath, err := safeJoin(desc.App.Dir, desc.App.AppName+".app")
+	if err != nil {
+		return "", err
+	}
 	want := ""
 	if !desc.Version.Dynamic() {
 		want = version
@@ -54,7 +57,10 @@ func attestSignedApp(desc *Descriptor, version, exec string) (string, error) {
 			return "", &ManualUpgradeError{Name: desc.Name, Cask: desc.App.Cask, Want: want, Got: installed}
 		}
 	}
-	entrypoint := filepath.Join(appPath, exec)
+	entrypoint, err := safeJoin(appPath, exec)
+	if err != nil {
+		return "", err
+	}
 	if !regular(entrypoint) {
 		return "", fmt.Errorf("%w: installed app entrypoint %q missing", ErrInvalidDescriptor, exec)
 	}
@@ -90,5 +96,5 @@ func (s Store) deploySignedApp(ctx context.Context, desc *Descriptor, version, e
 	if !ok {
 		return "", fmt.Errorf("artifact: signed app %q deploy produced no active generation", desc.Name)
 	}
-	return filepath.Join(current.Path, exec), nil
+	return safeJoin(current.Path, exec)
 }

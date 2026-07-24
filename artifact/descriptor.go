@@ -239,13 +239,24 @@ func (e PlatformEntry) validate(platform Platform, template bool) error {
 	if e.Hash != "sha256" {
 		return fmt.Errorf("%w: platform %q hash %q is not sha256", ErrInvalidDescriptor, platform, e.Hash)
 	}
-	if len(e.Digest) != 64 {
-		return fmt.Errorf("%w: platform %q digest is not a sha256 hex", ErrInvalidDescriptor, platform)
+	if len(e.Digest) != 64 || !isLowerHex(e.Digest) {
+		return fmt.Errorf("%w: platform %q digest is not a lowercase sha256 hex", ErrInvalidDescriptor, platform)
 	}
 	if e.Size <= 0 {
 		return fmt.Errorf("%w: platform %q size must be positive", ErrInvalidDescriptor, platform)
 	}
 	return nil
+}
+
+func isLowerHex(s string) bool {
+	for _, c := range s {
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func (p Provider) validate() error {

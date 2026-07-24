@@ -12,18 +12,19 @@ import (
 	"strings"
 )
 
-func extract(format Format, src, dest string) error {
+func extract(format Format, src, dest string, maxBytes int64) error {
 	switch format {
 	case TarGz:
-		return extractTarGz(src, dest)
+		return extractTarGz(src, dest, maxBytes)
 	case Zip:
-		return extractZip(src, dest)
+		return extractZip(src, dest, maxBytes)
 	default:
 		return fmt.Errorf("%w: %q", ErrUnsupportedFormat, format)
 	}
 }
 
-func extractTarGz(src, dest string) error {
+func extractTarGz(src, dest string, maxBytes int64) error {
+	remaining := maxBytes
 	file, err := os.Open(src)
 	if err != nil {
 		return fmt.Errorf("artifact: open archive: %w", err)
@@ -56,7 +57,7 @@ func extractTarGz(src, dest string) error {
 			if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
 				return fmt.Errorf("artifact: create archive directory: %w", err)
 			}
-			if err := writeArchiveFile(target, reader); err != nil {
+			if err := writeArchiveFile(target, reader, &remaining); err != nil {
 				return err
 			}
 		case tar.TypeSymlink, tar.TypeLink:
@@ -65,12 +66,13 @@ func extractTarGz(src, dest string) error {
 	}
 }
 
-func extractZip(src, dest string) error {
+func extractZip(src, dest string, maxBytes int64) error {
 	reader, err := zip.OpenReader(src)
 	if err != nil {
 		return fmt.Errorf("artifact: open zip: %w", err)
 	}
 	defer reader.Close()
+	remaining := maxBytes
 	for _, entry := range reader.File {
 		target, err := safeJoin(dest, entry.Name)
 		if err != nil {
@@ -92,7 +94,7 @@ func extractZip(src, dest string) error {
 		if err != nil {
 			return fmt.Errorf("artifact: open zip entry: %w", err)
 		}
-		err = writeArchiveFile(target, rc)
+		err = writeArchiveFile(target, rc, &remaining)
 		rc.Close()
 		if err != nil {
 			return err
@@ -101,24 +103,33 @@ func extractZip(src, dest string) error {
 	return nil
 }
 
+// safeJoin joins name under dest and refuses any name that escapes dest. It
+// contains descriptor-supplied paths (a platform Path, a tool dist/version, an
+// app exec) and archive member names alike.
 func safeJoin(dest, name string) (string, error) {
 	target := filepath.Join(dest, name)
 	rel, err := filepath.Rel(dest, target)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-		return "", fmt.Errorf("%w: %q escapes archive root", ErrUnsafeArchive, name)
+		return "", fmt.Errorf("%w: %q escapes its containment root", ErrUnsafeArchive, name)
 	}
 	return target, nil
 }
 
-func writeArchiveFile(target string, r io.Reader) error {
+func writeArchiveFile(target string, r io.Reader, remaining *int64) error {
 	file, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("artifact: create archive file: %w", err)
 	}
-	if _, err := io.Copy(file, r); err != nil {
+	written, err := io.Copy(file, io.LimitReader(r, *remaining+1))
+	if err != nil {
 		file.Close()
 		return fmt.Errorf("artifact: write archive file: %w", err)
 	}
+	if written > *remaining {
+		file.Close()
+		return fmt.Errorf("%w: exceeds decompression budget", ErrUnsafeArchive)
+	}
+	*remaining -= written
 	if err := file.Sync(); err != nil {
 		file.Close()
 		return fmt.Errorf("artifact: sync archive file: %w", err)

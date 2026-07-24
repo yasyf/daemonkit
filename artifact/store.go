@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -19,6 +20,20 @@ import (
 )
 
 const materializeLockDeadline = 5 * time.Minute
+
+// defaultDownloadClient fails fast on a server that accepts a connection but
+// stalls, so a hung host cannot hold the per-artifact lock for the whole
+// acquisition window. A slow-but-progressing transfer is still allowed, bounded
+// by the download context.
+var defaultDownloadClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		TLSHandshakeTimeout:   30 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	},
+}
 
 // Store is the on-disk root (~/.daemonkit) holding the content-addressed release
 // cache, the version-addressed python-tool store, and per-artifact locks.
@@ -124,7 +139,7 @@ func (o options) http() *http.Client {
 	if o.httpClient != nil {
 		return o.httpClient
 	}
-	return http.DefaultClient
+	return defaultDownloadClient
 }
 
 func (o options) uvExecutable() string {
@@ -171,6 +186,8 @@ func writeCacheMeta(digestDir, name string, entry PlatformEntry) error {
 }
 
 func download(ctx context.Context, client *http.Client, url, token string, dst *os.File) (digest string, size int64, err error) {
+	ctx, cancel := context.WithTimeout(ctx, materializeLockDeadline)
+	defer cancel()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", 0, fmt.Errorf("artifact: build request: %w", err)

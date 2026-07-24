@@ -36,7 +36,7 @@ func TestExtractTarGzRejectsSymlink(t *testing.T) {
 	if err := os.WriteFile(src, buf.Bytes(), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := extractTarGz(src, t.TempDir()); !errors.Is(err, ErrUnsafeArchive) {
+	if err := extractTarGz(src, t.TempDir(), 1<<20); !errors.Is(err, ErrUnsafeArchive) {
 		t.Fatalf("extractTarGz() = %v, want ErrUnsafeArchive", err)
 	}
 }
