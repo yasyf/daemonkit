@@ -866,11 +866,12 @@ func (r *Reaper) reapGroupOutcome(
 	switch {
 	case leaderErr == nil && leader.startTime != rec.StartTime:
 		return true, ReapIdentityReused, nil
-	case leaderErr == nil && (leader.groupID != rec.PID || leader.sessionID != rec.SessionID):
-		return false, 0, errors.New("process-group leader left its recorded group or session")
 	case leaderErr != nil && !errors.Is(leaderErr, errNoProc):
 		return false, 0, leaderErr
 	}
+	// A reaped leader PID can be reused within the same Linux start-time tick.
+	// Never signal that mismatched process; settle only members still in the
+	// durably recorded dedicated session.
 	members, err := r.verifiedGroupMembers(rec)
 	if err != nil {
 		return false, 0, err

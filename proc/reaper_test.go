@@ -1114,6 +1114,44 @@ func TestReapSignalsEveryGroupInDedicatedSession(t *testing.T) {
 	}
 }
 
+func TestReapIgnoresSameTickReusedLeaderAndSettlesRecordedSession(t *testing.T) {
+	ctx := context.Background()
+	store := &memStore{}
+	leaderPID := 4175
+	memberPID := 4176
+	replacement := groupInfo(9001, liveInfo().startTime, liveInfo().comm)
+	member := groupInfo(leaderPID, "333.555", "descendant")
+	memberSet := []groupMember{{pid: memberPID, info: member}}
+	prober := &fakeProber{
+		info: replacement,
+		byPID: map[int]probeResult{
+			leaderPID: {info: replacement},
+			memberPID: {info: member},
+		},
+		memberSets: [][]groupMember{memberSet, memberSet, nil},
+	}
+	signals := &recSignaler{}
+	record := matchingGroupRecord(leaderPID, "old-gen")
+	mustAdd(t, store, record)
+	reaper := &Reaper{
+		Store: store, Generation: testOwnerGeneration("new-gen"),
+		prober: prober, signaler: signals, clock: newFakeClock(),
+	}
+	if err := reaper.Reap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	want := []signalCall{
+		{pid: -leaderPID, sig: syscall.SIGTERM},
+		{pid: -leaderPID, sig: syscall.SIGKILL},
+	}
+	if got := signals.calls(); !slices.Equal(got, want) {
+		t.Fatalf("signals = %v, want %v", got, want)
+	}
+	if store.len() != 0 {
+		t.Fatalf("store size = %d, want settled record removed", store.len())
+	}
+}
+
 func TestReapKillsGroupAppearingDuringDedicatedSessionSettlement(t *testing.T) {
 	ctx := context.Background()
 	store := &memStore{}
