@@ -1,11 +1,15 @@
 package proc
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	bolt "go.etcd.io/bbolt"
 )
@@ -77,6 +81,69 @@ func TestFileStoreArchivesUnsupportedSchemaWhenOptedIn(t *testing.T) {
 	}
 	if err := store.Add(t.Context(), storeRecord(RecoveryTask, 7)); err != nil {
 		t.Fatalf("Add to fresh store = %v", err)
+	}
+}
+
+func TestFileStoreArchiveIgnoresTransientOpenFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "workers.db")
+	seed := &FileStore{Path: path}
+	if err := seed.Add(t.Context(), storeRecord(RecoveryTask, 42)); err != nil {
+		t.Fatal(err)
+	}
+	wedgeSchemaFingerprint(t, path)
+
+	// Hold the bolt file lock so a concurrent open blocks and times out rather
+	// than reaching the schema check.
+	held, err := bolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+
+	store := &FileStore{Path: path, UnsupportedSchema: ArchiveUnsupportedSchema}
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+	if db, err := store.open(ctx); err == nil {
+		_ = db.Close()
+		t.Fatal("open of a locked store succeeded, want a timeout error")
+	}
+	if bak := storeBackups(t, path); len(bak) != 0 {
+		t.Fatalf("a transient open failure must not archive; found %v", bak)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("store must be preserved on a transient failure: %v", err)
+	}
+}
+
+func TestFileStoreArchiveIsSingleFlight(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "workers.db")
+	seed := &FileStore{Path: path}
+	if err := seed.Add(t.Context(), storeRecord(RecoveryTask, 42)); err != nil {
+		t.Fatal(err)
+	}
+	wedgeSchemaFingerprint(t, path)
+
+	var wg sync.WaitGroup
+	errs := make([]error, 16)
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			records, err := (&FileStore{Path: path, UnsupportedSchema: ArchiveUnsupportedSchema}).Load(t.Context())
+			if err == nil && len(records) != 0 {
+				err = fmt.Errorf("fresh store returned %d records, want 0", len(records))
+			}
+			errs[i] = err
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent opener %d: %v", i, err)
+		}
+	}
+	if bak := storeBackups(t, path); len(bak) != 1 {
+		t.Fatalf("concurrent archive must leave exactly one .bak, found %d: %v", len(bak), bak)
 	}
 }
 

@@ -102,20 +102,10 @@ func (s *FileStore) open(ctx context.Context) (*bolt.DB, error) {
 		if s.UnsupportedSchema != ArchiveUnsupportedSchema || !errors.Is(err, ErrRecordSchema) {
 			return nil, err
 		}
-		backup, archiveErr := ArchiveUnsupportedStore(s.Path)
-		if archiveErr != nil {
-			return nil, errors.Join(err, archiveErr)
-		}
-		slog.Warn("proc: archived unsupported-schema keyed store",
-			"path", s.Path, "backup", backup, "schema", recordSchemaVersion)
-		created = true
-		if db, err = bolt.Open(s.Path, 0o600, &bolt.Options{Timeout: timeout}); err != nil {
-			return nil, fmt.Errorf("proc: reopen keyed file store after archive: %w", err)
-		}
-		if err := db.Update(initializeFileStore); err != nil {
-			_ = db.Close()
+		if db, err = s.archiveUnderLock(ctx, timeout, err); err != nil {
 			return nil, err
 		}
+		created = true
 	}
 	fileInfo, err := os.Stat(s.Path)
 	if err != nil {
@@ -131,6 +121,49 @@ func (s *FileStore) open(ctx context.Context) (*bolt.DB, error) {
 			_ = db.Close()
 			return nil, fmt.Errorf("proc: persist keyed file store directory entry: %w", err)
 		}
+	}
+	return db, nil
+}
+
+// archiveUnderLock serializes detect→archive→create on a sidecar file lock so
+// concurrent openers of one unsupported store produce exactly one backup: the
+// winner archives and creates a fresh store, and every loser re-checks the
+// schema inside the lock and proceeds onto that fresh store. mismatch is the
+// original schema error, reported if the archival rename itself fails.
+func (s *FileStore) archiveUnderLock(ctx context.Context, timeout time.Duration, mismatch error) (*bolt.DB, error) {
+	lock, err := (FileLockSpec{Path: s.Path + ".archive.lock", Mode: FileLockExclusive, Deadline: timeout}).Acquire(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("proc: lock keyed store for archive: %w", err)
+	}
+	defer func() { _ = lock.Close() }()
+
+	db, err := bolt.Open(s.Path, 0o600, &bolt.Options{Timeout: timeout})
+	if err != nil {
+		return nil, fmt.Errorf("proc: reopen keyed file store for archive: %w", err)
+	}
+	switch initErr := db.Update(initializeFileStore); {
+	case initErr == nil:
+		return db, nil
+	case !errors.Is(initErr, ErrRecordSchema):
+		_ = db.Close()
+		return nil, initErr
+	default:
+		_ = db.Close()
+	}
+
+	backup, err := ArchiveUnsupportedStore(s.Path)
+	if err != nil {
+		return nil, errors.Join(mismatch, err)
+	}
+	slog.Warn("proc: archived unsupported-schema keyed store",
+		"path", s.Path, "backup", backup, "schema", recordSchemaVersion)
+	db, err = bolt.Open(s.Path, 0o600, &bolt.Options{Timeout: timeout})
+	if err != nil {
+		return nil, fmt.Errorf("proc: reopen keyed file store after archive: %w", err)
+	}
+	if err := db.Update(initializeFileStore); err != nil {
+		_ = db.Close()
+		return nil, err
 	}
 	return db, nil
 }
