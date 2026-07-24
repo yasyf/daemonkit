@@ -158,6 +158,7 @@ type Server struct {
 	readinessMu                  sync.Mutex
 	readinessSubscribers         map[*session]*readinessSubscription
 	readinessSubscriptionsClosed bool
+	staticOrdinary               bool
 
 	queue                chan job
 	slots                chan struct{}
