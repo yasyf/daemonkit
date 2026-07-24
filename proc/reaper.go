@@ -56,9 +56,9 @@ var (
 // PID with the boot session and opaque kernel start stamp before signaling;
 // PID alone is never kill authority, while Comm remains informational across exec.
 type Record struct {
-	// RecoveryClass names the consumer barrier that must settle before the
+	// RecoveryID names the consumer barrier that must settle before the
 	// retirement receipt can be acknowledged.
-	RecoveryClass RecoveryClass `json:"recovery_class"`
+	RecoveryID RecoveryID `json:"recovery_id"`
 	// PID is the spawned child's process id.
 	PID int `json:"pid"`
 	// StartTime is the prober's opaque, platform-native process start stamp.
@@ -74,7 +74,7 @@ type Record struct {
 	// protected peer. Spawned disposable workers use the zero value.
 	AuditToken AuditToken `json:"audit_token"`
 	// Generation tags the daemon instance that spawned the child.
-	Generation string `json:"generation"`
+	Generation OwnerGeneration `json:"generation"`
 	// ProcessGroup means PID is also the process-group id and signals target the
 	// entire group after its dedicated session membership is revalidated.
 	ProcessGroup bool `json:"process_group"`
@@ -89,20 +89,20 @@ type Record struct {
 	StopSession             StopSessionID        `json:"stop_session"`
 	PreparationNonce        StopPreparationNonce `json:"preparation_nonce"`
 	RuntimeProtocol         int                  `json:"runtime_protocol"`
-	TargetProcessGeneration string               `json:"target_process_generation"`
+	TargetProcessGeneration OwnerGeneration      `json:"target_process_generation"`
 	StopAuthorityState      StopAuthorityState   `json:"stop_authority_state"`
 	ExpiresUnixMilli        int64                `json:"expires_unix_milli"`
 }
 
 // Validate rejects an incomplete durable process identity.
 func (r Record) Validate() error {
-	if err := r.RecoveryClass.Validate(); err != nil {
+	if err := r.RecoveryID.Validate(); err != nil {
 		return errors.Join(ErrInvalidRecord, err)
 	}
 	if err := validateRecordIdentity(r); err != nil {
 		return err
 	}
-	if r.Generation == "" {
+	if r.Generation == (OwnerGeneration{}) {
 		return fmt.Errorf("%w: generation is required", ErrInvalidRecord)
 	}
 	if r.ProcessGroup {
@@ -112,10 +112,10 @@ func (r Record) Validate() error {
 	} else if r.SessionID != 0 {
 		return fmt.Errorf("%w: non-group record has a session id", ErrInvalidRecord)
 	}
-	if r.RecoveryClass == RecoveryStopControl {
+	if r.RecoveryID == RecoveryStopControlID {
 		if r.Role == "" || r.OperationID == "" || r.StopSession == (StopSessionID{}) ||
 			r.PreparationNonce == (StopPreparationNonce{}) || r.RuntimeProtocol <= 0 ||
-			r.TargetProcessGeneration == "" || r.ProcessGroup {
+			r.TargetProcessGeneration == (OwnerGeneration{}) || r.ProcessGroup {
 			return fmt.Errorf("%w: incomplete stop-control authority", ErrInvalidRecord)
 		}
 		switch r.StopAuthorityState {
@@ -132,7 +132,7 @@ func (r Record) Validate() error {
 		}
 	} else if r.Role != "" || r.OperationID != "" || r.StopSession != (StopSessionID{}) ||
 		r.PreparationNonce != (StopPreparationNonce{}) || r.RuntimeProtocol != 0 ||
-		r.TargetProcessGeneration != "" || r.StopAuthorityState != "" || r.ExpiresUnixMilli != 0 {
+		r.TargetProcessGeneration != (OwnerGeneration{}) || r.StopAuthorityState != "" || r.ExpiresUnixMilli != 0 {
 		return fmt.Errorf("%w: non-stop record carries stop authority", ErrInvalidRecord)
 	}
 	return nil
@@ -173,17 +173,24 @@ type Store interface {
 	Remove(ctx context.Context, victims []Record) error
 	// BeginReap durably claims an exact prior-generation record so concurrent
 	// graceful untracking cannot erase it before receipt commit.
-	BeginReap(ctx context.Context, rec Record, reaperGeneration string) error
+	BeginReap(ctx context.Context, rec Record, reaperGeneration OwnerGeneration) error
 	// CommitReap atomically replaces one exact process record with its ordered
 	// durable retirement receipt.
-	CommitReap(ctx context.Context, rec Record, reaperGeneration string, outcome ReapOutcome) (ReapReceipt, error)
-	// LoadReapReceipts returns a bounded stable class page.
+	CommitReap(ctx context.Context, rec Record, reaperGeneration OwnerGeneration, outcome ReapOutcome) (ReapReceipt, error)
+	// LoadReapReceipts returns a bounded stable recovery-ID page.
 	LoadReapReceipts(
 		ctx context.Context,
-		class RecoveryClass,
+		id RecoveryID,
 		after ReapReceiptCursor,
 		limit int,
 	) (ReapReceiptPage, error)
+	// ScanReapReceipts returns one bounded page from the exhaustive global
+	// receipt keyspace.
+	ScanReapReceipts(
+		ctx context.Context,
+		after ReapReceiptScanCursor,
+		limit int,
+	) (ReapReceiptScanPage, error)
 	// HasReapReceipt reports an exact durable receipt match.
 	HasReapReceipt(ctx context.Context, receipt ReapReceipt) (bool, error)
 	// FindReapReceipt returns the durable receipt for one exact process record,
@@ -192,7 +199,7 @@ type Store interface {
 	// AcknowledgeReap forgets an exact receipt; absence is idempotent.
 	AcknowledgeReap(ctx context.Context, receipt ReapReceipt) (ReapReceiptFloor, error)
 	// ReapReceiptFloor returns the durable contiguous acknowledgement floor.
-	ReapReceiptFloor(ctx context.Context, class RecoveryClass) (ReapReceiptFloor, error)
+	ReapReceiptFloor(ctx context.Context, id RecoveryID) (ReapReceiptFloor, error)
 }
 
 type procInfo struct {
@@ -242,7 +249,7 @@ type Reaper struct {
 	Store Store
 	// Generation uniquely identifies this daemon instance; children Track records
 	// carry it, and records bearing it are never signaled by this reaper. Required.
-	Generation string
+	Generation OwnerGeneration
 	// Grace bounds the wait between SIGTERM and SIGKILL; zero means DefaultReapGrace.
 	Grace time.Duration
 	// Settlement bounds post-SIGKILL proof; zero means DefaultReapSettlement.
@@ -257,17 +264,17 @@ type Reaper struct {
 
 // Track snapshots a freshly spawned child's identity through the same prober
 // Reap revalidates with and records it under this reaper's Generation.
-func (r *Reaper) Track(ctx context.Context, pid int, class RecoveryClass) (Record, error) {
-	return r.track(ctx, pid, false, class)
+func (r *Reaper) Track(ctx context.Context, pid int, id RecoveryID) (Record, error) {
+	return r.track(ctx, pid, false, id)
 }
 
 // TrackIdentity durably records an already authenticated exact process identity.
 // It re-probes before writing so PID reuse can never turn the supplied identity
 // into authority over a different process.
-func (r *Reaper) TrackIdentity(ctx context.Context, identity Identity, class RecoveryClass) (Record, error) {
+func (r *Reaper) TrackIdentity(ctx context.Context, identity Identity, id RecoveryID) (Record, error) {
 	rec := Record{
-		RecoveryClass: class,
-		PID:           identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
+		RecoveryID: id,
+		PID:        identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
 		Comm: identity.Comm, Generation: r.Generation, Executable: identity.Executable,
 		AuditToken: identity.AuditToken,
 	}
@@ -329,12 +336,12 @@ func (r *Reaper) TrackStopControl(
 	stopSession StopSessionID,
 	preparationNonce StopPreparationNonce,
 	protocol int,
-	targetProcessGeneration string,
+	targetProcessGeneration OwnerGeneration,
 	authorityWindow time.Duration,
 ) (Record, error) {
 	record := Record{
-		RecoveryClass: RecoveryStopControl,
-		PID:           identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
+		RecoveryID: RecoveryStopControlID,
+		PID:        identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
 		Comm: identity.Comm, Generation: r.Generation, Executable: identity.Executable,
 		AuditToken: identity.AuditToken, Role: role, OperationID: operationID,
 		StopSession: stopSession, PreparationNonce: preparationNonce, RuntimeProtocol: protocol,
@@ -380,16 +387,16 @@ func (r *Reaper) RevokeStopControl(ctx context.Context, record Record) (Record, 
 // StopControlStore atomically consumes one exact one-shot stop authority.
 type StopControlStore interface {
 	ConsumeStopControl(
-		context.Context, Identity, string, string, StopSessionID, StopPreparationNonce, int, string, time.Time,
+		context.Context, Identity, string, string, StopSessionID, StopPreparationNonce, int, OwnerGeneration, time.Time,
 	) (Record, bool, error)
 }
 
 // TrackGroup records a child whose PID leads its own process group and session.
-func (r *Reaper) TrackGroup(ctx context.Context, pid int, class RecoveryClass) (Record, error) {
-	return r.track(ctx, pid, true, class)
+func (r *Reaper) TrackGroup(ctx context.Context, pid int, id RecoveryID) (Record, error) {
+	return r.track(ctx, pid, true, id)
 }
 
-func (r *Reaper) track(ctx context.Context, pid int, processGroup bool, class RecoveryClass) (Record, error) {
+func (r *Reaper) track(ctx context.Context, pid int, processGroup bool, id RecoveryID) (Record, error) {
 	boot, err := r.prb().bootID()
 	if err != nil {
 		return Record{}, fmt.Errorf("snapshot boot identity: %w", err)
@@ -402,13 +409,13 @@ func (r *Reaper) track(ctx context.Context, pid int, processGroup bool, class Re
 		return Record{}, fmt.Errorf("pid %d has process group %d and session %d, want a dedicated session leader", pid, info.groupID, info.sessionID)
 	}
 	rec := Record{
-		RecoveryClass: class,
-		PID:           pid,
-		StartTime:     info.startTime,
-		Boot:          boot,
-		Comm:          info.comm,
-		Generation:    r.Generation,
-		ProcessGroup:  processGroup,
+		RecoveryID:   id,
+		PID:          pid,
+		StartTime:    info.startTime,
+		Boot:         boot,
+		Comm:         info.comm,
+		Generation:   r.Generation,
+		ProcessGroup: processGroup,
 	}
 	if processGroup {
 		rec.SessionID = info.sessionID
@@ -488,8 +495,8 @@ func (r *Reaper) TerminateIdentityWithin(ctx context.Context, identity Identity,
 		return errors.New("proc: termination grace must be positive")
 	}
 	record := Record{
-		RecoveryClass: RecoveryTask,
-		PID:           identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
+		RecoveryID: RecoveryTaskID,
+		PID:        identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
 		Comm: identity.Comm, Generation: r.Generation, Executable: identity.Executable,
 		AuditToken: identity.AuditToken,
 	}
@@ -578,18 +585,23 @@ func (r *Reaper) Owns(rec Record) (bool, error) {
 // Reap settles every prior-generation record and atomically replaces each
 // settled kill authority with an ordered durable receipt.
 func (r *Reaper) Reap(ctx context.Context) error {
+	_, err := r.reap(ctx)
+	return err
+}
+
+func (r *Reaper) reap(ctx context.Context) (map[RecoveryID][]OwnerGeneration, error) {
 	recs, err := r.Store.Load(ctx)
 	if err != nil {
-		return fmt.Errorf("load reaper records: %w", err)
+		return nil, fmt.Errorf("load reaper records: %w", err)
 	}
 	boot, err := r.prb().bootID()
 	if err != nil {
-		return fmt.Errorf("load current boot identity: %w", err)
+		return nil, fmt.Errorf("load current boot identity: %w", err)
 	}
 	var unresolved []error
 	for _, rec := range recs {
 		if err := ctx.Err(); err != nil {
-			return err
+			return nil, err
 		}
 		if rec.Generation == r.Generation {
 			continue
@@ -609,30 +621,62 @@ func (r *Reaper) Reap(ctx context.Context) error {
 			}
 		}
 	}
-	return errors.Join(unresolved...)
+	if err := errors.Join(unresolved...); err != nil {
+		return nil, err
+	}
+	settledSets := make(map[RecoveryID]map[OwnerGeneration]struct{})
+	var cursor ReapReceiptScanCursor
+	for {
+		page, err := r.Store.ScanReapReceipts(ctx, cursor, ReapReceiptPageLimit)
+		if err != nil {
+			return nil, fmt.Errorf("scan settled recovery receipts: %w", err)
+		}
+		for _, receipt := range page.Receipts {
+			id := receipt.Record.RecoveryID
+			generations := settledSets[id]
+			if generations == nil {
+				generations = make(map[OwnerGeneration]struct{})
+				settledSets[id] = generations
+			}
+			generations[receipt.Record.Generation] = struct{}{}
+		}
+		if !page.More {
+			break
+		}
+		cursor = page.Next
+	}
+	settled := make(map[RecoveryID][]OwnerGeneration, len(settledSets))
+	for id, generations := range settledSets {
+		settled[id] = make([]OwnerGeneration, 0, len(generations))
+		for generation := range generations {
+			settled[id] = append(settled[id], generation)
+		}
+		slices.SortFunc(settled[id], generationCompare)
+	}
+	return settled, nil
 }
 
-// ReapReceipts returns one stable class-filtered ledger page.
+// ReapReceipts returns one stable recovery-ID-filtered ledger page.
 func (r *Reaper) ReapReceipts(
 	ctx context.Context,
-	class RecoveryClass,
+	id RecoveryID,
 	after ReapReceiptCursor,
 	limit int,
 ) (ReapReceiptPage, error) {
-	if r == nil || r.Store == nil || r.Generation == "" {
+	if r == nil || r.Store == nil || r.Generation == (OwnerGeneration{}) {
 		return ReapReceiptPage{}, errors.New("proc: reap receipt page requires store and generation")
 	}
-	if err := class.Validate(); err != nil {
+	if err := id.Validate(); err != nil {
 		return ReapReceiptPage{}, err
 	}
-	return r.Store.LoadReapReceipts(ctx, class, after, limit)
+	return r.Store.LoadReapReceipts(ctx, id, after, limit)
 }
 
 // RecoverReapReceipts settles and acknowledges every receipt in one recovery
-// class, returning the durable committed floor even when no receipt remains.
+// id, returning the durable committed floor even when no receipt remains.
 func (r *Reaper) RecoverReapReceipts(
 	ctx context.Context,
-	class RecoveryClass,
+	id RecoveryID,
 	settle func(context.Context, ReapReceipt) error,
 ) (ReapReceiptFloor, error) {
 	if settle == nil {
@@ -640,7 +684,7 @@ func (r *Reaper) RecoverReapReceipts(
 	}
 	var cursor ReapReceiptCursor
 	for {
-		page, err := r.ReapReceipts(ctx, class, cursor, ReapReceiptPageLimit)
+		page, err := r.ReapReceipts(ctx, id, cursor, ReapReceiptPageLimit)
 		if err != nil {
 			return ReapReceiptFloor{}, err
 		}
@@ -656,7 +700,7 @@ func (r *Reaper) RecoverReapReceipts(
 			cursor = ReapReceiptCursor{LedgerID: receipt.LedgerID, Sequence: receipt.Sequence}
 		}
 		if !page.More {
-			return r.Store.ReapReceiptFloor(ctx, class)
+			return r.Store.ReapReceiptFloor(ctx, id)
 		}
 	}
 }
@@ -667,7 +711,7 @@ func (r *Reaper) ReapReceipt(
 	ctx context.Context,
 	record Record,
 ) (ReapReceipt, bool, error) {
-	if r == nil || r.Store == nil || r.Generation == "" {
+	if r == nil || r.Store == nil || r.Generation == (OwnerGeneration{}) {
 		return ReapReceipt{}, false, errors.New("proc: reap receipt lookup requires store and generation")
 	}
 	if err := record.Validate(); err != nil {
@@ -679,7 +723,7 @@ func (r *Reaper) ReapReceipt(
 // ReapRecord settles one exact prior-generation record independently of the
 // bounded replay page and returns its durable receipt.
 func (r *Reaper) ReapRecord(ctx context.Context, record Record) (ReapReceipt, error) {
-	if r == nil || r.Store == nil || r.Generation == "" {
+	if r == nil || r.Store == nil || r.Generation == (OwnerGeneration{}) {
 		return ReapReceipt{}, errors.New("proc: exact reap requires store and generation")
 	}
 	if err := record.Validate(); err != nil {

@@ -240,7 +240,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
             let path = directory.appendingPathComponent("s.sock").path
             let takeover = UnknownDeliveryTakeoverSequence()
             let oldLifecycle = try testRuntimeController()
-            let successorLifecycle = try testRuntimeController(generation: "boot-2")
+            let successorLifecycle = try testRuntimeController(generation: testOwnerGeneration(2))
             let oldServer = SocketServer(
                 path: path,
                 wireBuild: "service.v1",
@@ -384,7 +384,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
     }
 
     @Test func terminalLifecycleWinsPeerCloseRace() async throws {
-        let identity = RuntimeIdentity(runtimeBuild: "app.v1", processGeneration: "boot-1")
+        let identity = RuntimeIdentity(runtimeBuild: "app.v1", processGeneration: testOwnerGeneration())
         for state in [RuntimeReadinessState.failed, .draining] {
             try await withRawServicePeers(count: 1) { _, codec in
                 let receipt = try nextRequest(codec)
@@ -452,7 +452,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
     }
 
     @Test func brokerHandoffTerminalResponseCannotOutliveFixedDeadline() async throws {
-        let identity = RuntimeIdentity(runtimeBuild: "app.v1", processGeneration: "boot-1")
+        let identity = RuntimeIdentity(runtimeBuild: "app.v1", processGeneration: testOwnerGeneration())
         let responseGate = ServiceWriteGate()
         try await withRawServicePeers(count: 1) { _, codec in
             let receipt = try nextRequest(codec)

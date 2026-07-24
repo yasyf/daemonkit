@@ -145,26 +145,26 @@ func (s *controllerStoreStub) record(event string) {
 }
 
 type controllerReceiptsStub struct {
-	events  *[]string
-	calls   int
-	classes []proc.RecoveryClass
-	err     error
+	events *[]string
+	calls  int
+	ids    []proc.RecoveryID
+	err    error
 }
 
 func (r *controllerReceiptsStub) RecoverReapReceipts(
 	_ context.Context,
-	class proc.RecoveryClass,
+	id proc.RecoveryID,
 	_ func(context.Context, proc.ReapReceipt) error,
 ) (proc.ReapReceiptFloor, error) {
-	if class != proc.RecoveryService && class != proc.RecoveryStopControl {
-		return proc.ReapReceiptFloor{}, fmt.Errorf("receipt class = %q", class)
+	if id != proc.RecoveryServiceID && id != proc.RecoveryStopControlID {
+		return proc.ReapReceiptFloor{}, fmt.Errorf("receipt id = %q", id)
 	}
 	r.calls++
-	r.classes = append(r.classes, class)
+	r.ids = append(r.ids, id)
 	if r.events != nil {
-		*r.events = append(*r.events, fmt.Sprintf("recover-receipts:%d", class))
+		*r.events = append(*r.events, fmt.Sprintf("recover-receipts:%s", id))
 	}
-	return proc.ReapReceiptFloor{RecoveryClass: class}, r.err
+	return proc.ReapReceiptFloor{RecoveryID: id}, r.err
 }
 
 func controllerConfig(t *testing.T) ControllerConfig {
@@ -329,8 +329,8 @@ func TestControllerRecoveryConvergesBeforeAcknowledgingReceipts(t *testing.T) {
 	}
 	wantLast := []string{
 		"set-applied:" + agent.Label,
-		fmt.Sprintf("recover-receipts:%d", proc.RecoveryService),
-		fmt.Sprintf("recover-receipts:%d", proc.RecoveryStopControl),
+		fmt.Sprintf("recover-receipts:%s", proc.RecoveryServiceID),
+		fmt.Sprintf("recover-receipts:%s", proc.RecoveryStopControlID),
 	}
 	if len(events) < len(wantLast) || !reflect.DeepEqual(events[len(events)-len(wantLast):], wantLast) {
 		t.Fatalf("events = %v, want suffix %v", events, wantLast)
@@ -393,8 +393,8 @@ func TestControllerRecoveryVerifiesExactAgentWithoutRelaunch(t *testing.T) {
 	want := []string{
 		"start", "load", "run:print " + serviceTarget(agent.Label),
 		"run:enable " + serviceTarget(agent.Label),
-		fmt.Sprintf("recover-receipts:%d", proc.RecoveryService),
-		fmt.Sprintf("recover-receipts:%d", proc.RecoveryStopControl),
+		fmt.Sprintf("recover-receipts:%s", proc.RecoveryServiceID),
+		fmt.Sprintf("recover-receipts:%s", proc.RecoveryStopControlID),
 	}
 	if !reflect.DeepEqual(events, want) {
 		t.Fatalf("recovery events = %v, want %v", events, want)

@@ -67,7 +67,7 @@ func TestSessionStopPreparationRejectsBadRequestWithoutConsuming(t *testing.T) {
 	stopSession := proc.StopSessionID{1}
 	nonce := proc.StopPreparationNonce{2}
 	target := proc.Identity{PID: 42, StartTime: "start", Boot: "boot", Executable: "/bin/runtime"}
-	runtimeIdentity := RuntimeIdentity{RuntimeBuild: "runtime-v1", ProcessGeneration: "generation-v1"}
+	runtimeIdentity := RuntimeIdentity{RuntimeBuild: "runtime-v1", ProcessGeneration: proc.OwnerGeneration{1}}
 	sessionA := &session{ctx: ctx, role: "stop"}
 	preparation := sessionStopPreparation{
 		role: "stop", stopSession: stopSession, preparationNonce: nonce,
@@ -118,7 +118,7 @@ func TestSessionStopPreparationRejectsBadRequestWithoutConsuming(t *testing.T) {
 }
 
 func TestPreparedStopPreSendFailureIsRetryable(t *testing.T) {
-	target := RuntimeIdentity{RuntimeBuild: "runtime-v1", ProcessGeneration: "generation-v1"}
+	target := RuntimeIdentity{RuntimeBuild: "runtime-v1", ProcessGeneration: proc.OwnerGeneration{1}}
 	process := proc.Identity{PID: 42, StartTime: "start", Boot: "boot", Executable: "/bin/runtime"}
 	payload, err := json.Marshal(stopControlResponse{
 		Version: 1, Target: newStopControlTarget(process, target.ProcessGeneration),
@@ -151,7 +151,7 @@ func TestPreparedStopDeliveryUnknownSealsHandle(t *testing.T) {
 	}
 	prepared := &PreparedStop{
 		client:          client,
-		target:          RuntimeIdentity{RuntimeBuild: "runtime-v1", ProcessGeneration: "generation-v1"},
+		target:          RuntimeIdentity{RuntimeBuild: "runtime-v1", ProcessGeneration: proc.OwnerGeneration{1}},
 		process:         proc.Identity{PID: 42, StartTime: "start", Boot: "boot", Executable: "/bin/runtime"},
 		runtimeProtocol: 1, stopSession: proc.StopSessionID{1}, preparationNonce: proc.StopPreparationNonce{2},
 	}

@@ -48,7 +48,7 @@ type AppKeepAlive struct {
 
 type appProcessReaper interface {
 	Reap(context.Context) error
-	TrackIdentity(context.Context, proc.Identity, proc.RecoveryClass) (proc.Record, error)
+	TrackIdentity(context.Context, proc.Identity, proc.RecoveryID) (proc.Record, error)
 	Terminate(context.Context, proc.Record) error
 }
 
@@ -64,12 +64,12 @@ type AppStopSpec struct {
 	// PolicyDigest is the opaque digest bound by the prior signed-side session.
 	PolicyDigest codeidentity.PolicyDigest
 	Reaper       *proc.Reaper
-	// RecoveryClass names the barrier required before a retired app receipt is
+	// RecoveryID names the barrier required before a retired app receipt is
 	// acknowledged.
-	RecoveryClass proc.RecoveryClass
-	Dependents    *proc.Reaper
-	reaper        appProcessReaper
-	dependents    appOwnedProcessRecovery
+	RecoveryID proc.RecoveryID
+	Dependents *proc.Reaper
+	reaper     appProcessReaper
+	dependents appOwnedProcessRecovery
 
 	peerFromConn func(net.Conn) (wire.Peer, error)
 	processes    func(string) ([]proc.Identity, error)
@@ -271,7 +271,7 @@ func (k AppKeepAlive) Stop(
 				_ = conn.Close()
 				return errors.New("fixed app peer changed after authenticated proof")
 			}
-			record, err := reaper.TrackIdentity(ctx, peer.ProcessIdentity(), spec.RecoveryClass)
+			record, err := reaper.TrackIdentity(ctx, peer.ProcessIdentity(), spec.RecoveryID)
 			if err != nil {
 				_ = conn.Close()
 				return fmt.Errorf("durably track fixed app: %w", err)
@@ -350,8 +350,8 @@ func (k AppKeepAlive) validateStop(spec AppStopSpec) (string, error) {
 	if spec.PolicyDigest == (codeidentity.PolicyDigest{}) {
 		return "", errors.New("keepalive agent: app stop policy digest is required")
 	}
-	if err := spec.RecoveryClass.Validate(); err != nil {
-		return "", fmt.Errorf("keepalive agent: app stop recovery class: %w", err)
+	if err := spec.RecoveryID.Validate(); err != nil {
+		return "", fmt.Errorf("keepalive agent: app stop recovery id: %w", err)
 	}
 	if filepath.Base(spec.ExecutableName) != spec.ExecutableName || spec.ExecutableName == "." || spec.ExecutableName == "" {
 		return "", errors.New("keepalive agent: app stop executable name is invalid")

@@ -40,7 +40,7 @@ func newSpawnedWireManager(t *testing.T) *proc.Manager {
 	t.Helper()
 	manager, err := proc.NewManager(1, &proc.Reaper{
 		Store:      &proc.FileStore{Path: filepath.Join(t.TempDir(), "recovery.db")},
-		Generation: "wire-spawned-test", Grace: 10 * time.Millisecond, Settlement: time.Second,
+		Generation: proc.OwnerGeneration{1}, Grace: 10 * time.Millisecond, Settlement: time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -71,9 +71,9 @@ func TestSpawnedSessionPublicSeamStreamsEventsCancelsAndJoins(t *testing.T) {
 	var signature proc.SignatureDigest
 	signature[0] = 1
 	request, err := proc.NewSpawnRequest(proc.SpawnConfig{
-		RecoveryClass: proc.RecoveryTask,
-		Executable:    executable,
-		Args:          []string{"-test.run=^TestSpawnedWireHelperProcess$", "-test.v"},
+		RecoveryID: proc.RecoveryTaskID,
+		Executable: executable,
+		Args:       []string{"-test.run=^TestSpawnedWireHelperProcess$", "-test.v"},
 		Env: []string{
 			"SPAWNED_WIRE_DIAGNOSTIC=" + diagnostic,
 			"SPAWNED_WIRE_HELPER=1",
@@ -280,7 +280,7 @@ func TestSpawnedSessionAbruptParentCloseJoinsChild(t *testing.T) {
 	var signature proc.SignatureDigest
 	signature[0] = 1
 	request, err := proc.NewSpawnRequest(proc.SpawnConfig{
-		RecoveryClass: proc.RecoveryTask, Executable: executable,
+		RecoveryID: proc.RecoveryTaskID, Executable: executable,
 		Args:  []string{"-test.run=^TestSpawnedWireHelperProcess$", "-test.v"},
 		Env:   []string{"SPAWNED_WIRE_DIAGNOSTIC=" + diagnostic, "SPAWNED_WIRE_HELPER=1"},
 		Stdin: proc.StdioNull, Stdout: proc.StdioNull, Stderr: proc.StdioNull,

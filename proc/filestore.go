@@ -37,7 +37,7 @@ var (
 	fileStoreLedgerKey          = []byte("ledger")
 	fileStoreOutstandingKey     = []byte("outstanding")
 	fileStoreIdentity           = []byte("daemonkit.proc.file-store.v1")
-	fileStoreFingerprint        = []byte("2114d0e5e58dfd74db3f61a3adea3ae61d7588e63e240e024c99394d9c45f463")
+	fileStoreFingerprint        = []byte("7268154e033f8712bf88c5a0bab097f05f87d14cc7febf435c93196e2f3a6766")
 )
 
 // ErrReceiptBacklog means durable unacknowledged recovery liabilities reached
@@ -202,18 +202,24 @@ func uint64Bytes(value uint64) []byte {
 	return encoded[:]
 }
 
-func classKey(class RecoveryClass) []byte { return []byte{byte(class)} }
+func recoveryIDKey(id RecoveryID) []byte {
+	key := make([]byte, 8+len(id))
+	binary.BigEndian.PutUint64(key[:8], uint64(len(id)))
+	copy(key[8:], id)
+	return key
+}
 
-func receiptKey(class RecoveryClass, sequence uint64) []byte {
-	key := make([]byte, 9)
-	key[0] = byte(class)
-	binary.BigEndian.PutUint64(key[1:], sequence)
+func receiptKey(id RecoveryID, sequence uint64) []byte {
+	prefix := recoveryIDKey(id)
+	key := make([]byte, len(prefix)+8)
+	copy(key, prefix)
+	binary.BigEndian.PutUint64(key[len(prefix):], sequence)
 	return key
 }
 
 func recordKey(record Record) string {
 	key := strconv.Itoa(record.PID) + "\x00" + record.Boot + "\x00" + record.StartTime
-	if record.RecoveryClass == RecoveryStopControl {
+	if record.RecoveryID == RecoveryStopControlID {
 		key += "\x00" + record.OperationID + "\x00" + string(record.StopSession[:]) +
 			"\x00" + string(record.PreparationNonce[:])
 	}
@@ -230,8 +236,8 @@ func fileStoreLedger(tx *bolt.Tx) (ReceiptLedgerID, error) {
 	return ledger, nil
 }
 
-func bucketSequence(bucket *bolt.Bucket, class RecoveryClass) (uint64, error) {
-	value := bucket.Get(classKey(class))
+func bucketSequence(bucket *bolt.Bucket, id RecoveryID) (uint64, error) {
+	value := bucket.Get(recoveryIDKey(id))
 	if value == nil {
 		return 0, nil
 	}
@@ -241,8 +247,8 @@ func bucketSequence(bucket *bolt.Bucket, class RecoveryClass) (uint64, error) {
 	return binary.BigEndian.Uint64(value), nil
 }
 
-func putBucketSequence(bucket *bolt.Bucket, class RecoveryClass, sequence uint64) error {
-	return bucket.Put(classKey(class), uint64Bytes(sequence))
+func putBucketSequence(bucket *bolt.Bucket, id RecoveryID, sequence uint64) error {
+	return bucket.Put(recoveryIDKey(id), uint64Bytes(sequence))
 }
 
 func updateOutstanding(tx *bolt.Tx, delta int64) error {
@@ -287,7 +293,7 @@ func decodeStored[T any](data []byte, value *T) error {
 }
 
 var recordJSONFields = []string{
-	"recovery_class", "pid", "start_time", "boot", "comm", "executable", "audit_token",
+	"recovery_id", "pid", "start_time", "boot", "comm", "executable", "audit_token",
 	"generation", "process_group", "session_id", "role", "operation_id", "stop_session",
 	"preparation_nonce", "runtime_protocol", "target_process_generation", "stop_authority_state", "expires_unix_milli",
 }
@@ -392,7 +398,7 @@ func stopControlPending(record Record) Record {
 }
 
 func (s *FileStore) addStopControlPending(ctx context.Context, rec Record) (Record, error) {
-	if rec.RecoveryClass != RecoveryStopControl || rec.StopAuthorityState != StopAuthorityPending ||
+	if rec.RecoveryID != RecoveryStopControlID || rec.StopAuthorityState != StopAuthorityPending ||
 		rec.ExpiresUnixMilli != 0 {
 		return Record{}, errors.New("proc: pending stop control admission is invalid")
 	}
@@ -453,7 +459,7 @@ func (s *FileStore) addStopControlPending(ctx context.Context, rec Record) (Reco
 }
 
 func (s *FileStore) armStopControl(ctx context.Context, pending Record, authorityWindow time.Duration) (Record, error) {
-	if pending.RecoveryClass != RecoveryStopControl || pending.StopAuthorityState != StopAuthorityPending ||
+	if pending.RecoveryID != RecoveryStopControlID || pending.StopAuthorityState != StopAuthorityPending ||
 		pending.ExpiresUnixMilli != 0 || authorityWindow <= 0 {
 		return Record{}, errors.New("proc: stop control arm is invalid")
 	}
@@ -532,7 +538,7 @@ func (s *FileStore) armStopControl(ctx context.Context, pending Record, authorit
 }
 
 func (s *FileStore) revokeStopControl(ctx context.Context, armed Record) (Record, error) {
-	if armed.RecoveryClass != RecoveryStopControl || armed.StopAuthorityState != StopAuthorityArmed ||
+	if armed.RecoveryID != RecoveryStopControlID || armed.StopAuthorityState != StopAuthorityArmed ||
 		armed.ExpiresUnixMilli <= 0 {
 		return Record{}, errors.New("proc: stop control revoke is invalid")
 	}
@@ -680,12 +686,12 @@ func (s *FileStore) ConsumeStopControl(
 	stopSession StopSessionID,
 	preparationNonce StopPreparationNonce,
 	runtimeProtocol int,
-	targetProcessGeneration string,
+	targetProcessGeneration OwnerGeneration,
 	now time.Time,
 ) (Record, bool, error) {
 	if identity.PID <= 0 || identity.StartTime == "" || identity.Boot == "" ||
 		role == "" || operationID == "" || stopSession == (StopSessionID{}) ||
-		preparationNonce == (StopPreparationNonce{}) || runtimeProtocol <= 0 || targetProcessGeneration == "" {
+		preparationNonce == (StopPreparationNonce{}) || runtimeProtocol <= 0 || targetProcessGeneration == (OwnerGeneration{}) {
 		return Record{}, false, errors.New("proc: stop authority lookup is incomplete")
 	}
 	db, err := s.open(ctx)
@@ -694,8 +700,8 @@ func (s *FileStore) ConsumeStopControl(
 	}
 	defer db.Close()
 	authority := Record{
-		RecoveryClass: RecoveryStopControl,
-		PID:           identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
+		RecoveryID: RecoveryStopControlID,
+		PID:        identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
 		OperationID: operationID, StopSession: stopSession, PreparationNonce: preparationNonce,
 	}
 	var consumed Record
@@ -717,7 +723,7 @@ func (s *FileStore) ConsumeStopControl(
 		if err := stored.Validate(); err != nil {
 			return err
 		}
-		if stored.RecoveryClass != RecoveryStopControl || stored.PID != identity.PID ||
+		if stored.RecoveryID != RecoveryStopControlID || stored.PID != identity.PID ||
 			stored.StartTime != identity.StartTime || stored.Boot != identity.Boot ||
 			stored.Comm != identity.Comm || stored.Executable != identity.Executable ||
 			stored.AuditToken != identity.AuditToken || stored.Role != role ||
@@ -737,11 +743,11 @@ func (s *FileStore) ConsumeStopControl(
 		consumed = stored
 		return nil
 	})
-	return consumed, consumed.RecoveryClass == RecoveryStopControl, err
+	return consumed, consumed.RecoveryID == RecoveryStopControlID, err
 }
 
 // BeginReap durably fences graceful untracking of rec.
-func (s *FileStore) BeginReap(ctx context.Context, rec Record, reaperGeneration string) error {
+func (s *FileStore) BeginReap(ctx context.Context, rec Record, reaperGeneration OwnerGeneration) error {
 	claim := reapClaim{Record: rec, ReaperGeneration: reaperGeneration}
 	if err := claim.validate(); err != nil {
 		return err
@@ -780,11 +786,11 @@ func (s *FileStore) BeginReap(ctx context.Context, rec Record, reaperGeneration 
 	})
 }
 
-// CommitReap replaces one claimed record with the next ordered class receipt.
+// CommitReap replaces one claimed record with the next ordered id receipt.
 func (s *FileStore) CommitReap(
 	ctx context.Context,
 	rec Record,
-	reaperGeneration string,
+	reaperGeneration OwnerGeneration,
 	outcome ReapOutcome,
 ) (ReapReceipt, error) {
 	if err := rec.Validate(); err != nil {
@@ -807,7 +813,7 @@ func (s *FileStore) CommitReap(
 			if err := existing.Validate(); err != nil {
 				return err
 			}
-			if !bytes.Equal(existingKey, receiptKey(existing.Record.RecoveryClass, existing.Sequence)) {
+			if !bytes.Equal(existingKey, receiptKey(existing.Record.RecoveryID, existing.Sequence)) {
 				return fmt.Errorf("%w: receipt index key does not match value", ErrRecordSchema)
 			}
 			if existing.Record != rec || existing.ReaperGeneration != reaperGeneration || existing.Outcome != outcome {
@@ -831,7 +837,7 @@ func (s *FileStore) CommitReap(
 			return errors.New("proc: reap receipt has no exact durable claim")
 		}
 		sequences := tx.Bucket(fileStoreSequencesBucket)
-		sequence, err := bucketSequence(sequences, rec.RecoveryClass)
+		sequence, err := bucketSequence(sequences, rec.RecoveryID)
 		if err != nil {
 			return err
 		}
@@ -851,14 +857,14 @@ func (s *FileStore) CommitReap(
 		if err != nil {
 			return err
 		}
-		key := receiptKey(rec.RecoveryClass, sequence)
+		key := receiptKey(rec.RecoveryID, sequence)
 		if err := tx.Bucket(fileStoreReceiptsBucket).Put(key, encoded); err != nil {
 			return err
 		}
 		if err := index.Put(recordKeyBytes, key); err != nil {
 			return err
 		}
-		if err := putBucketSequence(sequences, rec.RecoveryClass, sequence); err != nil {
+		if err := putBucketSequence(sequences, rec.RecoveryID, sequence); err != nil {
 			return err
 		}
 		if err := tx.Bucket(fileStoreClaimsBucket).Delete(recordKeyBytes); err != nil {
@@ -872,15 +878,15 @@ func (s *FileStore) CommitReap(
 	return receipt, err
 }
 
-// LoadReapReceipts returns an oldest-first class page without scanning another
-// class or rewriting prior receipts.
+// LoadReapReceipts returns an oldest-first ID page without scanning another ID
+// or rewriting prior receipts.
 func (s *FileStore) LoadReapReceipts(
 	ctx context.Context,
-	class RecoveryClass,
+	id RecoveryID,
 	after ReapReceiptCursor,
 	limit int,
 ) (ReapReceiptPage, error) {
-	if err := class.Validate(); err != nil {
+	if err := id.Validate(); err != nil {
 		return ReapReceiptPage{}, err
 	}
 	if limit <= 0 || limit > ReapReceiptPageLimit {
@@ -903,11 +909,11 @@ func (s *FileStore) LoadReapReceipts(
 		if after.Sequence != 0 && after.LedgerID == (ReceiptLedgerID{}) {
 			return fmt.Errorf("%w: receipt cursor sequence has no ledger", ErrReapReceiptStale)
 		}
-		floorSequence, err := bucketSequence(tx.Bucket(fileStoreFloorsBucket), class)
+		floorSequence, err := bucketSequence(tx.Bucket(fileStoreFloorsBucket), id)
 		if err != nil {
 			return err
 		}
-		page.Floor = ReapReceiptFloor{LedgerID: ledger, RecoveryClass: class, Sequence: floorSequence}
+		page.Floor = ReapReceiptFloor{LedgerID: ledger, RecoveryID: id, Sequence: floorSequence}
 		if after.Sequence == ^uint64(0) {
 			return fmt.Errorf("%w: receipt cursor sequence exhausted", ErrReapReceiptStale)
 		}
@@ -919,9 +925,10 @@ func (s *FileStore) LoadReapReceipts(
 		if start <= floorSequence {
 			start = floorSequence + 1
 		}
+		prefix := recoveryIDKey(id)
 		cursor := tx.Bucket(fileStoreReceiptsBucket).Cursor()
-		key, value := cursor.Seek(receiptKey(class, start))
-		for len(key) == 9 && key[0] == byte(class) && len(page.Receipts) <= limit {
+		key, value := cursor.Seek(receiptKey(id, start))
+		for len(key) == len(prefix)+8 && bytes.Equal(key[:len(prefix)], prefix) && len(page.Receipts) <= limit {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -932,8 +939,8 @@ func (s *FileStore) LoadReapReceipts(
 			if err := receipt.Validate(); err != nil {
 				return err
 			}
-			if receipt.LedgerID != ledger || receipt.Record.RecoveryClass != class ||
-				receipt.Sequence != binary.BigEndian.Uint64(key[1:]) {
+			if receipt.LedgerID != ledger || receipt.Record.RecoveryID != id ||
+				receipt.Sequence != binary.BigEndian.Uint64(key[len(prefix):]) {
 				return fmt.Errorf("%w: receipt key does not match value", ErrRecordSchema)
 			}
 			page.Receipts = append(page.Receipts, receipt)
@@ -948,6 +955,83 @@ func (s *FileStore) LoadReapReceipts(
 			page.Next = ReapReceiptCursor{LedgerID: last.LedgerID, Sequence: last.Sequence}
 		} else {
 			page.Next = ReapReceiptCursor{LedgerID: ledger, Sequence: after.Sequence}
+		}
+		return nil
+	})
+	return page, err
+}
+
+// ScanReapReceipts returns one bounded page from the exhaustive global receipt
+// keyspace.
+func (s *FileStore) ScanReapReceipts(
+	ctx context.Context,
+	after ReapReceiptScanCursor,
+	limit int,
+) (ReapReceiptScanPage, error) {
+	if limit <= 0 || limit > ReapReceiptPageLimit {
+		return ReapReceiptScanPage{}, fmt.Errorf("proc: reap receipt scan limit %d is out of bounds", limit)
+	}
+	zero := after == (ReapReceiptScanCursor{})
+	if !zero {
+		if after.LedgerID == (ReceiptLedgerID{}) || after.Sequence == 0 {
+			return ReapReceiptScanPage{}, fmt.Errorf("%w: incomplete global receipt cursor", ErrReapReceiptStale)
+		}
+		if err := after.RecoveryID.Validate(); err != nil {
+			return ReapReceiptScanPage{}, errors.Join(ErrReapReceiptStale, err)
+		}
+	}
+	db, err := s.open(ctx)
+	if err != nil {
+		return ReapReceiptScanPage{}, err
+	}
+	defer db.Close()
+	var page ReapReceiptScanPage
+	err = db.View(func(tx *bolt.Tx) error {
+		ledger, err := fileStoreLedger(tx)
+		if err != nil {
+			return err
+		}
+		if !zero && after.LedgerID != ledger {
+			return fmt.Errorf("%w: global receipt cursor ledger changed", ErrReapReceiptStale)
+		}
+		cursor := tx.Bucket(fileStoreReceiptsBucket).Cursor()
+		var key, value []byte
+		if zero {
+			key, value = cursor.First()
+		} else {
+			start := receiptKey(after.RecoveryID, after.Sequence)
+			key, value = cursor.Seek(start)
+			if bytes.Equal(key, start) {
+				key, value = cursor.Next()
+			}
+		}
+		for key != nil && len(page.Receipts) <= limit {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			var receipt ReapReceipt
+			if err := decodeStored(value, &receipt); err != nil {
+				return err
+			}
+			if err := receipt.Validate(); err != nil {
+				return err
+			}
+			if receipt.LedgerID != ledger ||
+				!bytes.Equal(key, receiptKey(receipt.Record.RecoveryID, receipt.Sequence)) {
+				return fmt.Errorf("%w: receipt key does not match value", ErrRecordSchema)
+			}
+			page.Receipts = append(page.Receipts, receipt)
+			key, value = cursor.Next()
+		}
+		if len(page.Receipts) > limit {
+			page.Receipts = page.Receipts[:limit]
+			page.More = true
+		}
+		if len(page.Receipts) != 0 {
+			last := page.Receipts[len(page.Receipts)-1]
+			page.Next = ReapReceiptScanCursor{
+				LedgerID: last.LedgerID, RecoveryID: last.Record.RecoveryID, Sequence: last.Sequence,
+			}
 		}
 		return nil
 	})
@@ -973,7 +1057,7 @@ func (s *FileStore) HasReapReceipt(ctx context.Context, receipt ReapReceipt) (bo
 		if ledger != receipt.LedgerID {
 			return nil
 		}
-		floor, err := bucketSequence(tx.Bucket(fileStoreFloorsBucket), receipt.Record.RecoveryClass)
+		floor, err := bucketSequence(tx.Bucket(fileStoreFloorsBucket), receipt.Record.RecoveryID)
 		if err != nil {
 			return err
 		}
@@ -982,7 +1066,7 @@ func (s *FileStore) HasReapReceipt(ctx context.Context, receipt ReapReceipt) (bo
 		}
 		var existing ReapReceipt
 		if err := decodeStored(
-			tx.Bucket(fileStoreReceiptsBucket).Get(receiptKey(receipt.Record.RecoveryClass, receipt.Sequence)),
+			tx.Bucket(fileStoreReceiptsBucket).Get(receiptKey(receipt.Record.RecoveryID, receipt.Sequence)),
 			&existing,
 		); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -994,7 +1078,7 @@ func (s *FileStore) HasReapReceipt(ctx context.Context, receipt ReapReceipt) (bo
 			return err
 		}
 		if existing.LedgerID != ledger || existing.Sequence != receipt.Sequence ||
-			existing.Record.RecoveryClass != receipt.Record.RecoveryClass {
+			existing.Record.RecoveryID != receipt.Record.RecoveryID {
 			return fmt.Errorf("%w: receipt key does not match value", ErrRecordSchema)
 		}
 		found = existing == receipt
@@ -1026,7 +1110,7 @@ func (s *FileStore) FindReapReceipt(ctx context.Context, record Record) (ReapRec
 		if err := receipt.Validate(); err != nil {
 			return err
 		}
-		if !bytes.Equal(key, receiptKey(receipt.Record.RecoveryClass, receipt.Sequence)) {
+		if !bytes.Equal(key, receiptKey(receipt.Record.RecoveryID, receipt.Sequence)) {
 			return fmt.Errorf("%w: receipt index key does not match value", ErrRecordSchema)
 		}
 		if receipt.Record != record {
@@ -1038,7 +1122,7 @@ func (s *FileStore) FindReapReceipt(ctx context.Context, record Record) (ReapRec
 	return receipt, found, err
 }
 
-// AcknowledgeReap deletes only the exact next class receipt and advances its
+// AcknowledgeReap deletes only the exact next id receipt and advances its
 // durable contiguous floor.
 func (s *FileStore) AcknowledgeReap(
 	ctx context.Context,
@@ -1052,7 +1136,7 @@ func (s *FileStore) AcknowledgeReap(
 		return ReapReceiptFloor{}, err
 	}
 	defer db.Close()
-	class := receipt.Record.RecoveryClass
+	id := receipt.Record.RecoveryID
 	var result ReapReceiptFloor
 	err = db.Update(func(tx *bolt.Tx) error {
 		ledger, err := fileStoreLedger(tx)
@@ -1063,11 +1147,11 @@ func (s *FileStore) AcknowledgeReap(
 			return ErrReapReceiptStale
 		}
 		floors := tx.Bucket(fileStoreFloorsBucket)
-		floor, err := bucketSequence(floors, class)
+		floor, err := bucketSequence(floors, id)
 		if err != nil {
 			return err
 		}
-		result = ReapReceiptFloor{LedgerID: ledger, RecoveryClass: class, Sequence: floor}
+		result = ReapReceiptFloor{LedgerID: ledger, RecoveryID: id, Sequence: floor}
 		switch {
 		case receipt.Sequence < floor:
 			return ErrReapReceiptStale
@@ -1076,7 +1160,7 @@ func (s *FileStore) AcknowledgeReap(
 		case receipt.Sequence != floor+1:
 			return ErrReapReceiptOrder
 		}
-		key := receiptKey(class, receipt.Sequence)
+		key := receiptKey(id, receipt.Sequence)
 		var existing ReapReceipt
 		if err := decodeStored(tx.Bucket(fileStoreReceiptsBucket).Get(key), &existing); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -1093,7 +1177,7 @@ func (s *FileStore) AcknowledgeReap(
 		if err := tx.Bucket(fileStoreReceiptIndexBucket).Delete([]byte(recordKey(receipt.Record))); err != nil {
 			return err
 		}
-		if err := putBucketSequence(floors, class, receipt.Sequence); err != nil {
+		if err := putBucketSequence(floors, id, receipt.Sequence); err != nil {
 			return err
 		}
 		if err := updateOutstanding(tx, -1); err != nil {
@@ -1105,9 +1189,9 @@ func (s *FileStore) AcknowledgeReap(
 	return result, err
 }
 
-// ReapReceiptFloor returns the retained contiguous class floor.
-func (s *FileStore) ReapReceiptFloor(ctx context.Context, class RecoveryClass) (ReapReceiptFloor, error) {
-	if err := class.Validate(); err != nil {
+// ReapReceiptFloor returns the retained contiguous id floor.
+func (s *FileStore) ReapReceiptFloor(ctx context.Context, id RecoveryID) (ReapReceiptFloor, error) {
+	if err := id.Validate(); err != nil {
 		return ReapReceiptFloor{}, err
 	}
 	db, err := s.open(ctx)
@@ -1121,11 +1205,11 @@ func (s *FileStore) ReapReceiptFloor(ctx context.Context, class RecoveryClass) (
 		if err != nil {
 			return err
 		}
-		sequence, err := bucketSequence(tx.Bucket(fileStoreFloorsBucket), class)
+		sequence, err := bucketSequence(tx.Bucket(fileStoreFloorsBucket), id)
 		if err != nil {
 			return err
 		}
-		floor = ReapReceiptFloor{LedgerID: ledger, RecoveryClass: class, Sequence: sequence}
+		floor = ReapReceiptFloor{LedgerID: ledger, RecoveryID: id, Sequence: sequence}
 		return nil
 	})
 	return floor, err

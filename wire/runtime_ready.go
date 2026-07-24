@@ -463,7 +463,7 @@ func validateRuntimeClientConfig(config RuntimeClientConfig) error {
 }
 
 func validateRuntimeIdentity(identity RuntimeIdentity) error {
-	if identity.RuntimeBuild == "" || identity.ProcessGeneration == "" {
+	if identity.RuntimeBuild == "" || identity.ProcessGeneration == (proc.OwnerGeneration{}) {
 		return errors.New("wire: exact runtime build and process generation are required")
 	}
 	return nil
@@ -486,7 +486,7 @@ func newRuntimeProgressTracker(
 func (t *runtimeProgressTracker) observe(event runtimeReadinessEvent, allowSuccessor bool) (bool, error) {
 	identity := event.RuntimeIdentity
 	progress := cloneReadinessProgress(event.Progress)
-	if identity.RuntimeBuild == "" || identity.ProcessGeneration == "" {
+	if identity.RuntimeBuild == "" || identity.ProcessGeneration == (proc.OwnerGeneration{}) {
 		return false, fmt.Errorf("%w: empty runtime identity", ErrReadinessProgress)
 	}
 	if progress.Sequence == 0 || len(progress.Detail) > MaxReadinessDetailBytes {

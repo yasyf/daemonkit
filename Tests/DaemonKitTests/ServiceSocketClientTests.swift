@@ -26,15 +26,15 @@ func genericServiceCall(
 func lifecyclePayload(
     _ state: RuntimeReadinessState,
     sequence: UInt64,
-    generation: String = "boot-1"
+    generation: OwnerGeneration = testOwnerGeneration()
 ) -> Data {
     let json = #"{"progress":{"detail":"","sequence":\#(sequence),"state":"\#(state.rawValue)"},"protocol":1,"# +
-        #""runtime_identity":{"process_generation":"\#(generation)","runtime_build":"app.v1"},"wire_build":"service.v1"}"#
+        #""runtime_identity":{"process_generation":"\#(generation.value)","runtime_build":"app.v1"},"wire_build":"service.v1"}"#
     return Data(json.utf8)
 }
 
 func testRuntimeController(
-    generation: String = "boot-1"
+    generation: OwnerGeneration = testOwnerGeneration()
 ) throws -> RuntimeLifecycleController {
     let controller = try liveRuntimeController(
         wireBuild: "service.v1",
@@ -46,7 +46,7 @@ func testRuntimeController(
 }
 
 func testStartingRuntimeController(
-    generation: String = "boot-1"
+    generation: OwnerGeneration = testOwnerGeneration()
 ) throws -> (RuntimeLifecycleController, RuntimeActivation) {
     let controller = try liveRuntimeController(
         wireBuild: "service.v1",
@@ -455,7 +455,7 @@ extension SocketTransportTests {
                 let (oldLifecycle, _) = try testStartingRuntimeController()
                 let registered = AsyncLatch()
                 oldLifecycle.registrationHook = { registered.finish() }
-                let successorLifecycle = try testRuntimeController(generation: "boot-2")
+                let successorLifecycle = try testRuntimeController(generation: testOwnerGeneration(2))
                 let oldServer = SocketServer(
                     path: path,
                     wireBuild: "service.v1",
@@ -662,7 +662,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
         await #expect(throws: ServiceSocketClientError.deadlineExceeded) {
             try await client.call(ServiceSocketCall(
                 operation: "",
-                runtimeTarget: .exact(RuntimeIdentity(runtimeBuild: "", processGeneration: "")),
+                runtimeTarget: .exact(RuntimeIdentity(runtimeBuild: "", processGeneration: testOwnerGeneration())),
                 deadline: Date().addingTimeInterval(-1)
             ))
         }

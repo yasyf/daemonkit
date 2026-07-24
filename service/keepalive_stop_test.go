@@ -41,15 +41,15 @@ func (r *recordingAppReaper) Reap(context.Context) error {
 	return r.reapErr
 }
 
-func (r *recordingAppReaper) TrackIdentity(_ context.Context, identity proc.Identity, class proc.RecoveryClass) (proc.Record, error) {
+func (r *recordingAppReaper) TrackIdentity(_ context.Context, identity proc.Identity, id proc.RecoveryID) (proc.Record, error) {
 	*r.events = append(*r.events, "track")
 	if r.trackErr != nil {
 		return proc.Record{}, r.trackErr
 	}
 	r.record = proc.Record{
-		RecoveryClass: class,
-		PID:           identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
-		Comm: identity.Comm, Generation: "stop",
+		RecoveryID: id,
+		PID:        identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
+		Comm: identity.Comm, Generation: proc.OwnerGeneration{1},
 	}
 	return r.record, nil
 }
@@ -101,7 +101,7 @@ func fixedAppFixture(t *testing.T) (AppKeepAlive, AppStopSpec, AuthenticatedAppP
 		CodeIdentity:   requirement.CodeIdentity(),
 		PolicyDigest:   validationDigest,
 		reaper:         reaper, dependents: recordingAppRecovery{events: events},
-		RecoveryClass: proc.RecoveryHolder,
+		RecoveryID: proc.RecoveryServiceID,
 		Dial: func(context.Context) (net.Conn, error) {
 			*events = append(*events, "dial")
 			client, server := net.Pipe()

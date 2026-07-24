@@ -41,8 +41,12 @@ func newChildFenceFixture(t *testing.T) *childFenceFixture {
 	if !ok {
 		t.Fatal("product role has no signature digest")
 	}
+	ownerGeneration, err := proc.ProcessGeneration()
+	if err != nil {
+		t.Fatal(err)
+	}
 	manager, err := proc.NewManager(1, &proc.Reaper{
-		Store: &proc.FileStore{Path: filepath.Join(t.TempDir(), "children.db")}, Generation: "child-fence-test",
+		Store: &proc.FileStore{Path: filepath.Join(t.TempDir(), "children.db")}, Generation: ownerGeneration,
 		Grace: 10 * time.Millisecond, Settlement: time.Second,
 	})
 	if err != nil {
@@ -55,7 +59,7 @@ func newChildFenceFixture(t *testing.T) *childFenceFixture {
 		t.Fatal(err)
 	}
 	request, err := proc.NewSpawnRequest(proc.SpawnConfig{
-		RecoveryClass: proc.RecoveryTask, Executable: "/bin/sh", Args: []string{"-c", "trap '' TERM; sleep 60"},
+		RecoveryID: proc.RecoveryTaskID, Executable: "/bin/sh", Args: []string{"-c", "trap '' TERM; sleep 60"},
 		Stdin: proc.StdioNull, Stdout: proc.StdioNull, Stderr: proc.StdioNull,
 		RequiresPeerFence: true, ExpectedSignature: &signature,
 	})
@@ -139,7 +143,7 @@ func waitChildFenceDispatch(t *testing.T, fixture *childFenceFixture) {
 }
 
 func TestChildFenceMismatchDoesNotReenterRuntimeLock(t *testing.T) {
-	key := childFenceKey{pid: 42, start: "start", boot: "boot", generation: "generation"}
+	key := childFenceKey{pid: 42, start: "start", boot: "boot", generation: proc.OwnerGeneration{1}}
 	state := &childFenceState{executable: "/expected", authDone: make(chan struct{})}
 	runtime := &Runtime{lifecycle: newLifecycle(), childFences: map[childFenceKey]*childFenceState{key: state}}
 	done := make(chan error, 1)

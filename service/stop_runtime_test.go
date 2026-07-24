@@ -95,7 +95,7 @@ func newStopRuntimeFixture(t *testing.T) *stopRuntimeFixture {
 			PID: 4242, StartTime: "runtime-start", Boot: "runtime-boot",
 			Comm: "runtime", Executable: "/bin/runtime",
 		},
-		target: wire.RuntimeIdentity{RuntimeBuild: "runtime-v1", ProcessGeneration: "generation-v1"},
+		target: wire.RuntimeIdentity{RuntimeBuild: "runtime-v1", ProcessGeneration: proc.OwnerGeneration{1}},
 	}
 	t.Cleanup(func() { _ = fixture.store.Close() })
 	return fixture
@@ -117,7 +117,7 @@ func (f *stopRuntimeFixture) controller() *Controller {
 	controller := &Controller{
 		store: f.store,
 		stopReaper: &proc.Reaper{
-			Store: &proc.FileStore{Path: f.processPath}, Generation: "controller-generation",
+			Store: &proc.FileStore{Path: f.processPath}, Generation: proc.OwnerGeneration{2},
 		},
 	}
 	controller.stopRuntimePrepare = func(

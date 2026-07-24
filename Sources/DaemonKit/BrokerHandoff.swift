@@ -41,8 +41,7 @@ enum BrokerHandoffCodec {
 
     static func encode(nonce: Data, identity: RuntimeIdentity) throws -> Data {
         guard nonce.count == brokerHandoffNonceBytes,
-              !identity.runtimeBuild.isEmpty,
-              !identity.processGeneration.isEmpty
+              !identity.runtimeBuild.isEmpty
         else { throw BrokerHandoffError.invalidPayload }
         let payload = try canonicalEncoder().encode(BrokerHandoffEnvelope(
             protocolVersion: daemonKitSessionProtocolVersion,
@@ -72,8 +71,7 @@ enum BrokerHandoffCodec {
               let nonce = Data(base64Encoded: envelope.nonce),
               nonce.count == brokerHandoffNonceBytes,
               nonce.base64EncodedString() == envelope.nonce,
-              !envelope.runtimeIdentity.runtimeBuild.isEmpty,
-              !envelope.runtimeIdentity.processGeneration.isEmpty
+              !envelope.runtimeIdentity.runtimeBuild.isEmpty
         else { throw BrokerHandoffError.invalidPayload }
         guard try encode(nonce: nonce, identity: envelope.runtimeIdentity) == payload else {
             throw BrokerHandoffError.invalidPayload

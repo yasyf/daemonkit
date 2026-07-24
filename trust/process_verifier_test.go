@@ -39,7 +39,7 @@ printf '{"protocol":1,"result":"trusted"}\n'
 		t.Fatal(err)
 	}
 	store := &proc.FileStore{Path: filepath.Join(directory, "workers.json")}
-	reaper := &proc.Reaper{Store: store, Generation: "trust-test"}
+	reaper := &proc.Reaper{Store: store, Generation: proc.OwnerGeneration{1}}
 	pool, err := worker.NewPool(worker.Config{
 		Capacity: 1, QueueCapacity: 1, MaxTotalRun: 5 * time.Second,
 		MaxStdinBytes: maxVerifierPayload, MaxStdoutBytes: maxVerifierResponse, MaxStderrBytes: maxVerifierResponse,

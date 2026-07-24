@@ -57,7 +57,7 @@ type spawnedSessionBootstrap struct {
 	ReceiptDigest      []byte                `json:"receipt_digest"`
 	RequestDigest      []byte                `json:"request_digest"`
 	Signature          []byte                `json:"signature"`
-	OwnerGeneration    string                `json:"owner_generation"`
+	OwnerGeneration    OwnerGeneration       `json:"owner_generation"`
 	ExpectedExecutable string                `json:"expected_executable"`
 	Child              spawnedSessionProcess `json:"child"`
 	Parent             spawnedSessionProcess `json:"parent"`
@@ -138,7 +138,7 @@ func (s *spawnedSessionParent) claim(
 	parent Identity,
 ) (SpawnedSessionEndpoint, error) {
 	if !receipt.Prepared() || !receipt.spawnedSession || !receipt.hasSignature ||
-		receipt.signature == (SignatureDigest{}) || receipt.generation == "" ||
+		receipt.signature == (SignatureDigest{}) || receipt.generation == (OwnerGeneration{}) ||
 		receipt.executable == "" || receipt.process.PID <= 0 ||
 		receipt.requestDigest == (SpawnRequestDigest{}) {
 		return SpawnedSessionEndpoint{}, ErrSpawnedSessionIdentity
@@ -215,7 +215,7 @@ func digestSpawnedSessionReceipt(receipt ProcessReceipt) [sha256.Size]byte {
 	writeSpawnDigestBytes(h, []byte("daemonkit.proc.spawned-session-receipt.v1"))
 	writeSpawnDigestBytes(h, []byte(receipt.executable))
 	writeSpawnDigestBytes(h, receipt.requestDigest[:])
-	writeSpawnDigestBytes(h, []byte(receipt.generation))
+	writeSpawnDigestBytes(h, receipt.generation[:])
 	writeSpawnDigestBytes(h, []byte(receipt.process.StartTime))
 	writeSpawnDigestBytes(h, []byte(receipt.process.Boot))
 	writeSpawnDigestBytes(h, []byte(strconv.Itoa(receipt.process.PID)))
@@ -391,7 +391,7 @@ func validateSpawnedSessionBootstrap(bootstrap spawnedSessionBootstrap, self Ide
 		bytes.Equal(bootstrap.ReceiptDigest, make([]byte, sha256.Size)) ||
 		bytes.Equal(bootstrap.RequestDigest, make([]byte, sha256.Size)) ||
 		bytes.Equal(bootstrap.Signature, make([]byte, sha256.Size)) ||
-		bootstrap.OwnerGeneration == "" || bootstrap.ExpectedExecutable == "" {
+		bootstrap.OwnerGeneration == (OwnerGeneration{}) || bootstrap.ExpectedExecutable == "" {
 		return ErrSpawnedSessionIdentity
 	}
 	if bootstrap.Child.PID != self.PID || bootstrap.Child.StartTime != self.StartTime ||

@@ -8,15 +8,15 @@ import (
 
 // VerifyCurrentOwner proves record names this exact live dedicated-session
 // leader and carries the expected recovery policy.
-func VerifyCurrentOwner(record Record, expected RecoveryClass) error {
+func VerifyCurrentOwner(record Record, expected RecoveryID) error {
 	if err := expected.Validate(); err != nil {
-		return fmt.Errorf("proc: verify current owner recovery class: %w", err)
+		return fmt.Errorf("proc: verify current owner recovery id: %w", err)
 	}
 	if err := record.Validate(); err != nil {
 		return err
 	}
-	if record.RecoveryClass != expected {
-		return fmt.Errorf("%w: recovery class is %v, want %v", ErrIdentityChanged, record.RecoveryClass, expected)
+	if record.RecoveryID != expected {
+		return fmt.Errorf("%w: recovery id is %v, want %v", ErrIdentityChanged, record.RecoveryID, expected)
 	}
 	if !record.ProcessGroup || record.SessionID != record.PID {
 		return fmt.Errorf("%w: owner is not a dedicated-session leader", ErrIdentityChanged)

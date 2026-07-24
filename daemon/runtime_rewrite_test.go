@@ -204,11 +204,15 @@ func newRuntimeTestRig(
 	if childStore == nil {
 		childStore = &proc.FileStore{Path: filepath.Join(dir, "children.db")}
 	}
+	ownerGeneration, err := proc.ProcessGeneration()
+	if err != nil {
+		t.Fatal(err)
+	}
 	workerReaper := &proc.Reaper{
-		Store: workerStore, Generation: "runtime-test-workers", Grace: 10 * time.Millisecond, Settlement: time.Second,
+		Store: workerStore, Generation: ownerGeneration, Grace: 10 * time.Millisecond, Settlement: time.Second,
 	}
 	childReaper := &proc.Reaper{
-		Store: childStore, Generation: "runtime-test-children", Grace: 10 * time.Millisecond, Settlement: time.Second,
+		Store: childStore, Generation: ownerGeneration, Grace: 10 * time.Millisecond, Settlement: time.Second,
 	}
 	workers, err := worker.NewPool(worker.Config{
 		Capacity: 8, QueueCapacity: 8, MaxTotalRun: 5 * time.Second,
@@ -336,8 +340,12 @@ func TestRuntimeBeginRecoversEveryProcessOwnerBeforeListener(t *testing.T) {
 		return nil
 	}
 
-	workerReaper := &proc.Reaper{Store: workerStore, Generation: "workers-current"}
-	childReaper := &proc.Reaper{Store: childStore, Generation: "children-current"}
+	ownerGeneration, err := proc.ProcessGeneration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerReaper := &proc.Reaper{Store: workerStore, Generation: ownerGeneration}
+	childReaper := &proc.Reaper{Store: childStore, Generation: ownerGeneration}
 	workers, err := worker.NewPool(worker.Config{
 		Capacity: 2, QueueCapacity: 2, MaxTotalRun: 5 * time.Second,
 		MaxStdinBytes: 4096, MaxStdoutBytes: 4096, MaxStderrBytes: 4096,
@@ -378,6 +386,47 @@ func TestRuntimeBeginRecoversEveryProcessOwnerBeforeListener(t *testing.T) {
 	}
 	if err := closeRuntimeTest(t, runtime); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRuntimeRecoveryCapabilityGatesReadinessAndIsOneShot(t *testing.T) {
+	rig := newRuntimeTestRig(t, nil, 0, nil, nil)
+	activation := rig.begin(t)
+	recoveryID, err := proc.ParseRecoveryID("consumer.barrier.v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	capability, err := activation.RecoveryCapability(recoveryID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := capability.Receipt().Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if capability.Receipt().Current() != rig.runtime.processGeneration {
+		t.Fatalf("current generation = %q", capability.Receipt().Current())
+	}
+	if _, err := activation.RecoveryCapability(recoveryID); err == nil {
+		t.Fatal("duplicate recovery capability issued")
+	}
+	publication, err := rig.slot.Stage(activation, "ready")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := activation.CommitReady(publication); err == nil {
+		t.Fatal("readiness committed with unconsumed recovery capability")
+	}
+	if err := capability.Consume(); err != nil {
+		t.Fatal(err)
+	}
+	if err := capability.Consume(); err == nil {
+		t.Fatal("recovery capability consumed twice")
+	}
+	if err := activation.CommitReady(publication); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := activation.RecoveryCapability(proc.RecoveryTrustID); !errors.Is(err, ErrPublicationStale) {
+		t.Fatalf("ready recovery capability = %v", err)
 	}
 }
 
@@ -657,7 +706,7 @@ func TestRuntimeRetainsOwnershipOnIncompleteChildSettlement(t *testing.T) {
 	var signature proc.SignatureDigest
 	signature[0] = 1
 	request, err := proc.NewSpawnRequest(proc.SpawnConfig{
-		RecoveryClass:     proc.RecoveryTask,
+		RecoveryID:        proc.RecoveryTaskID,
 		Executable:        "/bin/sh",
 		Args:              []string{"-c", "exec /bin/sleep 60"},
 		Stdin:             proc.StdioNull,

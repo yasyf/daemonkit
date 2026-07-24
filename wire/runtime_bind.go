@@ -56,7 +56,7 @@ func (s *Server) bindRuntime(
 	if err != nil {
 		return fmt.Errorf("wire: runtime health identity: %w", err)
 	}
-	if health.ProcessGeneration == "" {
+	if health.ProcessGeneration == (proc.OwnerGeneration{}) {
 		return errors.New("wire: runtime process generation is required")
 	}
 	if health.RuntimeBuild != build {
@@ -147,7 +147,7 @@ func (s *Server) bindRuntime(
 			return nil, errors.New("wire: prepared stop target changed before shutdown")
 		}
 		generation := health.ProcessGeneration
-		if generation == "" || generation != s.stopTargetProcessGeneration {
+		if generation == (proc.OwnerGeneration{}) || generation != s.stopTargetProcessGeneration {
 			return nil, errors.New("wire: stop target generation changed before shutdown")
 		}
 		if req.Session == nil || req.Session.s == nil {
@@ -296,7 +296,7 @@ func (s *Server) authorizeStopControl(
 	}
 	if message.Version != 1 || message.OperationID == "" || strings.TrimSpace(message.OperationID) != message.OperationID ||
 		len(message.OperationID) > 256 || message.RuntimeIdentity.RuntimeBuild == "" ||
-		message.RuntimeIdentity.ProcessGeneration == "" || message.RuntimeProtocol <= 0 {
+		message.RuntimeIdentity.ProcessGeneration == (proc.OwnerGeneration{}) || message.RuntimeProtocol <= 0 {
 		return ctx, errors.New("wire: invalid stop control request")
 	}
 	if _, err := message.Target.identity(); err != nil {

@@ -17,7 +17,7 @@ import (
 
 func TestRunCombinedCancellationReapsDaemonizedDescendantAndRecord(t *testing.T) {
 	store := &proc.FileStore{Path: filepath.Join(t.TempDir(), "workers.json")}
-	reaper := &proc.Reaper{Store: store, Generation: "service-test"}
+	reaper := &proc.Reaper{Store: store, Generation: proc.OwnerGeneration{1}}
 	runtime, err := newControllerWorkerRuntime(1, reaper)
 	if err != nil {
 		t.Fatal(err)

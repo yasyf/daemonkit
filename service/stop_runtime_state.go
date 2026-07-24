@@ -17,8 +17,8 @@ import (
 )
 
 type stopRuntimeTargetWire struct {
-	RuntimeBuild      string `json:"runtime_build"`
-	ProcessGeneration string `json:"process_generation"`
+	RuntimeBuild      string               `json:"runtime_build"`
+	ProcessGeneration proc.OwnerGeneration `json:"process_generation"`
 }
 
 type stopRuntimeProcessWire struct {
@@ -233,7 +233,7 @@ func decodeStopRuntimeIntent(payload []byte) (*stopRuntimeIntent, error) {
 
 func validateStopRuntimeIntent(intent stopRuntimeIntent) error {
 	if intent.OperationID == "" || intent.ExpectedRuntimeBuild == "" || intent.ControlRole == "" ||
-		intent.Target.RuntimeBuild != intent.ExpectedRuntimeBuild || intent.Target.ProcessGeneration == "" ||
+		intent.Target.RuntimeBuild != intent.ExpectedRuntimeBuild || intent.Target.ProcessGeneration == (proc.OwnerGeneration{}) ||
 		intent.RuntimeProtocol <= 0 || intent.RequestDigest == ([sha256.Size]byte{}) {
 		return errors.New("service: stop runtime intent is incomplete")
 	}
@@ -310,7 +310,7 @@ func decodeStopRuntimeReceipt(payload []byte) (*StopReceipt, error) {
 func validateStopRuntimeReceipt(receipt StopReceipt) error {
 	if receipt.operationID == "" || receipt.requestDigest == ([sha256.Size]byte{}) ||
 		receipt.expectedRuntimeBuild == "" || receipt.controlRole == "" ||
-		receipt.target.RuntimeBuild != receipt.expectedRuntimeBuild || receipt.target.ProcessGeneration == "" ||
+		receipt.target.RuntimeBuild != receipt.expectedRuntimeBuild || receipt.target.ProcessGeneration == (proc.OwnerGeneration{}) ||
 		receipt.processRecordDigest == (proc.RecordDigest{}) || receipt.settlement != StopSettlementGone {
 		return errors.New("service: stop runtime receipt is incomplete")
 	}

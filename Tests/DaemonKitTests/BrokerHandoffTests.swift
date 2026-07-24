@@ -36,9 +36,9 @@ extension SocketTransportTests {
 
         @Test func canonicalPayloadIsStrictAndNonceIsPaddedBase64() throws {
             let nonce = Data(0 ..< 32)
-            let identity = RuntimeIdentity(
+            let identity = try RuntimeIdentity(
                 runtimeBuild: "daemonkit-v0.11.0",
-                processGeneration: "0123456789abcdef0123456789abcdef"
+                processGeneration: OwnerGeneration("0123456789abcdef0123456789abcdef")
             )
             let payload = try BrokerHandoffCodec.encode(nonce: nonce, identity: identity)
             let golden = #"{"nonce":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=","protocol":1,"# +
@@ -53,11 +53,13 @@ extension SocketTransportTests {
             )
             #expect(acknowledgment == payload)
 
+            let canonicalIdentity =
+                #""runtime_identity":{"process_generation":"00000000000000000000000000000001","runtime_build":"app.v1"}"#
             let malformed = [
-                Data(#"{"nonce":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=","protocol":1,"protocol":1,"runtime_identity":{"process_generation":"boot-1","runtime_build":"app.v1"}}"#.utf8),
-                Data(#" {"nonce":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=","protocol":1,"runtime_identity":{"process_generation":"boot-1","runtime_build":"app.v1"}}"#.utf8),
-                Data(#"{"nonce":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8","protocol":1,"runtime_identity":{"process_generation":"boot-1","runtime_build":"app.v1"}}"#.utf8),
-                Data(#"{"extra":true,"nonce":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=","protocol":1,"runtime_identity":{"process_generation":"boot-1","runtime_build":"app.v1"}}"#.utf8),
+                Data((#"{"nonce":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=","protocol":1,"protocol":1,"# + canonicalIdentity + "}").utf8),
+                Data((#" {"nonce":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=","protocol":1,"# + canonicalIdentity + "}").utf8),
+                Data((#"{"nonce":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8","protocol":1,"# + canonicalIdentity + "}").utf8),
+                Data((#"{"extra":true,"nonce":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=","protocol":1,"# + canonicalIdentity + "}").utf8),
             ]
             for candidate in malformed {
                 #expect(throws: BrokerHandoffError.invalidPayload) {

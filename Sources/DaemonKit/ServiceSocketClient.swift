@@ -218,7 +218,7 @@ public actor ServiceSocketClient {
             throw SessionTransportError.invalidFrame("empty operation")
         }
         if let expected = request.expectedIdentity,
-           expected.runtimeBuild.isEmpty || expected.processGeneration.isEmpty
+           expected.runtimeBuild.isEmpty
         {
             throw RuntimeReadinessValidationError.invalidResponse("exact runtime identity is required")
         }

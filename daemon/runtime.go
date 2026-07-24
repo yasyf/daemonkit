@@ -30,6 +30,19 @@ type Activation struct {
 	ctx        context.Context
 }
 
+// RecoveryCapability is one unforgeable generation-bound recovery proof.
+type RecoveryCapability struct {
+	runtime    *Runtime
+	generation uint64
+	id         proc.RecoveryID
+	receipt    proc.RecoveryReceipt
+	state      *recoveryCapabilityState
+}
+
+type recoveryCapabilityState struct {
+	consumed bool
+}
+
 // RuntimeConfig defines one daemon process generation. Every ownership seam is
 // required so a partial shutdown cannot silently omit an owned phase.
 type RuntimeConfig struct {
@@ -48,7 +61,7 @@ type RuntimeConfig struct {
 // Runtime is the sole process coordinator for one daemon generation.
 type Runtime struct {
 	cfg                  RuntimeConfig
-	processGeneration    string
+	processGeneration    proc.OwnerGeneration
 	mu                   sync.Mutex
 	started              bool
 	finished             bool
@@ -78,6 +91,7 @@ type Runtime struct {
 	trustExecutable      string
 	childFenceTimeout    time.Duration
 	childFenceVerifier   func(context.Context, peeridentity.Identity, trust.Requirement) error
+	recoveryCapabilities map[proc.RecoveryID]*recoveryCapabilityState
 }
 
 func init() {
@@ -111,6 +125,9 @@ func newRuntime(cfg RuntimeConfig, policy trust.TrustPolicy) (*Runtime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("daemon: derive process generation: %w", err)
 	}
+	if cfg.Children.OwnerGeneration() != generation {
+		return nil, errors.New("daemon: runtime process and process owners must share one generation")
+	}
 	executable, err := os.Executable()
 	if err != nil {
 		return nil, fmt.Errorf("daemon: trust verifier executable: %w", err)
@@ -125,6 +142,7 @@ func newRuntime(cfg RuntimeConfig, policy trust.TrustPolicy) (*Runtime, error) {
 		childFences:          make(map[childFenceKey]*childFenceState),
 		trustPolicy:          policy,
 		trustExecutable:      executable,
+		recoveryCapabilities: make(map[proc.RecoveryID]*recoveryCapabilityState),
 	}, nil
 }
 
@@ -140,6 +158,10 @@ func validateRuntimeConfig(cfg RuntimeConfig) error {
 		return errors.New("daemon: runtime workers are required")
 	case cfg.Children == nil:
 		return errors.New("daemon: runtime child manager is required")
+	case cfg.Children.OwnerGeneration() == (proc.OwnerGeneration{}) || cfg.Workers.OwnerGeneration() == (proc.OwnerGeneration{}):
+		return errors.New("daemon: runtime owner generation is required")
+	case cfg.Children.OwnerGeneration() != cfg.Workers.OwnerGeneration():
+		return errors.New("daemon: runtime children and workers must share one owner generation")
 	}
 	return nil
 }
@@ -572,6 +594,76 @@ func (a Activation) Context() context.Context {
 	return a.ctx
 }
 
+// RecoveryCapability issues one barrier proof during this Starting generation.
+// Exactly one capability may be issued for each recovery ID.
+func (a Activation) RecoveryCapability(id proc.RecoveryID) (RecoveryCapability, error) {
+	if a.runtime == nil {
+		return RecoveryCapability{}, ErrPublicationStale
+	}
+	if err := id.Validate(); err != nil {
+		return RecoveryCapability{}, fmt.Errorf("daemon: recovery id: %w", err)
+	}
+	r := a.runtime
+	r.mu.Lock()
+	lifecycle := r.lifecycle
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
+	defer r.mu.Unlock()
+	if a.generation != r.controllerGeneration || r.finished || r.stopping || !r.serverLive ||
+		r.serverTerminal || lifecycle.progress.State != LifecycleStarting || lifecycle.fatal != nil ||
+		r.workerClaim == nil || !r.childrenClaimed {
+		return RecoveryCapability{}, ErrPublicationStale
+	}
+	if _, exists := r.recoveryCapabilities[id]; exists {
+		return RecoveryCapability{}, errors.New("daemon: recovery capability already issued")
+	}
+	children, err := r.cfg.Children.RecoveryReceipt(id)
+	if err != nil {
+		return RecoveryCapability{}, fmt.Errorf("daemon: child recovery proof: %w", err)
+	}
+	workers, err := r.workerClaim.RecoveryReceipt(id)
+	if err != nil {
+		return RecoveryCapability{}, fmt.Errorf("daemon: worker recovery proof: %w", err)
+	}
+	receipt, err := proc.CombineRecoveryReceipts(id, r.processGeneration, children, workers)
+	if err != nil {
+		return RecoveryCapability{}, fmt.Errorf("daemon: combine runtime recovery proof: %w", err)
+	}
+	state := &recoveryCapabilityState{}
+	r.recoveryCapabilities[id] = state
+	return RecoveryCapability{
+		runtime: r, generation: a.generation, id: id, receipt: receipt, state: state,
+	}, nil
+}
+
+// Receipt returns the immutable process-settlement proof carried by c.
+func (c RecoveryCapability) Receipt() proc.RecoveryReceipt { return c.receipt }
+
+// Consume marks c complete after product recovery has settled its receipt.
+func (c RecoveryCapability) Consume() error {
+	if c.runtime == nil || c.state == nil {
+		return ErrPublicationStale
+	}
+	r := c.runtime
+	r.mu.Lock()
+	lifecycle := r.lifecycle
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
+	defer r.mu.Unlock()
+	state := r.recoveryCapabilities[c.id]
+	if c.generation != r.controllerGeneration || r.finished || r.stopping || !r.serverLive ||
+		r.serverTerminal || lifecycle.progress.State != LifecycleStarting || lifecycle.fatal != nil ||
+		state == nil || state != c.state || c.receipt.RecoveryID() != c.id ||
+		c.receipt.Current() != r.processGeneration || c.receipt.Validate() != nil {
+		return ErrPublicationStale
+	}
+	if state.consumed {
+		return errors.New("daemon: recovery capability already consumed")
+	}
+	state.consumed = true
+	return nil
+}
+
 // UpdateProgress publishes copied opaque Starting progress.
 func (a Activation) UpdateProgress(detail []byte) error {
 	if len(detail) > MaxLifecycleDetailBytes {
@@ -637,6 +729,13 @@ func (a Activation) CommitReady(publication Publication) error {
 		lifecycle.mu.Unlock()
 		r.mu.Unlock()
 		return ErrPublicationUnavailable
+	}
+	for _, recovery := range r.recoveryCapabilities {
+		if !recovery.consumed {
+			lifecycle.mu.Unlock()
+			r.mu.Unlock()
+			return errors.New("daemon: issued recovery capability is unconsumed")
+		}
 	}
 	core := publication.core
 	if lifecycle.progress.Sequence >= math.MaxUint64-1 {

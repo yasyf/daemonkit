@@ -214,7 +214,7 @@ func transactionSchemaFingerprint() string {
 		"|plan:" + strings.Join(planFields(), ",") +
 		"|agent:" + strings.Join(serviceAgentFields(), ",") +
 		"|activation:operation_id,binding,epoch,plan_digest" +
-		"|runtime:operation_id,role,bundle_device,bundle_inode,bundle_cdhash,bundle_digest,absent,process_generation,digest" +
+		"|runtime:operation_id,role,bundle_device,bundle_inode,bundle_cdhash,bundle_digest,absent,process_generation:owner_generation_v1_or_null,digest" +
 		"|proof:" + strings.Join(proofFields(), ",") +
 		"|receipt:" + receiptIdentity
 	sum := sha256.Sum256([]byte(descriptor))
@@ -479,7 +479,7 @@ func (p storedProof) matches(operationID string, role ProofRole, generation stor
 func (p storedRuntimeProof) matches(operationID string, role ProofRole, generation storedGeneration) bool {
 	return p.OperationID == operationID && p.Role == role && p.BundleDevice == generation.FileID.Device &&
 		p.BundleInode == generation.FileID.Inode && p.BundleCDHash == generation.CDHash &&
-		p.BundleDigest == generation.BundleDigest && p.Absent == (p.ProcessGeneration == "") &&
+		p.BundleDigest == generation.BundleDigest && p.Absent == (p.ProcessGeneration == nil) &&
 		validDigestString(p.Digest)
 }
 

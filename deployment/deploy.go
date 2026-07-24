@@ -16,13 +16,14 @@ import (
 	"github.com/yasyf/daemonkit/bundle"
 	"github.com/yasyf/daemonkit/codeidentity"
 	"github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/service"
 )
 
 const (
 	deploymentSchema      = 1
 	deploymentIdentity    = "daemonkit.deployment.transaction.v1"
-	deploymentFingerprint = "8d3c5de15ddabe1c9ab19093239d7f3f222c62dbef813dd028d46c2a4434e127"
+	deploymentFingerprint = "138726fba17f9d49bf368bcea2f3b828e3656fbad959874e3ad241a1af8790ce"
 	receiptIdentity       = "daemonkit.deployment.receipt.v1"
 	receiptFingerprint    = "87f517a7e2d67df3c3aa715aa8adc1918d393e2755cc61a47243b7a672729311"
 	serviceWorkerLimit    = 4
@@ -47,7 +48,7 @@ type RuntimeStopper interface {
 type RuntimeProof struct {
 	Role              ProofRole
 	Absent            bool
-	ProcessGeneration string
+	ProcessGeneration proc.OwnerGeneration
 	Digest            SHA256
 }
 
@@ -503,15 +504,15 @@ type storedPlan struct {
 }
 
 type storedRuntimeProof struct {
-	OperationID       string    `json:"operation_id"`
-	Role              ProofRole `json:"role"`
-	BundleDevice      string    `json:"bundle_device"`
-	BundleInode       string    `json:"bundle_inode"`
-	BundleCDHash      string    `json:"bundle_cdhash"`
-	BundleDigest      string    `json:"bundle_digest"`
-	Absent            bool      `json:"absent"`
-	ProcessGeneration string    `json:"process_generation"`
-	Digest            string    `json:"digest"`
+	OperationID       string                `json:"operation_id"`
+	Role              ProofRole             `json:"role"`
+	BundleDevice      string                `json:"bundle_device"`
+	BundleInode       string                `json:"bundle_inode"`
+	BundleCDHash      string                `json:"bundle_cdhash"`
+	BundleDigest      string                `json:"bundle_digest"`
+	Absent            bool                  `json:"absent"`
+	ProcessGeneration *proc.OwnerGeneration `json:"process_generation"`
+	Digest            string                `json:"digest"`
 }
 
 type storedActivation struct {
@@ -718,7 +719,7 @@ func validateProof(proof Proof, role ProofRole, planDigest SHA256) error {
 }
 
 func validateRuntimeProof(proof RuntimeProof, role ProofRole) error {
-	if proof.Absent == (proof.ProcessGeneration != "") {
+	if proof.Absent == (proof.ProcessGeneration != (proc.OwnerGeneration{})) {
 		return errors.New("deployment: runtime proof must identify exactly one of absence or a process generation")
 	}
 	return validateProof(Proof{Role: proof.Role, Digest: proof.Digest}, role, SHA256{})
@@ -733,11 +734,16 @@ func bindProof(id string, role ProofRole, generation storedGeneration, planDiges
 }
 
 func bindRuntimeProof(id string, role ProofRole, generation storedGeneration, proof RuntimeProof) *storedRuntimeProof {
+	var processGeneration *proc.OwnerGeneration
+	if proof.ProcessGeneration != (proc.OwnerGeneration{}) {
+		value := proof.ProcessGeneration
+		processGeneration = &value
+	}
 	return &storedRuntimeProof{
 		OperationID: id, Role: role, BundleDevice: generation.FileID.Device,
 		BundleInode: generation.FileID.Inode, BundleCDHash: generation.CDHash, BundleDigest: generation.BundleDigest,
 		Absent:            proof.Absent,
-		ProcessGeneration: proof.ProcessGeneration, Digest: proof.Digest.String(),
+		ProcessGeneration: processGeneration, Digest: proof.Digest.String(),
 	}
 }
 

@@ -533,9 +533,13 @@ func workerTestConfig() Config {
 
 func workerTestReaper(t *testing.T) *proc.Reaper {
 	t.Helper()
+	generation, err := proc.ProcessGeneration()
+	if err != nil {
+		t.Fatal(err)
+	}
 	return &proc.Reaper{
 		Store:      &proc.FileStore{Path: filepath.Join(t.TempDir(), "workers.db")},
-		Generation: "worker-test-" + strings.ReplaceAll(t.Name(), "/", "-"),
+		Generation: generation,
 		Grace:      10 * time.Millisecond, Settlement: time.Second,
 	}
 }

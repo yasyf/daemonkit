@@ -1,5 +1,14 @@
+@testable import DaemonKit
 import Darwin
 import Foundation
+
+func testOwnerGeneration(_ value: UInt8 = 1) -> OwnerGeneration {
+    do {
+        return try OwnerGeneration(String(format: "%032x", value))
+    } catch {
+        fatalError("test owner generation is invalid: \(error)")
+    }
+}
 
 final class AsyncCleanup: @unchecked Sendable {
     private let lock = NSLock()

@@ -234,8 +234,7 @@ final class RuntimeLifecycleController: @unchecked Sendable {
 
     init(wireBuild: String, runtimeIdentity: RuntimeIdentity) throws {
         guard !wireBuild.isEmpty,
-              !runtimeIdentity.runtimeBuild.isEmpty,
-              !runtimeIdentity.processGeneration.isEmpty
+              !runtimeIdentity.runtimeBuild.isEmpty
         else {
             throw RuntimeReadinessValidationError.invalidResponse("runtime lifecycle initial values")
         }

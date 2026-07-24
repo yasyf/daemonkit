@@ -26,18 +26,18 @@ extension SocketTransportTests {
             try RuntimeReadinessCodec.decodeSubscribeAck(request)
 
             let valid = #"{"protocol":1,"wire_build":"suite.v1","# +
-                #""runtime_identity":{"runtime_build":"app.v1","process_generation":"boot-1"},"# +
+                #""runtime_identity":{"runtime_build":"app.v1","process_generation":"00000000000000000000000000000001"},"# +
                 #""progress":{"sequence":1,"state":"runtime_starting","detail":""}}"#
             let event = try RuntimeReadinessCodec.decodeEvent(Data(valid.utf8))
             #expect(event.runtimeIdentity == RuntimeIdentity(
                 runtimeBuild: "app.v1",
-                processGeneration: "boot-1"
+                processGeneration: testOwnerGeneration()
             ))
             #expect(event.progress == ReadinessProgress(sequence: 1, state: .starting, detail: Data()))
 
             #expect(throws: RuntimeReadinessValidationError.self) {
                 let legacy = #"{"protocol":1,"wire_build":"suite.v1","# +
-                    #""runtime_identity":{"runtime_build":"app.v1","process_generation":"boot-1"},"# +
+                    #""runtime_identity":{"runtime_build":"app.v1","process_generation":"00000000000000000000000000000001"},"# +
                     #""progress":{"sequence":1,"state":"runtime_starting","detail":""},"legacy":true}"#
                 _ = try RuntimeReadinessCodec.decodeEvent(Data(legacy.utf8))
             }
@@ -67,7 +67,7 @@ extension SocketTransportTests {
             let clock = TestReadinessClock()
             let tracker = makeTracker(expected: RuntimeIdentity(
                 runtimeBuild: "app.v1",
-                processGeneration: "boot-1"
+                processGeneration: testOwnerGeneration()
             ), clock: clock)
             let initial = event(sequence: 2, detail: "one")
             _ = try tracker.observe(initial, allowSuccessor: false)
@@ -105,7 +105,7 @@ extension SocketTransportTests {
 
             let draining = makeTracker()
             #expect(throws: RuntimeReadinessValidationError.draining(RuntimeLifecycleSnapshot(
-                identity: RuntimeIdentity(runtimeBuild: "app.v1", processGeneration: "boot-1"),
+                identity: RuntimeIdentity(runtimeBuild: "app.v1", processGeneration: testOwnerGeneration()),
                 progress: ReadinessProgress(sequence: 1, state: .draining, detail: Data("drain".utf8))
             ))) {
                 _ = try draining.observe(
@@ -119,23 +119,23 @@ extension SocketTransportTests {
             _ = try successor.observe(event(sequence: 4), allowSuccessor: true)
             successorClock.advance(seconds: 9)
             _ = try successor.observe(
-                event(sequence: 1, processGeneration: "boot-2"),
+                event(sequence: 1, processGeneration: testOwnerGeneration(2)),
                 allowSuccessor: true
             )
-            #expect(successor.snapshot?.identity.processGeneration == "boot-2")
+            #expect(successor.snapshot?.identity.processGeneration == testOwnerGeneration(2))
             #expect(successor.deadlineNanoseconds == 10_000_000_000)
 
             let pinned = makeTracker(expected: RuntimeIdentity(
                 runtimeBuild: "app.v1",
-                processGeneration: "boot-1"
+                processGeneration: testOwnerGeneration()
             ))
             _ = try pinned.observe(event(sequence: 1), allowSuccessor: false)
             #expect(throws: RuntimeReadinessValidationError.runtimeIdentity(
-                got: RuntimeIdentity(runtimeBuild: "app.v1", processGeneration: "boot-2"),
-                want: RuntimeIdentity(runtimeBuild: "app.v1", processGeneration: "boot-1")
+                got: RuntimeIdentity(runtimeBuild: "app.v1", processGeneration: testOwnerGeneration(2)),
+                want: RuntimeIdentity(runtimeBuild: "app.v1", processGeneration: testOwnerGeneration())
             )) {
                 _ = try pinned.observe(
-                    event(sequence: 1, processGeneration: "boot-2"),
+                    event(sequence: 1, processGeneration: testOwnerGeneration(2)),
                     allowSuccessor: false
                 )
             }
@@ -163,7 +163,7 @@ extension SocketTransportTests {
                 )
             }
             #expect(throws: RuntimeReadinessValidationError.draining(RuntimeLifecycleSnapshot(
-                identity: RuntimeIdentity(runtimeBuild: "app.v1", processGeneration: "boot-1"),
+                identity: RuntimeIdentity(runtimeBuild: "app.v1", processGeneration: testOwnerGeneration()),
                 progress: ReadinessProgress(sequence: 8, state: .draining, detail: Data())
             ))) {
                 _ = try ready.observe(
@@ -240,7 +240,7 @@ extension SocketTransportTests {
         private func event(
             sequence: UInt64,
             state: RuntimeReadinessState = .starting,
-            processGeneration: String = "boot-1",
+            processGeneration: OwnerGeneration = testOwnerGeneration(),
             detail: String = ""
         ) -> RuntimeReadinessEvent {
             RuntimeReadinessEvent(

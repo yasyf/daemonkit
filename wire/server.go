@@ -150,11 +150,11 @@ type Server struct {
 	trustWorkers                 *worker.RuntimeClaim
 	trustExecutable              string
 	stopControlStore             *proc.FileStore
-	stopTargetProcessGeneration  string
+	stopTargetProcessGeneration  proc.OwnerGeneration
 	hasObservations              bool
 	lifecycle                    *daemon.Lifecycle
 	runtimeBuild                 string
-	processGeneration            string
+	processGeneration            proc.OwnerGeneration
 	readinessMu                  sync.Mutex
 	readinessSubscribers         map[*session]*readinessSubscription
 	readinessSubscriptionsClosed bool

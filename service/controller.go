@@ -65,7 +65,7 @@ type controllerRuntime interface {
 type serviceReceiptRecovery interface {
 	RecoverReapReceipts(
 		context.Context,
-		proc.RecoveryClass,
+		proc.RecoveryID,
 		func(context.Context, proc.ReapReceipt) error,
 	) (proc.ReapReceiptFloor, error)
 }
@@ -188,14 +188,14 @@ func newControllerWithRuntime(
 	}
 	if _, err := receipts.RecoverReapReceipts(
 		ctx,
-		proc.RecoveryService,
+		proc.RecoveryServiceID,
 		func(context.Context, proc.ReapReceipt) error { return nil },
 	); err != nil {
 		return nil, fmt.Errorf("service: acknowledge recovered service workers: %w", err)
 	}
 	if _, err := receipts.RecoverReapReceipts(
 		ctx,
-		proc.RecoveryStopControl,
+		proc.RecoveryStopControlID,
 		func(context.Context, proc.ReapReceipt) error { return nil },
 	); err != nil {
 		return nil, fmt.Errorf("service: acknowledge recovered stop controls: %w", err)

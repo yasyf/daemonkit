@@ -18,6 +18,24 @@ type unpublishedDeadlineContext struct {
 	deadline time.Time
 }
 
+func TestReceiptKeyLengthPrefixesFullRecoveryID(t *testing.T) {
+	id, err := ParseRecoveryID("consumer.barrier.v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sequence = uint64(42)
+	key := receiptKey(id, sequence)
+	if got := binary.BigEndian.Uint64(key[:8]); got != uint64(len(id)) {
+		t.Fatalf("id length = %d, want %d", got, len(id))
+	}
+	if got := string(key[8 : 8+len(id)]); got != string(id) {
+		t.Fatalf("id = %q, want %q", got, id)
+	}
+	if got := binary.BigEndian.Uint64(key[8+len(id):]); got != sequence {
+		t.Fatalf("sequence = %d, want %d", got, sequence)
+	}
+}
+
 func (c unpublishedDeadlineContext) Deadline() (time.Time, bool) { return c.deadline, true }
 func (unpublishedDeadlineContext) Done() <-chan struct{}         { return nil }
 func (unpublishedDeadlineContext) Err() error                    { return nil }
@@ -34,7 +52,7 @@ func TestFileStoreExpiredDeadlineNeverReturnsNilSuccess(t *testing.T) {
 func TestFileStoreSchemaIsExactEpochOne(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "recovery.db")
 	store := &FileStore{Path: path}
-	if err := store.Add(t.Context(), storeRecord(RecoveryTask, 42)); err != nil {
+	if err := store.Add(t.Context(), storeRecord(RecoveryTaskID, 42)); err != nil {
 		t.Fatal(err)
 	}
 	db, err := bolt.Open(path, 0o600, nil)
@@ -89,7 +107,7 @@ func TestFileStoreRejectsForeignMetadata(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "recovery.db")
 			store := &FileStore{Path: path}
-			if err := store.Add(t.Context(), storeRecord(RecoveryTask, 42)); err != nil {
+			if err := store.Add(t.Context(), storeRecord(RecoveryTaskID, 42)); err != nil {
 				t.Fatal(err)
 			}
 			db, err := bolt.Open(path, 0o600, nil)
@@ -115,7 +133,7 @@ func TestFileStoreRejectsForeignMetadata(t *testing.T) {
 func TestFileStoreRejectsMissingRecordField(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "recovery.db")
 	store := &FileStore{Path: path}
-	record := storeRecord(RecoveryTask, 42)
+	record := storeRecord(RecoveryTaskID, 42)
 	if err := store.Add(t.Context(), record); err != nil {
 		t.Fatal(err)
 	}
@@ -198,14 +216,14 @@ func TestFileStoreRejectsIncompleteOldEpochOneWithoutMutation(t *testing.T) {
 	}
 }
 
-func storeRecord(class RecoveryClass, pid int) Record {
+func storeRecord(id RecoveryID, pid int) Record {
 	return Record{
-		RecoveryClass: class,
-		PID:           pid,
-		StartTime:     "start",
-		Boot:          "boot",
-		Comm:          "worker",
-		Generation:    "prior",
+		RecoveryID: id,
+		PID:        pid,
+		StartTime:  "start",
+		Boot:       "boot",
+		Comm:       "worker",
+		Generation: testOwnerGeneration("prior"),
 	}
 }
 
@@ -214,17 +232,17 @@ func commitStoreReceipt(t *testing.T, store *FileStore, record Record) ReapRecei
 	if err := store.Add(t.Context(), record); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.BeginReap(t.Context(), record, "successor"); err != nil {
+	if err := store.BeginReap(t.Context(), record, testOwnerGeneration("successor")); err != nil {
 		t.Fatal(err)
 	}
-	receipt, err := store.CommitReap(t.Context(), record, "successor", ReapAbsent)
+	receipt, err := store.CommitReap(t.Context(), record, testOwnerGeneration("successor"), ReapAbsent)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return receipt
 }
 
-func seedStoreReceipts(t *testing.T, store *FileStore, class RecoveryClass, count int) []ReapReceipt {
+func seedStoreReceipts(t *testing.T, store *FileStore, id RecoveryID, count int) []ReapReceipt {
 	t.Helper()
 	db, err := store.open(t.Context())
 	if err != nil {
@@ -238,8 +256,8 @@ func seedStoreReceipts(t *testing.T, store *FileStore, class RecoveryClass, coun
 			return err
 		}
 		for index := range receipts {
-			record := storeRecord(class, 1000+index)
-			receipt, err := newReapReceipt(ledger, uint64(index+1), record, "successor", ReapAbsent)
+			record := storeRecord(id, 1000+index)
+			receipt, err := newReapReceipt(ledger, uint64(index+1), record, testOwnerGeneration("successor"), ReapAbsent)
 			if err != nil {
 				return err
 			}
@@ -247,7 +265,7 @@ func seedStoreReceipts(t *testing.T, store *FileStore, class RecoveryClass, coun
 			if err != nil {
 				return err
 			}
-			key := receiptKey(class, receipt.Sequence)
+			key := receiptKey(id, receipt.Sequence)
 			if err := tx.Bucket(fileStoreReceiptsBucket).Put(key, encoded); err != nil {
 				return err
 			}
@@ -256,7 +274,7 @@ func seedStoreReceipts(t *testing.T, store *FileStore, class RecoveryClass, coun
 			}
 			receipts[index] = receipt
 		}
-		if err := putBucketSequence(tx.Bucket(fileStoreSequencesBucket), class, uint64(count)); err != nil {
+		if err := putBucketSequence(tx.Bucket(fileStoreSequencesBucket), id, uint64(count)); err != nil {
 			return err
 		}
 		return updateOutstanding(tx, int64(count))
@@ -269,7 +287,7 @@ func seedStoreReceipts(t *testing.T, store *FileStore, class RecoveryClass, coun
 
 func TestFileStoreAddIsExactIdempotent(t *testing.T) {
 	store := &FileStore{Path: filepath.Join(t.TempDir(), "recovery.db")}
-	record := storeRecord(RecoveryTask, 42)
+	record := storeRecord(RecoveryTaskID, 42)
 	if err := store.Add(t.Context(), record); err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +295,7 @@ func TestFileStoreAddIsExactIdempotent(t *testing.T) {
 		t.Fatalf("exact retry: %v", err)
 	}
 	changed := record
-	changed.Generation = "different-owner"
+	changed.Generation = testOwnerGeneration("different-owner")
 	if err := store.Add(t.Context(), changed); !errors.Is(err, ErrIdentityChanged) {
 		t.Fatalf("changed process-instance record = %v", err)
 	}
@@ -307,12 +325,12 @@ func stopControlStoreRecord(pid int, expires time.Time) (Identity, Record) {
 	var preparationNonce StopPreparationNonce
 	preparationNonce[0] = 2
 	return identity, Record{
-		RecoveryClass: RecoveryStopControl,
-		PID:           identity.PID, StartTime: identity.StartTime, Boot: identity.Boot, Comm: identity.Comm,
+		RecoveryID: RecoveryStopControlID,
+		PID:        identity.PID, StartTime: identity.StartTime, Boot: identity.Boot, Comm: identity.Comm,
 		Executable: identity.Executable, AuditToken: identity.AuditToken,
-		Generation: "controller-generation", Role: "com.example.stop", OperationID: "stop-operation",
+		Generation: testOwnerGeneration("controller-generation"), Role: "com.example.stop", OperationID: "stop-operation",
 		StopSession: stopSession, PreparationNonce: preparationNonce, RuntimeProtocol: 1,
-		TargetProcessGeneration: "runtime-generation",
+		TargetProcessGeneration: testOwnerGeneration("runtime-generation"),
 		StopAuthorityState:      state, ExpiresUnixMilli: expiresUnixMilli,
 	}
 }
@@ -476,11 +494,11 @@ func TestFileStoreStopControlConsumesExactlyOnceConcurrently(t *testing.T) {
 
 func TestFileStoreConsumedStopControlCannotBeRetracked(t *testing.T) {
 	store := &FileStore{Path: filepath.Join(t.TempDir(), "recovery.db")}
-	reaper := &Reaper{Store: store, Generation: "controller-generation"}
+	reaper := &Reaper{Store: store, Generation: testOwnerGeneration("controller-generation")}
 	identity, _ := stopControlStoreRecord(148, time.Time{})
 	record, err := reaper.TrackStopControl(
 		t.Context(), identity, "com.example.stop", "stop-operation", StopSessionID{1},
-		StopPreparationNonce{2}, 1, "runtime-generation", time.Minute,
+		StopPreparationNonce{2}, 1, testOwnerGeneration("runtime-generation"), time.Minute,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -493,7 +511,7 @@ func TestFileStoreConsumedStopControlCannotBeRetracked(t *testing.T) {
 	}
 	if _, err := reaper.TrackStopControl(
 		t.Context(), identity, "com.example.stop", "stop-operation", StopSessionID{1},
-		StopPreparationNonce{2}, 1, "runtime-generation", time.Minute,
+		StopPreparationNonce{2}, 1, testOwnerGeneration("runtime-generation"), time.Minute,
 	); err == nil || !strings.Contains(err.Error(), "already consumed") {
 		t.Fatalf("retrack error = %v, want already consumed", err)
 	}
@@ -507,12 +525,12 @@ func TestFileStoreStopControlRevokeRejectsRecoveryOwnership(t *testing.T) {
 			if err := store.Add(t.Context(), record); err != nil {
 				t.Fatal(err)
 			}
-			if err := store.BeginReap(t.Context(), record, "successor-generation"); err != nil {
+			if err := store.BeginReap(t.Context(), record, testOwnerGeneration("successor-generation")); err != nil {
 				t.Fatal(err)
 			}
 			if state == "receipted" {
 				if _, err := store.CommitReap(
-					t.Context(), record, "successor-generation", ReapTerminated,
+					t.Context(), record, testOwnerGeneration("successor-generation"), ReapTerminated,
 				); err != nil {
 					t.Fatal(err)
 				}
@@ -530,7 +548,7 @@ func TestFileStoreStopControlRevokeRejectsRecoveryOwnership(t *testing.T) {
 					t.Fatalf("claimed record changed = %+v", records)
 				}
 				if _, err := store.CommitReap(
-					t.Context(), record, "successor-generation", ReapTerminated,
+					t.Context(), record, testOwnerGeneration("successor-generation"), ReapTerminated,
 				); err != nil {
 					t.Fatalf("successor could not settle unchanged claim: %v", err)
 				}
@@ -643,7 +661,7 @@ func TestFileStoreStopControlRejectsNearMatchesWithoutConsuming(t *testing.T) {
 		stopSession      StopSessionID
 		preparationNonce StopPreparationNonce
 		protocol         int
-		target           string
+		target           OwnerGeneration
 	}{
 		{name: "pid", identity: wrongPID, role: record.Role, operationID: record.OperationID, stopSession: record.StopSession, preparationNonce: record.PreparationNonce, protocol: record.RuntimeProtocol, target: record.TargetProcessGeneration},
 		{name: "start", identity: wrongStart, role: record.Role, operationID: record.OperationID, stopSession: record.StopSession, preparationNonce: record.PreparationNonce, protocol: record.RuntimeProtocol, target: record.TargetProcessGeneration},
@@ -656,7 +674,7 @@ func TestFileStoreStopControlRejectsNearMatchesWithoutConsuming(t *testing.T) {
 		{name: "session", identity: identity, role: record.Role, operationID: record.OperationID, stopSession: StopSessionID{9}, preparationNonce: record.PreparationNonce, protocol: record.RuntimeProtocol, target: record.TargetProcessGeneration},
 		{name: "nonce", identity: identity, role: record.Role, operationID: record.OperationID, stopSession: record.StopSession, preparationNonce: StopPreparationNonce{9}, protocol: record.RuntimeProtocol, target: record.TargetProcessGeneration},
 		{name: "protocol", identity: identity, role: record.Role, operationID: record.OperationID, stopSession: record.StopSession, preparationNonce: record.PreparationNonce, protocol: 2, target: record.TargetProcessGeneration},
-		{name: "target", identity: identity, role: record.Role, operationID: record.OperationID, stopSession: record.StopSession, preparationNonce: record.PreparationNonce, protocol: record.RuntimeProtocol, target: "other-runtime"},
+		{name: "target", identity: identity, role: record.Role, operationID: record.OperationID, stopSession: record.StopSession, preparationNonce: record.PreparationNonce, protocol: record.RuntimeProtocol, target: testOwnerGeneration("other-runtime")},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got, ok, err := store.ConsumeStopControl(
@@ -689,18 +707,18 @@ func TestFileStoreConsumedStopControlRecoversThroughReceiptAcknowledgement(t *te
 	); err != nil || !ok {
 		t.Fatalf("consume = %v, %v", ok, err)
 	}
-	if err := store.BeginReap(t.Context(), record, "reaper-generation"); err != nil {
+	if err := store.BeginReap(t.Context(), record, testOwnerGeneration("reaper-generation")); err != nil {
 		t.Fatal(err)
 	}
-	receipt, err := store.CommitReap(t.Context(), record, "reaper-generation", ReapTerminated)
+	receipt, err := store.CommitReap(t.Context(), record, testOwnerGeneration("reaper-generation"), ReapTerminated)
 	if err != nil {
 		t.Fatal(err)
 	}
 	reopened := &FileStore{Path: path}
-	reaper := &Reaper{Store: reopened, Generation: "successor-generation"}
+	reaper := &Reaper{Store: reopened, Generation: testOwnerGeneration("successor-generation")}
 	var settled []ReapReceipt
 	floor, err := reaper.RecoverReapReceipts(
-		t.Context(), RecoveryStopControl,
+		t.Context(), RecoveryStopControlID,
 		func(_ context.Context, got ReapReceipt) error {
 			settled = append(settled, got)
 			return nil
@@ -712,7 +730,7 @@ func TestFileStoreConsumedStopControlRecoversThroughReceiptAcknowledgement(t *te
 	if len(settled) != 1 || settled[0] != receipt || floor.Sequence != receipt.Sequence {
 		t.Fatalf("recovery = receipts %+v floor %+v; want receipt %+v", settled, floor, receipt)
 	}
-	page, err := reaper.ReapReceipts(t.Context(), RecoveryStopControl, ReapReceiptCursor{}, ReapReceiptPageLimit)
+	page, err := reaper.ReapReceipts(t.Context(), RecoveryStopControlID, ReapReceiptCursor{}, ReapReceiptPageLimit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -746,7 +764,7 @@ func TestFileStoreStopControlExpiryIsExactAndRetainedForRecovery(t *testing.T) {
 func TestFileStoreReceiptLedgerPagesClassesAndPersistsFloors(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "recovery.db")
 	store := &FileStore{Path: path, MaxOutstanding: 256}
-	tasks := seedStoreReceipts(t, store, RecoveryTask, ReapReceiptPageLimit+2)
+	tasks := seedStoreReceipts(t, store, RecoveryTaskID, ReapReceiptPageLimit+2)
 	for index := range tasks {
 		if tasks[index].Sequence != uint64(index+1) {
 			t.Fatalf("task sequence %d = %d", index, tasks[index].Sequence)
@@ -754,35 +772,55 @@ func TestFileStoreReceiptLedgerPagesClassesAndPersistsFloors(t *testing.T) {
 	}
 	trust := make([]ReapReceipt, 3)
 	for index := range trust {
-		trust[index] = commitStoreReceipt(t, store, storeRecord(RecoveryTrust, 2000+index))
+		trust[index] = commitStoreReceipt(t, store, storeRecord(RecoveryTrustID, 2000+index))
 		if trust[index].Sequence != uint64(index+1) {
 			t.Fatalf("trust sequence %d = %d", index, trust[index].Sequence)
 		}
 		if trust[index].LedgerID != tasks[0].LedgerID {
-			t.Fatal("classes did not share the stable store ledger")
+			t.Fatal("ids did not share the stable store ledger")
 		}
 	}
 
-	first, err := store.LoadReapReceipts(t.Context(), RecoveryTask, ReapReceiptCursor{}, ReapReceiptPageLimit)
+	first, err := store.LoadReapReceipts(t.Context(), RecoveryTaskID, ReapReceiptCursor{}, ReapReceiptPageLimit)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(first.Receipts) != ReapReceiptPageLimit || !first.More || first.Next.Sequence != ReapReceiptPageLimit {
 		t.Fatalf("first page = %+v", first)
 	}
-	second, err := store.LoadReapReceipts(t.Context(), RecoveryTask, first.Next, ReapReceiptPageLimit)
+	second, err := store.LoadReapReceipts(t.Context(), RecoveryTaskID, first.Next, ReapReceiptPageLimit)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(second.Receipts) != 2 || second.More || second.Receipts[0].Sequence != ReapReceiptPageLimit+1 {
 		t.Fatalf("second page = %+v", second)
 	}
-	trustPage, err := store.LoadReapReceipts(t.Context(), RecoveryTrust, ReapReceiptCursor{}, ReapReceiptPageLimit)
+	trustPage, err := store.LoadReapReceipts(t.Context(), RecoveryTrustID, ReapReceiptCursor{}, ReapReceiptPageLimit)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(trustPage.Receipts) != 3 || trustPage.Receipts[0] != trust[0] {
 		t.Fatalf("trust page = %+v", trustPage)
+	}
+	var all []ReapReceipt
+	var scanCursor ReapReceiptScanCursor
+	for {
+		page, err := store.ScanReapReceipts(t.Context(), scanCursor, ReapReceiptPageLimit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		all = append(all, page.Receipts...)
+		if !page.More {
+			break
+		}
+		scanCursor = page.Next
+	}
+	counts := make(map[RecoveryID]int)
+	for _, receipt := range all {
+		counts[receipt.Record.RecoveryID]++
+	}
+	if len(all) != len(tasks)+len(trust) || counts[RecoveryTaskID] != len(tasks) || counts[RecoveryTrustID] != len(trust) {
+		t.Fatalf("exhaustive receipts = %d, counts %v", len(all), counts)
 	}
 
 	if _, err := store.AcknowledgeReap(t.Context(), tasks[1]); !errors.Is(err, ErrReapReceiptOrder) {
@@ -805,7 +843,7 @@ func TestFileStoreReceiptLedgerPagesClassesAndPersistsFloors(t *testing.T) {
 	}
 
 	reopened := &FileStore{Path: path, MaxOutstanding: 256}
-	persisted, err := reopened.ReapReceiptFloor(t.Context(), RecoveryTask)
+	persisted, err := reopened.ReapReceiptFloor(t.Context(), RecoveryTaskID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -813,19 +851,19 @@ func TestFileStoreReceiptLedgerPagesClassesAndPersistsFloors(t *testing.T) {
 		t.Fatalf("persisted floor = %+v", persisted)
 	}
 	badCursor := ReapReceiptCursor{LedgerID: ReceiptLedgerID{9}, Sequence: 2}
-	if _, err := reopened.LoadReapReceipts(t.Context(), RecoveryTask, badCursor, 1); !errors.Is(err, ErrReapReceiptStale) {
+	if _, err := reopened.LoadReapReceipts(t.Context(), RecoveryTaskID, badCursor, 1); !errors.Is(err, ErrReapReceiptStale) {
 		t.Fatalf("foreign cursor = %v", err)
 	}
-	if _, err := reopened.LoadReapReceipts(t.Context(), RecoveryTask, ReapReceiptCursor{Sequence: 2}, 1); !errors.Is(err, ErrReapReceiptStale) {
+	if _, err := reopened.LoadReapReceipts(t.Context(), RecoveryTaskID, ReapReceiptCursor{Sequence: 2}, 1); !errors.Is(err, ErrReapReceiptStale) {
 		t.Fatalf("anonymous nonzero cursor = %v", err)
 	}
 }
 
 func TestFileStoreBackpressureCountsRecordsAndReceipts(t *testing.T) {
 	store := &FileStore{Path: filepath.Join(t.TempDir(), "recovery.db"), MaxOutstanding: 2}
-	first := storeRecord(RecoveryTask, 1)
-	second := storeRecord(RecoveryTask, 2)
-	third := storeRecord(RecoveryTask, 3)
+	first := storeRecord(RecoveryTaskID, 1)
+	second := storeRecord(RecoveryTaskID, 2)
+	third := storeRecord(RecoveryTaskID, 3)
 	if err := store.Add(t.Context(), first); err != nil {
 		t.Fatal(err)
 	}
@@ -835,10 +873,10 @@ func TestFileStoreBackpressureCountsRecordsAndReceipts(t *testing.T) {
 	if err := store.Add(t.Context(), third); !errors.Is(err, ErrReceiptBacklog) {
 		t.Fatalf("third record admission = %v", err)
 	}
-	if err := store.BeginReap(t.Context(), first, "successor"); err != nil {
+	if err := store.BeginReap(t.Context(), first, testOwnerGeneration("successor")); err != nil {
 		t.Fatal(err)
 	}
-	receipt, err := store.CommitReap(t.Context(), first, "successor", ReapAbsent)
+	receipt, err := store.CommitReap(t.Context(), first, testOwnerGeneration("successor"), ReapAbsent)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -857,12 +895,12 @@ func TestRecoverReapReceiptsAcknowledgesOnlySettledPrefix(t *testing.T) {
 	store := &FileStore{Path: filepath.Join(t.TempDir(), "recovery.db")}
 	receipts := make([]ReapReceipt, 3)
 	for index := range receipts {
-		receipts[index] = commitStoreReceipt(t, store, storeRecord(RecoveryObserver, 100+index))
+		receipts[index] = commitStoreReceipt(t, store, storeRecord(testConsumerRecoveryID, 100+index))
 	}
-	reaper := &Reaper{Store: store, Generation: "successor"}
+	reaper := &Reaper{Store: store, Generation: testOwnerGeneration("successor")}
 	settleErr := errors.New("catalog not committed")
 	var attempted []uint64
-	_, err := reaper.RecoverReapReceipts(t.Context(), RecoveryObserver, func(_ context.Context, receipt ReapReceipt) error {
+	_, err := reaper.RecoverReapReceipts(t.Context(), testConsumerRecoveryID, func(_ context.Context, receipt ReapReceipt) error {
 		attempted = append(attempted, receipt.Sequence)
 		if receipt.Sequence == 2 {
 			return settleErr
@@ -872,12 +910,12 @@ func TestRecoverReapReceiptsAcknowledgesOnlySettledPrefix(t *testing.T) {
 	if !errors.Is(err, settleErr) {
 		t.Fatalf("first recovery = %v", err)
 	}
-	floor, err := store.ReapReceiptFloor(t.Context(), RecoveryObserver)
+	floor, err := store.ReapReceiptFloor(t.Context(), testConsumerRecoveryID)
 	if err != nil || floor.Sequence != 1 {
 		t.Fatalf("failed recovery floor = %+v, %v", floor, err)
 	}
 	attempted = nil
-	floor, err = reaper.RecoverReapReceipts(t.Context(), RecoveryObserver, func(_ context.Context, receipt ReapReceipt) error {
+	floor, err = reaper.RecoverReapReceipts(t.Context(), testConsumerRecoveryID, func(_ context.Context, receipt ReapReceipt) error {
 		attempted = append(attempted, receipt.Sequence)
 		return nil
 	})
@@ -887,7 +925,7 @@ func TestRecoverReapReceiptsAcknowledgesOnlySettledPrefix(t *testing.T) {
 	if floor.Sequence != 3 || len(attempted) != 2 || attempted[0] != 2 || attempted[1] != 3 {
 		t.Fatalf("retry floor/attempts = %+v/%v", floor, attempted)
 	}
-	page, err := store.LoadReapReceipts(t.Context(), RecoveryObserver, ReapReceiptCursor{}, 1)
+	page, err := store.LoadReapReceipts(t.Context(), testConsumerRecoveryID, ReapReceiptCursor{}, 1)
 	if err != nil || len(page.Receipts) != 0 || page.Floor.Sequence != 3 {
 		t.Fatalf("post-recovery page = %+v, %v", page, err)
 	}

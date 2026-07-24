@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/proc"
 )
 
 // MaxReadinessDetailBytes bounds opaque product progress on the wire.
@@ -42,8 +43,8 @@ var (
 
 // RuntimeIdentity identifies one exact product runtime process.
 type RuntimeIdentity struct {
-	RuntimeBuild      string `json:"runtime_build"`
-	ProcessGeneration string `json:"process_generation"`
+	RuntimeBuild      string               `json:"runtime_build"`
+	ProcessGeneration proc.OwnerGeneration `json:"process_generation"`
 }
 
 // RuntimeReceipt proves the exact runtime process returned by an authenticated

@@ -24,10 +24,10 @@ func TestRuntimeStopControlStoreConsumesControllerAuthority(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reaper := &proc.Reaper{Store: controllerStore, Generation: "deployment-controller-test"}
+	reaper := &proc.Reaper{Store: controllerStore, Generation: proc.OwnerGeneration{1}}
 	const role = "com.example.stop"
 	const operationID = "stop-operation"
-	const target = "runtime-generation"
+	target := proc.OwnerGeneration{2}
 	stopSession := proc.StopSessionID{1}
 	preparationNonce := proc.StopPreparationNonce{2}
 	if _, err := reaper.TrackStopControl(

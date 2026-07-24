@@ -131,7 +131,7 @@ func PrepareStop(
 	if response.Version != 1 || response.RuntimeProtocol <= 0 ||
 		len(response.StopSession) != len(proc.StopSessionID{}) ||
 		len(response.PreparationNonce) != len(proc.StopPreparationNonce{}) ||
-		response.RuntimeIdentity.RuntimeBuild == "" || response.RuntimeIdentity.ProcessGeneration == "" ||
+		response.RuntimeIdentity.RuntimeBuild == "" || response.RuntimeIdentity.ProcessGeneration == (proc.OwnerGeneration{}) ||
 		response.RuntimeIdentity.ProcessGeneration != response.Target.ProcessGeneration {
 		return nil, errors.New("wire: stop preparation returned an incomplete runtime identity")
 	}

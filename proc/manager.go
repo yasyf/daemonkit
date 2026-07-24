@@ -74,7 +74,7 @@ type SpawnRequestDigest [sha256.Size]byte
 
 // SpawnConfig is copied and compiled by NewSpawnRequest.
 type SpawnConfig struct {
-	RecoveryClass     RecoveryClass
+	RecoveryID        RecoveryID
 	Executable        string
 	Args              []string
 	Dir               string
@@ -89,7 +89,7 @@ type SpawnConfig struct {
 
 // SpawnRequest is an immutable validated child launch request.
 type SpawnRequest struct {
-	recoveryClass  RecoveryClass
+	recoveryID     RecoveryID
 	executable     string
 	args           []string
 	dir            string
@@ -106,8 +106,8 @@ type SpawnRequest struct {
 
 // NewSpawnRequest validates and deep-copies one exact launch request.
 func NewSpawnRequest(config SpawnConfig) (SpawnRequest, error) {
-	if err := config.RecoveryClass.Validate(); err != nil {
-		return SpawnRequest{}, fmt.Errorf("proc: spawn recovery class: %w", err)
+	if err := config.RecoveryID.Validate(); err != nil {
+		return SpawnRequest{}, fmt.Errorf("proc: spawn recovery id: %w", err)
 	}
 	if strings.ContainsRune(config.Executable, '\x00') || !filepath.IsAbs(config.Executable) || filepath.Clean(config.Executable) != config.Executable {
 		return SpawnRequest{}, errors.New("proc: spawn executable must be exact and absolute")
@@ -149,7 +149,7 @@ func NewSpawnRequest(config SpawnConfig) (SpawnRequest, error) {
 	environment := append([]string(nil), config.Env...)
 	sort.Strings(environment)
 	request := SpawnRequest{
-		recoveryClass: config.RecoveryClass, executable: config.Executable,
+		recoveryID: config.RecoveryID, executable: config.Executable,
 		args: append([]string(nil), config.Args...), dir: config.Dir,
 		env: environment, stdin: config.Stdin, stdout: config.Stdout, stderr: config.Stderr,
 		requiresFence: config.RequiresPeerFence, spawnedSession: config.SpawnedSession,
@@ -165,7 +165,7 @@ func NewSpawnRequest(config SpawnConfig) (SpawnRequest, error) {
 func digestSpawnRequest(request SpawnRequest) SpawnRequestDigest {
 	h := sha256.New()
 	writeSpawnDigestBytes(h, []byte("daemonkit.proc.spawn-request.v1"))
-	writeSpawnDigestBytes(h, []byte{byte(request.recoveryClass)})
+	writeSpawnDigestBytes(h, []byte(request.recoveryID))
 	writeSpawnDigestBytes(h, []byte(request.executable))
 	writeSpawnDigestBytes(h, []byte(request.dir))
 	writeSpawnDigestStrings(h, request.args)
@@ -216,7 +216,7 @@ type ProcessReceipt struct {
 	requestDigest  SpawnRequestDigest
 	requiresFence  bool
 	spawnedSession bool
-	generation     string
+	generation     OwnerGeneration
 	state          *preparedReceiptState
 	owner          *managerToken
 }
@@ -247,7 +247,7 @@ func (r ProcessReceipt) RequiresPeerFence() bool { return r.requiresFence }
 func (r ProcessReceipt) HasSpawnedSession() bool { return r.spawnedSession }
 
 // OwnerGeneration returns the exact daemon generation that durably owns the child.
-func (r ProcessReceipt) OwnerGeneration() string { return r.generation }
+func (r ProcessReceipt) OwnerGeneration() OwnerGeneration { return r.generation }
 
 // Prepared reports whether the exact child is still owned and undispatched or live.
 func (r ProcessReceipt) Prepared() bool {
@@ -278,6 +278,7 @@ type Manager struct {
 	children  map[*PreparedChild]struct{}
 	untracked map[*untrackedChild]struct{}
 	changed   chan struct{}
+	settled   map[RecoveryID][]OwnerGeneration
 }
 
 type managerToken struct{}
@@ -303,6 +304,7 @@ func (m *Manager) ClaimRuntime() error {
 	if m.state != managerUnclaimed || m.preparing != 0 || len(m.children) != 0 || len(m.untracked) != 0 {
 		return errors.New("proc: manager is already used or runtime-owned")
 	}
+	m.settled = nil
 	m.state = managerClaimedUnrecovered
 	return nil
 }
@@ -318,6 +320,7 @@ func (m *Manager) ReleaseRuntime() error {
 		return errors.New("proc: manager claim cannot be released")
 	}
 	m.state = managerUnclaimed
+	m.settled = nil
 	return nil
 }
 
@@ -326,12 +329,13 @@ func NewManager(limit int, reaper *Reaper) (*Manager, error) {
 	if limit <= 0 {
 		return nil, errors.New("proc: manager limit must be positive")
 	}
-	if reaper == nil || reaper.Store == nil || reaper.Generation == "" {
+	if reaper == nil || reaper.Store == nil || reaper.Generation == (OwnerGeneration{}) {
 		return nil, errors.New("proc: manager reaper is incomplete")
 	}
 	return &Manager{
 		reaper: reaper, limit: make(chan struct{}, limit), token: &managerToken{},
 		children: make(map[*PreparedChild]struct{}), untracked: make(map[*untrackedChild]struct{}), changed: make(chan struct{}),
+		settled: nil,
 	}, nil
 }
 
@@ -401,7 +405,7 @@ func (m *Manager) Prepare(ctx context.Context, request SpawnRequest) (*PreparedC
 		cleanupErr := m.cleanupUntracked(pipes, Identity{}, waited, true)
 		return nil, ProcessReceipt{}, errors.Join(fmt.Errorf("proc: snapshot prepared wrapper: %w", err), cleanupErr)
 	}
-	record, err := m.reaper.TrackGroup(ctx, command.Process.Pid, request.recoveryClass)
+	record, err := m.reaper.TrackGroup(ctx, command.Process.Pid, request.recoveryID)
 	if err != nil {
 		waitErr := m.cleanupUntracked(pipes, preparedIdentity, waited, true)
 		return nil, ProcessReceipt{}, errors.Join(fmt.Errorf("proc: track prepared child: %w", err), waitErr)
@@ -791,16 +795,42 @@ func (m *Manager) Recover(ctx context.Context) error {
 	m.state = managerRecovering
 	m.notifyLocked()
 	m.mu.Unlock()
-	err := m.reaper.Reap(ctx)
+	settled, err := m.reaper.reap(ctx)
 	m.mu.Lock()
 	if err == nil {
+		m.settled = settled
 		m.state = managerRecovered
 	} else {
+		m.settled = nil
 		m.state = managerClaimedUnrecovered
 	}
 	m.notifyLocked()
 	m.mu.Unlock()
 	return err
+}
+
+// OwnerGeneration returns the exact generation that owns this manager.
+func (m *Manager) OwnerGeneration() OwnerGeneration {
+	if m == nil || m.reaper == nil {
+		return OwnerGeneration{}
+	}
+	return m.reaper.Generation
+}
+
+// RecoveryReceipt mints one immutable barrier proof from the exhaustive store scan.
+func (m *Manager) RecoveryReceipt(id RecoveryID) (RecoveryReceipt, error) {
+	if m == nil {
+		return RecoveryReceipt{}, errors.New("proc: manager is required")
+	}
+	if err := id.Validate(); err != nil {
+		return RecoveryReceipt{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.state != managerRecovered && m.state != managerActivated && m.state != managerClosed {
+		return RecoveryReceipt{}, errors.New("proc: manager recovery proof is unavailable")
+	}
+	return newRecoveryReceipt(id, m.reaper.Generation, m.settled[id])
 }
 
 // OwnsReceipt reports whether this manager minted and still owns receipt.

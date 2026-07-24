@@ -12,7 +12,7 @@ const stopControlOp = Op("daemon.control.stop")
 // StopResult records the exact process identity and runtime returned by Dispatch.
 type StopResult struct {
 	Process           proc.Identity
-	ProcessGeneration string
+	ProcessGeneration proc.OwnerGeneration
 	RuntimeBuild      string
 	RuntimeProtocol   int
 	Stopped           bool
@@ -37,17 +37,17 @@ type stopControlResponse struct {
 }
 
 type stopControlTarget struct {
-	PID               int    `json:"pid"`
-	StartTime         string `json:"start_time"`
-	Boot              string `json:"boot"`
-	Comm              string `json:"comm"`
-	Executable        string `json:"executable"`
-	Audit             []byte `json:"audit,omitempty"`
-	ProcessGeneration string `json:"process_generation"`
+	PID               int                  `json:"pid"`
+	StartTime         string               `json:"start_time"`
+	Boot              string               `json:"boot"`
+	Comm              string               `json:"comm"`
+	Executable        string               `json:"executable"`
+	Audit             []byte               `json:"audit,omitempty"`
+	ProcessGeneration proc.OwnerGeneration `json:"process_generation"`
 }
 
 func (t stopControlTarget) identity() (proc.Identity, error) {
-	if t.PID <= 1 || t.StartTime == "" || t.Boot == "" || t.Executable == "" || t.ProcessGeneration == "" {
+	if t.PID <= 1 || t.StartTime == "" || t.Boot == "" || t.Executable == "" || t.ProcessGeneration == (proc.OwnerGeneration{}) {
 		return proc.Identity{}, errors.New("incomplete stop target")
 	}
 	identity := proc.Identity{
@@ -63,7 +63,7 @@ func (t stopControlTarget) identity() (proc.Identity, error) {
 	return identity, nil
 }
 
-func newStopControlTarget(identity proc.Identity, generation string) stopControlTarget {
+func newStopControlTarget(identity proc.Identity, generation proc.OwnerGeneration) stopControlTarget {
 	target := stopControlTarget{
 		PID: identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
 		Comm: identity.Comm, Executable: identity.Executable, ProcessGeneration: generation,

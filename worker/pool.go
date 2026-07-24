@@ -187,6 +187,38 @@ func (c *RuntimeClaim) Product() *Pool {
 	return c.product
 }
 
+// OwnerGeneration returns the exact generation shared by both worker managers.
+func (c *RuntimeClaim) OwnerGeneration() proc.OwnerGeneration {
+	if c == nil || c.product == nil || c.product.manager == nil {
+		return proc.OwnerGeneration{}
+	}
+	return c.product.manager.OwnerGeneration()
+}
+
+// RecoveryReceipt combines product and verifier recovery for one barrier.
+func (c *RuntimeClaim) RecoveryReceipt(id proc.RecoveryID) (proc.RecoveryReceipt, error) {
+	if c == nil || c.product == nil || c.verifier == nil {
+		return proc.RecoveryReceipt{}, errors.New("worker: runtime claim is required")
+	}
+	product, err := c.product.manager.RecoveryReceipt(id)
+	if err != nil {
+		return proc.RecoveryReceipt{}, fmt.Errorf("worker: product recovery receipt: %w", err)
+	}
+	verifier, err := c.verifier.manager.RecoveryReceipt(id)
+	if err != nil {
+		return proc.RecoveryReceipt{}, fmt.Errorf("worker: verifier recovery receipt: %w", err)
+	}
+	return proc.CombineRecoveryReceipts(id, c.OwnerGeneration(), product, verifier)
+}
+
+// OwnerGeneration returns the exact generation that owns this pool.
+func (p *Pool) OwnerGeneration() proc.OwnerGeneration {
+	if p == nil || p.manager == nil {
+		return proc.OwnerGeneration{}
+	}
+	return p.manager.OwnerGeneration()
+}
+
 // Recover settles product and verifier tasks before listener admission.
 func (c *RuntimeClaim) Recover(ctx context.Context) error {
 	if err := c.acquire(ctx); err != nil {
@@ -477,7 +509,7 @@ func (p *Pool) Run(ctx context.Context, request CommandRequest) (CommandResult, 
 		return CommandResult{}, err
 	}
 	spawn, err := proc.NewSpawnRequest(proc.SpawnConfig{
-		RecoveryClass:     proc.RecoveryTask,
+		RecoveryID:        proc.RecoveryTaskID,
 		Executable:        request.Path,
 		Args:              request.Args,
 		Dir:               request.Dir,

@@ -64,8 +64,8 @@ func TestSpawnedSessionManagerExchangeAndOneShotClaims(t *testing.T) {
 	signature[0] = 1
 	diagnostic := filepath.Join(t.TempDir(), "helper-error")
 	request, err := NewSpawnRequest(SpawnConfig{
-		RecoveryClass: RecoveryTask,
-		Executable:    self.Executable,
+		RecoveryID: RecoveryTaskID,
+		Executable: self.Executable,
 		Args: []string{
 			"-test.run=^TestSpawnedSessionHelperProcess$",
 			"-test.v",
@@ -185,7 +185,7 @@ func TestSpawnedSessionSpawnConfigIsExact(t *testing.T) {
 	var signature SignatureDigest
 	signature[0] = 1
 	base := SpawnConfig{
-		RecoveryClass: RecoveryTask, Executable: "/bin/sh",
+		RecoveryID: RecoveryTaskID, Executable: "/bin/sh",
 		Stdin: StdioNull, Stdout: StdioNull, Stderr: StdioNull,
 		SpawnedSession: true, ExpectedSignature: &signature,
 	}

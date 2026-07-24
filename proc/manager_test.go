@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -19,7 +20,7 @@ func newManagerTest(t *testing.T, capacity int) (*Manager, *memStore) {
 	t.Helper()
 	store := &memStore{}
 	manager, err := NewManager(capacity, &Reaper{
-		Store: store, Generation: "manager-test", Grace: 10 * time.Millisecond, Settlement: time.Second,
+		Store: store, Generation: testOwnerGeneration("manager-test"), Grace: 10 * time.Millisecond, Settlement: time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -47,7 +48,7 @@ func managerTestRequest(t *testing.T, script string, modes ...StdioMode) SpawnRe
 	var signature SignatureDigest
 	signature[0] = 1
 	request, err := NewSpawnRequest(SpawnConfig{
-		RecoveryClass: RecoveryTask, Executable: "/bin/sh", Args: []string{"-c", script},
+		RecoveryID: RecoveryTaskID, Executable: "/bin/sh", Args: []string{"-c", script},
 		Stdin: stdio[0], Stdout: stdio[1], Stderr: stdio[2], ExpectedSignature: &signature,
 	})
 	if err != nil {
@@ -73,7 +74,7 @@ func waitManagerChild(t *testing.T, child *PreparedChild) ProcessExit {
 func newUnrecoveredManagerTest(t *testing.T, store Store) *Manager {
 	t.Helper()
 	manager, err := NewManager(1, &Reaper{
-		Store: store, Generation: "manager-test", Grace: 10 * time.Millisecond, Settlement: time.Second,
+		Store: store, Generation: testOwnerGeneration("manager-test"), Grace: 10 * time.Millisecond, Settlement: time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -342,7 +343,7 @@ func TestManagerCapacityAndRequestImmutability(t *testing.T) {
 	var signature SignatureDigest
 	signature[0] = 1
 	request, err := NewSpawnRequest(SpawnConfig{
-		RecoveryClass: RecoveryTask, Executable: "/bin/sh", Args: args, Env: env,
+		RecoveryID: RecoveryTaskID, Executable: "/bin/sh", Args: args, Env: env,
 		Stdin: StdioNull, Stdout: StdioNull, Stderr: StdioNull, ExpectedSignature: &signature,
 	})
 	if err != nil {
@@ -385,7 +386,7 @@ func (s *failRemoveStore) Remove(ctx context.Context, records []Record) error {
 func TestManagerRetainsOwnershipUntilDurableSettlement(t *testing.T) {
 	store := &failRemoveStore{memStore: &memStore{}, fail: true}
 	manager, err := NewManager(1, &Reaper{
-		Store: store, Generation: "manager-test", Grace: 10 * time.Millisecond, Settlement: time.Second,
+		Store: store, Generation: testOwnerGeneration("manager-test"), Grace: 10 * time.Millisecond, Settlement: time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -428,7 +429,7 @@ func TestNewSpawnRequestRejectsAmbientAndMalformedInput(t *testing.T) {
 	var signature SignatureDigest
 	signature[0] = 1
 	base := SpawnConfig{
-		RecoveryClass: RecoveryTask, Executable: "/bin/sh", Stdin: StdioNull, Stdout: StdioNull,
+		RecoveryID: RecoveryTaskID, Executable: "/bin/sh", Stdin: StdioNull, Stdout: StdioNull,
 		Stderr: StdioNull, ExpectedSignature: &signature,
 	}
 	for _, mutate := range []func(*SpawnConfig){
@@ -452,7 +453,7 @@ func TestNewSpawnRequestRejectsAmbientAndMalformedInput(t *testing.T) {
 
 func TestSpawnRequestOptionalSignatureAndPeerFence(t *testing.T) {
 	base := SpawnConfig{
-		RecoveryClass: RecoveryTask, Executable: "/bin/sh",
+		RecoveryID: RecoveryTaskID, Executable: "/bin/sh",
 		Stdin: StdioNull, Stdout: StdioNull, Stderr: StdioNull,
 	}
 	request, err := NewSpawnRequest(base)
@@ -613,7 +614,7 @@ func (s *blockingAddStore) Add(ctx context.Context, record Record) error {
 func TestManagerShutdownBoundsInflightPrepareAndRejectsPublication(t *testing.T) {
 	store := &blockingAddStore{memStore: &memStore{}, entered: make(chan struct{}), release: make(chan struct{})}
 	manager, err := NewManager(1, &Reaper{
-		Store: store, Generation: "manager-test", Grace: 10 * time.Millisecond, Settlement: time.Second,
+		Store: store, Generation: testOwnerGeneration("manager-test"), Grace: 10 * time.Millisecond, Settlement: time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -660,12 +661,12 @@ func TestManagerRecoverSettlesPriorGenerationBeforeUse(t *testing.T) {
 	}
 	waited := make(chan error, 1)
 	go func() { waited <- command.Wait() }()
-	oldReaper := &Reaper{Store: store, Generation: "old", Grace: 10 * time.Millisecond, Settlement: time.Second}
-	if _, err := oldReaper.TrackGroup(context.Background(), command.Process.Pid, RecoveryTask); err != nil {
+	oldReaper := &Reaper{Store: store, Generation: testOwnerGeneration("old"), Grace: 10 * time.Millisecond, Settlement: time.Second}
+	if _, err := oldReaper.TrackGroup(context.Background(), command.Process.Pid, RecoveryTaskID); err != nil {
 		t.Fatal(err)
 	}
 	manager, err := NewManager(1, &Reaper{
-		Store: store, Generation: "new", Grace: 10 * time.Millisecond, Settlement: time.Second,
+		Store: store, Generation: testOwnerGeneration("new"), Grace: 10 * time.Millisecond, Settlement: time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -677,6 +678,27 @@ func TestManagerRecoverSettlesPriorGenerationBeforeUse(t *testing.T) {
 	defer cancel()
 	if err := manager.Recover(ctx); err != nil {
 		t.Fatal(err)
+	}
+	recovery, err := manager.RecoveryReceipt(RecoveryTaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recovery.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if recovery.Current() != testOwnerGeneration("new") ||
+		!slices.Equal(recovery.Settled(), []OwnerGeneration{testOwnerGeneration("old")}) {
+		t.Fatalf("task recovery receipt = current %q, settled %v", recovery.Current(), recovery.Settled())
+	}
+	empty, err := manager.RecoveryReceipt(testConsumerRecoveryID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if empty.RecoveryID() != testConsumerRecoveryID || len(empty.Settled()) != 0 {
+		t.Fatalf("on-demand recovery receipt = id %q, settled %v", empty.RecoveryID(), empty.Settled())
+	}
+	if store.scanCalls != 1 {
+		t.Fatalf("exhaustive receipt scan pages = %d, want 1", store.scanCalls)
 	}
 	select {
 	case <-waited:
@@ -697,7 +719,7 @@ func TestManagerUntrackedCleanupFailureIsBoundedAndRetained(t *testing.T) {
 	}
 	signaler := &termThenKillFailureSignaler{killErr: killFailure}
 	manager, err := NewManager(1, &Reaper{
-		Store: &memStore{}, Generation: "manager-test", Grace: 10 * time.Millisecond,
+		Store: &memStore{}, Generation: testOwnerGeneration("manager-test"), Grace: 10 * time.Millisecond,
 		Settlement: time.Second, prober: prober, signaler: signaler,
 	})
 	if err != nil {

@@ -216,10 +216,10 @@ func managerTestProductRequest(t *testing.T) proc.SpawnRequest {
 	var signature proc.SignatureDigest
 	signature[0] = 1
 	request, err := proc.NewSpawnRequest(proc.SpawnConfig{
-		RecoveryClass: proc.RecoveryTask,
-		Executable:    "/bin/sh",
-		Args:          []string{"-c", "exit 0"},
-		Stdin:         proc.StdioNull, Stdout: proc.StdioNull, Stderr: proc.StdioNull,
+		RecoveryID: proc.RecoveryTaskID,
+		Executable: "/bin/sh",
+		Args:       []string{"-c", "exit 0"},
+		Stdin:      proc.StdioNull, Stdout: proc.StdioNull, Stderr: proc.StdioNull,
 		ExpectedSignature: &signature,
 	})
 	if err != nil {

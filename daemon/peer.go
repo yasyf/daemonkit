@@ -3,6 +3,8 @@
 // observation, idle exit, and embedded-process coordination.
 package daemon
 
+import "github.com/yasyf/daemonkit/proc"
+
 // State is a runtime's coarse health verdict. A temporary secure-hardware outage is
 // StateDegraded, never a crash loop.
 type State string
@@ -24,7 +26,7 @@ type Health struct {
 	// RuntimeProtocol is the product runtime's exact protocol version.
 	RuntimeProtocol int
 	// ProcessGeneration is daemonkit's canonical identity for this process execution.
-	ProcessGeneration string
+	ProcessGeneration proc.OwnerGeneration
 	// PID is the peer's process id, the revalidation anchor for any signal.
 	PID int
 	// State is the coarse health verdict.

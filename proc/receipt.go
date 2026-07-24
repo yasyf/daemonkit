@@ -26,17 +26,25 @@ var (
 // ReceiptLedgerID identifies one durable receipt ledger across process restarts.
 type ReceiptLedgerID [16]byte
 
-// ReapReceiptCursor resumes a class page after one exact sequence.
+// ReapReceiptCursor resumes an ID page after one exact sequence.
 type ReapReceiptCursor struct {
 	LedgerID ReceiptLedgerID
 	Sequence uint64
 }
 
-// ReapReceiptFloor is the highest contiguously acknowledged class sequence.
+// ReapReceiptScanCursor resumes the exhaustive global receipt scan after one
+// exact recovery ID and sequence.
+type ReapReceiptScanCursor struct {
+	LedgerID   ReceiptLedgerID
+	RecoveryID RecoveryID
+	Sequence   uint64
+}
+
+// ReapReceiptFloor is the highest contiguously acknowledged recovery-ID sequence.
 type ReapReceiptFloor struct {
-	LedgerID      ReceiptLedgerID
-	RecoveryClass RecoveryClass
-	Sequence      uint64
+	LedgerID   ReceiptLedgerID
+	RecoveryID RecoveryID
+	Sequence   uint64
 }
 
 // ReapOutcome records how the exact prior process identity became retired.
@@ -60,7 +68,7 @@ type ReapReceipt struct {
 	LedgerID         ReceiptLedgerID `json:"ledger_id"`
 	Sequence         uint64          `json:"sequence"`
 	Record           Record          `json:"record"`
-	ReaperGeneration string          `json:"reaper_generation"`
+	ReaperGeneration OwnerGeneration `json:"reaper_generation"`
 	Outcome          ReapOutcome     `json:"outcome"`
 	Digest           [32]byte        `json:"digest"`
 }
@@ -74,7 +82,7 @@ func (r ReapReceipt) Validate() error {
 	if err := r.Record.Validate(); err != nil {
 		return errors.Join(ErrInvalidReapReceipt, err)
 	}
-	if r.ReaperGeneration == "" || r.ReaperGeneration == r.Record.Generation {
+	if r.ReaperGeneration == (OwnerGeneration{}) || r.ReaperGeneration == r.Record.Generation {
 		return fmt.Errorf("%w: successor generation is invalid", ErrInvalidReapReceipt)
 	}
 	switch r.Outcome {
@@ -94,7 +102,7 @@ func (r ReapReceipt) Validate() error {
 	return nil
 }
 
-// ReapReceiptPage is one stable class-filtered page of durable receipts.
+// ReapReceiptPage is one stable recovery-ID-filtered page of durable receipts.
 type ReapReceiptPage struct {
 	Receipts []ReapReceipt
 	Next     ReapReceiptCursor
@@ -102,11 +110,18 @@ type ReapReceiptPage struct {
 	Floor    ReapReceiptFloor
 }
 
+// ReapReceiptScanPage is one bounded page from the global receipt keyspace.
+type ReapReceiptScanPage struct {
+	Receipts []ReapReceipt
+	Next     ReapReceiptScanCursor
+	More     bool
+}
+
 func newReapReceipt(
 	ledgerID ReceiptLedgerID,
 	sequence uint64,
 	record Record,
-	reaperGeneration string,
+	reaperGeneration OwnerGeneration,
 	outcome ReapOutcome,
 ) (ReapReceipt, error) {
 	digest, err := reapReceiptDigest(ledgerID, sequence, record, reaperGeneration, outcome)
@@ -128,14 +143,14 @@ func reapReceiptDigest(
 	ledgerID ReceiptLedgerID,
 	sequence uint64,
 	record Record,
-	reaperGeneration string,
+	reaperGeneration OwnerGeneration,
 	outcome ReapOutcome,
 ) ([32]byte, error) {
 	payload, err := json.Marshal(struct {
 		LedgerID         ReceiptLedgerID `json:"ledger_id"`
 		Sequence         uint64          `json:"sequence"`
 		Record           Record          `json:"record"`
-		ReaperGeneration string          `json:"reaper_generation"`
+		ReaperGeneration OwnerGeneration `json:"reaper_generation"`
 		Outcome          ReapOutcome     `json:"outcome"`
 	}{
 		LedgerID: ledgerID, Sequence: sequence, Record: record,
@@ -148,15 +163,15 @@ func reapReceiptDigest(
 }
 
 type reapClaim struct {
-	Record           Record `json:"record"`
-	ReaperGeneration string `json:"reaper_generation"`
+	Record           Record          `json:"record"`
+	ReaperGeneration OwnerGeneration `json:"reaper_generation"`
 }
 
 func (c reapClaim) validate() error {
 	if err := c.Record.Validate(); err != nil {
 		return err
 	}
-	if c.ReaperGeneration == "" || c.ReaperGeneration == c.Record.Generation {
+	if c.ReaperGeneration == (OwnerGeneration{}) || c.ReaperGeneration == c.Record.Generation {
 		return errors.New("proc: invalid reap claim successor generation")
 	}
 	return nil

@@ -9,9 +9,9 @@ let runtimeReceiptOperation = "daemon.control.runtime.receipt"
 /// RuntimeIdentity identifies one exact product runtime process.
 public struct RuntimeIdentity: Codable, Equatable, Sendable {
     public let runtimeBuild: String
-    public let processGeneration: String
+    public let processGeneration: OwnerGeneration
 
-    public init(runtimeBuild: String, processGeneration: String) {
+    public init(runtimeBuild: String, processGeneration: OwnerGeneration) {
         self.runtimeBuild = runtimeBuild
         self.processGeneration = processGeneration
     }
@@ -162,7 +162,6 @@ enum RuntimeReadinessCodec {
         }
         guard !event.wireBuild.isEmpty,
               !event.runtimeIdentity.runtimeBuild.isEmpty,
-              !event.runtimeIdentity.processGeneration.isEmpty,
               event.progress.sequence > 0,
               event.progress.detail.count <= daemonKitMaxReadinessDetailBytes
         else {
@@ -184,7 +183,7 @@ enum RuntimeReceiptCodec {
     }
 
     static func encodeResponse(_ identity: RuntimeIdentity) throws -> Data {
-        guard !identity.runtimeBuild.isEmpty, !identity.processGeneration.isEmpty else {
+        guard !identity.runtimeBuild.isEmpty else {
             throw RuntimeReadinessValidationError.invalidResponse("runtime receipt identity values")
         }
         return try JSONEncoder().encode(RuntimeReceiptResponse(
@@ -210,8 +209,7 @@ enum RuntimeReceiptCodec {
         guard response.protocolVersion == daemonKitSessionProtocolVersion else {
             throw SessionTransportError.unsupportedProtocolVersion(response.protocolVersion)
         }
-        guard !response.runtimeIdentity.runtimeBuild.isEmpty,
-              !response.runtimeIdentity.processGeneration.isEmpty
+        guard !response.runtimeIdentity.runtimeBuild.isEmpty
         else {
             throw RuntimeReadinessValidationError.invalidResponse("runtime receipt identity values")
         }

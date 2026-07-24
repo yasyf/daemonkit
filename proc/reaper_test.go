@@ -30,8 +30,10 @@ type memStore struct {
 	recs      []Record
 	claims    map[string]reapClaim
 	receipts  []ReapReceipt
-	sequences map[RecoveryClass]uint64
-	floors    map[RecoveryClass]uint64
+	sequences map[RecoveryID]uint64
+	floors    map[RecoveryID]uint64
+	scanCalls int
+	scanMax   int
 }
 
 func (m *memStore) Add(_ context.Context, rec Record) error {
@@ -71,7 +73,7 @@ func (m *memStore) Remove(_ context.Context, victims []Record) error {
 	return nil
 }
 
-func (m *memStore) BeginReap(_ context.Context, rec Record, generation string) error {
+func (m *memStore) BeginReap(_ context.Context, rec Record, generation OwnerGeneration) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.claims == nil {
@@ -88,15 +90,15 @@ func (m *memStore) BeginReap(_ context.Context, rec Record, generation string) e
 func (m *memStore) CommitReap(
 	_ context.Context,
 	rec Record,
-	reaperGeneration string,
+	reaperGeneration OwnerGeneration,
 	outcome ReapOutcome,
 ) (ReapReceipt, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.sequences == nil {
-		m.sequences = make(map[RecoveryClass]uint64)
+		m.sequences = make(map[RecoveryID]uint64)
 	}
-	sequence := m.sequences[rec.RecoveryClass] + 1
+	sequence := m.sequences[rec.RecoveryID] + 1
 	receipt, err := newReapReceipt(ReceiptLedgerID{1}, sequence, rec, reaperGeneration, outcome)
 	if err != nil {
 		return ReapReceipt{}, err
@@ -127,23 +129,23 @@ func (m *memStore) CommitReap(
 	m.recs = records
 	delete(m.claims, recordKey(rec))
 	m.receipts = append(m.receipts, receipt)
-	m.sequences[rec.RecoveryClass] = sequence
+	m.sequences[rec.RecoveryID] = sequence
 	return receipt, nil
 }
 
 func (m *memStore) LoadReapReceipts(
 	_ context.Context,
-	class RecoveryClass,
+	id RecoveryID,
 	after ReapReceiptCursor,
 	limit int,
 ) (ReapReceiptPage, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	page := ReapReceiptPage{
-		Floor: ReapReceiptFloor{LedgerID: ReceiptLedgerID{1}, RecoveryClass: class, Sequence: m.floors[class]},
+		Floor: ReapReceiptFloor{LedgerID: ReceiptLedgerID{1}, RecoveryID: id, Sequence: m.floors[id]},
 	}
 	for _, receipt := range m.receipts {
-		if receipt.Record.RecoveryClass != class || receipt.Sequence <= after.Sequence {
+		if receipt.Record.RecoveryID != id || receipt.Sequence <= after.Sequence {
 			continue
 		}
 		if len(page.Receipts) == limit {
@@ -154,6 +156,54 @@ func (m *memStore) LoadReapReceipts(
 		page.Next = ReapReceiptCursor{LedgerID: receipt.LedgerID, Sequence: receipt.Sequence}
 	}
 	return page, nil
+}
+
+func (m *memStore) ScanReapReceipts(
+	_ context.Context,
+	after ReapReceiptScanCursor,
+	limit int,
+) (ReapReceiptScanPage, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	receipts := append([]ReapReceipt(nil), m.receipts...)
+	slices.SortFunc(receipts, func(left, right ReapReceipt) int {
+		if compared := strings.Compare(left.Record.RecoveryID.String(), right.Record.RecoveryID.String()); compared != 0 {
+			return compared
+		}
+		return intCompare(left.Sequence, right.Sequence)
+	})
+	page := ReapReceiptScanPage{}
+	for _, receipt := range receipts {
+		if after != (ReapReceiptScanCursor{}) {
+			compared := strings.Compare(receipt.Record.RecoveryID.String(), after.RecoveryID.String())
+			if compared < 0 || compared == 0 && receipt.Sequence <= after.Sequence {
+				continue
+			}
+		}
+		if len(page.Receipts) == limit {
+			page.More = true
+			break
+		}
+		page.Receipts = append(page.Receipts, receipt)
+		page.Next = ReapReceiptScanCursor{
+			LedgerID: receipt.LedgerID, RecoveryID: receipt.Record.RecoveryID, Sequence: receipt.Sequence,
+		}
+	}
+	m.scanCalls++
+	if len(page.Receipts) > m.scanMax {
+		m.scanMax = len(page.Receipts)
+	}
+	return page, nil
+}
+
+func intCompare(left, right uint64) int {
+	if left < right {
+		return -1
+	}
+	if left > right {
+		return 1
+	}
+	return 0
 }
 
 func (m *memStore) HasReapReceipt(_ context.Context, receipt ReapReceipt) (bool, error) {
@@ -180,15 +230,15 @@ func (m *memStore) AcknowledgeReap(_ context.Context, receipt ReapReceipt) (Reap
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.floors == nil {
-		m.floors = make(map[RecoveryClass]uint64)
+		m.floors = make(map[RecoveryID]uint64)
 	}
-	class := receipt.Record.RecoveryClass
-	floor := m.floors[class]
+	id := receipt.Record.RecoveryID
+	floor := m.floors[id]
 	if receipt.Sequence < floor {
 		return ReapReceiptFloor{}, ErrReapReceiptStale
 	}
 	if receipt.Sequence == floor {
-		return ReapReceiptFloor{LedgerID: receipt.LedgerID, RecoveryClass: class, Sequence: floor}, nil
+		return ReapReceiptFloor{LedgerID: receipt.LedgerID, RecoveryID: id, Sequence: floor}, nil
 	}
 	if receipt.Sequence != floor+1 {
 		return ReapReceiptFloor{}, ErrReapReceiptOrder
@@ -199,14 +249,14 @@ func (m *memStore) AcknowledgeReap(_ context.Context, receipt ReapReceipt) (Reap
 	m.receipts = slices.DeleteFunc(m.receipts, func(existing ReapReceipt) bool {
 		return existing == receipt
 	})
-	m.floors[class] = receipt.Sequence
-	return ReapReceiptFloor{LedgerID: receipt.LedgerID, RecoveryClass: class, Sequence: receipt.Sequence}, nil
+	m.floors[id] = receipt.Sequence
+	return ReapReceiptFloor{LedgerID: receipt.LedgerID, RecoveryID: id, Sequence: receipt.Sequence}, nil
 }
 
-func (m *memStore) ReapReceiptFloor(_ context.Context, class RecoveryClass) (ReapReceiptFloor, error) {
+func (m *memStore) ReapReceiptFloor(_ context.Context, id RecoveryID) (ReapReceiptFloor, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return ReapReceiptFloor{LedgerID: ReceiptLedgerID{1}, RecoveryClass: class, Sequence: m.floors[class]}, nil
+	return ReapReceiptFloor{LedgerID: ReceiptLedgerID{1}, RecoveryID: id, Sequence: m.floors[id]}, nil
 }
 
 func (m *memStore) len() int {
@@ -325,7 +375,36 @@ func liveInfo() procInfo { return procInfo{startTime: "111.222", comm: "worker"}
 
 func matchingRecord(pid int, gen string) Record {
 	i := liveInfo()
-	return Record{RecoveryClass: RecoveryTask, PID: pid, StartTime: i.startTime, Boot: testBoot, Comm: i.comm, Generation: gen}
+	return Record{RecoveryID: RecoveryTaskID, PID: pid, StartTime: i.startTime, Boot: testBoot, Comm: i.comm, Generation: testOwnerGeneration(gen)}
+}
+
+func TestReapGlobalReceiptScanIsPageBoundedAndDeduplicatesGenerations(t *testing.T) {
+	store := &memStore{}
+	const receiptCount = ReapReceiptPageLimit*3 + 7
+	prior := testOwnerGeneration("prior")
+	current := testOwnerGeneration("current")
+	for index := range receiptCount {
+		record := matchingRecord(1000+index, "prior")
+		record.RecoveryID = testConsumerRecoveryID
+		receipt, err := newReapReceipt(
+			ReceiptLedgerID{1}, uint64(index+1), record, current, ReapAbsent,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		store.receipts = append(store.receipts, receipt)
+	}
+	reaper := &Reaper{Store: store, Generation: current, prober: &fakeProber{boot: testBoot}}
+	settled, err := reaper.reap(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := settled[testConsumerRecoveryID]; !slices.Equal(got, []OwnerGeneration{prior}) {
+		t.Fatalf("deduplicated generations = %v", got)
+	}
+	if store.scanCalls != 4 || store.scanMax != ReapReceiptPageLimit {
+		t.Fatalf("scan pages = %d, max page = %d", store.scanCalls, store.scanMax)
+	}
 }
 
 func TestReapReceiptPersistsAndReplaysByteIdenticallyUntilAcknowledged(t *testing.T) {
@@ -337,7 +416,7 @@ func TestReapReceiptPersistsAndReplaysByteIdenticallyUntilAcknowledged(t *testin
 	record.AuditToken = auditTokenForPID(record.PID, 9)
 	mustAdd(t, store, record)
 	firstReaper := &Reaper{
-		Store: store, Generation: "current-generation",
+		Store: store, Generation: testOwnerGeneration("current-generation"),
 		prober: &fakeProber{err: errNoProc},
 		auditPath: func(AuditToken) (string, error) {
 			return "", ErrNoProcess
@@ -346,7 +425,7 @@ func TestReapReceiptPersistsAndReplaysByteIdenticallyUntilAcknowledged(t *testin
 	if err := firstReaper.Reap(ctx); err != nil {
 		t.Fatal(err)
 	}
-	first, err := firstReaper.ReapReceipts(ctx, RecoveryTask, ReapReceiptCursor{}, ReapReceiptPageLimit)
+	first, err := firstReaper.ReapReceipts(ctx, RecoveryTaskID, ReapReceiptCursor{}, ReapReceiptPageLimit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,13 +445,13 @@ func TestReapReceiptPersistsAndReplaysByteIdenticallyUntilAcknowledged(t *testin
 	}
 
 	restarted := &Reaper{
-		Store: &FileStore{Path: path}, Generation: "next-generation",
+		Store: &FileStore{Path: path}, Generation: testOwnerGeneration("next-generation"),
 		prober: &fakeProber{},
 	}
 	if err := restarted.Reap(ctx); err != nil {
 		t.Fatal(err)
 	}
-	replayed, err := restarted.ReapReceipts(ctx, RecoveryTask, ReapReceiptCursor{}, ReapReceiptPageLimit)
+	replayed, err := restarted.ReapReceipts(ctx, RecoveryTaskID, ReapReceiptCursor{}, ReapReceiptPageLimit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -398,7 +477,7 @@ func TestReapReceiptPersistsAndReplaysByteIdenticallyUntilAcknowledged(t *testin
 	if err := restarted.Reap(ctx); err != nil {
 		t.Fatalf("Reap after acknowledgement = %v", err)
 	}
-	empty, err := restarted.ReapReceipts(ctx, RecoveryTask, ReapReceiptCursor{}, ReapReceiptPageLimit)
+	empty, err := restarted.ReapReceipts(ctx, RecoveryTaskID, ReapReceiptCursor{}, ReapReceiptPageLimit)
 	if err != nil || len(empty.Receipts) != 0 || empty.More || empty.Floor.Sequence != receipt.Sequence {
 		t.Fatalf("receipts after acknowledgement = %+v, %v", empty, err)
 	}
@@ -407,7 +486,7 @@ func TestReapReceiptPersistsAndReplaysByteIdenticallyUntilAcknowledged(t *testin
 func TestReapRecordRejectsVacuousAbsenceWithoutOwnedRecord(t *testing.T) {
 	record := matchingRecord(4045, "prior-generation")
 	reaper := &Reaper{
-		Store: &memStore{}, Generation: "current-generation",
+		Store: &memStore{}, Generation: testOwnerGeneration("current-generation"),
 		prober: &fakeProber{err: errNoProc},
 	}
 
@@ -426,25 +505,25 @@ func TestReapReceiptRejectsForgeryWithoutForgettingDurableProof(t *testing.T) {
 	record := matchingRecord(4042, "prior-generation")
 	mustAdd(t, store, record)
 	reaper := &Reaper{
-		Store: store, Generation: "current-generation",
+		Store: store, Generation: testOwnerGeneration("current-generation"),
 		prober: &fakeProber{err: errNoProc},
 	}
 	if err := reaper.Reap(ctx); err != nil {
 		t.Fatal(err)
 	}
-	result, err := reaper.ReapReceipts(ctx, RecoveryTask, ReapReceiptCursor{}, ReapReceiptPageLimit)
+	result, err := reaper.ReapReceipts(ctx, RecoveryTaskID, ReapReceiptCursor{}, ReapReceiptPageLimit)
 	if err != nil {
 		t.Fatal(err)
 	}
 	receipt := result.Receipts[0]
 	forged := receipt
-	forged.Record.Generation = "forged-generation"
+	forged.Record.Generation = testOwnerGeneration("forged-generation")
 	if err := reaper.VerifyReapReceipt(ctx, forged); !errors.Is(err, ErrInvalidReapReceipt) {
 		t.Fatalf("Verify forged digest = %v, want invalid receipt", err)
 	}
 	other, err := newReapReceipt(
 		ReceiptLedgerID{1}, receipt.Sequence,
-		matchingRecord(4043, "prior-generation"), "current-generation", ReapAbsent,
+		matchingRecord(4043, "prior-generation"), testOwnerGeneration("current-generation"), ReapAbsent,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -468,7 +547,7 @@ func TestReapReceiptRejectsLiveSignedProcessSubstitution(t *testing.T) {
 	store := &memStore{}
 	mustAdd(t, store, record)
 	reaper := &Reaper{
-		Store: store, Generation: "current-generation",
+		Store: store, Generation: testOwnerGeneration("current-generation"),
 		prober: &fakeProber{info: liveInfo()},
 		auditPath: func(AuditToken) (string, error) {
 			return "/Applications/Substituted.app/Contents/MacOS/Substituted", nil
@@ -478,7 +557,7 @@ func TestReapReceiptRejectsLiveSignedProcessSubstitution(t *testing.T) {
 	if !errors.Is(err, ErrIdentityChanged) {
 		t.Fatalf("Reap substituted process = %v, want identity rejection", err)
 	}
-	page, pageErr := reaper.ReapReceipts(t.Context(), RecoveryTask, ReapReceiptCursor{}, ReapReceiptPageLimit)
+	page, pageErr := reaper.ReapReceipts(t.Context(), RecoveryTaskID, ReapReceiptCursor{}, ReapReceiptPageLimit)
 	if pageErr != nil || len(page.Receipts) != 0 || store.len() != 1 {
 		t.Fatalf("substituted process produced proof or lost authority: page=%+v err=%v records=%d",
 			page, pageErr, store.len())
@@ -495,13 +574,13 @@ func TestReapReceiptsArePageBoundedWithoutDroppingKillAuthority(t *testing.T) {
 		mustAdd(t, store, record)
 	}
 	reaper := &Reaper{
-		Store: store, Generation: "current-generation",
+		Store: store, Generation: testOwnerGeneration("current-generation"),
 		prober: &fakeProber{boot: testBoot},
 	}
 	if err := reaper.Reap(ctx); err != nil {
 		t.Fatal(err)
 	}
-	first, err := reaper.ReapReceipts(ctx, RecoveryTask, ReapReceiptCursor{}, ReapReceiptPageLimit)
+	first, err := reaper.ReapReceipts(ctx, RecoveryTaskID, ReapReceiptCursor{}, ReapReceiptPageLimit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -524,7 +603,7 @@ func TestReapReceiptsArePageBoundedWithoutDroppingKillAuthority(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	second, err := reaper.ReapReceipts(ctx, RecoveryTask, first.Next, ReapReceiptPageLimit)
+	second, err := reaper.ReapReceipts(ctx, RecoveryTaskID, first.Next, ReapReceiptPageLimit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -559,7 +638,7 @@ func TestReapRetainedAuthenticatedAppRecordUsesAuditTokenAuthority(t *testing.T)
 	pathCalls := 0
 	var signals []syscall.Signal
 	r := &Reaper{
-		Store: store, Generation: "restarted-daemon", prober: &fakeProber{info: liveInfo()}, clock: newFakeClock(),
+		Store: store, Generation: testOwnerGeneration("restarted-daemon"), prober: &fakeProber{info: liveInfo()}, clock: newFakeClock(),
 		auditPath: func(got AuditToken) (string, error) {
 			if got != token {
 				t.Fatalf("audit token = %v, want %v", got, token)
@@ -608,7 +687,7 @@ func TestTerminateIdentityRejectsNearMatchesWithoutSignal(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			signals := &recSignaler{}
-			reaper := &Reaper{Generation: "controller", prober: test.prober, signaler: signals, clock: newFakeClock()}
+			reaper := &Reaper{Generation: testOwnerGeneration("controller"), prober: test.prober, signaler: signals, clock: newFakeClock()}
 			if err := reaper.TerminateIdentityWithin(t.Context(), test.identity, time.Millisecond); err != nil {
 				t.Fatal(err)
 			}
@@ -644,7 +723,7 @@ func TestTerminateIdentityRejectsNearMatchesWithoutSignal(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			var signals []syscall.Signal
 			reaper := &Reaper{
-				Generation: "controller", prober: &fakeProber{info: liveInfo()}, clock: newFakeClock(),
+				Generation: testOwnerGeneration("controller"), prober: &fakeProber{info: liveInfo()}, clock: newFakeClock(),
 				auditPath: func(AuditToken) (string, error) { return test.path, nil },
 				auditSignal: func(_ AuditToken, signal syscall.Signal) (bool, error) {
 					signals = append(signals, signal)
@@ -690,8 +769,8 @@ func TestTrackGroupAndUntrack(t *testing.T) {
 	})
 
 	store := &memStore{}
-	r := &Reaper{Store: store, Generation: "current-gen"}
-	rec, err := r.TrackGroup(ctx, cmd.Process.Pid, RecoveryTask)
+	r := &Reaper{Store: store, Generation: testOwnerGeneration("current-gen")}
+	rec, err := r.TrackGroup(ctx, cmd.Process.Pid, RecoveryTaskID)
 	if err != nil {
 		t.Fatalf("TrackGroup: %v", err)
 	}
@@ -701,7 +780,7 @@ func TestTrackGroupAndUntrack(t *testing.T) {
 	if rec.SessionID != cmd.Process.Pid {
 		t.Fatalf("SessionID = %d, want %d", rec.SessionID, cmd.Process.Pid)
 	}
-	if rec.PID != cmd.Process.Pid || rec.Generation != "current-gen" {
+	if rec.PID != cmd.Process.Pid || rec.Generation != testOwnerGeneration("current-gen") {
 		t.Fatalf("record = %+v, want pid %d generation current-gen", rec, cmd.Process.Pid)
 	}
 	boot, err := BootID()
@@ -738,10 +817,10 @@ func TestTrackGroupRejectsNonLeader(t *testing.T) {
 	})
 	r := &Reaper{
 		Store:      &memStore{},
-		Generation: "current-gen",
+		Generation: testOwnerGeneration("current-gen"),
 		prober:     &fakeProber{info: liveInfo()},
 	}
-	if _, err := r.TrackGroup(context.Background(), cmd.Process.Pid, RecoveryTask); err == nil {
+	if _, err := r.TrackGroup(context.Background(), cmd.Process.Pid, RecoveryTaskID); err == nil {
 		t.Fatal("TrackGroup succeeded for a process-group member, want error")
 	}
 }
@@ -787,8 +866,8 @@ func TestTrackIdentityRejectsMismatchAndAbsence(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			store := &memStore{}
-			reaper := &Reaper{Store: store, Generation: "stop", prober: &fakeProber{perProbe: []probeResult{test.probe}}}
-			if _, err := reaper.TrackIdentity(t.Context(), identity, RecoveryTrust); !errors.Is(err, test.want) {
+			reaper := &Reaper{Store: store, Generation: testOwnerGeneration("stop"), prober: &fakeProber{perProbe: []probeResult{test.probe}}}
+			if _, err := reaper.TrackIdentity(t.Context(), identity, RecoveryTrustID); !errors.Is(err, test.want) {
 				t.Fatalf("TrackIdentity error = %v, want %v", err, test.want)
 			}
 			if store.len() != 0 {
@@ -808,11 +887,11 @@ func TestTerminateTrackedIdentityEscalatesAndSettles(t *testing.T) {
 	}}
 	signaler := &recSignaler{}
 	reaper := &Reaper{
-		Store: store, Generation: "stop", prober: prober, signaler: signaler, clock: newFakeClock(),
+		Store: store, Generation: testOwnerGeneration("stop"), prober: prober, signaler: signaler, clock: newFakeClock(),
 		Grace: time.Millisecond, Settlement: time.Millisecond,
 	}
 	identity := Identity{PID: 4242, StartTime: liveInfo().startTime, Comm: liveInfo().comm, Boot: testBoot}
-	record, err := reaper.TrackIdentity(t.Context(), identity, RecoveryTrust)
+	record, err := reaper.TrackIdentity(t.Context(), identity, RecoveryTrustID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -836,9 +915,9 @@ func TestTerminateTrackedIdentityNeverKillsReusedPID(t *testing.T) {
 		{info: procInfo{startTime: "reused", comm: "innocent"}},
 	}}
 	signaler := &recSignaler{}
-	reaper := &Reaper{Store: store, Generation: "stop", prober: prober, signaler: signaler, clock: newFakeClock()}
+	reaper := &Reaper{Store: store, Generation: testOwnerGeneration("stop"), prober: prober, signaler: signaler, clock: newFakeClock()}
 	identity := Identity{PID: 4242, StartTime: liveInfo().startTime, Comm: liveInfo().comm, Boot: testBoot}
-	record, err := reaper.TrackIdentity(t.Context(), identity, RecoveryTrust)
+	record, err := reaper.TrackIdentity(t.Context(), identity, RecoveryTrustID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -859,7 +938,7 @@ func TestTerminateTrackedIdentityCancellationRetainsDurableRecord(t *testing.T) 
 	mustAdd(t, store, record)
 	ctx, cancel := context.WithCancel(context.Background())
 	signaler := &cancelSignaler{cancel: cancel}
-	reaper := &Reaper{Store: store, Generation: "stop", prober: &fakeProber{info: liveInfo()}, signaler: signaler}
+	reaper := &Reaper{Store: store, Generation: testOwnerGeneration("stop"), prober: &fakeProber{info: liveInfo()}, signaler: signaler}
 	if err := reaper.Terminate(ctx, record); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Terminate error = %v, want context canceled", err)
 	}
@@ -871,7 +950,7 @@ func TestTerminateTrackedIdentityCancellationRetainsDurableRecord(t *testing.T) 
 func TestTerminateRefusesUntrackedIdentity(t *testing.T) {
 	signaler := &recSignaler{}
 	reaper := &Reaper{
-		Store: &memStore{}, Generation: "stop", prober: &fakeProber{info: liveInfo()}, signaler: signaler,
+		Store: &memStore{}, Generation: testOwnerGeneration("stop"), prober: &fakeProber{info: liveInfo()}, signaler: signaler,
 	}
 	if err := reaper.Terminate(t.Context(), matchingRecord(4242, "stop")); err == nil {
 		t.Fatal("Terminate accepted an identity without durable ownership")
@@ -930,12 +1009,12 @@ func TestReapSignalsProcessGroup(t *testing.T) {
 	rec := matchingGroupRecord(4141, "old-gen")
 	mustAdd(t, store, rec)
 
-	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
+	r := &Reaper{Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: sig, clock: newFakeClock()}
 	err := r.Reap(ctx)
 	if err != nil {
 		t.Fatalf("Reap: %v", err)
 	}
-	result, err := r.ReapReceipts(ctx, RecoveryTask, ReapReceiptCursor{}, ReapReceiptPageLimit)
+	result, err := r.ReapReceipts(ctx, RecoveryTaskID, ReapReceiptCursor{}, ReapReceiptPageLimit)
 	if err != nil {
 		t.Fatalf("ReapReceipts: %v", err)
 	}
@@ -971,12 +1050,12 @@ func TestReapLeaderlessGroupUsesDurableSessionMembers(t *testing.T) {
 	rec := matchingGroupRecord(leaderPID, "old-gen")
 	mustAdd(t, store, rec)
 
-	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
+	r := &Reaper{Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: sig, clock: newFakeClock()}
 	err := r.Reap(ctx)
 	if err != nil {
 		t.Fatalf("Reap: %v", err)
 	}
-	result, err := r.ReapReceipts(ctx, RecoveryTask, ReapReceiptCursor{}, ReapReceiptPageLimit)
+	result, err := r.ReapReceipts(ctx, RecoveryTaskID, ReapReceiptCursor{}, ReapReceiptPageLimit)
 	if err != nil {
 		t.Fatalf("ReapReceipts: %v", err)
 	}
@@ -1014,7 +1093,7 @@ func TestReapSignalsEveryGroupInDedicatedSession(t *testing.T) {
 	signals := &recSignaler{}
 	record := matchingGroupRecord(leaderPID, "old-gen")
 	mustAdd(t, store, record)
-	reaper := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: signals, clock: newFakeClock()}
+	reaper := &Reaper{Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: signals, clock: newFakeClock()}
 	if err := reaper.Reap(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -1061,7 +1140,7 @@ func TestReapKillsGroupAppearingDuringDedicatedSessionSettlement(t *testing.T) {
 	signals := &recSignaler{}
 	record := matchingGroupRecord(leaderPID, "old-gen")
 	mustAdd(t, store, record)
-	reaper := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: signals, clock: newFakeClock()}
+	reaper := &Reaper{Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: signals, clock: newFakeClock()}
 	if err := reaper.Reap(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -1085,7 +1164,7 @@ func TestReapLeaderlessGroupEnumerationFailureFailsRecovery(t *testing.T) {
 		groupErr: errors.New("process table unavailable"),
 	}
 	sig := &recSignaler{err: errors.New("signal must not be sent")}
-	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig}
+	r := &Reaper{Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: sig}
 	if err := r.Reap(context.Background()); err == nil || !strings.Contains(err.Error(), "process table unavailable") {
 		t.Fatalf("Reap error = %v, want unresolved enumeration failure", err)
 	}
@@ -1104,7 +1183,7 @@ func TestReapRejectsLegacyGroupWithoutSessionIdentity(t *testing.T) {
 	mustAdd(t, store, rec)
 	prober := &fakeProber{byPID: map[int]probeResult{rec.PID: {err: errNoProc}}}
 	sig := &recSignaler{err: errors.New("signal must not be sent")}
-	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig}
+	r := &Reaper{Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: sig}
 	if err := r.Reap(context.Background()); !errors.Is(err, ErrInvalidRecord) {
 		t.Fatalf("Reap error = %v, want ErrInvalidRecord", err)
 	}
@@ -1126,7 +1205,7 @@ func TestReapDropsCrossBootRecordWithoutProbeOrSignal(t *testing.T) {
 	mustAdd(t, store, rec)
 	prober := &fakeProber{boot: "current-boot", info: liveInfo()}
 	sig := &recSignaler{err: errors.New("signal must not be sent")}
-	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig}
+	r := &Reaper{Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: sig}
 
 	if err := r.Reap(context.Background()); err != nil {
 		t.Fatalf("Reap: %v", err)
@@ -1152,12 +1231,12 @@ func TestReapPIDReuseResistance(t *testing.T) {
 	rec.StartTime = "999999.000000"
 	mustAdd(t, store, rec)
 
-	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
+	r := &Reaper{Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: sig, clock: newFakeClock()}
 	err := r.Reap(ctx)
 	if err != nil {
 		t.Fatalf("Reap: %v", err)
 	}
-	result, err := r.ReapReceipts(ctx, RecoveryTask, ReapReceiptCursor{}, ReapReceiptPageLimit)
+	result, err := r.ReapReceipts(ctx, RecoveryTaskID, ReapReceiptCursor{}, ReapReceiptPageLimit)
 	if err != nil {
 		t.Fatalf("ReapReceipts: %v", err)
 	}
@@ -1180,7 +1259,7 @@ func TestReapProbeErrorFailsClosed(t *testing.T) {
 	sig := &recSignaler{err: errors.New("signal must not be sent")}
 	mustAdd(t, store, matchingRecord(5252, "old-gen"))
 
-	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
+	r := &Reaper{Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: sig, clock: newFakeClock()}
 	if err := r.Reap(ctx); err == nil || !strings.Contains(err.Error(), "kern.proc probe failed") {
 		t.Fatalf("Reap error = %v, want unresolved probe failure", err)
 	}
@@ -1199,12 +1278,12 @@ func TestReapStaleRecordCleanup(t *testing.T) {
 	sig := &recSignaler{err: errors.New("signal must not be sent")}
 	mustAdd(t, store, matchingRecord(6262, "old-gen"))
 
-	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
+	r := &Reaper{Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: sig, clock: newFakeClock()}
 	err := r.Reap(ctx)
 	if err != nil {
 		t.Fatalf("Reap: %v", err)
 	}
-	result, err := r.ReapReceipts(ctx, RecoveryTask, ReapReceiptCursor{}, ReapReceiptPageLimit)
+	result, err := r.ReapReceipts(ctx, RecoveryTaskID, ReapReceiptCursor{}, ReapReceiptPageLimit)
 	if err != nil {
 		t.Fatalf("ReapReceipts: %v", err)
 	}
@@ -1226,12 +1305,12 @@ func TestReapESRCHOnSignalIsSuccess(t *testing.T) {
 	sig := &recSignaler{err: syscall.ESRCH}
 	mustAdd(t, store, matchingRecord(7272, "old-gen"))
 
-	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
+	r := &Reaper{Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: sig, clock: newFakeClock()}
 	err := r.Reap(ctx)
 	if err != nil {
 		t.Fatalf("Reap: %v", err)
 	}
-	result, err := r.ReapReceipts(ctx, RecoveryTask, ReapReceiptCursor{}, ReapReceiptPageLimit)
+	result, err := r.ReapReceipts(ctx, RecoveryTaskID, ReapReceiptCursor{}, ReapReceiptPageLimit)
 	if err != nil {
 		t.Fatalf("ReapReceipts: %v", err)
 	}
@@ -1256,7 +1335,7 @@ func TestReapRefusesSelfAndPID1(t *testing.T) {
 	mustAdd(t, store, matchingRecord(0, "old-gen"))
 	mustAdd(t, store, matchingRecord(os.Getpid(), "old-gen"))
 
-	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
+	r := &Reaper{Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: sig, clock: newFakeClock()}
 	if err := r.Reap(ctx); err == nil || !strings.Contains(err.Error(), "refusing unsafe process identity") {
 		t.Fatalf("Reap error = %v, want unsafe identity refusal", err)
 	}
@@ -1278,12 +1357,12 @@ func TestReapSkipsOwnGeneration(t *testing.T) {
 	sig := &recSignaler{err: errors.New("signal must not be sent")}
 	mustAdd(t, store, matchingRecord(8282, "current-gen"))
 
-	r := &Reaper{Store: store, Generation: "current-gen", prober: prober, signaler: sig, clock: newFakeClock()}
+	r := &Reaper{Store: store, Generation: testOwnerGeneration("current-gen"), prober: prober, signaler: sig, clock: newFakeClock()}
 	err := r.Reap(ctx)
 	if err != nil {
 		t.Fatalf("Reap: %v", err)
 	}
-	result, err := r.ReapReceipts(ctx, RecoveryTask, ReapReceiptCursor{}, ReapReceiptPageLimit)
+	result, err := r.ReapReceipts(ctx, RecoveryTaskID, ReapReceiptCursor{}, ReapReceiptPageLimit)
 	if err != nil {
 		t.Fatalf("ReapReceipts: %v", err)
 	}
@@ -1308,7 +1387,7 @@ func TestReapPIDReuseDuringGrace(t *testing.T) {
 	sig := &recSignaler{}
 	mustAdd(t, store, matchingRecord(9292, "old-gen"))
 
-	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
+	r := &Reaper{Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: sig, clock: newFakeClock()}
 	if err := r.Reap(ctx); err != nil {
 		t.Fatalf("Reap: %v", err)
 	}
@@ -1331,7 +1410,7 @@ func TestReapExecWithStableStartIdentityStillEscalates(t *testing.T) {
 	sig := &recSignaler{}
 	mustAdd(t, store, matchingRecord(9393, "old-gen"))
 
-	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
+	r := &Reaper{Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: sig, clock: newFakeClock()}
 	if err := r.Reap(ctx); err != nil {
 		t.Fatalf("Reap: %v", err)
 	}
@@ -1354,7 +1433,7 @@ func TestReapReprobeErrorFailsClosed(t *testing.T) {
 	sig := &recSignaler{}
 	mustAdd(t, store, matchingRecord(9494, "old-gen"))
 
-	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock()}
+	r := &Reaper{Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: sig, clock: newFakeClock()}
 	if err := r.Reap(ctx); err == nil || !strings.Contains(err.Error(), "re-probe failed") {
 		t.Fatalf("Reap error = %v, want unresolved re-probe failure", err)
 	}
@@ -1379,7 +1458,7 @@ func TestReapRemovesRecordOnlyAfterPostKillAbsence(t *testing.T) {
 		{err: errNoProc},
 	}}
 	sig := &recSignaler{}
-	r := &Reaper{Store: store, Generation: "new-gen", prober: prober, signaler: sig, clock: newFakeClock(), Settlement: 50 * time.Millisecond}
+	r := &Reaper{Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: sig, clock: newFakeClock(), Settlement: 50 * time.Millisecond}
 	if err := r.Reap(context.Background()); err != nil {
 		t.Fatalf("Reap: %v", err)
 	}
@@ -1397,7 +1476,7 @@ func TestReapRetainsRecordWhenKilledProcessNeverSettles(t *testing.T) {
 	mustAdd(t, store, rec)
 	prober := &fakeProber{info: liveInfo()}
 	r := &Reaper{
-		Store: store, Generation: "new-gen", prober: prober,
+		Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober,
 		signaler: &recSignaler{}, clock: newFakeClock(), Settlement: 25 * time.Millisecond,
 	}
 	err := r.Reap(context.Background())
@@ -1417,7 +1496,7 @@ func TestReapRetainsRecordWhenKilledGroupNeverSettles(t *testing.T) {
 	member := groupMember{pid: rec.PID, info: info}
 	prober := &fakeProber{info: info, members: []groupMember{member}}
 	r := &Reaper{
-		Store: store, Generation: "new-gen", prober: prober,
+		Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober,
 		signaler: &recSignaler{}, clock: newFakeClock(), Settlement: 25 * time.Millisecond,
 	}
 	err := r.Reap(context.Background())
@@ -1440,13 +1519,13 @@ func TestReapLadderRealChild(t *testing.T) {
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	store := &FileStore{Path: filepath.Join(dir, "recovery.db")}
 
-	old := &Reaper{Store: store, Generation: "old-gen"}
-	if _, err := old.Track(ctx, pid, RecoveryTask); err != nil {
+	old := &Reaper{Store: store, Generation: testOwnerGeneration("old-gen")}
+	if _, err := old.Track(ctx, pid, RecoveryTaskID); err != nil {
 		t.Fatalf("Track: %v", err)
 	}
 
 	sig := &recSignaler{delegate: sysSignaler{}}
-	r := &Reaper{Store: store, Generation: "new-gen", signaler: sig, clock: newFakeClock()}
+	r := &Reaper{Store: store, Generation: testOwnerGeneration("new-gen"), signaler: sig, clock: newFakeClock()}
 	if err := r.Reap(ctx); err != nil {
 		t.Fatalf("Reap: %v", err)
 	}
@@ -1535,8 +1614,8 @@ func TestFileStoreRoundTrip(t *testing.T) {
 		t.Errorf("Load missing = %v, want empty", got)
 	}
 
-	a := Record{RecoveryClass: RecoveryTask, PID: 100, StartTime: "1.1", Boot: testBoot, Comm: "a", Generation: "g1"}
-	b := Record{RecoveryClass: RecoveryTask, PID: 200, StartTime: "2.2", Boot: testBoot, Comm: "b", Generation: "g1"}
+	a := Record{RecoveryID: RecoveryTaskID, PID: 100, StartTime: "1.1", Boot: testBoot, Comm: "a", Generation: testOwnerGeneration("g1")}
+	b := Record{RecoveryID: RecoveryTaskID, PID: 200, StartTime: "2.2", Boot: testBoot, Comm: "b", Generation: testOwnerGeneration("g1")}
 	mustAdd(t, store, a)
 	mustAdd(t, store, b)
 	mustAdd(t, store, a)
@@ -1570,8 +1649,8 @@ func TestFileStoreRemoveByInstance(t *testing.T) {
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	store := &FileStore{Path: filepath.Join(dir, "recovery.db")}
 
-	current := Record{RecoveryClass: RecoveryTask, PID: 300, StartTime: "9.9", Boot: "current-boot", Comm: "new", Generation: "g2"}
-	prior := Record{RecoveryClass: RecoveryTask, PID: 300, StartTime: "9.9", Boot: "prior-boot", Comm: "old", Generation: "g1"}
+	current := Record{RecoveryID: RecoveryTaskID, PID: 300, StartTime: "9.9", Boot: "current-boot", Comm: "new", Generation: testOwnerGeneration("g2")}
+	prior := Record{RecoveryID: RecoveryTaskID, PID: 300, StartTime: "9.9", Boot: "prior-boot", Comm: "old", Generation: testOwnerGeneration("g1")}
 	mustAdd(t, store, prior)
 	mustAdd(t, store, current)
 

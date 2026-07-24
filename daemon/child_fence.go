@@ -30,7 +30,7 @@ var (
 type childFenceKey struct {
 	pid         int
 	start, boot string
-	generation  string
+	generation  proc.OwnerGeneration
 }
 
 type childFenceState struct {
@@ -117,7 +117,7 @@ func (l ReadyOnlyListener) ArmChild(receipt proc.ProcessReceipt, role trust.Peer
 		return nil, ErrUnfenceable
 	}
 	identity := receipt.ProcessIdentity()
-	if identity.PID <= 0 || identity.StartTime == "" || identity.Boot == "" || receipt.OwnerGeneration() == "" || receipt.ExpectedExecutable() == "" {
+	if identity.PID <= 0 || identity.StartTime == "" || identity.Boot == "" || receipt.OwnerGeneration() == (proc.OwnerGeneration{}) || receipt.ExpectedExecutable() == "" {
 		return nil, ErrUnfenceable
 	}
 	key := childFenceKey{pid: identity.PID, start: identity.StartTime, boot: identity.Boot, generation: receipt.OwnerGeneration()}

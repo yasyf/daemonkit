@@ -97,7 +97,7 @@ extension SocketTransportTests {
     struct RuntimeLifecycleControllerTests {
         private let identity = RuntimeIdentity(
             runtimeBuild: "app.v1",
-            processGeneration: "boot-1"
+            processGeneration: testOwnerGeneration()
         )
 
         @Test func progressIsCopiedBoundedIdempotentAndSequenced() throws {
@@ -502,7 +502,7 @@ extension SocketTransportTests.RuntimeLifecycleControllerTests {
         let first = try liveRuntimeController(wireBuild: "service.v1", runtimeIdentity: identity)
         let second = try liveRuntimeController(
             wireBuild: "service.v1",
-            runtimeIdentity: RuntimeIdentity(runtimeBuild: "app.v1", processGeneration: "boot-2")
+            runtimeIdentity: RuntimeIdentity(runtimeBuild: "app.v1", processGeneration: testOwnerGeneration(2))
         )
         let reporter = try first.beginActivation().statusReporter()
         let wrong = StatusReporter(controller: second, activationID: reporter.activationID)
@@ -515,7 +515,7 @@ extension SocketTransportTests.RuntimeLifecycleControllerTests {
         let first = try liveRuntimeController(wireBuild: "service.v1", runtimeIdentity: identity)
         let second = try liveRuntimeController(
             wireBuild: "service.v1",
-            runtimeIdentity: RuntimeIdentity(runtimeBuild: "app.v1", processGeneration: "boot-2")
+            runtimeIdentity: RuntimeIdentity(runtimeBuild: "app.v1", processGeneration: testOwnerGeneration(2))
         )
         let firstActivation = try first.beginActivation()
         let secondActivation = try second.beginActivation()
@@ -612,7 +612,7 @@ extension SocketTransportTests.RuntimeLifecycleControllerTests {
 
         let drainController = try liveRuntimeController(
             wireBuild: "service.v1",
-            runtimeIdentity: RuntimeIdentity(runtimeBuild: "app.v1", processGeneration: "boot-2")
+            runtimeIdentity: RuntimeIdentity(runtimeBuild: "app.v1", processGeneration: testOwnerGeneration(2))
         )
         let drainActivation = try drainController.beginActivation()
         drainController.setStartingSequenceForTesting(.max - 1)
