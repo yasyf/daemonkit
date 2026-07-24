@@ -39,6 +39,41 @@ func TestNewer(t *testing.T) {
 	}
 }
 
+func TestEqual(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0)
+	devBase := DevString(base)
+	devNext := DevString(base.Add(time.Nanosecond))
+
+	tests := []struct {
+		name string
+		a, b string
+		want bool
+	}{
+		{"tag and bare spellings", "v12.15.3", "12.15.3", true},
+		{"bare and bare", "12.15.3", "12.15.3", true},
+		{"tag and tag", "v12.15.3", "v12.15.3", true},
+		{"suffix normalizes to triple", "v0.8.0-1-gHASH", "0.8.0", true},
+		{"different patch", "12.15.3", "12.15.4", false},
+		{"different minor", "12.15.3", "12.16.3", false},
+		{"different major", "12.15.3", "13.15.3", false},
+		{"release never equals legacy dev", "12.15.3", "dev", false},
+		{"release never equals mtime dev", "9.9.9", devBase, false},
+		{"same mtime dev", devBase, devBase, true},
+		{"different mtime dev", devBase, devNext, false},
+		{"legacy dev not equal mtime dev", "dev", devBase, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := Equal(tt.a, tt.b); got != tt.want {
+				t.Errorf("Equal(%q, %q) = %v, want %v", tt.a, tt.b, got, tt.want)
+			}
+			if got := Equal(tt.b, tt.a); got != tt.want {
+				t.Errorf("Equal(%q, %q) = %v, want %v (symmetry)", tt.b, tt.a, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParse(t *testing.T) {
 	tests := []struct {
 		name string
