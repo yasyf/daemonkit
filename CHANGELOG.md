@@ -16,7 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `brew upgrade --cask` handoff, for TCC-bound installs). A dynamic version is
   refused for a release binary, which has no independent integrity gate.
   Resolution pins the exact descriptor version and never consults a latest
-  release.
+  release. `Store.CacheEntries` and `Store.RemoveCacheEntry` enumerate and prune
+  the content cache for a garbage collector, surfacing even entries whose
+  meta.json is damaged.
 - `ghrelease.Latest` queries a repository's latest published release for
   self-update flows; artifact resolution never consults it.
 - `version.Equal` reports exact-release equality, treating the TAG and BARE

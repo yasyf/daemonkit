@@ -14,8 +14,10 @@
 // It downloads with hash-while-streaming, verifies size and digest before any
 // rename, and stores the result in a content-addressed cache under
 // Store.CacheDir as cache/<first-two-hex>/<digest>/<path>; the verified rename is
-// the receipt, and a sibling meta.json records provenance for gc. A second
-// resolution is a stat-and-return cache hit.
+// the receipt, and a sibling meta.json records provenance. A second resolution
+// is a stat-and-return cache hit. Store.CacheEntries and Store.RemoveCacheEntry
+// enumerate and prune that cache for a garbage collector, surfacing even entries
+// whose meta.json is damaged.
 //
 // PythonTool materializes a PyPI distribution into a version-addressed store
 // under Store.ToolsDir via "uv tool install <dist>==<version>" with a redirected
