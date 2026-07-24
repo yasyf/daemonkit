@@ -50,7 +50,7 @@ extension SocketTransportTests {
                 try await old.start()
                 cleanup.add { await old.stop() }
                 let client = try await SocketClient(path: path, wireBuild: "old",
-                role: SessionPeerRole.unprotected)
+                                                    role: SessionPeerRole.unprotected)
                 cleanup.add { client.abort() }
                 let call = Task { try await client.call(operation: "hold") }
                 await handlerGate.waitUntilEntered()

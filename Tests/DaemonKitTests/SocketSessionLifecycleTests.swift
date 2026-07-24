@@ -44,7 +44,7 @@ extension SocketTransportTests {
         @Test func acceptedSessionClosesExactlyOnPeerDisconnect() async throws {
             let fixture = try await makeFixture()
             let client = try await SocketClient(path: fixture.path, wireBuild: "server-test",
-            role: SessionPeerRole.unprotected)
+                                                role: SessionPeerRole.unprotected)
             _ = try await client.call(operation: "capture")
             let session = await fixture.capture.value()
             #expect(session.isConnected)
@@ -59,7 +59,7 @@ extension SocketTransportTests {
             try await withAsyncCleanup { cleanup in
                 let fixture = try await makeFixture()
                 let client = try await SocketClient(path: fixture.path, wireBuild: "server-test",
-                role: SessionPeerRole.unprotected)
+                                                    role: SessionPeerRole.unprotected)
                 cleanup.add { await client.close() }
                 _ = try await client.call(operation: "capture")
                 let session = await fixture.capture.value()

@@ -241,7 +241,7 @@ extension SocketTransportTests {
                 try await server.start()
                 cleanup.add { await server.stop() }
                 let client = try await SocketClient(path: path, wireBuild: "server-test",
-                role: SessionPeerRole.unprotected)
+                                                    role: SessionPeerRole.unprotected)
                 cleanup.add { await client.close() }
                 #expect(client.peerWireBuild == "server-test")
 
@@ -397,7 +397,7 @@ extension SocketTransportTests.SocketServerTests {
             try await server.start()
             cleanup.add { await server.stop() }
             let client = try await SocketClient(path: path, wireBuild: "server-test",
-            role: SessionPeerRole.unprotected)
+                                                role: SessionPeerRole.unprotected)
             cleanup.add { await client.close() }
             let call = try await client.open(operation: "collect", endInput: false)
             try await call.sendChunk(Data("one".utf8))
@@ -425,7 +425,7 @@ extension SocketTransportTests.SocketServerTests {
                 client: "old-build"
             )) {
                 _ = try await SocketClient(path: path, wireBuild: "old-build",
-                role: SessionPeerRole.unprotected)
+                                           role: SessionPeerRole.unprotected)
             }
         }
     }

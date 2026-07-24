@@ -159,12 +159,12 @@ extension SocketTransportTests {
                 try await upstream.start()
                 cleanup.add { await upstream.stop() }
                 let upstreamClient = try await SocketClient(path: upstreamPath, wireBuild: "relay-test",
-                role: SessionPeerRole.unprotected)
+                                                            role: SessionPeerRole.unprotected)
                 cleanup.add { await upstreamClient.close() }
                 let relay = try await makeRelay(path: relayPath, upstream: upstreamClient)
                 cleanup.add { await relay.stop() }
                 let client = try await SocketClient(path: relayPath, wireBuild: "relay-test",
-                role: SessionPeerRole.unprotected)
+                                                    role: SessionPeerRole.unprotected)
                 cleanup.add { await client.close() }
 
                 let call = try await client.open(operation: "catalog.open_at")

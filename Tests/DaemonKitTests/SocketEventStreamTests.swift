@@ -75,7 +75,7 @@ extension SocketTransportTests {
                 try await server.start()
                 cleanup.add { await server.stop() }
                 let client = try await SocketClient(path: path, wireBuild: "event-test",
-                role: SessionPeerRole.unprotected)
+                                                    role: SessionPeerRole.unprotected)
                 let waiting = Task {
                     var iterator = client.events.makeAsyncIterator()
                     return try await iterator.next()
