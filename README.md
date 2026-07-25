@@ -21,7 +21,7 @@ go: added github.com/yasyf/daemonkit v<version>
 Add the package to your dependencies and link the `DaemonKit` library product into your app or helper target:
 
 ```swift
-.package(url: "https://github.com/yasyf/daemonkit", exact: "0.18.0"),
+.package(url: "https://github.com/yasyf/daemonkit", exact: "0.19.1"),
 ```
 
 </details>
@@ -131,7 +131,7 @@ executable skips the dispatch refuses to start with
 `daemon.ErrTrustVerifierProbe` instead of silently rejecting every peer as
 untrusted.
 
-Status: v0.18.0 is the hard-cut release line. Protocol and durable-state epochs
+Status: v0.19.1 is the hard-cut release line. Protocol and durable-state epochs
 begin at 1 with exact equality; the API stabilizes at v1.0.0.
 
 Licensed under [PolyForm-Noncommercial-1.0.0](LICENSE).
