@@ -4,6 +4,30 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.0] - 2026-07-24
+
+### Added
+
+- `service.StableProgram(name, build)` maintains `~/.daemonkit/bin/<name>` as
+  a version-stable launchd program path: an atomically-replaced byte copy of
+  the invoking executable with a digest/size/mtime sidecar, a newer-or-repair
+  replace predicate under an exclusive lock, a stat-only lockless fast path,
+  and a canonical return that never follows a symlink at the final component.
+  `service.RemoveStableProgram` clears the pair.
+
+### Changed
+
+- `service.Controller` no longer re-validates stored agents' program liveness
+  when loading persisted state: `Desired` and `Applied` decode structurally,
+  reconcile skips (and logs) a desired agent whose program path is missing,
+  and `verify` reports a missing program as drift — so an upgrade that
+  deletes an old versioned binary path (a Homebrew Caskroom or content-cache
+  directory) heals on the next converge instead of permanently wedging the
+  controller before it can reconcile. Only the missing-path error class is
+  treated as heal-able; permission failures, symlinked ancestry, and
+  non-regular or non-executable programs still fail closed at reconcile,
+  verify, and every write/effect site.
+
 ## [0.19.1] - 2026-07-24
 
 ### Added
@@ -515,7 +539,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.19.1...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/yasyf/daemonkit/compare/v0.19.1...v0.20.0
 [0.19.1]: https://github.com/yasyf/daemonkit/compare/v0.18.0...v0.19.1
 [0.18.0]: https://github.com/yasyf/daemonkit/compare/v0.17.4...v0.18.0
 [0.17.4]: https://github.com/yasyf/daemonkit/compare/v0.17.3...v0.17.4
