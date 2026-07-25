@@ -21,7 +21,7 @@ go: added github.com/yasyf/daemonkit v<version>
 Add the package to your dependencies and link the `DaemonKit` library product into your app or helper target:
 
 ```swift
-.package(url: "https://github.com/yasyf/daemonkit", exact: "0.15.0"),
+.package(url: "https://github.com/yasyf/daemonkit", exact: "0.18.0"),
 ```
 
 </details>
