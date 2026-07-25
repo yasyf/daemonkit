@@ -96,6 +96,15 @@ func TestStableProgramMaterializesCallingExecutable(t *testing.T) {
 	if meta != wantMeta {
 		t.Fatalf("meta = %+v, want %+v", meta, wantMeta)
 	}
+	for _, directory := range []string{filepath.Join(root, "bin"), filepath.Join(root, "locks")} {
+		info, err := os.Stat(directory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o700 {
+			t.Fatalf("directory %q mode = %v, want %v", directory, info.Mode().Perm(), os.FileMode(0o700))
+		}
+	}
 }
 
 func TestStableProgramSameBuildTakesFastPath(t *testing.T) {
@@ -129,6 +138,112 @@ func TestStableProgramSameBuildTakesFastPath(t *testing.T) {
 	}
 	if _, err := os.Stat(lock); !os.IsNotExist(err) {
 		t.Fatalf("stat %q = %v, want not exist — the fast path must not lock", lock, err)
+	}
+}
+
+func TestStableProgramReplacesSymlinkedStablePath(t *testing.T) {
+	root := stableTestRoot(t)
+	stable, err := stableProgram(root, "cc-review", "v1.0.0", fakeExecutable(t, "cc-review", "installed"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, err := readStableMeta(stableMetaPath(stable))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := fakeExecutable(t, "target", "installed")
+	targetTime := time.Unix(0, meta.MTime)
+	if err := os.Chtimes(target, targetTime, targetTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(stable); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, stable); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := stableProgram(root, "cc-review", "v1.0.0", fakeExecutable(t, "cc-review", "replacement"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != stable {
+		t.Fatalf("stableProgram() = %q, want %q", got, stable)
+	}
+	if got == target {
+		t.Fatalf("stableProgram() returned symlink target %q", target)
+	}
+	info, err := os.Lstat(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Mode().IsRegular() {
+		t.Fatalf("stable program mode = %v, want regular file", info.Mode())
+	}
+	if body := stableBytes(t, got); body != "replacement" {
+		t.Fatalf("stable program bytes = %q, want %q", body, "replacement")
+	}
+}
+
+func TestStableProgramRepairsNonExecutableMode(t *testing.T) {
+	root := stableTestRoot(t)
+	self := fakeExecutable(t, "cc-review", "release one")
+	stable, err := stableProgram(root, "cc-review", "v1.0.0", self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(stable, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := stableProgram(root, "cc-review", "v1.0.0", self); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(stable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Fatalf("stable program mode = %v, want %v", info.Mode().Perm(), os.FileMode(0o755))
+	}
+}
+
+func TestStableProgramRefreshesTouchedMTimeForFastPath(t *testing.T) {
+	root := stableTestRoot(t)
+	self := fakeExecutable(t, "cc-review", "release one")
+	stable, err := stableProgram(root, "cc-review", "v1.0.0", self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, err := readStableMeta(stableMetaPath(stable))
+	if err != nil {
+		t.Fatal(err)
+	}
+	touched := time.Unix(0, meta.MTime).Add(time.Second)
+	if err := os.Chtimes(stable, touched, touched); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := stableProgram(root, "cc-review", "v1.0.0", self); err != nil {
+		t.Fatal(err)
+	}
+	refreshed, err := readStableMeta(stableMetaPath(stable))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.MTime != touched.UnixNano() {
+		t.Fatalf("refreshed meta mtime = %d, want %d", refreshed.MTime, touched.UnixNano())
+	}
+	lock := filepath.Join(root, "locks", "stable-cc-review.lock")
+	if err := os.Remove(lock); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := stableProgram(root, "cc-review", "v1.0.0", self); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(lock); !os.IsNotExist(err) {
+		t.Fatalf("stat %q = %v, want not exist — the refreshed fast path must not lock", lock, err)
 	}
 }
 
@@ -317,6 +432,22 @@ func TestStableProgramRejectsUncanonicalName(t *testing.T) {
 				t.Fatalf("stableProgram(%q) = %q, want %q", test.program, got, want)
 			}
 		})
+	}
+}
+
+func TestStableProgramRejectsEmptyBuildWithoutWriting(t *testing.T) {
+	root := stableTestRoot(t)
+
+	if _, err := stableProgram(root, "cc-review", "", fakeExecutable(t, "self", "installed")); err == nil ||
+		!strings.Contains(err.Error(), "build is empty") {
+		t.Fatalf("stableProgram() error = %v, want empty build rejection", err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("stableProgram() wrote entries for empty build: %v", entries)
 	}
 }
 

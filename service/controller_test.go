@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -482,6 +483,61 @@ func TestControllerRejectsUnsafeProgramTreeBeforeEffects(t *testing.T) {
 				t.Fatalf("unsafe program plist exists or stat failed unexpectedly: %v", err)
 			}
 		})
+	}
+}
+
+func TestControllerReconcileAndVerifyRejectNonMissingProgramErrors(t *testing.T) {
+	t.Run("symlink program", func(t *testing.T) {
+		target := controllerExecutable(t, "target")
+		program := filepath.Join(filepath.Dir(target), "program-link")
+		if err := os.Symlink(target, program); err != nil {
+			t.Fatal(err)
+		}
+		agent := controllerAgent(t, "com.example.symlink-program")
+		agent.Program = program
+		assertReconcileAndVerifyProgramError(t, agent, nil)
+	})
+
+	t.Run("inaccessible ancestor", func(t *testing.T) {
+		base, err := filepath.EvalSymlinks(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		directory := filepath.Join(base, "blocked")
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		program := filepath.Join(directory, "program")
+		if err := os.WriteFile(program, []byte("#!/bin/sh\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := os.Chmod(directory, 0o700); err != nil {
+				t.Errorf("restore directory permissions: %v", err)
+			}
+		})
+		if err := os.Chmod(directory, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Lstat(program); !errors.Is(err, syscall.EACCES) {
+			t.Fatalf("Lstat() error = %v, want EACCES", err)
+		}
+		agent := controllerAgent(t, "com.example.inaccessible-program")
+		agent.Program = program
+		assertReconcileAndVerifyProgramError(t, agent, syscall.EACCES)
+	})
+}
+
+func assertReconcileAndVerifyProgramError(t *testing.T, agent Agent, target error) {
+	t.Helper()
+	controller := &Controller{}
+	err := controller.reconcile(t.Context(), map[string]Agent{}, map[string]Agent{agent.Label: agent})
+	if err == nil || target != nil && !errors.Is(err, target) {
+		t.Fatalf("reconcile() error = %v, want non-missing program error %v", err, target)
+	}
+	verified, err := controller.verify(t.Context(), agent)
+	if err == nil || target != nil && !errors.Is(err, target) {
+		t.Fatalf("verify() = (%t, %v), want non-missing program error %v", verified, err, target)
 	}
 }
 

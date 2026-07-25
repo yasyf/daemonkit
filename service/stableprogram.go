@@ -74,6 +74,9 @@ func stableProgram(root, name, build, self string) (string, error) {
 	if err := validateStableName(name); err != nil {
 		return "", err
 	}
+	if build == "" {
+		return "", errors.New("service: stable program build is empty")
+	}
 	stablePath := stableProgramPath(root, name)
 	if self == stablePath {
 		return self, nil
@@ -90,12 +93,16 @@ func stableProgram(root, name, build, self string) (string, error) {
 	if stableProgramCurrent(stablePath, metaPath, build) {
 		return canonicalExecutablePath(stablePath)
 	}
-	replace, err := stableProgramNeedsReplace(stablePath, metaPath, build)
+	replace, refresh, err := stableProgramNeedsReplace(stablePath, metaPath, build)
 	if err != nil {
 		return "", err
 	}
 	if replace {
 		if err := materializeStableProgram(stablePath, metaPath, build, self); err != nil {
+			return "", err
+		}
+	} else if refresh != nil {
+		if err := writeStableMeta(metaPath, *refresh); err != nil {
 			return "", err
 		}
 	}
@@ -154,29 +161,50 @@ func stableProgramCurrent(stablePath, metaPath, build string) bool {
 	if !version.Equal(build, meta.Build) {
 		return false
 	}
-	info, err := os.Stat(stablePath)
+	info, err := os.Lstat(stablePath)
 	if err != nil {
 		return false
 	}
-	return info.Mode().IsRegular() && info.Size() == meta.Size && info.ModTime().UnixNano() == meta.MTime
+	return info.Mode().IsRegular() &&
+		info.Mode().Perm()&0o111 != 0 &&
+		info.Size() == meta.Size &&
+		info.ModTime().UnixNano() == meta.MTime
 }
 
-func stableProgramNeedsReplace(stablePath, metaPath, build string) (bool, error) {
+func stableProgramNeedsReplace(stablePath, metaPath, build string) (bool, *stableProgramMeta, error) {
 	meta, err := readStableMeta(metaPath)
 	if err != nil {
-		return true, nil
+		return true, nil, nil
+	}
+	info, err := os.Lstat(stablePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil, nil
+	}
+	if err != nil {
+		return false, nil, err
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		return true, nil, nil
 	}
 	digest, err := fileDigest(stablePath)
 	if errors.Is(err, os.ErrNotExist) {
-		return true, nil
+		return true, nil, nil
 	}
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	if digest != meta.Digest {
-		return true, nil
+		return true, nil, nil
 	}
-	return version.Newer(build, meta.Build), nil
+	if version.Newer(build, meta.Build) {
+		return true, nil, nil
+	}
+	if info.Size() != meta.Size || info.ModTime().UnixNano() != meta.MTime {
+		meta.Size = info.Size()
+		meta.MTime = info.ModTime().UnixNano()
+		return false, &meta, nil
+	}
+	return false, nil, nil
 }
 
 // materializeStableProgram writes the binary before its sidecar: a crash between
@@ -186,21 +214,28 @@ func materializeStableProgram(stablePath, metaPath, build, self string) error {
 	if err != nil {
 		return fmt.Errorf("service: read executable %q: %w", self, err)
 	}
+	if err := os.MkdirAll(filepath.Dir(stablePath), 0o700); err != nil {
+		return fmt.Errorf("service: create bin directory: %w", err)
+	}
 	if err := dkdaemon.WriteFileDurable(stablePath, data, 0o755); err != nil {
 		return fmt.Errorf("service: write stable program %q: %w", stablePath, err)
 	}
-	info, err := os.Stat(stablePath)
+	info, err := os.Lstat(stablePath)
 	if err != nil {
 		return fmt.Errorf("service: inspect stable program %q: %w", stablePath, err)
 	}
 	sum := sha256.Sum256(data)
-	encoded, err := json.Marshal(stableProgramMeta{
+	return writeStableMeta(metaPath, stableProgramMeta{
 		Schema: stableProgramSchema,
 		Build:  build,
 		Digest: hex.EncodeToString(sum[:]),
 		Size:   info.Size(),
 		MTime:  info.ModTime().UnixNano(),
 	})
+}
+
+func writeStableMeta(metaPath string, meta stableProgramMeta) error {
+	encoded, err := json.Marshal(meta)
 	if err != nil {
 		return fmt.Errorf("service: encode stable program meta: %w", err)
 	}

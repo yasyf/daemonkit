@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"maps"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	dkdaemon "github.com/yasyf/daemonkit/daemon"
@@ -391,6 +393,9 @@ func (c *Controller) reconcile(
 	}
 	for _, label := range slices.Sorted(maps.Keys(desired)) {
 		if err := validateProgramTree(desired[label]); err != nil {
+			if !programMissing(err) {
+				return err
+			}
 			slog.Warn("service: desired agent program is not serviceable; awaiting reconverge", "label", label, "error", err)
 			continue
 		}
@@ -419,7 +424,10 @@ func (c *Controller) reconcile(
 // serviceable program can heal them.
 func (c *Controller) verify(ctx context.Context, agent Agent) (bool, error) {
 	if err := validateProgramTree(agent); err != nil {
-		return false, nil
+		if programMissing(err) {
+			return false, nil
+		}
+		return false, err
 	}
 	want, err := agent.Plist()
 	if err != nil {
@@ -455,6 +463,10 @@ func (c *Controller) verify(ctx context.Context, agent Agent) (bool, error) {
 		return false, fmt.Errorf("launchctl enable: %w: %s", err, strings.TrimSpace(out))
 	}
 	return true, nil
+}
+
+func programMissing(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)
 }
 
 func (c *Controller) install(ctx context.Context, agent Agent) error {
