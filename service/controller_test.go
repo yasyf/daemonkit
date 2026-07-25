@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -184,6 +185,19 @@ func controllerAgent(t *testing.T, label string) Agent {
 		LogPath:       filepath.Join(t.TempDir(), label+".log"),
 		RestartPolicy: RestartAlways,
 	}
+}
+
+func controllerExecutable(t *testing.T, name string) string {
+	t.Helper()
+	directory, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, name)
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func launchctlExit(code int) error { return &worker.ExitError{ExitCode: code} }
@@ -491,41 +505,212 @@ func TestControllerRejectsEmptyProgramBeforePersistence(t *testing.T) {
 	}
 }
 
-func TestControllerRecoveryRejectsUnsafeAppliedProgramBeforeReceiptAck(t *testing.T) {
+func TestControllerRecoveryToleratesStaleAppliedProgramAndReconverges(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	base, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
+	stale := controllerAgent(t, "com.example.stale-recovery")
+	stale.Program = controllerExecutable(t, "stale")
+	if err := os.Remove(stale.Program); err != nil {
 		t.Fatal(err)
 	}
-	executable := filepath.Join(base, "holder")
-	if err := os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	linked := filepath.Join(base, "holder-link")
-	if err := os.Symlink(executable, linked); err != nil {
-		t.Fatal(err)
-	}
-	agent := controllerAgent(t, "com.example.unsafe-recovery")
-	agent.Program = linked
 	var events []string
-	runtime := &controllerRuntimeStub{events: &events, run: launchctlStub(func(args []string) (string, error) {
-		return "", fmt.Errorf("unexpected launchctl effect: %v", args)
-	})}
-	store := &controllerStoreStub{events: &events, state: controllerState{
-		Desired: map[string]Agent{agent.Label: agent},
-		Applied: map[string]Agent{agent.Label: agent},
-	}}
-	receipts := &controllerReceiptsStub{events: &events}
-	if _, err := newControllerWithRuntime(context.Background(), controllerConfig(t), runtime, receipts, store); err == nil {
-		t.Fatal("newControllerWithRuntime() accepted unsafe recovered program")
+	var calls [][]string
+	run := launchctlStub(func(args []string) (string, error) {
+		calls = append(calls, append([]string(nil), args...))
+		if args[0] == "bootout" {
+			return "not loaded", launchctlExit(launchctlNotLoadedExit)
+		}
+		return "", nil
+	})
+	controller, _, store, receipts := newTestController(t, controllerState{
+		Desired: map[string]Agent{stale.Label: stale},
+		Applied: map[string]Agent{stale.Label: stale},
+	}, run, &events)
+	if len(calls) != 0 {
+		t.Fatalf("stale recovery launchctl calls = %v, want none", calls)
 	}
-	if receipts.calls != 0 {
-		t.Fatalf("receipt recovery calls = %d, want 0", receipts.calls)
+	if receipts.calls != 2 {
+		t.Fatalf("receipt recovery calls = %d, want 2", receipts.calls)
 	}
 	for _, event := range events {
 		if strings.HasPrefix(event, "run:") {
-			t.Fatalf("unsafe recovery invoked launchctl: %v", events)
+			t.Fatalf("stale recovery invoked launchctl: %v", events)
 		}
+	}
+	if got := store.state.Applied[stale.Label]; !reflect.DeepEqual(got, stale) {
+		t.Fatalf("stale applied agent = %#v, want %#v", got, stale)
+	}
+
+	fresh := stale
+	fresh.Program = controllerExecutable(t, "fresh")
+	calls = nil
+	if err := controller.Converge(t.Context(), []Agent{fresh}); err != nil {
+		t.Fatal(err)
+	}
+	path, err := fresh.PlistPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{
+		{"bootout", serviceTarget(fresh.Label)},
+		{"enable", serviceTarget(fresh.Label)},
+		{"bootstrap", domainTarget(), path},
+		{"kickstart", serviceTarget(fresh.Label)},
+	}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("reconverge launchctl calls = %v, want %v", calls, want)
+	}
+	if got := store.state.Desired[fresh.Label]; !reflect.DeepEqual(got, fresh) {
+		t.Fatalf("reconverged desired agent = %#v, want %#v", got, fresh)
+	}
+	if got := store.state.Applied[fresh.Label]; !reflect.DeepEqual(got, fresh) {
+		t.Fatalf("reconverged applied agent = %#v, want %#v", got, fresh)
+	}
+}
+
+func TestControllerRecoveryInstallsFreshDesiredOverStaleApplied(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	stale := controllerAgent(t, "com.example.recovery-upgrade")
+	stale.Program = controllerExecutable(t, "stale")
+	if err := os.Remove(stale.Program); err != nil {
+		t.Fatal(err)
+	}
+	fresh := stale
+	fresh.Program = controllerExecutable(t, "fresh")
+	var calls [][]string
+	run := launchctlStub(func(args []string) (string, error) {
+		calls = append(calls, append([]string(nil), args...))
+		if args[0] == "bootout" {
+			return "not loaded", launchctlExit(launchctlNotLoadedExit)
+		}
+		return "", nil
+	})
+	_, _, store, _ := newTestController(t, controllerState{
+		Desired: map[string]Agent{fresh.Label: fresh},
+		Applied: map[string]Agent{stale.Label: stale},
+	}, run, nil)
+	path, err := fresh.PlistPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{
+		{"bootout", serviceTarget(fresh.Label)},
+		{"enable", serviceTarget(fresh.Label)},
+		{"bootstrap", domainTarget(), path},
+		{"kickstart", serviceTarget(fresh.Label)},
+	}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("recovery launchctl calls = %v, want %v", calls, want)
+	}
+	if got := store.state.Applied[fresh.Label]; !reflect.DeepEqual(got, fresh) {
+		t.Fatalf("recovered applied agent = %#v, want %#v", got, fresh)
+	}
+}
+
+func TestControllerRecoverySkipsStaleLabelAndVerifiesHealthyLabel(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	stale := controllerAgent(t, "com.example.a-stale")
+	stale.Program = controllerExecutable(t, "stale")
+	if err := os.Remove(stale.Program); err != nil {
+		t.Fatal(err)
+	}
+	healthy := controllerAgent(t, "com.example.b-healthy")
+	plist, err := healthy.Plist()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := healthy.PlistPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, plist, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var calls [][]string
+	run := launchctlStub(func(args []string) (string, error) {
+		calls = append(calls, append([]string(nil), args...))
+		if slices.Contains(args, serviceTarget(stale.Label)) {
+			return "", fmt.Errorf("stale label reached launchctl: %v", args)
+		}
+		return "loaded", nil
+	})
+	_, _, store, _ := newTestController(t, controllerState{
+		Desired: map[string]Agent{stale.Label: stale, healthy.Label: healthy},
+		Applied: map[string]Agent{stale.Label: stale, healthy.Label: healthy},
+	}, run, nil)
+	want := [][]string{
+		{"print", serviceTarget(healthy.Label)},
+		{"enable", serviceTarget(healthy.Label)},
+	}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("recovery launchctl calls = %v, want %v", calls, want)
+	}
+	if !reflect.DeepEqual(store.state.Applied, map[string]Agent{
+		stale.Label: stale, healthy.Label: healthy,
+	}) {
+		t.Fatalf("recovery changed applied state: %#v", store.state.Applied)
+	}
+}
+
+func TestControllerConvergeRemovesStalePersistedAgent(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	stale := controllerAgent(t, "com.example.remove-stale")
+	stale.Program = controllerExecutable(t, "stale")
+	if err := os.Remove(stale.Program); err != nil {
+		t.Fatal(err)
+	}
+	var calls [][]string
+	run := launchctlStub(func(args []string) (string, error) {
+		calls = append(calls, append([]string(nil), args...))
+		return "not loaded", launchctlExit(launchctlNotLoadedExit)
+	})
+	controller, _, store, _ := newTestController(t, controllerState{
+		Desired: map[string]Agent{stale.Label: stale},
+		Applied: map[string]Agent{stale.Label: stale},
+	}, run, nil)
+	calls = nil
+	if err := controller.Converge(t.Context(), nil); err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{{"bootout", serviceTarget(stale.Label)}}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("uninstall launchctl calls = %v, want %v", calls, want)
+	}
+	if len(store.state.Desired) != 0 || len(store.state.Applied) != 0 {
+		t.Fatalf("stale agent remains durable: %#v", store.state)
+	}
+}
+
+func TestControllerStatusReportsStaleLoadedAgentAsDrift(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	stale := controllerAgent(t, "com.example.status-stale")
+	stale.Program = controllerExecutable(t, "stale")
+	if err := os.Remove(stale.Program); err != nil {
+		t.Fatal(err)
+	}
+	var calls [][]string
+	run := launchctlStub(func(args []string) (string, error) {
+		calls = append(calls, append([]string(nil), args...))
+		return "loaded", nil
+	})
+	controller, _, _, _ := newTestController(t, controllerState{
+		Desired: map[string]Agent{stale.Label: stale},
+		Applied: map[string]Agent{stale.Label: stale},
+	}, run, nil)
+	calls = nil
+	status, err := controller.Status(t.Context(), stale.Label)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Status{Label: stale.Label, Desired: true, Applied: true, Loaded: true}
+	if status != want {
+		t.Fatalf("Status() = %#v, want %#v", status, want)
+	}
+	wantCalls := [][]string{{"print", serviceTarget(stale.Label)}}
+	if !reflect.DeepEqual(calls, wantCalls) {
+		t.Fatalf("Status launchctl calls = %v, want %v", calls, wantCalls)
 	}
 }
 

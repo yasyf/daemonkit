@@ -440,7 +440,7 @@ func loadControllerStateTx(tx *bolt.Tx) (controllerState, error) {
 func loadControllerAgents(bucket *bolt.Bucket) (map[string]Agent, error) {
 	agents := make(map[string]Agent)
 	err := bucket.ForEach(func(key, payload []byte) error {
-		agent, err := decodeLiveControllerAgent(payload)
+		agent, err := decodeControllerAgent(payload)
 		if err != nil {
 			return fmt.Errorf("agent %q: %w", key, err)
 		}
@@ -931,17 +931,6 @@ func decodeControllerAgent(payload []byte) (Agent, error) {
 	agent.AssociatedBundleIdentifiers, _ = canonicalAssociatedBundleIdentifiers(
 		agent.AssociatedBundleIdentifiers,
 	)
-	return agent, nil
-}
-
-func decodeLiveControllerAgent(payload []byte) (Agent, error) {
-	agent, err := decodeControllerAgent(payload)
-	if err != nil {
-		return Agent{}, err
-	}
-	if err := validateProgramTree(agent); err != nil {
-		return Agent{}, fmt.Errorf("validate live stored agent: %w", err)
-	}
 	return agent, nil
 }
 

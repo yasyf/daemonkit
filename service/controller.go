@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"os"
 	"path/filepath"
@@ -123,9 +124,10 @@ type Status struct {
 	Exact   bool
 }
 
-// NewController opens the durable controller, settles prior workers, restores
-// the persisted exact desired set, and acknowledges service recovery receipts
-// only after that state has converged.
+// NewController opens the durable controller, settles prior workers, and
+// restores the complete persisted desired and applied sets. Stale stored
+// programs are tolerated as drift and healed by the next Converge with a
+// serviceable program.
 func NewController(ctx context.Context, config ControllerConfig) (*Controller, error) {
 	if err := config.validate(); err != nil {
 		return nil, err
@@ -388,6 +390,10 @@ func (c *Controller) reconcile(
 		delete(c.state.Applied, label)
 	}
 	for _, label := range slices.Sorted(maps.Keys(desired)) {
+		if err := validateProgramTree(desired[label]); err != nil {
+			slog.Warn("service: desired agent program is not serviceable; awaiting reconverge", "label", label, "error", err)
+			continue
+		}
 		if previous, ok := applied[label]; ok && reflect.DeepEqual(previous, desired[label]) {
 			verified, err := c.verify(ctx, desired[label])
 			if err != nil {
@@ -409,9 +415,11 @@ func (c *Controller) reconcile(
 	return nil
 }
 
+// verify reports stale stored programs as drift so a later Converge with a
+// serviceable program can heal them.
 func (c *Controller) verify(ctx context.Context, agent Agent) (bool, error) {
 	if err := validateProgramTree(agent); err != nil {
-		return false, err
+		return false, nil
 	}
 	want, err := agent.Plist()
 	if err != nil {

@@ -97,6 +97,71 @@ func TestControllerStorePersistsExactDesiredAndAppliedState(t *testing.T) {
 	}
 }
 
+func TestControllerStoreLoadsStaleDesiredAndAppliedPrograms(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		write func(*boltControllerStore, Agent) error
+		load  func(controllerState, string) (Agent, bool)
+	}{
+		{
+			name: "desired",
+			write: func(store *boltControllerStore, agent Agent) error {
+				_, err := store.ReplaceDesired(t.Context(), map[string]Agent{agent.Label: agent})
+				return err
+			},
+			load: func(state controllerState, label string) (Agent, bool) {
+				agent, ok := state.Desired[label]
+				return agent, ok
+			},
+		},
+		{
+			name: "applied",
+			write: func(store *boltControllerStore, agent Agent) error {
+				return store.SetApplied(t.Context(), agent.Label, &agent)
+			},
+			load: func(state controllerState, label string) (Agent, bool) {
+				agent, ok := state.Applied[label]
+				return agent, ok
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "services.db")
+			store, err := openControllerStore(t.Context(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			agent := controllerAgent(t, "com.example.stale-"+test.name)
+			agent.Program = controllerExecutable(t, "executable")
+			if err := test.write(store, agent); err != nil {
+				_ = store.Close()
+				t.Fatal(err)
+			}
+			if err := os.Remove(agent.Program); err != nil {
+				_ = store.Close()
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			store, err = openControllerStore(t.Context(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = store.Close() })
+			state, err := store.Load(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, ok := test.load(state, agent.Label)
+			if !ok || !reflect.DeepEqual(got, agent) {
+				t.Fatalf("loaded stale agent = %#v, %t; want %#v, true", got, ok, agent)
+			}
+		})
+	}
+}
+
 func TestControllerStateCanonicalizesAndClonesAssociatedBundleIdentifiers(t *testing.T) {
 	agent := controllerAgent(t, "com.example.associated")
 	agent.AssociatedBundleIdentifiers = []string{"com.example.z", "com.example.a"}
@@ -391,7 +456,7 @@ func TestControllerStoreRejectsUnknownAgentFieldsAndLegacyJSON(t *testing.T) {
 	})
 }
 
-func TestControllerStoreRejectsPersistedUnsafeProgram(t *testing.T) {
+func TestControllerStoreRejectsPersistedInvalidProgramAndLoadsStaleProgram(t *testing.T) {
 	executable := filepath.Join(t.TempDir(), "executable")
 	if err := os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o700); err != nil {
 		t.Fatal(err)
@@ -403,9 +468,10 @@ func TestControllerStoreRejectsPersistedUnsafeProgram(t *testing.T) {
 	for _, test := range []struct {
 		name    string
 		program string
+		wantErr bool
 	}{
-		{name: "empty", program: ""},
-		{name: "relative", program: "usr/bin/true"},
+		{name: "empty", program: "", wantErr: true},
+		{name: "relative", program: "usr/bin/true", wantErr: true},
 		{name: "symlink", program: link},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -454,10 +520,37 @@ func TestControllerStoreRejectsPersistedUnsafeProgram(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer store.Close()
-			if _, err := store.Load(context.Background()); err == nil {
-				t.Fatal("Load accepted persisted unsafe program")
+			state, err := store.Load(context.Background())
+			if test.wantErr {
+				if err == nil {
+					t.Fatal("Load accepted persisted invalid program")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			agent.Program = test.program
+			if got := state.Desired[agent.Label]; !reflect.DeepEqual(got, agent) {
+				t.Fatalf("loaded stale agent = %#v, want %#v", got, agent)
 			}
 		})
+	}
+}
+
+func TestControllerStoreRejectsMissingProgramAtWrite(t *testing.T) {
+	store, err := openControllerStore(t.Context(), filepath.Join(t.TempDir(), "services.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	agent := controllerAgent(t, "com.example.missing-at-write")
+	agent.Program = filepath.Join(t.TempDir(), "missing")
+	if _, err := store.ReplaceDesired(t.Context(), map[string]Agent{agent.Label: agent}); err == nil {
+		t.Fatal("ReplaceDesired() accepted a missing program")
+	}
+	if err := store.SetApplied(t.Context(), agent.Label, &agent); err == nil {
+		t.Fatal("SetApplied() accepted a missing program")
 	}
 }
 

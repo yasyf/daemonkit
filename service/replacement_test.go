@@ -395,6 +395,65 @@ func TestReplacementFenceSurvivesStoreReopen(t *testing.T) {
 	}
 }
 
+func TestRunningOwnedReplacementFenceLoadsAfterProgramRemoval(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	path := filepath.Join(t.TempDir(), "services.db")
+	store, err := openControllerStore(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent := controllerAgent(t, "com.example.running-owned-stale")
+	agent.Program = controllerExecutable(t, "executable")
+	plan := replacementPlan(t, agent)
+	programPaths, err := plan.programPaths()
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	replacement := &replacementState{
+		OperationID: "replace-running-owned-stale",
+		Binding:     replacementBinding("running-owned-stale"),
+		Phase:       ReplacementRunningOwned,
+		Epoch:       1,
+		Prior:       plan,
+		Current:     plan,
+		Proofs: []replacementProof{{
+			Epoch: 1, PlanDigest: plan.digest, ProgramPaths: programPaths,
+			ProvedAt: time.Unix(1_700_000_000, 0),
+		}},
+	}
+	if _, err := store.SetReplacement(
+		t.Context(), map[string]Agent{agent.Label: agent}, replacement, nil, nil,
+	); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if err := os.Remove(agent.Program); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = openControllerStore(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	state, err := store.Load(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Replacement == nil || state.Replacement.Phase != ReplacementRunningOwned ||
+		!plansEqual(state.Replacement.Current, plan) {
+		t.Fatalf("reopened running-owned fence = %#v", state.Replacement)
+	}
+	if got := state.Desired[agent.Label]; !reflect.DeepEqual(got, agent) {
+		t.Fatalf("reopened stale desired agent = %#v, want %#v", got, agent)
+	}
+}
+
 func TestProveQuiescedIsExactAndIdempotentAfterControllerReopen(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	directory := t.TempDir()
