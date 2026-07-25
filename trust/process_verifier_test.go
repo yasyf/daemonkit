@@ -95,12 +95,19 @@ printf '{"protocol":1,"result":"trusted"}\n'
 	if err := verifier.Check(nextCtx, peer.Identity{UID: os.Geteuid()}); err != nil {
 		t.Fatalf("next Check after reaping: %v", err)
 	}
-	records, err := store.Load(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(records) != 0 {
-		t.Fatalf("verifier records after settled checks = %#v", records)
+	untracked := time.Now().Add(3 * time.Second)
+	for {
+		records, err := store.Load(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(records) == 0 {
+			return
+		}
+		if time.Now().After(untracked) {
+			t.Fatalf("verifier records after settled checks = %#v", records)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

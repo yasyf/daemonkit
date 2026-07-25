@@ -1491,6 +1491,43 @@ func TestReapStaleRecordCleanup(t *testing.T) {
 	}
 }
 
+type untrackRaceStore struct {
+	*memStore
+}
+
+func (s *untrackRaceStore) BeginReap(ctx context.Context, rec Record, generation OwnerGeneration) error {
+	if err := s.Remove(ctx, []Record{rec}); err != nil {
+		return err
+	}
+	return s.memStore.BeginReap(ctx, rec, generation)
+}
+
+func TestReapToleratesRecordUntrackedBeforeClaim(t *testing.T) {
+	ctx := context.Background()
+	store := &untrackRaceStore{memStore: &memStore{}}
+	prober := &fakeProber{info: liveInfo()}
+	sig := &recSignaler{err: errors.New("signal must not be sent")}
+	mustAdd(t, store, matchingRecord(6363, "old-gen"))
+
+	r := &Reaper{Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: sig, clock: newFakeClock()}
+	if err := r.Reap(ctx); err != nil {
+		t.Fatalf("Reap over a concurrently untracked record: %v", err)
+	}
+	result, err := r.ReapReceipts(ctx, RecoveryTaskID, ReapReceiptCursor{}, ReapReceiptPageLimit)
+	if err != nil {
+		t.Fatalf("ReapReceipts: %v", err)
+	}
+	if len(result.Receipts) != 0 {
+		t.Fatalf("receipts = %+v, want none for an already untracked record", result)
+	}
+	if got := sig.calls(); len(got) != 0 {
+		t.Errorf("signals sent = %v, want none for an already untracked record", got)
+	}
+	if store.len() != 0 {
+		t.Errorf("store size = %d, want 0", store.len())
+	}
+}
+
 func TestReapESRCHOnSignalIsSuccess(t *testing.T) {
 	ctx := context.Background()
 	store := &memStore{}

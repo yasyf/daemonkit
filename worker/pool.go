@@ -23,7 +23,7 @@ var (
 	ErrOutputLimit = errors.New("worker: output limit exceeded")
 	// ErrTimedOut means the queue and execution deadline elapsed.
 	ErrTimedOut = errors.New("worker: timed out")
-	// ErrSettlementIncomplete means exact termination or durable untracking did not settle.
+	// ErrSettlementIncomplete means exact termination did not settle.
 	ErrSettlementIncomplete = errors.New("worker: settlement incomplete")
 	// ErrClosed means the pool is terminal and admits no more work.
 	ErrClosed = errors.New("worker: pool closed")

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -19,6 +20,8 @@ import (
 )
 
 const runtimeTestTimeout = 3 * time.Second
+
+const unprovableSettlement = time.Nanosecond
 
 type runtimeTestServer struct {
 	mu sync.Mutex
@@ -142,25 +145,15 @@ func (s *runtimeOrderingStore) Load(ctx context.Context) ([]proc.Record, error) 
 	return s.Store.Load(ctx)
 }
 
-type runtimeFailRemoveStore struct {
-	proc.Store
-	fail atomic.Bool
-}
-
-func (s *runtimeFailRemoveStore) Remove(ctx context.Context, records []proc.Record) error {
-	if s.fail.Load() {
-		return errors.New("test durable remove failure")
-	}
-	return s.Store.Remove(ctx, records)
-}
-
 type runtimeTestRig struct {
-	runtime  *Runtime
-	slot     *PublicationSlot[string]
-	server   *runtimeTestServer
-	workers  *worker.Pool
-	children *proc.Manager
-	socket   string
+	runtime      *Runtime
+	slot         *PublicationSlot[string]
+	server       *runtimeTestServer
+	workers      *worker.Pool
+	workerReaper *proc.Reaper
+	children     *proc.Manager
+	childReaper  *proc.Reaper
+	socket       string
 }
 
 func runtimeTestDir(t *testing.T) string {
@@ -245,8 +238,8 @@ func newRuntimeTestRig(
 	}
 	runtime.server = server
 	rig := &runtimeTestRig{
-		runtime: runtime, server: server, workers: workers, children: children,
-		socket: runtime.cfg.Socket,
+		runtime: runtime, server: server, workers: workers, workerReaper: workerReaper,
+		children: children, childReaper: childReaper, socket: runtime.cfg.Socket,
 	}
 	rig.slot = NewPublicationSlot[string](runtime)
 	t.Cleanup(func() {
@@ -316,6 +309,16 @@ func assertRuntimeTestRetained(t *testing.T, runtime *Runtime) {
 	defer runtime.mu.Unlock()
 	if runtime.retainedListener == nil || runtime.retainedLock == nil {
 		t.Fatalf("runtime did not retain listener ownership: listener=%v lock=%v", runtime.retainedListener, runtime.retainedLock)
+	}
+}
+
+func killTestProcessGroup(t *testing.T, pid int) {
+	t.Helper()
+	if pid <= 1 {
+		t.Fatalf("process group leader pid = %d", pid)
+	}
+	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -735,16 +738,16 @@ func TestRuntimeRetainsOwnershipOnIncompleteWorkerSettlement(t *testing.T) {
 }
 
 func TestRuntimeRetainsOwnershipOnIncompleteChildSettlement(t *testing.T) {
-	base := &proc.FileStore{Path: filepath.Join(t.TempDir(), "children.db")}
-	store := &runtimeFailRemoveStore{Store: base}
-	trig := newRuntimeTestRig(t, nil, time.Second, nil, store)
+	trig := newRuntimeTestRig(t, nil, time.Second, nil, nil)
+	trig.childReaper.Settlement = unprovableSettlement
 	trig.ready(t, "ready")
 	var signature proc.SignatureDigest
 	signature[0] = 1
+	marker := filepath.Join(t.TempDir(), "child-started")
 	request, err := proc.NewSpawnRequest(proc.SpawnConfig{
 		RecoveryID:        proc.RecoveryTaskID,
 		Executable:        "/bin/sh",
-		Args:              []string{"-c", "exec /bin/sleep 60"},
+		Args:              []string{"-c", `trap '' TERM; : > "$1"; while :; do /bin/sleep 1; done`, "child", marker},
 		Stdin:             proc.StdioNull,
 		Stdout:            proc.StdioNull,
 		Stderr:            proc.StdioNull,
@@ -753,14 +756,14 @@ func TestRuntimeRetainsOwnershipOnIncompleteChildSettlement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	child, _, err := trig.children.Prepare(context.Background(), request)
+	child, receipt, err := trig.children.Prepare(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := child.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	store.fail.Store(true)
+	waitRuntimeTestFile(t, marker)
 	if err := closeRuntimeTest(t, trig.runtime); !errors.Is(err, ErrShutdownIncomplete) {
 		t.Fatalf("Close = %v, want incomplete child shutdown", err)
 	}
@@ -770,10 +773,10 @@ func TestRuntimeRetainsOwnershipOnIncompleteChildSettlement(t *testing.T) {
 	}
 	select {
 	case <-child.Done():
-		t.Fatal("child completion published despite durable remove failure")
+		t.Fatal("child completion published despite incomplete settlement")
 	default:
 	}
-	store.fail.Store(false)
+	killTestProcessGroup(t, receipt.ProcessIdentity().PID)
 	ctx, cancel := context.WithTimeout(context.Background(), runtimeTestTimeout)
 	defer cancel()
 	if err := child.Stop(ctx); err != nil {
@@ -782,26 +785,30 @@ func TestRuntimeRetainsOwnershipOnIncompleteChildSettlement(t *testing.T) {
 }
 
 func TestRuntimeTerminatesWhenWorkerClaimTerminalizes(t *testing.T) {
-	store := &runtimeFailRemoveStore{Store: &proc.FileStore{Path: filepath.Join(t.TempDir(), "workers.db")}}
-	trig := newRuntimeTestRig(t, nil, 0, store, nil)
+	trig := newRuntimeTestRig(t, nil, 0, nil, nil)
+	trig.workerReaper.Settlement = unprovableSettlement
 	trig.ready(t, "ready")
 	marker := filepath.Join(t.TempDir(), "worker-started")
-	runResult := make(chan error, 1)
+	type workerRun struct {
+		result worker.CommandResult
+		err    error
+	}
+	runResult := make(chan workerRun, 1)
 	go func() {
-		_, err := trig.workers.Run(context.Background(), worker.CommandRequest{
+		result, err := trig.workers.Run(context.Background(), worker.CommandRequest{
 			Path: "/bin/sh", Dir: "/bin",
-			Args:         []string{"-c", `: > "$1"; exec /bin/sleep 10`, "worker", marker},
+			Args:         []string{"-c", `trap '' TERM; : > "$1"; while :; do /bin/sleep 1; done`, "worker", marker},
 			TotalTimeout: 2 * time.Second,
 		})
-		runResult <- err
+		runResult <- workerRun{result: result, err: err}
 	}()
 	waitRuntimeTestFile(t, marker)
-	store.fail.Store(true)
 	select {
-	case err := <-runResult:
-		if !errors.Is(err, worker.ErrSettlementIncomplete) {
-			t.Fatalf("worker Run = %v, want settlement incomplete", err)
+	case run := <-runResult:
+		if !errors.Is(run.err, worker.ErrSettlementIncomplete) {
+			t.Fatalf("worker Run = %v, want settlement incomplete", run.err)
 		}
+		killTestProcessGroup(t, run.result.Receipt.ProcessIdentity().PID)
 	case <-time.After(runtimeTestTimeout):
 		t.Fatal("worker settlement overrun did not surface")
 	}

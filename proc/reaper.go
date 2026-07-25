@@ -458,19 +458,29 @@ func (r *Reaper) Terminate(ctx context.Context, rec Record) error {
 	if !tracked {
 		return errors.New("proc: process is not durably tracked")
 	}
+	if err := r.settleWithin(ctx, rec, r.graceDur()); err != nil {
+		return err
+	}
+	if err := r.Store.Remove(ctx, []Record{rec}); err != nil {
+		return fmt.Errorf("remove terminated process %d: %w", rec.PID, err)
+	}
+	return nil
+}
+
+// Deliberately store-free: durable I/O latency must never fail a settlement.
+func (r *Reaper) settleWithin(ctx context.Context, rec Record, grace time.Duration) error {
 	boot, err := r.prb().bootID()
 	if err != nil {
 		return fmt.Errorf("load current boot identity: %w", err)
 	}
-	reaped, err := r.terminateOne(ctx, rec, boot)
+	clone := *r
+	clone.Grace = grace
+	settled, err := clone.terminateOne(ctx, rec, boot)
 	if err != nil {
 		return err
 	}
-	if !reaped {
+	if !settled {
 		return errors.New("proc: tracked process remained live")
-	}
-	if err := r.Store.Remove(ctx, []Record{rec}); err != nil {
-		return fmt.Errorf("remove terminated process %d: %w", rec.PID, err)
 	}
 	return nil
 }
@@ -607,7 +617,14 @@ func (r *Reaper) reap(ctx context.Context) (map[RecoveryID][]OwnerGeneration, er
 			continue
 		}
 		if claimErr := r.Store.BeginReap(ctx, rec, r.Generation); claimErr != nil {
-			unresolved = append(unresolved, fmt.Errorf("claim child %d for reap: %w", rec.PID, claimErr))
+			vanished, loadErr := r.recordVanished(ctx, rec)
+			if loadErr != nil {
+				unresolved = append(unresolved, fmt.Errorf("claim child %d for reap: %w", rec.PID, errors.Join(claimErr, loadErr)))
+				continue
+			}
+			if !vanished {
+				unresolved = append(unresolved, fmt.Errorf("claim child %d for reap: %w", rec.PID, claimErr))
+			}
 			continue
 		}
 		reaped, outcome, reapErr := r.reapOne(ctx, rec, boot)
@@ -654,6 +671,16 @@ func (r *Reaper) reap(ctx context.Context) (map[RecoveryID][]OwnerGeneration, er
 		slices.SortFunc(settled[id], generationCompare)
 	}
 	return settled, nil
+}
+
+// A prior generation's deferred untrack can land between the recovery scan and
+// its claim; the record is then already settled and has nothing left to reap.
+func (r *Reaper) recordVanished(ctx context.Context, rec Record) (bool, error) {
+	records, err := r.Store.Load(ctx)
+	if err != nil {
+		return false, fmt.Errorf("reload reaper records: %w", err)
+	}
+	return !slices.Contains(records, rec), nil
 }
 
 // ReapReceipts returns one stable recovery-ID-filtered ledger page.

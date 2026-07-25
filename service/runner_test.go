@@ -52,13 +52,7 @@ func TestRunCombinedCancellationReapsDaemonizedDescendantAndRecord(t *testing.T)
 		t.Fatal("canceled disposable service task did not settle")
 	}
 	assertProcessGone(t, descendant)
-	records, err := store.Load(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(records) != 0 {
-		t.Fatalf("durable service worker records after settlement = %+v", records)
-	}
+	assertRecordsUntracked(t, store)
 }
 
 func TestRunCombinedBoundsOutputWithoutStrandingWorker(t *testing.T) {
@@ -89,6 +83,24 @@ func awaitPIDFile(t *testing.T, path string) int {
 	}
 	t.Fatalf("descendant pid file %q was not written", path)
 	return 0
+}
+
+func assertRecordsUntracked(t *testing.T, store proc.Store) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		records, err := store.Load(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(records) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("durable service worker records after settlement = %+v", records)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func assertProcessGone(t *testing.T, pid int) {

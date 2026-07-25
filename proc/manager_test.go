@@ -57,6 +57,17 @@ func managerTestRequest(t *testing.T, script string, modes ...StdioMode) SpawnRe
 	return request
 }
 
+func waitManagerUntracked(t *testing.T, store *memStore) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for store.len() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("durable records after settlement = %d, want deferred untrack to drain", store.len())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func waitManagerChild(t *testing.T, child *PreparedChild) ProcessExit {
 	t.Helper()
 	select {
@@ -253,10 +264,7 @@ func TestManagerPrepareRecordsBeforeDispatch(t *testing.T) {
 	if err != nil || string(data) != "yes" {
 		t.Fatalf("marker = %q, %v", data, err)
 	}
-	records, err = store.Load(context.Background())
-	if err != nil || len(records) != 0 {
-		t.Fatalf("durable records after settlement = %d, %v", len(records), err)
-	}
+	waitManagerUntracked(t, store)
 }
 
 func TestManagerStopWinsDispatchRace(t *testing.T) {
@@ -369,22 +377,14 @@ func TestManagerCapacityAndRequestImmutability(t *testing.T) {
 
 type failRemoveStore struct {
 	*memStore
-	muFail sync.Mutex
-	fail   bool
 }
 
-func (s *failRemoveStore) Remove(ctx context.Context, records []Record) error {
-	s.muFail.Lock()
-	fail := s.fail
-	s.muFail.Unlock()
-	if fail {
-		return errors.New("remove failed")
-	}
-	return s.memStore.Remove(ctx, records)
+func (s *failRemoveStore) Remove(context.Context, []Record) error {
+	return errors.New("remove failed")
 }
 
-func TestManagerRetainsOwnershipUntilDurableSettlement(t *testing.T) {
-	store := &failRemoveStore{memStore: &memStore{}, fail: true}
+func TestManagerSettlesDespiteDurableRemoveFailureAndNextGenerationReaps(t *testing.T) {
+	store := &failRemoveStore{memStore: &memStore{}}
 	manager, err := NewManager(1, &Reaper{
 		Store: store, Generation: testOwnerGeneration("manager-test"), Grace: 10 * time.Millisecond, Settlement: time.Second,
 	})
@@ -404,24 +404,149 @@ func TestManagerRetainsOwnershipUntilDurableSettlement(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	err = child.Stop(ctx)
 	cancel()
-	if !errors.Is(err, ErrChildSettlementIncomplete) || manager.Active() != 1 {
-		t.Fatalf("first Stop = %v, active=%d", err, manager.Active())
+	if err != nil || manager.Active() != 0 {
+		t.Fatalf("Stop with failing durable remove = %v, active=%d", err, manager.Active())
 	}
 	select {
 	case <-child.Done():
-		t.Fatal("child settled despite durable remove failure")
 	default:
+		t.Fatal("child did not settle despite deferred untrack")
 	}
-	store.muFail.Lock()
-	store.fail = false
-	store.muFail.Unlock()
-	ctx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	if err := child.Stop(ctx); err != nil {
+	if store.len() != 1 {
+		t.Fatalf("store size = %d, want one leaked record", store.len())
+	}
+	if err := manager.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	next, err := NewManager(1, &Reaper{
+		Store: store, Generation: testOwnerGeneration("manager-next"), Grace: 10 * time.Millisecond, Settlement: time.Second,
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if manager.Active() != 0 {
-		t.Fatalf("active after retry = %d", manager.Active())
+	if err := next.ClaimRuntime(); err != nil {
+		t.Fatal(err)
+	}
+	if err := next.Recover(context.Background()); err != nil {
+		t.Fatalf("next-generation Recover: %v", err)
+	}
+	if store.len() != 0 {
+		t.Fatalf("store size after next-generation Recover = %d, want leaked record reaped", store.len())
+	}
+	if err := next.Shutdown(context.Background()); err != nil {
+		t.Fatalf("next Shutdown: %v", err)
+	}
+}
+
+type stallRemoveStore struct {
+	*memStore
+	once    sync.Once
+	entered chan struct{}
+}
+
+func (s *stallRemoveStore) Remove(ctx context.Context, _ []Record) error {
+	s.once.Do(func() { close(s.entered) })
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+type transientRemoveStore struct {
+	*memStore
+	mu        sync.Mutex
+	remaining int
+}
+
+func (s *transientRemoveStore) Remove(ctx context.Context, records []Record) error {
+	s.mu.Lock()
+	if s.remaining > 0 {
+		s.remaining--
+		s.mu.Unlock()
+		return errors.New("remove failed")
+	}
+	s.mu.Unlock()
+	return s.memStore.Remove(ctx, records)
+}
+
+func (s *transientRemoveStore) failuresLeft() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.remaining
+}
+
+func TestManagerDeferredUntrackRetriesTransientRemoveFailure(t *testing.T) {
+	store := &transientRemoveStore{memStore: &memStore{}, remaining: 3}
+	manager, err := NewManager(1, &Reaper{
+		Store: store, Generation: testOwnerGeneration("manager-test"), Grace: 10 * time.Millisecond, Settlement: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ClaimRuntime(); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	child, _, err := manager.Prepare(context.Background(), managerTestRequest(t, "sleep 60"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	err = child.Stop(ctx)
+	cancel()
+	if err != nil || manager.Active() != 0 {
+		t.Fatalf("Stop with transient durable remove failures = %v, active=%d", err, manager.Active())
+	}
+	waitManagerUntracked(t, store.memStore)
+	if left := store.failuresLeft(); left != 0 {
+		t.Fatalf("injected failures left = %d, want every transient failure retried", left)
+	}
+	if err := manager.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+}
+
+func TestManagerShutdownAbandonsStalledUntrackWithinBudget(t *testing.T) {
+	store := &stallRemoveStore{memStore: &memStore{}, entered: make(chan struct{})}
+	manager, err := NewManager(1, &Reaper{
+		Store: store, Generation: testOwnerGeneration("manager-test"), Grace: 10 * time.Millisecond, Settlement: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ClaimRuntime(); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	child, _, err := manager.Prepare(context.Background(), managerTestRequest(t, "sleep 60"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	err = child.Stop(stopCtx)
+	stopCancel()
+	if err != nil {
+		t.Fatalf("Stop with a stalled durable remove = %v", err)
+	}
+	select {
+	case <-store.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("deferred untrack did not reach the stalled store")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := manager.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown over a stalled untrack = %v", err)
+	}
+	if spent := time.Since(start); spent > 2*time.Second {
+		t.Fatalf("Shutdown spent %v draining a stalled untrack, want a bounded drain", spent)
+	}
+	if store.len() != 1 {
+		t.Fatalf("store size = %d, want the abandoned record left for the next generation", store.len())
 	}
 }
 
@@ -541,10 +666,7 @@ func TestManagerNaturalLeaderExitSettlesDescendants(t *testing.T) {
 	if exit.Code != 0 || exit.Stopped || exit.Error != "" {
 		t.Fatalf("exit = %+v", exit)
 	}
-	records, err := store.Load(context.Background())
-	if err != nil || len(records) != 0 {
-		t.Fatalf("records after natural group settlement = %d, %v", len(records), err)
-	}
+	waitManagerUntracked(t, store)
 	data, err := os.ReadFile(pidFile)
 	if err != nil {
 		t.Fatal(err)

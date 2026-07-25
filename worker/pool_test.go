@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -645,6 +646,8 @@ func TestOrderedCloseTerminalIsErrClosed(t *testing.T) {
 	}
 }
 
+const unprovableSettlement = time.Nanosecond
+
 type failRemoveStore struct {
 	proc.Store
 	fail atomic.Bool
@@ -662,31 +665,15 @@ func TestRunSettlementOverrunTerminalizesClaimAndSignalsWatcher(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := &failRemoveStore{Store: &proc.FileStore{Path: filepath.Join(t.TempDir(), "workers.db")}}
-	reaper := &proc.Reaper{
-		Store: store, Generation: generation, Grace: 10 * time.Millisecond, Settlement: time.Second,
-	}
-	pool, err := NewPool(workerTestConfig(), reaper)
-	if err != nil {
-		t.Fatalf("NewPool: %v", err)
-	}
-	claim, err := pool.ClaimRuntime(workerTestVerifierBudgets())
-	if err != nil {
-		t.Fatalf("ClaimRuntime: %v", err)
-	}
-	if err := claim.Recover(context.Background()); err != nil {
-		t.Fatalf("Recover: %v", err)
-	}
-	if err := claim.Activate(); err != nil {
-		t.Fatalf("Activate: %v", err)
-	}
-
+	pool, claim := newWorkerTestPoolWithReaper(t, workerTestConfig(), &proc.Reaper{
+		Store:      &proc.FileStore{Path: filepath.Join(t.TempDir(), "workers.db")},
+		Generation: generation, Grace: 10 * time.Millisecond, Settlement: unprovableSettlement,
+	})
 	marker := filepath.Join(t.TempDir(), "started")
-	request := shellRequest(filepath.Dir(marker), "touch "+marker+"; sleep 10")
-	request.TotalTimeout = 2 * time.Second
-	running := runAsync(context.Background(), pool, request)
+	running := runAsync(context.Background(), pool, shellRequest(
+		filepath.Dir(marker), `trap '' TERM; : > `+marker+`; while :; do /bin/sleep 1; done`,
+	))
 	waitForPath(t, marker)
-	store.fail.Store(true)
 	select {
 	case <-claim.Terminalized():
 		t.Fatal("Terminalized fired before the settlement overrun")
@@ -697,6 +684,7 @@ func TestRunSettlementOverrunTerminalizesClaimAndSignalsWatcher(t *testing.T) {
 		if !errors.Is(stopped.err, ErrSettlementIncomplete) {
 			t.Fatalf("overrun Run = %v, want settlement incomplete", stopped.err)
 		}
+		killTestProcessGroup(t, stopped.result.Receipt.ProcessIdentity().PID)
 	case <-time.After(5 * time.Second):
 		t.Fatal("overrun Run did not return")
 	}
@@ -712,6 +700,152 @@ func TestRunSettlementOverrunTerminalizesClaimAndSignalsWatcher(t *testing.T) {
 	result, err := pool.Run(context.Background(), shellRequest(t.TempDir(), "exit 0"))
 	if !errors.Is(err, ErrClosed) || result.Receipt.ProcessIdentity().PID != 0 {
 		t.Fatalf("post-terminal Run = %+v, %v, want ErrClosed", result, err)
+	}
+}
+
+type stallRemoveStore struct {
+	proc.Store
+	stall   atomic.Bool
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *stallRemoveStore) Remove(ctx context.Context, records []proc.Record) error {
+	if s.stall.Load() {
+		s.once.Do(func() { close(s.entered) })
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.release:
+		}
+	}
+	return s.Store.Remove(ctx, records)
+}
+
+func TestRunStalledDurableRemoveDoesNotTerminalizeClaim(t *testing.T) {
+	generation, err := proc.ProcessGeneration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &stallRemoveStore{
+		Store:   &proc.FileStore{Path: filepath.Join(t.TempDir(), "workers.db")},
+		entered: make(chan struct{}), release: make(chan struct{}),
+	}
+	store.stall.Store(true)
+	config := workerTestConfig()
+	config.MaxTotalRun = 6 * time.Second
+	pool, claim := newWorkerTestPoolWithReaper(t, config, &proc.Reaper{
+		Store: store, Generation: generation, Grace: 10 * time.Millisecond, Settlement: time.Second,
+	})
+
+	request := shellRequest(t.TempDir(), "exit 0")
+	request.TotalTimeout = 5 * time.Second
+	result, err := pool.Run(context.Background(), request)
+	if err != nil || result.ExitCode != 0 {
+		t.Fatalf("Run with stalled durable remove = %+v, %v", result, err)
+	}
+	select {
+	case <-store.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("deferred untrack did not reach the stalled store")
+	}
+	select {
+	case <-claim.Terminalized():
+		t.Fatal("stalled durable remove terminalized the claim")
+	case <-time.After(totalReserve + 500*time.Millisecond):
+	}
+	if err := claim.Terminal(); err != nil {
+		t.Fatalf("Terminal during stalled remove = %v", err)
+	}
+	second, err := pool.Run(context.Background(), request)
+	if err != nil || second.ExitCode != 0 {
+		t.Fatalf("Run during stalled remove = %+v, %v", second, err)
+	}
+	store.stall.Store(false)
+	close(store.release)
+	waitFor(t, func() bool {
+		records, err := store.Load(context.Background())
+		return err == nil && len(records) == 0
+	}, "deferred untrack to drain the store")
+	if err := claim.Terminal(); err != nil {
+		t.Fatalf("Terminal after stall release = %v", err)
+	}
+}
+
+func TestCloseUnderStalledDurableRemovePreservesSettlementBudget(t *testing.T) {
+	generation, err := proc.ProcessGeneration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &stallRemoveStore{
+		Store:   &proc.FileStore{Path: filepath.Join(t.TempDir(), "workers.db")},
+		entered: make(chan struct{}), release: make(chan struct{}),
+	}
+	store.stall.Store(true)
+	config := workerTestConfig()
+	config.MaxTotalRun = 6 * time.Second
+	pool, claim := newWorkerTestPoolWithReaper(t, config, &proc.Reaper{
+		Store: store, Generation: generation, Grace: 10 * time.Millisecond, Settlement: time.Second,
+	})
+	defer close(store.release)
+
+	request := shellRequest(t.TempDir(), "exit 0")
+	request.TotalTimeout = 5 * time.Second
+	result, err := pool.Run(context.Background(), request)
+	if err != nil || result.ExitCode != 0 {
+		t.Fatalf("Run with stalled durable remove = %+v, %v", result, err)
+	}
+	select {
+	case <-store.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("deferred untrack did not reach the stalled store")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := claim.Close(ctx); err != nil {
+		t.Fatalf("Close over a stalled durable remove = %v", err)
+	}
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("Close spent the caller's settlement budget on the deferred untrack: %v", err)
+	}
+}
+
+func TestNextGenerationRecoverReapsDeferredUntrackLeak(t *testing.T) {
+	generation, err := proc.ProcessGeneration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &failRemoveStore{Store: &proc.FileStore{Path: filepath.Join(t.TempDir(), "workers.db")}}
+	store.fail.Store(true)
+	pool, claim := newWorkerTestPoolWithReaper(t, workerTestConfig(), &proc.Reaper{
+		Store: store, Generation: generation, Grace: 10 * time.Millisecond, Settlement: time.Second,
+	})
+
+	result, err := pool.Run(context.Background(), shellRequest(t.TempDir(), "exit 0"))
+	if err != nil || result.ExitCode != 0 {
+		t.Fatalf("Run with failing durable remove = %+v, %v", result, err)
+	}
+	select {
+	case <-claim.Terminalized():
+		t.Fatal("failed durable remove terminalized the claim")
+	default:
+	}
+	records, err := store.Load(context.Background())
+	if err != nil || len(records) != 1 {
+		t.Fatalf("leaked records = %d, %v, want one deferred-untrack leak", len(records), err)
+	}
+
+	nextGeneration, err := proc.ParseOwnerGeneration("00112233445566778899aabbccddeeff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newWorkerTestPoolWithReaper(t, workerTestConfig(), &proc.Reaper{
+		Store: store, Generation: nextGeneration, Grace: 10 * time.Millisecond, Settlement: time.Second,
+	})
+	records, err = store.Load(context.Background())
+	if err != nil || len(records) != 0 {
+		t.Fatalf("records after next-generation Recover = %d, %v, want leak reaped", len(records), err)
 	}
 }
 
@@ -770,7 +904,12 @@ func newWorkerTestPool(t *testing.T, config Config) *Pool {
 
 func newWorkerTestPoolWithoutCleanup(t *testing.T, config Config) (*Pool, *RuntimeClaim) {
 	t.Helper()
-	pool, err := NewPool(config, workerTestReaper(t))
+	return newWorkerTestPoolWithReaper(t, config, workerTestReaper(t))
+}
+
+func newWorkerTestPoolWithReaper(t *testing.T, config Config, reaper *proc.Reaper) (*Pool, *RuntimeClaim) {
+	t.Helper()
+	pool, err := NewPool(config, reaper)
 	if err != nil {
 		t.Fatalf("NewPool: %v", err)
 	}
@@ -784,11 +923,27 @@ func newWorkerTestPoolWithoutCleanup(t *testing.T, config Config) (*Pool, *Runti
 	if err := claim.Activate(); err != nil {
 		t.Fatalf("Activate: %v", err)
 	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = pool.manager.Shutdown(ctx)
+		_ = claim.verifier.manager.Shutdown(ctx)
+	})
 	return pool, claim
 }
 
 func shellRequest(dir, script string) CommandRequest {
 	return CommandRequest{Path: "/bin/sh", Dir: dir, Args: []string{"-c", script}, TotalTimeout: 2 * time.Second}
+}
+
+func killTestProcessGroup(t *testing.T, pid int) {
+	t.Helper()
+	if pid <= 1 {
+		t.Fatalf("process group leader pid = %d", pid)
+	}
+	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func waitForPath(t *testing.T, path string) {

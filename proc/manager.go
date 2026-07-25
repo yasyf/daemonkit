@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,13 +37,19 @@ var (
 	ErrChildStarted = errors.New("proc: prepared child already started")
 	// ErrChildStopped means Stop won the dispatch race.
 	ErrChildStopped = errors.New("proc: prepared child stopped before dispatch")
-	// ErrChildSettlementIncomplete means exact reap or durable untracking did not settle.
+	// ErrChildSettlementIncomplete means the exact reap did not settle.
 	ErrChildSettlementIncomplete = errors.New("proc: child settlement incomplete")
 	// ErrFenceRequired means a peer-fenced child cannot be directly dispatched.
 	ErrFenceRequired = errors.New("proc: child requires a ready-only peer fence")
 )
 
-const preparedChildTerminationGrace = 500 * time.Millisecond
+const (
+	preparedChildTerminationGrace = 500 * time.Millisecond
+	settledUntrackTimeout         = 5 * time.Second
+	settledUntrackRetryDelay      = 100 * time.Millisecond
+	settledUntrackRetryAttempts   = 6
+	settledUntrackDrainWindow     = 500 * time.Millisecond
+)
 
 // ErrPipeUnavailable means a configured prepared-child pipe is absent, transferred, or dispatched.
 var ErrPipeUnavailable = errors.New("proc: prepared child pipe is unavailable")
@@ -268,9 +275,12 @@ type ProcessExit struct {
 
 // Manager bounds and owns prepared and started child process groups.
 type Manager struct {
-	reaper *Reaper
-	limit  chan struct{}
-	token  *managerToken
+	reaper     *Reaper
+	limit      chan struct{}
+	token      *managerToken
+	untracks   sync.WaitGroup
+	untrackCtx context.Context
+	abandon    context.CancelFunc
 
 	mu        sync.Mutex
 	state     managerState
@@ -332,8 +342,10 @@ func NewManager(limit int, reaper *Reaper) (*Manager, error) {
 	if reaper == nil || reaper.Store == nil || reaper.Generation == (OwnerGeneration{}) {
 		return nil, errors.New("proc: manager reaper is incomplete")
 	}
+	untrackCtx, abandon := context.WithCancel(context.Background())
 	return &Manager{
 		reaper: reaper, limit: make(chan struct{}, limit), token: &managerToken{},
+		untrackCtx: untrackCtx, abandon: abandon,
 		children: make(map[*PreparedChild]struct{}), untracked: make(map[*untrackedChild]struct{}), changed: make(chan struct{}),
 		settled: nil,
 	}, nil
@@ -621,7 +633,8 @@ func (c *PreparedChild) takePipe(endpoint **os.File) (*os.File, error) {
 	return result, nil
 }
 
-// Done closes only after the exact process group is reaped and untracked.
+// Done closes only after the exact process group is reaped; durable
+// untracking is deferred off the settlement path.
 func (c *PreparedChild) Done() <-chan struct{} { return c.done }
 
 // Exit returns the immutable completion once Done is closed.
@@ -636,7 +649,8 @@ func (c *PreparedChild) Exit() (ProcessExit, bool) {
 	}
 }
 
-// Stop synchronously TERM/KILLs, reaps, and untracks the exact child group.
+// Stop synchronously TERM/KILLs and reaps the exact child group, deferring
+// the durable untrack off the settlement-critical path.
 func (c *PreparedChild) Stop(ctx context.Context) error {
 	if c == nil {
 		return nil
@@ -719,7 +733,7 @@ func (c *PreparedChild) settleAttempt(ctx context.Context, stopped bool) error {
 	terminated := c.terminated
 	c.mu.Unlock()
 	if !terminated {
-		if err := c.manager.reaper.TerminateWithin(ctx, c.record, preparedChildTerminationGrace); err != nil {
+		if err := c.manager.reaper.settleWithin(ctx, c.record, preparedChildTerminationGrace); err != nil {
 			return errors.Join(ErrChildSettlementIncomplete, err)
 		}
 		c.mu.Lock()
@@ -731,11 +745,45 @@ func (c *PreparedChild) settleAttempt(ctx context.Context, stopped bool) error {
 		return errors.Join(ErrChildSettlementIncomplete, ctx.Err())
 	case <-c.observed:
 	}
+	c.manager.untracks.Add(1)
+	go c.untrackSettled()
 	c.settle(stopped, nil)
 	return nil
 }
 
-// Shutdown closes admission and synchronously settles every owned child.
+// Exhausting every attempt leaks a stale record that the next generation's Recover reaps.
+//
+//nolint:contextcheck // The deferred untrack owns a detached post-settlement budget.
+func (c *PreparedChild) untrackSettled() {
+	defer c.manager.untracks.Done()
+	delay := settledUntrackRetryDelay
+	for attempt := 1; ; attempt++ {
+		ctx, cancel := context.WithTimeout(c.manager.untrackCtx, settledUntrackTimeout)
+		err := c.manager.reaper.Untrack(ctx, c.record)
+		cancel()
+		if err == nil {
+			return
+		}
+		slog.Warn("proc: deferred untrack of settled child failed",
+			"pid", c.record.PID, "attempt", attempt, "error", err)
+		if attempt == settledUntrackRetryAttempts {
+			return
+		}
+		retry := time.NewTimer(delay)
+		select {
+		case <-c.manager.untrackCtx.Done():
+			retry.Stop()
+			return
+		case <-retry.C:
+		}
+		delay *= 2
+	}
+}
+
+// Shutdown closes admission, synchronously settles every owned child, and
+// gives deferred untracks a bounded window to drain before abandoning them to
+// the next generation's Recover. The drain never spends the caller's remaining
+// settlement budget.
 func (m *Manager) Shutdown(ctx context.Context) error {
 	if m == nil {
 		return errors.New("proc: manager is required")
@@ -779,7 +827,26 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	for _, child := range untracked {
 		errs = append(errs, child.Stop(ctx))
 	}
-	return errors.Join(errs...)
+	settlement := errors.Join(errs...)
+	m.drainUntracks(ctx)
+	return settlement
+}
+
+func (m *Manager) drainUntracks(ctx context.Context) {
+	drained := make(chan struct{})
+	go func() {
+		m.untracks.Wait()
+		close(drained)
+	}()
+	window := time.NewTimer(settledUntrackDrainWindow)
+	defer window.Stop()
+	select {
+	case <-drained:
+	case <-ctx.Done():
+		m.abandon()
+	case <-window.C:
+		m.abandon()
+	}
 }
 
 // Recover settles every exact prior-generation child before listener acquisition.
