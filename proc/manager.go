@@ -1035,6 +1035,13 @@ type preparedPipes struct {
 	sessionParent, sessionChild                                                   *os.File
 }
 
+func parentPath() string {
+	if path := os.Getenv("PATH"); path != "" {
+		return path
+	}
+	return "/usr/bin:/bin:/usr/sbin:/sbin"
+}
+
 func prepareCommand(request SpawnRequest) (*exec.Cmd, *preparedPipes, error) {
 	p := &preparedPipes{}
 	var err error
@@ -1066,7 +1073,7 @@ func prepareCommand(request SpawnRequest) (*exec.Cmd, *preparedPipes, error) {
 	args := append([]string{"-c", childWrapper, "daemonkit-child", request.executable}, request.args...)
 	cmd := exec.Command("/bin/sh", args...)
 	cmd.Dir = request.dir
-	cmd.Env = append([]string{"PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LANG=C"}, request.env...)
+	cmd.Env = append([]string{"PATH=" + parentPath(), "LANG=C"}, request.env...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = p.stdinChild, p.stdoutChild, p.stderrChild
 	cmd.ExtraFiles = []*os.File{p.readyWrite, p.gateRead}
 	if p.sessionChild != nil {

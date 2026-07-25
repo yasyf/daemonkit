@@ -810,3 +810,19 @@ func waitFor(t *testing.T, ready func() bool, description string) {
 	}
 	t.Fatalf("timed out waiting for %s", description)
 }
+
+func TestRunChildInheritsParentPath(t *testing.T) {
+	t.Setenv("PATH", "/usr/bin:/bin:/inherited/bin")
+	pool := newWorkerTestPool(t, workerTestConfig())
+	result, err := pool.Run(context.Background(), CommandRequest{
+		Path: "/bin/sh", Dir: t.TempDir(),
+		Args:         []string{"-c", `printf %s "$PATH"`},
+		TotalTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if string(result.Stdout) != os.Getenv("PATH") {
+		t.Fatalf("child PATH = %q, parent PATH = %q", result.Stdout, os.Getenv("PATH"))
+	}
+}

@@ -813,3 +813,14 @@ func TestManagerUntrackedCleanupNeverWaitsPastCallerBound(t *testing.T) {
 	waited <- nil
 	<-child.done
 }
+
+func TestParentPathInheritsProcessPath(t *testing.T) {
+	t.Setenv("PATH", "/usr/bin:/custom/bin")
+	if got := parentPath(); got != "/usr/bin:/custom/bin" {
+		t.Fatalf("parentPath() = %q", got)
+	}
+	t.Setenv("PATH", "")
+	if got := parentPath(); got != "/usr/bin:/bin:/usr/sbin:/sbin" {
+		t.Fatalf("parentPath() fallback = %q", got)
+	}
+}

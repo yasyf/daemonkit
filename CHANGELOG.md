@@ -4,6 +4,19 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.3] - 2026-07-25
+
+### Changed
+
+- Worker children inherit the daemon's `PATH` instead of a hardcoded
+  hermetic `/usr/bin:/bin:/usr/sbin:/sbin` (which remains the fallback when
+  the parent has none), and `daemon.Runtime` extends the process `PATH` once
+  at construction with the standard user bin directories launchd omits
+  (`/usr/local/bin`, `/opt/homebrew/bin`, `~/.local/bin`, `~/.bun/bin`) —
+  so daemon-context subprocesses resolve user-installed CLIs (`claude`,
+  `codex`, `gh`) by plain inheritance. Spawn requests still cannot override
+  `PATH`.
+
 ## [0.20.2] - 2026-07-25
 
 ### Fixed
@@ -555,7 +568,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.20.2...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.20.3...HEAD
+[0.20.3]: https://github.com/yasyf/daemonkit/compare/v0.20.2...v0.20.3
 [0.20.2]: https://github.com/yasyf/daemonkit/compare/v0.20.1...v0.20.2
 [0.20.1]: https://github.com/yasyf/daemonkit/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/yasyf/daemonkit/compare/v0.19.1...v0.20.0

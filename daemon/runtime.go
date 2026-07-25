@@ -9,6 +9,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"slices"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -119,10 +121,31 @@ func init() {
 	})
 }
 
+// extendPath appends the standard user bin directories launchd omits, so the
+// daemon and every child it spawns resolve user-installed CLIs by inheritance.
+func extendPath() {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	path := os.Getenv("PATH")
+	if path == "" {
+		path = "/usr/bin:/bin:/usr/sbin:/sbin"
+	}
+	entries := strings.Split(path, ":")
+	for _, dir := range []string{"/usr/local/bin", "/opt/homebrew/bin", home + "/.local/bin", home + "/.bun/bin"} {
+		if !slices.Contains(entries, dir) {
+			path += ":" + dir
+		}
+	}
+	_ = os.Setenv("PATH", path)
+}
+
 func newRuntime(cfg RuntimeConfig, policy trust.TrustPolicy) (*Runtime, error) {
 	if err := validateRuntimeConfig(cfg); err != nil {
 		return nil, err
 	}
+	extendPath()
 	generation, err := proc.ProcessGeneration()
 	if err != nil {
 		return nil, fmt.Errorf("daemon: derive process generation: %w", err)
