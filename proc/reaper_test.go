@@ -888,7 +888,7 @@ func TestTerminateTrackedIdentityEscalatesAndSettles(t *testing.T) {
 	prober := &fakeProber{perProbe: []probeResult{
 		{info: liveInfo()}, // TrackIdentity.
 		{info: liveInfo()}, // Initial termination revalidation.
-		{info: liveInfo()}, // TERM-resistant grace expiry.
+		{info: liveInfo()}, // TERM-resistant grace poll at expiry.
 		{err: errNoProc},   // KILL settlement.
 	}}
 	signaler := &recSignaler{}
@@ -1010,12 +1010,15 @@ func TestReapSignalsProcessGroup(t *testing.T) {
 	store := &memStore{}
 	info := groupInfo(4141, liveInfo().startTime, liveInfo().comm)
 	members := []groupMember{{pid: 4141, info: info}}
-	prober := &fakeProber{info: info, memberSets: [][]groupMember{members, members, nil}}
+	prober := &fakeProber{info: info, memberSets: [][]groupMember{members, members, members, nil}}
 	sig := &recSignaler{}
 	rec := matchingGroupRecord(4141, "old-gen")
 	mustAdd(t, store, rec)
 
-	r := &Reaper{Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: sig, clock: newFakeClock()}
+	r := &Reaper{
+		Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: sig,
+		clock: newFakeClock(), Grace: settlementPollInterval,
+	}
 	err := r.Reap(ctx)
 	if err != nil {
 		t.Fatalf("Reap: %v", err)
@@ -1033,6 +1036,63 @@ func TestReapSignalsProcessGroup(t *testing.T) {
 	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
 		t.Fatalf("signals = %v, want %v", got, want)
 	}
+}
+
+func TestReapGroupSettlesEarlyWithinGrace(t *testing.T) {
+	t.Run("first grace poll settles without escalation", func(t *testing.T) {
+		store := &memStore{}
+		rec := matchingGroupRecord(4145, "old-gen")
+		mustAdd(t, store, rec)
+		info := groupInfo(rec.PID, rec.StartTime, rec.Comm)
+		members := []groupMember{{pid: rec.PID, info: info}}
+		prober := &fakeProber{info: info, memberSets: [][]groupMember{members, nil}}
+		signals := &recSignaler{}
+		clock := newFakeClock()
+		start := clock.Now()
+		r := &Reaper{Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: signals, clock: clock}
+		if err := r.Reap(t.Context()); err != nil {
+			t.Fatalf("Reap: %v", err)
+		}
+		if got := signals.calls(); !slices.Equal(got, []signalCall{{pid: -rec.PID, sig: syscall.SIGTERM}}) {
+			t.Fatalf("signals = %v, want SIGTERM only for a group settling within grace", got)
+		}
+		if elapsed := clock.Now().Sub(start); elapsed != settlementPollInterval {
+			t.Fatalf("grace wait = %s, want one settlement poll instead of the full %s grace", elapsed, r.graceDur())
+		}
+		if store.len() != 0 {
+			t.Fatalf("store size = %d, want settled record removed", store.len())
+		}
+		result, err := r.ReapReceipts(t.Context(), RecoveryTaskID, ReapReceiptCursor{}, ReapReceiptPageLimit)
+		if err != nil {
+			t.Fatalf("ReapReceipts: %v", err)
+		}
+		if len(result.Receipts) != 1 || result.Receipts[0].Outcome != ReapTerminated {
+			t.Fatalf("Reap receipt = %+v, want exact termination within grace", result)
+		}
+	})
+	t.Run("unsettled group still escalates at the grace cap", func(t *testing.T) {
+		store := &memStore{}
+		rec := matchingGroupRecord(4146, "old-gen")
+		mustAdd(t, store, rec)
+		info := groupInfo(rec.PID, rec.StartTime, rec.Comm)
+		members := []groupMember{{pid: rec.PID, info: info}}
+		prober := &fakeProber{info: info, memberSets: [][]groupMember{members, members, members, members, nil}}
+		signals := &recSignaler{}
+		r := &Reaper{
+			Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: signals,
+			clock: newFakeClock(), Grace: 2 * settlementPollInterval,
+		}
+		if err := r.Reap(t.Context()); err != nil {
+			t.Fatalf("Reap: %v", err)
+		}
+		want := []signalCall{{pid: -rec.PID, sig: syscall.SIGTERM}, {pid: -rec.PID, sig: syscall.SIGKILL}}
+		if got := signals.calls(); !slices.Equal(got, want) {
+			t.Fatalf("signals = %v, want %v", got, want)
+		}
+		if store.len() != 0 {
+			t.Fatalf("store size = %d, want settled record removed", store.len())
+		}
+	})
 }
 
 func TestReapAcceptsDeniedGroupSignalOnlyAfterExactSessionAbsence(t *testing.T) {
@@ -1091,11 +1151,11 @@ func TestReapAcceptsDeniedKillOnlyAfterExactSessionAbsence(t *testing.T) {
 	mustAdd(t, store, record)
 	info := groupInfo(record.PID, record.StartTime, record.Comm)
 	member := groupMember{pid: record.PID, info: info}
-	prober := &fakeProber{info: info, memberSets: [][]groupMember{{member}, {member}, nil}}
+	prober := &fakeProber{info: info, memberSets: [][]groupMember{{member}, {member}, {member}, nil}}
 	signals := &recSignaler{errs: []error{nil, syscall.EPERM}}
 	reaper := &Reaper{
 		Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: signals,
-		clock: newFakeClock(),
+		clock: newFakeClock(), Grace: settlementPollInterval,
 	}
 
 	if err := reaper.Reap(t.Context()); err != nil {
@@ -1127,6 +1187,7 @@ func TestReapLeaderlessGroupUsesDurableSessionMembers(t *testing.T) {
 		memberSets: [][]groupMember{
 			{{pid: memberPID, info: memberInfo}},
 			{{pid: memberPID, info: memberInfo}},
+			{{pid: memberPID, info: memberInfo}},
 			nil,
 		},
 	}
@@ -1134,7 +1195,10 @@ func TestReapLeaderlessGroupUsesDurableSessionMembers(t *testing.T) {
 	rec := matchingGroupRecord(leaderPID, "old-gen")
 	mustAdd(t, store, rec)
 
-	r := &Reaper{Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: sig, clock: newFakeClock()}
+	r := &Reaper{
+		Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: sig,
+		clock: newFakeClock(), Grace: settlementPollInterval,
+	}
 	err := r.Reap(ctx)
 	if err != nil {
 		t.Fatalf("Reap: %v", err)
@@ -1172,12 +1236,15 @@ func TestReapSignalsEveryGroupInDedicatedSession(t *testing.T) {
 			leaderPID:       {info: leader},
 			descendantGroup: {info: descendant},
 		},
-		memberSets: [][]groupMember{members, members, nil},
+		memberSets: [][]groupMember{members, members, members, nil},
 	}
 	signals := &recSignaler{}
 	record := matchingGroupRecord(leaderPID, "old-gen")
 	mustAdd(t, store, record)
-	reaper := &Reaper{Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: signals, clock: newFakeClock()}
+	reaper := &Reaper{
+		Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: signals,
+		clock: newFakeClock(), Grace: settlementPollInterval,
+	}
 	if err := reaper.Reap(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -1212,14 +1279,14 @@ func TestReapIgnoresSameTickReusedLeaderAndSettlesRecordedSession(t *testing.T) 
 			leaderPID: {info: replacement},
 			memberPID: {info: member},
 		},
-		memberSets: [][]groupMember{memberSet, memberSet, nil},
+		memberSets: [][]groupMember{memberSet, memberSet, memberSet, nil},
 	}
 	signals := &recSignaler{}
 	record := matchingGroupRecord(leaderPID, "old-gen")
 	mustAdd(t, store, record)
 	reaper := &Reaper{
 		Store: store, Generation: testOwnerGeneration("new-gen"),
-		prober: prober, signaler: signals, clock: newFakeClock(),
+		prober: prober, signaler: signals, clock: newFakeClock(), Grace: settlementPollInterval,
 	}
 	if err := reaper.Reap(ctx); err != nil {
 		t.Fatal(err)
@@ -1255,6 +1322,7 @@ func TestReapKillsGroupAppearingDuringDedicatedSessionSettlement(t *testing.T) {
 		memberSets: [][]groupMember{
 			{leaderMember},
 			{leaderMember},
+			{leaderMember},
 			{descendantMember},
 			nil,
 		},
@@ -1262,7 +1330,10 @@ func TestReapKillsGroupAppearingDuringDedicatedSessionSettlement(t *testing.T) {
 	signals := &recSignaler{}
 	record := matchingGroupRecord(leaderPID, "old-gen")
 	mustAdd(t, store, record)
-	reaper := &Reaper{Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: signals, clock: newFakeClock()}
+	reaper := &Reaper{
+		Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: signals,
+		clock: newFakeClock(), Grace: settlementPollInterval,
+	}
 	if err := reaper.Reap(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -1532,7 +1603,10 @@ func TestReapExecWithStableStartIdentityStillEscalates(t *testing.T) {
 	sig := &recSignaler{}
 	mustAdd(t, store, matchingRecord(9393, "old-gen"))
 
-	r := &Reaper{Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: sig, clock: newFakeClock()}
+	r := &Reaper{
+		Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: sig,
+		clock: newFakeClock(), Grace: settlementPollInterval,
+	}
 	if err := r.Reap(ctx); err != nil {
 		t.Fatalf("Reap: %v", err)
 	}
@@ -1580,7 +1654,10 @@ func TestReapRemovesRecordOnlyAfterPostKillAbsence(t *testing.T) {
 		{err: errNoProc},
 	}}
 	sig := &recSignaler{}
-	r := &Reaper{Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: sig, clock: newFakeClock(), Settlement: 50 * time.Millisecond}
+	r := &Reaper{
+		Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: sig,
+		clock: newFakeClock(), Grace: settlementPollInterval, Settlement: 50 * time.Millisecond,
+	}
 	if err := r.Reap(context.Background()); err != nil {
 		t.Fatalf("Reap: %v", err)
 	}

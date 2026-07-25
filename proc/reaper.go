@@ -819,24 +819,31 @@ func (r *Reaper) reapOrphanOutcome(
 	if gone {
 		return true, ReapAbsent, nil
 	}
-	select {
-	case <-ctx.Done():
-		return false, 0, ctx.Err()
-	case <-clockOrReal(r.clock).After(r.graceDur()):
-	}
-	if gone, err := r.auditRecordGone(rec); gone || err != nil {
-		return gone, ReapTerminated, err
-	}
-	info, perr := r.prb().probe(rec.PID)
-	switch {
-	case errors.Is(perr, errNoProc):
-		return true, ReapTerminated, nil
-	case perr != nil:
-		return false, 0, perr
-	case info.startTime != rec.StartTime:
-		return true, ReapIdentityReused, nil
-	case info.zombie:
-		return true, ReapTerminated, nil
+	clock := clockOrReal(r.clock)
+	deadline := clock.Now().Add(r.graceDur())
+	for {
+		select {
+		case <-ctx.Done():
+			return false, 0, ctx.Err()
+		case <-clock.After(min(settlementPollInterval, deadline.Sub(clock.Now()))):
+		}
+		if gone, err := r.auditRecordGone(rec); gone || err != nil {
+			return gone, ReapTerminated, err
+		}
+		info, perr := r.prb().probe(rec.PID)
+		switch {
+		case errors.Is(perr, errNoProc):
+			return true, ReapTerminated, nil
+		case perr != nil:
+			return false, 0, perr
+		case info.startTime != rec.StartTime:
+			return true, ReapIdentityReused, nil
+		case info.zombie:
+			return true, ReapTerminated, nil
+		}
+		if !clock.Now().Before(deadline) {
+			break
+		}
 	}
 	if _, err := r.sendRecordSignal(rec, syscall.SIGKILL); err != nil {
 		return false, 0, err
@@ -886,10 +893,24 @@ func (r *Reaper) reapGroupOutcome(
 	if settled {
 		return true, ReapAbsent, nil
 	}
-	select {
-	case <-ctx.Done():
-		return false, 0, ctx.Err()
-	case <-clockOrReal(r.clock).After(r.graceDur()):
+	clock := clockOrReal(r.clock)
+	deadline := clock.Now().Add(r.graceDur())
+	for {
+		select {
+		case <-ctx.Done():
+			return false, 0, ctx.Err()
+		case <-clock.After(min(settlementPollInterval, deadline.Sub(clock.Now()))):
+		}
+		members, err = r.verifiedGroupMembers(rec)
+		if err != nil {
+			return false, 0, err
+		}
+		if len(members) == 0 {
+			return true, ReapTerminated, nil
+		}
+		if !clock.Now().Before(deadline) {
+			break
+		}
 	}
 	reaped, err := r.awaitGroupSettlement(ctx, rec)
 	return reaped, ReapTerminated, err

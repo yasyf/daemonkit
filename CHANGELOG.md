@@ -4,6 +4,28 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] - 2026-07-24
+
+### Added
+
+- `worker.RuntimeClaim.Terminalized` exposes the claim's sticky terminal state
+  as a level-triggered channel, with `Terminal` returning the terminal error.
+
+### Changed
+
+- A worker claim that terminalizes after activation now tears the runtime
+  down: `daemon.Runtime.Wait` returns the terminal error instead of the daemon
+  serving forever with a closed pool — a state in which every peer was
+  rejected as untrusted and exit-based supervisors never intervened because
+  the process stayed alive. Ordered shutdown (`worker.ErrClosed`) is exempt.
+
+### Fixed
+
+- The reaper's termination-grace wait is now an early-settle poll instead of
+  an unconditional full-grace sleep, returning unused grace to the settlement
+  budget and making timeout-driven claim terminalization under load
+  correspondingly less likely.
+
 ## [0.18.0] - 2026-07-24
 
 ### Added

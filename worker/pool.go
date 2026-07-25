@@ -115,9 +115,10 @@ type Pool struct {
 
 // RuntimeClaim owns product and verifier workers for one daemon Runtime.
 type RuntimeClaim struct {
-	product   *Pool
-	verifier  *Pool
-	lifecycle chan struct{}
+	product      *Pool
+	verifier     *Pool
+	lifecycle    chan struct{}
+	terminalized chan struct{}
 
 	mu                sync.Mutex
 	productRecovered  bool
@@ -185,7 +186,8 @@ func (p *Pool) ClaimRuntime(budgets VerifierBudgets) (*RuntimeClaim, error) {
 		return nil, errors.Join(ErrRuntimeOwnership, err)
 	}
 	claim := &RuntimeClaim{
-		product: p, verifier: verifier, lifecycle: make(chan struct{}, 1), closeDone: make(chan struct{}),
+		product: p, verifier: verifier, lifecycle: make(chan struct{}, 1),
+		terminalized: make(chan struct{}), closeDone: make(chan struct{}),
 	}
 	claim.lifecycle <- struct{}{}
 	p.claim = claim
@@ -411,6 +413,25 @@ func (p *Pool) markTerminal(err error) {
 	p.mu.Unlock()
 }
 
+// Terminalized returns a channel closed exactly once when this claim becomes
+// terminal, whether by ordered Close or a settlement failure.
+func (c *RuntimeClaim) Terminalized() <-chan struct{} {
+	if c == nil {
+		return nil
+	}
+	return c.terminalized
+}
+
+// Terminal returns the sticky terminal error, or nil while this claim is live.
+func (c *RuntimeClaim) Terminal() error {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.terminal
+}
+
 func (c *RuntimeClaim) terminalize(err error) error {
 	if c == nil {
 		return err
@@ -418,6 +439,7 @@ func (c *RuntimeClaim) terminalize(err error) error {
 	c.mu.Lock()
 	if c.terminal == nil {
 		c.terminal = err
+		close(c.terminalized)
 	}
 	terminal := c.terminal
 	c.mu.Unlock()

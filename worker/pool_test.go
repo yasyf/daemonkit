@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -591,6 +592,126 @@ func TestCloseIncompleteResultIsStickyAndJoinsActiveRun(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("active Run survived terminal Close")
+	}
+}
+
+func TestTerminalizeSignalsTerminalizedOnce(t *testing.T) {
+	_, claim := newWorkerTestPoolWithoutCleanup(t, workerTestConfig())
+	select {
+	case <-claim.Terminalized():
+		t.Fatal("Terminalized fired before terminalization")
+	default:
+	}
+	if err := claim.Terminal(); err != nil {
+		t.Fatalf("Terminal before terminalization = %v", err)
+	}
+	first := errors.New("first settlement failure")
+	if got := claim.terminalize(errors.Join(ErrSettlementIncomplete, first)); !errors.Is(got, first) {
+		t.Fatalf("terminalize = %v, want %v", got, first)
+	}
+	select {
+	case <-claim.Terminalized():
+	default:
+		t.Fatal("Terminalized did not fire on terminalization")
+	}
+	second := errors.New("second settlement failure")
+	if got := claim.terminalize(second); !errors.Is(got, first) || errors.Is(got, second) {
+		t.Fatalf("repeated terminalize = %v, want sticky first terminal", got)
+	}
+	select {
+	case <-claim.Terminalized():
+	default:
+		t.Fatal("Terminalized stopped firing after repeated terminalize")
+	}
+	if got := claim.Terminal(); !errors.Is(got, ErrSettlementIncomplete) || !errors.Is(got, first) {
+		t.Fatalf("Terminal = %v, want sticky first terminal", got)
+	}
+}
+
+func TestOrderedCloseTerminalIsErrClosed(t *testing.T) {
+	_, claim := newWorkerTestPoolWithoutCleanup(t, workerTestConfig())
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := claim.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case <-claim.Terminalized():
+	default:
+		t.Fatal("ordered Close did not signal Terminalized")
+	}
+	if err := claim.Terminal(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Terminal after ordered Close = %v, want ErrClosed", err)
+	}
+}
+
+type failRemoveStore struct {
+	proc.Store
+	fail atomic.Bool
+}
+
+func (s *failRemoveStore) Remove(ctx context.Context, records []proc.Record) error {
+	if s.fail.Load() {
+		return errors.New("test durable remove failure")
+	}
+	return s.Store.Remove(ctx, records)
+}
+
+func TestRunSettlementOverrunTerminalizesClaimAndSignalsWatcher(t *testing.T) {
+	generation, err := proc.ProcessGeneration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &failRemoveStore{Store: &proc.FileStore{Path: filepath.Join(t.TempDir(), "workers.db")}}
+	reaper := &proc.Reaper{
+		Store: store, Generation: generation, Grace: 10 * time.Millisecond, Settlement: time.Second,
+	}
+	pool, err := NewPool(workerTestConfig(), reaper)
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	claim, err := pool.ClaimRuntime(workerTestVerifierBudgets())
+	if err != nil {
+		t.Fatalf("ClaimRuntime: %v", err)
+	}
+	if err := claim.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if err := claim.Activate(); err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+
+	marker := filepath.Join(t.TempDir(), "started")
+	request := shellRequest(filepath.Dir(marker), "touch "+marker+"; sleep 10")
+	request.TotalTimeout = 2 * time.Second
+	running := runAsync(context.Background(), pool, request)
+	waitForPath(t, marker)
+	store.fail.Store(true)
+	select {
+	case <-claim.Terminalized():
+		t.Fatal("Terminalized fired before the settlement overrun")
+	default:
+	}
+	select {
+	case stopped := <-running:
+		if !errors.Is(stopped.err, ErrSettlementIncomplete) {
+			t.Fatalf("overrun Run = %v, want settlement incomplete", stopped.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("overrun Run did not return")
+	}
+	select {
+	case <-claim.Terminalized():
+	default:
+		t.Fatal("settlement overrun did not signal Terminalized")
+	}
+	terminal := claim.Terminal()
+	if !errors.Is(terminal, ErrSettlementIncomplete) || errors.Is(terminal, ErrClosed) {
+		t.Fatalf("Terminal = %v, want non-ErrClosed settlement failure", terminal)
+	}
+	result, err := pool.Run(context.Background(), shellRequest(t.TempDir(), "exit 0"))
+	if !errors.Is(err, ErrClosed) || result.Receipt.ProcessIdentity().PID != 0 {
+		t.Fatalf("post-terminal Run = %+v, %v, want ErrClosed", result, err)
 	}
 }
 

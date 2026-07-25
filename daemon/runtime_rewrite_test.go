@@ -781,6 +781,52 @@ func TestRuntimeRetainsOwnershipOnIncompleteChildSettlement(t *testing.T) {
 	}
 }
 
+func TestRuntimeTerminatesWhenWorkerClaimTerminalizes(t *testing.T) {
+	store := &runtimeFailRemoveStore{Store: &proc.FileStore{Path: filepath.Join(t.TempDir(), "workers.db")}}
+	trig := newRuntimeTestRig(t, nil, 0, store, nil)
+	trig.ready(t, "ready")
+	marker := filepath.Join(t.TempDir(), "worker-started")
+	runResult := make(chan error, 1)
+	go func() {
+		_, err := trig.workers.Run(context.Background(), worker.CommandRequest{
+			Path: "/bin/sh", Dir: "/bin",
+			Args:         []string{"-c", `: > "$1"; exec /bin/sleep 10`, "worker", marker},
+			TotalTimeout: 2 * time.Second,
+		})
+		runResult <- err
+	}()
+	waitRuntimeTestFile(t, marker)
+	store.fail.Store(true)
+	select {
+	case err := <-runResult:
+		if !errors.Is(err, worker.ErrSettlementIncomplete) {
+			t.Fatalf("worker Run = %v, want settlement incomplete", err)
+		}
+	case <-time.After(runtimeTestTimeout):
+		t.Fatal("worker settlement overrun did not surface")
+	}
+	if err := waitRuntimeTest(t, trig.runtime); !errors.Is(err, worker.ErrSettlementIncomplete) {
+		t.Fatalf("Wait = %v, want self-termination on the terminal worker claim", err)
+	}
+	if progress := trig.runtime.Lifecycle().Snapshot(); progress.State != LifecycleFailed {
+		t.Fatalf("lifecycle after worker terminalization = %+v, want Failed", progress)
+	}
+}
+
+func TestRuntimeOrderedShutdownDoesNotSelfTerminate(t *testing.T) {
+	trig := newRuntimeTestRig(t, nil, 0, nil, nil)
+	trig.ready(t, "ready")
+	if err := closeRuntimeTest(t, trig.runtime); err != nil {
+		t.Fatalf("ordered Close = %v", err)
+	}
+	if err := waitRuntimeTest(t, trig.runtime); err != nil {
+		t.Fatalf("Wait after ordered Close = %v", err)
+	}
+	if progress := trig.runtime.Lifecycle().Snapshot(); progress.State != LifecycleDraining {
+		t.Fatalf("lifecycle after ordered Close = %+v, want Draining", progress)
+	}
+}
+
 func TestRuntimeHealthCopiesStatusAndTracksActivity(t *testing.T) {
 	trig := newRuntimeTestRig(t, nil, 0, nil, nil)
 	activation := trig.ready(t, "ready")
