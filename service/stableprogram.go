@@ -83,7 +83,7 @@ func stableProgram(root, name, build, self string) (string, error) {
 	}
 	metaPath := stableMetaPath(stablePath)
 	if stableProgramCurrent(stablePath, metaPath, build) {
-		return canonicalExecutablePath(stablePath)
+		return canonicalStableProgram(stablePath)
 	}
 	handle, err := stableProgramLock(root, name)
 	if err != nil {
@@ -91,7 +91,7 @@ func stableProgram(root, name, build, self string) (string, error) {
 	}
 	defer handle.Close()
 	if stableProgramCurrent(stablePath, metaPath, build) {
-		return canonicalExecutablePath(stablePath)
+		return canonicalStableProgram(stablePath)
 	}
 	replace, refresh, err := stableProgramNeedsReplace(stablePath, metaPath, build)
 	if err != nil {
@@ -106,7 +106,26 @@ func stableProgram(root, name, build, self string) (string, error) {
 			return "", err
 		}
 	}
-	return canonicalExecutablePath(stablePath)
+	return canonicalStableProgram(stablePath)
+}
+
+// canonicalStableProgram resolves the stable program's directory without ever
+// following a symlink at the final component, so a substituted link can never
+// be returned as the registered program.
+func canonicalStableProgram(stablePath string) (string, error) {
+	dir, err := filepath.EvalSymlinks(filepath.Dir(stablePath))
+	if err != nil {
+		return "", fmt.Errorf("service: resolve stable program directory: %w", err)
+	}
+	resolved := filepath.Join(dir, filepath.Base(stablePath))
+	info, err := os.Lstat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("service: inspect stable program: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("service: stable program %q is not a regular file", resolved)
+	}
+	return resolved, nil
 }
 
 func removeStableProgram(root, name string) error {
