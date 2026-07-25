@@ -1,1 +1,1 @@
-{"v":1,"lamport":3,"session":"4a23a643-72bd-4add-8b03-cbe4379168c6","ops":[{"kind":"remove_criterion","id":"9df5c5acf2d57010bb5acc646aaa0fb2"}]}
+{"v":1,"lamport":4,"session":"4a23a643-72bd-4add-8b03-cbe4379168c6","ops":[{"kind":"add_criterion","id":"17479ba16da15ddeb0cac359e31c0e58","text":"yasyf-home: cc-pool daemon running under launchd supervision with /Users/yasyf/.cc-pool/sync.sock accepting; serve.log handshake-failure delta = 0 and reconcile free of sync.sock dial errors over a 30-min window (the acct-18 string was stale — these are the live symptoms)","script":""}]}
