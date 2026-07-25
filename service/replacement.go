@@ -765,7 +765,7 @@ func (c *Controller) requireReplacementUnloaded(ctx context.Context, plan Plan) 
 		if err == nil {
 			return fmt.Errorf("%w: agent %q remains loaded", ErrNotQuiesced, agent.Label)
 		}
-		if launchctlExitCode(err) != launchctlNotLoadedExit {
+		if !launchctlNotLoaded(err) {
 			return fmt.Errorf("service: inspect quiesced agent %q: %w", agent.Label, err)
 		}
 	}

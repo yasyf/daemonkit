@@ -528,7 +528,10 @@ func (k AppKeepAlive) Uninstall(ctx context.Context) error {
 // bootout exits 3 ("No such process") for an unloaded service target.
 func notLoaded(err error) bool {
 	var exit interface{ ExitCode() int }
-	return errors.As(err, &exit) && exit.ExitCode() == 3
+	if !errors.As(err, &exit) {
+		return false
+	}
+	return exit.ExitCode() == launchctlNotLoadedExit || exit.ExitCode() == launchctlNotFoundExit
 }
 
 // Loaded reports whether launchd currently knows about the agent.

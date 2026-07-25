@@ -29,6 +29,7 @@ const (
 	bootstrapAttempts      = 6
 	bootstrapBaseDelay     = 200 * time.Millisecond
 	launchctlNotLoadedExit = 3
+	launchctlNotFoundExit  = 113
 	launchctlInFluxExit    = 5
 )
 
@@ -274,14 +275,10 @@ func (c *Controller) Status(ctx context.Context, label string) (Status, error) {
 	applied, isApplied := c.state.Applied[label]
 	status := Status{Label: label, Desired: isDesired, Applied: isApplied}
 	_, printErr := c.launchctl(opCtx, "print", serviceTarget(label))
-	switch launchctlExitCode(printErr) {
-	case launchctlNotLoadedExit:
+	switch {
+	case launchctlNotLoaded(printErr):
 		return status, nil
-	case -1:
-		if printErr != nil {
-			return Status{}, fmt.Errorf("service: inspect agent %q: %w", label, printErr)
-		}
-	default:
+	case printErr != nil:
 		return Status{}, fmt.Errorf("service: inspect agent %q: %w", label, printErr)
 	}
 	status.Loaded = true
@@ -453,7 +450,7 @@ func (c *Controller) verify(ctx context.Context, agent Agent) (bool, error) {
 	}
 	out, err := c.launchctl(ctx, "print", serviceTarget(agent.Label))
 	if err != nil {
-		if launchctlExitCode(err) == launchctlNotLoadedExit {
+		if launchctlNotLoaded(err) {
 			return false, nil
 		}
 		return false, fmt.Errorf("launchctl print: %w: %s", err, strings.TrimSpace(out))
@@ -534,7 +531,7 @@ func validateProgramTree(agent Agent) error {
 
 func (c *Controller) uninstall(ctx context.Context, agent Agent) error {
 	if out, err := c.launchctl(ctx, "bootout", serviceTarget(agent.Label)); err != nil &&
-		launchctlExitCode(err) != launchctlNotLoadedExit {
+		!launchctlNotLoaded(err) {
 		return fmt.Errorf("launchctl bootout: %w: %s", err, strings.TrimSpace(out))
 	}
 	path, err := agent.PlistPath()
@@ -556,7 +553,7 @@ func (c *Controller) reload(ctx context.Context, agent Agent, path string) error
 	var lastErr error
 	for attempt := 1; attempt <= bootstrapAttempts; attempt++ {
 		out, err := c.launchctl(ctx, "bootout", serviceTarget(agent.Label))
-		if err != nil && launchctlExitCode(err) != launchctlNotLoadedExit {
+		if err != nil && !launchctlNotLoaded(err) {
 			lastErr = fmt.Errorf("launchctl bootout before bootstrap: %w: %s", err, strings.TrimSpace(out))
 			if launchctlExitCode(err) != launchctlInFluxExit {
 				return lastErr
@@ -638,6 +635,13 @@ func launchctlExitCode(err error) int {
 		return exitErr.ExitCode
 	}
 	return -1
+}
+
+// launchctlNotLoaded reports a launchctl failure that means the service is not
+// known to launchd: bootout exits 3, print exits 113 on current macOS.
+func launchctlNotLoaded(err error) bool {
+	code := launchctlExitCode(err)
+	return code == launchctlNotLoadedExit || code == launchctlNotFoundExit
 }
 
 func waitServiceRetry(ctx context.Context, delay time.Duration) error {

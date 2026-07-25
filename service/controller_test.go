@@ -283,6 +283,27 @@ func TestControllerStatusReportsAbsentWithoutRuntimeConnection(t *testing.T) {
 	}
 }
 
+func TestControllerStatusTreatsPrintNotFoundExitAsAbsent(t *testing.T) {
+	runtime := &controllerRuntimeStub{run: launchctlStub(func(args []string) (string, error) {
+		if !reflect.DeepEqual(args, []string{"print", serviceTarget("com.example.absent")}) {
+			t.Fatalf("launchctl args = %v", args)
+		}
+		return "Could not find service", launchctlExit(launchctlNotFoundExit)
+	})}
+	controller := &Controller{
+		runtime:   runtime,
+		state:     controllerState{Desired: map[string]Agent{}, Applied: map[string]Agent{}},
+		closeDone: make(chan struct{}),
+	}
+	status, err := controller.Status(t.Context(), "com.example.absent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != (Status{Label: "com.example.absent"}) {
+		t.Fatalf("Status = %#v", status)
+	}
+}
+
 func TestControllerStatusRequiresExactDesiredAppliedLoadedState(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	agent := controllerAgent(t, "com.example.exact")

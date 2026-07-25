@@ -4,6 +4,18 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.5] - 2026-07-25
+
+### Fixed
+
+- `launchctl print` exit 113 ("Could not find service", current macOS) is now
+  recognized as not-loaded alongside exit 3, wherever launchctl outcomes are
+  classified (verify, status inspect, uninstall/reload bootout, replacement
+  quiesce inspect, keepalive). Previously a stored agent whose service was
+  booted out hard-failed controller recovery and `Status` instead of reading
+  as drift — wedging deployment applies whose prior host was stopped, the
+  exact cold-upgrade path a build-mismatched host requires.
+
 ## [0.20.4] - 2026-07-25
 
 ### Fixed
@@ -577,7 +589,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.20.4...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.20.5...HEAD
+[0.20.5]: https://github.com/yasyf/daemonkit/compare/v0.20.4...v0.20.5
 [0.20.4]: https://github.com/yasyf/daemonkit/compare/v0.20.3...v0.20.4
 [0.20.3]: https://github.com/yasyf/daemonkit/compare/v0.20.2...v0.20.3
 [0.20.2]: https://github.com/yasyf/daemonkit/compare/v0.20.1...v0.20.2
