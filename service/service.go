@@ -124,7 +124,11 @@ type Agent struct {
 	// launchd key.
 	ProcessType ProcessType
 	// LimitLoadToSessionType restricts the job to one launchd session type. The
-	// zero value omits the launchd key.
+	// zero value omits the launchd key. launchctl bootstrap refuses some
+	// key-bearing configurations with EIO (observed: .app Programs in Aqua
+	// sessions; Background bootstrapped from SSH contexts) — prefer ProcessType
+	// for background intent and omit this field unless the exact configuration
+	// is proven to load.
 	LimitLoadToSessionType SessionType
 }
 
