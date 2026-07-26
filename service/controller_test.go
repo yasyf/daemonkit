@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/daemonkit/internal/realhome"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/worker"
 )
@@ -305,7 +306,7 @@ func TestControllerStatusTreatsPrintNotFoundExitAsAbsent(t *testing.T) {
 }
 
 func TestControllerStatusRequiresExactDesiredAppliedLoadedState(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	agent := controllerAgent(t, "com.example.exact")
 	plist, err := agent.Plist()
 	if err != nil {
@@ -343,7 +344,7 @@ func TestControllerStatusRequiresExactDesiredAppliedLoadedState(t *testing.T) {
 }
 
 func TestControllerRecoveryConvergesBeforeAcknowledgingReceipts(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	agent := controllerAgent(t, "com.example.recover")
 	var events []string
 	run := launchctlStub(func(args []string) (string, error) {
@@ -373,15 +374,100 @@ func TestControllerRecoveryConvergesBeforeAcknowledgingReceipts(t *testing.T) {
 	}
 }
 
+func TestControllerRecoverySkipsFailingDesiredInstallUntilConvergeSupersedes(t *testing.T) {
+	t.Setenv(realhome.EnvOverride, t.TempDir())
+	wedged := controllerAgent(t, "com.example.wedged")
+	fresh := controllerAgent(t, "com.example.fresh")
+	deny := true
+	run := launchctlStub(func(args []string) (string, error) {
+		switch args[0] {
+		case "bootout":
+			return "not loaded", launchctlExit(launchctlNotLoadedExit)
+		case "bootstrap":
+			if deny {
+				return "denied", launchctlExit(77)
+			}
+		}
+		return "", nil
+	})
+	controller, _, store, _ := newTestController(t, controllerState{
+		Desired: map[string]Agent{wedged.Label: wedged},
+		Applied: map[string]Agent{wedged.Label: wedged},
+	}, run, nil)
+	if got := store.state.Applied[wedged.Label]; !reflect.DeepEqual(got, wedged) {
+		t.Fatalf("recovery removed the applied agent: %#v", got)
+	}
+	if got := store.state.Desired[wedged.Label]; !reflect.DeepEqual(got, wedged) {
+		t.Fatalf("recovery changed the desired agent: %#v", got)
+	}
+
+	deny = false
+	if err := controller.Converge(context.Background(), []Agent{fresh}); err != nil {
+		t.Fatalf("Converge() = %v", err)
+	}
+	if _, ok := store.state.Applied[wedged.Label]; ok {
+		t.Fatal("superseded agent still applied")
+	}
+	if got := store.state.Applied[fresh.Label]; !reflect.DeepEqual(got, fresh) {
+		t.Fatalf("fresh agent = %#v, want %#v", got, fresh)
+	}
+	if len(store.state.Applied) != 1 || len(store.state.Desired) != 1 {
+		t.Fatalf("converged state = %#v", store.state)
+	}
+}
+
+func TestControllerRecoverySkipsFailingStaleRemovalUntilConvergeRetries(t *testing.T) {
+	t.Setenv(realhome.EnvOverride, t.TempDir())
+	stale := controllerAgent(t, "com.example.stale-wedged")
+	deny := true
+	run := launchctlStub(func(args []string) (string, error) {
+		if args[0] == "bootout" {
+			if deny {
+				return "denied", launchctlExit(77)
+			}
+			return "not loaded", launchctlExit(launchctlNotLoadedExit)
+		}
+		return "", nil
+	})
+	controller, _, store, _ := newTestController(t, controllerState{
+		Desired: map[string]Agent{}, Applied: map[string]Agent{stale.Label: stale},
+	}, run, nil)
+	if got := store.state.Applied[stale.Label]; !reflect.DeepEqual(got, stale) {
+		t.Fatalf("recovery removed the stale agent: %#v", got)
+	}
+
+	if err := controller.Converge(context.Background(), []Agent{}); err == nil ||
+		!strings.Contains(err.Error(), "remove stale agent") {
+		t.Fatalf("Converge() error = %v, want loud stale-removal failure", err)
+	}
+	if got := store.state.Applied[stale.Label]; !reflect.DeepEqual(got, stale) {
+		t.Fatalf("failed strict removal changed applied state: %#v", got)
+	}
+
+	deny = false
+	if err := controller.Converge(context.Background(), []Agent{}); err != nil {
+		t.Fatalf("Converge() = %v", err)
+	}
+	if len(store.state.Applied) != 0 {
+		t.Fatalf("stale agent still applied: %#v", store.state.Applied)
+	}
+}
+
 func TestControllerRecoveryDoesNotAcknowledgeBeforeConvergence(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	agent := controllerAgent(t, "com.example.fail")
-	runtime := &controllerRuntimeStub{run: launchctlStub(func([]string) (string, error) {
-		return "denied", errors.New("denied")
+	runtime := &controllerRuntimeStub{run: launchctlStub(func(args []string) (string, error) {
+		if args[0] == "bootout" {
+			return "not loaded", launchctlExit(launchctlNotLoadedExit)
+		}
+		return "", nil
 	})}
-	store := &controllerStoreStub{state: controllerState{
-		Desired: map[string]Agent{agent.Label: agent}, Applied: map[string]Agent{},
-	}}
+	store := &controllerStoreStub{
+		state: controllerState{
+			Desired: map[string]Agent{agent.Label: agent}, Applied: map[string]Agent{},
+		},
+		setErr: errors.New("commit denied"),
+	}
 	receipts := &controllerReceiptsStub{}
 	if _, err := newControllerWithRuntime(
 		context.Background(), controllerConfig(t), runtime, receipts, store,
@@ -398,7 +484,7 @@ func TestControllerRecoveryDoesNotAcknowledgeBeforeConvergence(t *testing.T) {
 
 func TestControllerRecoveryVerifiesExactAgentWithoutRelaunch(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	t.Setenv(realhome.EnvOverride, home)
 	agent := controllerAgent(t, "com.example.recover-exact")
 	plist, err := agent.Plist()
 	if err != nil {
@@ -444,7 +530,7 @@ func TestControllerRecoveryVerifiesExactAgentWithoutRelaunch(t *testing.T) {
 }
 
 func TestControllerRejectsUnsafeProgramTreeBeforeEffects(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	base, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -552,7 +638,7 @@ func TestControllerReconcileAndVerifyRejectNonMissingProgramErrors(t *testing.T)
 func assertReconcileAndVerifyProgramError(t *testing.T, agent Agent, target error) {
 	t.Helper()
 	controller := &Controller{}
-	err := controller.reconcile(t.Context(), map[string]Agent{}, map[string]Agent{agent.Label: agent})
+	err := controller.reconcile(t.Context(), map[string]Agent{}, map[string]Agent{agent.Label: agent}, reconcileStrict)
 	if err == nil || target != nil && !errors.Is(err, target) {
 		t.Fatalf("reconcile() error = %v, want non-missing program error %v", err, target)
 	}
@@ -563,7 +649,7 @@ func assertReconcileAndVerifyProgramError(t *testing.T, agent Agent, target erro
 }
 
 func TestControllerRejectsEmptyProgramBeforePersistence(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	agent := controllerAgent(t, "com.example.empty-program")
 	agent.Program = ""
 	var events []string
@@ -583,7 +669,7 @@ func TestControllerRejectsEmptyProgramBeforePersistence(t *testing.T) {
 }
 
 func TestControllerRecoveryToleratesStaleAppliedProgramAndReconverges(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	stale := controllerAgent(t, "com.example.stale-recovery")
 	stale.Program = controllerExecutable(t, "stale")
 	if err := os.Remove(stale.Program); err != nil {
@@ -645,7 +731,7 @@ func TestControllerRecoveryToleratesStaleAppliedProgramAndReconverges(t *testing
 }
 
 func TestControllerRecoveryInstallsFreshDesiredOverStaleApplied(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	stale := controllerAgent(t, "com.example.recovery-upgrade")
 	stale.Program = controllerExecutable(t, "stale")
 	if err := os.Remove(stale.Program); err != nil {
@@ -684,7 +770,7 @@ func TestControllerRecoveryInstallsFreshDesiredOverStaleApplied(t *testing.T) {
 }
 
 func TestControllerRecoverySkipsStaleLabelAndVerifiesHealthyLabel(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	stale := controllerAgent(t, "com.example.a-stale")
 	stale.Program = controllerExecutable(t, "stale")
 	if err := os.Remove(stale.Program); err != nil {
@@ -732,7 +818,7 @@ func TestControllerRecoverySkipsStaleLabelAndVerifiesHealthyLabel(t *testing.T) 
 }
 
 func TestControllerConvergeRemovesStalePersistedAgent(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	stale := controllerAgent(t, "com.example.remove-stale")
 	stale.Program = controllerExecutable(t, "stale")
 	if err := os.Remove(stale.Program); err != nil {
@@ -761,7 +847,7 @@ func TestControllerConvergeRemovesStalePersistedAgent(t *testing.T) {
 }
 
 func TestControllerStatusReportsStaleLoadedAgentAsDrift(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	stale := controllerAgent(t, "com.example.status-stale")
 	stale.Program = controllerExecutable(t, "stale")
 	if err := os.Remove(stale.Program); err != nil {
@@ -792,7 +878,7 @@ func TestControllerStatusReportsStaleLoadedAgentAsDrift(t *testing.T) {
 }
 
 func TestControllerPersistsDesiredBeforeEffectsAndResumesAfterFailure(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	agent := controllerAgent(t, "com.example.persist")
 	var events []string
 	fail := true
@@ -831,7 +917,7 @@ func TestControllerPersistsDesiredBeforeEffectsAndResumesAfterFailure(t *testing
 }
 
 func TestControllerInstallUsesExactLaunchctlOrder(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	agent := controllerAgent(t, "com.example.install-order")
 	path, err := agent.PlistPath()
 	if err != nil {
@@ -863,13 +949,13 @@ func TestControllerInstallUsesExactLaunchctlOrder(t *testing.T) {
 }
 
 func TestControllerInstallEnableFailureStopsAndRetryRestartsAtBootout(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	agent := controllerAgent(t, "com.example.enable-failure")
 	path, err := agent.PlistPath()
 	if err != nil {
 		t.Fatal(err)
 	}
-	errEnable := launchctlExit(launchctlInFluxExit)
+	errEnable := launchctlExit(launchctlEIOExit)
 	failEnable := true
 	var calls [][]string
 	run := launchctlStub(func(args []string) (string, error) {
@@ -918,7 +1004,7 @@ func TestControllerInstallEnableFailureStopsAndRetryRestartsAtBootout(t *testing
 }
 
 func TestControllerInstallRetryRepeatsSequenceBeforeKickstart(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	agent := controllerAgent(t, "com.example.bootstrap-retry")
 	path, err := agent.PlistPath()
 	if err != nil {
@@ -934,7 +1020,7 @@ func TestControllerInstallRetryRepeatsSequenceBeforeKickstart(t *testing.T) {
 		case "bootstrap":
 			bootstrapCalls++
 			if bootstrapCalls == 1 {
-				return "in flux", launchctlExit(launchctlInFluxExit)
+				return "in flux", launchctlExit(launchctlEIOExit)
 			}
 		}
 		return "", nil
@@ -961,7 +1047,7 @@ func TestControllerInstallRetryRepeatsSequenceBeforeKickstart(t *testing.T) {
 }
 
 func TestControllerExactSetRemovesStaleBeforeInstallingDesired(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	stale := controllerAgent(t, "com.example.stale")
 	desired := controllerAgent(t, "com.example.desired")
 	var events []string
@@ -1001,7 +1087,7 @@ func TestControllerExactSetRemovesStaleBeforeInstallingDesired(t *testing.T) {
 }
 
 func TestControllerSameSetVerifiesAndRepairsDrift(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	agent := controllerAgent(t, "com.example.verify")
 	var events []string
 	run := launchctlStub(func(args []string) (string, error) {
@@ -1040,7 +1126,7 @@ func TestControllerSameSetVerifiesAndRepairsDrift(t *testing.T) {
 }
 
 func TestControllerVerifyEnablesExactLoadedAgentForRelaunch(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	agent := controllerAgent(t, "com.example.verify-disabled")
 	disabled := false
 	var calls [][]string
@@ -1076,7 +1162,7 @@ func TestControllerVerifyEnablesExactLoadedAgentForRelaunch(t *testing.T) {
 }
 
 func TestControllerVerifyEnableFailureIsNotConverged(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	agent := controllerAgent(t, "com.example.verify-enable-failure")
 	errEnable := launchctlExit(77)
 	failEnable := false
@@ -1125,7 +1211,7 @@ func TestControllerVerifyEnableFailureIsNotConverged(t *testing.T) {
 }
 
 func TestControllerVerifyPropagatesUnexpectedLaunchctlFailure(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	agent := controllerAgent(t, "com.example.verify-error")
 	var failPrint bool
 	run := launchctlStub(func(args []string) (string, error) {
@@ -1148,7 +1234,7 @@ func TestControllerVerifyPropagatesUnexpectedLaunchctlFailure(t *testing.T) {
 }
 
 func TestControllerRetriesWholeLoadSequenceOnLaunchdEIO(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	agent := controllerAgent(t, "com.example.retry")
 	agent.LimitLoadToSessionType = SessionTypeBackground
 	tests := []struct {
@@ -1166,13 +1252,11 @@ func TestControllerRetriesWholeLoadSequenceOnLaunchdEIO(t *testing.T) {
 				switch args[0] {
 				case "bootout":
 					if test.failure == "bootout" {
-						return "in flux", launchctlExit(launchctlInFluxExit)
+						return "in flux", launchctlExit(launchctlEIOExit)
 					}
 					return "not loaded", launchctlExit(launchctlNotLoadedExit)
 				case "bootstrap":
-					return "in flux", launchctlExit(launchctlInFluxExit)
-				case "managername":
-					return "Aqua\n", nil
+					return "Bootstrap failed: 5: Input/output error", launchctlExit(launchctlEIOExit)
 				default:
 					return "", nil
 				}
@@ -1186,15 +1270,12 @@ func TestControllerRetriesWholeLoadSequenceOnLaunchdEIO(t *testing.T) {
 				return nil
 			}
 			err := controller.reload(context.Background(), agent, "/tmp/retry.plist")
-			if err == nil || !strings.Contains(err.Error(), "after 6 attempts") ||
-				!strings.Contains(err.Error(), `desired session "Background"`) ||
-				!strings.Contains(err.Error(), `current manager "Aqua"`) {
+			if err == nil || !strings.Contains(err.Error(), "after 3 attempts") ||
+				!strings.Contains(err.Error(), `"/tmp/retry.plist"`) ||
+				strings.Contains(err.Error(), "desired session") {
 				t.Fatalf("reload() error = %v", err)
 			}
-			wantDelays := []time.Duration{
-				200 * time.Millisecond, 400 * time.Millisecond, 800 * time.Millisecond,
-				1600 * time.Millisecond, 3200 * time.Millisecond,
-			}
+			wantDelays := []time.Duration{200 * time.Millisecond, 400 * time.Millisecond}
 			if !reflect.DeepEqual(delays, wantDelays) {
 				t.Fatalf("retry delays = %v, want %v", delays, wantDelays)
 			}
@@ -1208,7 +1289,6 @@ func TestControllerRetriesWholeLoadSequenceOnLaunchdEIO(t *testing.T) {
 					)
 				}
 			}
-			wantCalls = append(wantCalls, []string{"managername"})
 			if !reflect.DeepEqual(calls, wantCalls) {
 				t.Fatalf("launchctl calls = %v, want %v", calls, wantCalls)
 			}
@@ -1217,7 +1297,7 @@ func TestControllerRetriesWholeLoadSequenceOnLaunchdEIO(t *testing.T) {
 }
 
 func TestControllerDoesNotRetryNonEIO(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	agent := controllerAgent(t, "com.example.no-retry")
 	var calls int
 	run := launchctlStub(func([]string) (string, error) {
@@ -1240,7 +1320,7 @@ func TestControllerDoesNotRetryNonEIO(t *testing.T) {
 }
 
 func TestControllerCloseCancelsAdmittedOperationAtBoundAndRejectsNewWork(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	agent := controllerAgent(t, "com.example.close")
 	started := make(chan struct{})
 	var once sync.Once

@@ -1,10 +1,14 @@
 package service
 
 import (
+	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/yasyf/daemonkit/internal/realhome"
 )
 
 func testAgent(t *testing.T) Agent {
@@ -192,5 +196,43 @@ func TestParseSessionType(t *testing.T) {
 	}
 	if _, err := ParseSessionType("unknown"); err == nil {
 		t.Fatal("ParseSessionType accepted an unknown manager")
+	}
+}
+
+func TestPlistPathIgnoresCallerHome(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, "")
+	agent := Agent{Label: "com.example.real-home"}
+
+	got, err := agent.PlistPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(current.HomeDir, "Library", "LaunchAgents", "com.example.real-home.plist")
+	if got != want {
+		t.Fatalf("PlistPath() = %q, want passwd-home path %q", got, want)
+	}
+	if strings.HasPrefix(got, os.Getenv("HOME")) {
+		t.Fatalf("PlistPath() = %q resolved under the caller HOME", got)
+	}
+}
+
+func TestPlistPathHonorsOverrideSeam(t *testing.T) {
+	override := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, override)
+	agent := Agent{Label: "com.example.override"}
+
+	got, err := agent.PlistPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(override, "Library", "LaunchAgents", "com.example.override.plist")
+	if got != want {
+		t.Fatalf("PlistPath() = %q, want override path %q", got, want)
 	}
 }

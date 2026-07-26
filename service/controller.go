@@ -26,11 +26,21 @@ import (
 
 const (
 	controllerCloseBound   = 30 * time.Second
-	bootstrapAttempts      = 6
+	bootstrapAttempts      = 3
 	bootstrapBaseDelay     = 200 * time.Millisecond
 	launchctlNotLoadedExit = 3
 	launchctlNotFoundExit  = 113
-	launchctlInFluxExit    = 5
+	launchctlEIOExit       = 5
+)
+
+// reconcileMode distinguishes open-path recovery, where a failing install or
+// stale-agent removal is drift a later Converge retries, from caller-requested
+// convergence, where either fails the request.
+type reconcileMode int
+
+const (
+	reconcileStrict reconcileMode = iota
+	reconcileRecovery
 )
 
 // ErrControllerClosed means a service convergence request arrived after drain began.
@@ -199,7 +209,7 @@ func newControllerWithRuntime(
 		return nil, err
 	}
 	controller.state = state
-	if err := controller.reconcile(ctx, state.Applied, state.Desired); err != nil {
+	if err := controller.reconcile(ctx, state.Applied, state.Desired, reconcileRecovery); err != nil {
 		return nil, fmt.Errorf("service: recover desired set: %w", err)
 	}
 	if _, err := receipts.RecoverReapReceipts(
@@ -254,7 +264,7 @@ func (c *Controller) Converge(ctx context.Context, agents []Agent) error {
 			ReplacementAck:    copyReplacementCommit(prior.ReplacementAck),
 		}
 	}
-	return c.reconcile(opCtx, copyAgents(c.state.Applied), c.state.Desired)
+	return c.reconcile(opCtx, copyAgents(c.state.Applied), c.state.Desired, reconcileStrict)
 }
 
 // Status reports durable desired/applied state and current launchd ownership
@@ -375,12 +385,17 @@ func (c *Controller) reconcile(
 	ctx context.Context,
 	applied map[string]Agent,
 	desired map[string]Agent,
+	mode reconcileMode,
 ) error {
 	for _, label := range slices.Sorted(maps.Keys(applied)) {
 		if _, keep := desired[label]; keep {
 			continue
 		}
 		if err := c.uninstall(ctx, applied[label]); err != nil {
+			if mode == reconcileRecovery {
+				slog.Warn("service: stale agent removal failed during recovery; awaiting reconverge", "label", label, "error", err)
+				continue
+			}
 			return fmt.Errorf("service: remove stale agent %q: %w", label, err)
 		}
 		if err := c.store.SetApplied(ctx, label, nil); err != nil {
@@ -406,6 +421,10 @@ func (c *Controller) reconcile(
 			}
 		}
 		if err := c.install(ctx, desired[label]); err != nil {
+			if mode == reconcileRecovery {
+				slog.Warn("service: desired agent install failed during recovery; awaiting reconverge", "label", label, "error", err)
+				continue
+			}
 			return fmt.Errorf("service: install agent %q: %w", label, err)
 		}
 		agent := desired[label]
@@ -555,7 +574,7 @@ func (c *Controller) reload(ctx context.Context, agent Agent, path string) error
 		out, err := c.launchctl(ctx, "bootout", serviceTarget(agent.Label))
 		if err != nil && !launchctlNotLoaded(err) {
 			lastErr = fmt.Errorf("launchctl bootout before bootstrap: %w: %s", err, strings.TrimSpace(out))
-			if launchctlExitCode(err) != launchctlInFluxExit {
+			if launchctlExitCode(err) != launchctlEIOExit {
 				return lastErr
 			}
 		} else {
@@ -572,7 +591,7 @@ func (c *Controller) reload(ctx context.Context, agent Agent, path string) error
 				return nil
 			}
 			lastErr = fmt.Errorf("launchctl bootstrap: %w: %s", err, strings.TrimSpace(out))
-			if launchctlExitCode(err) != launchctlInFluxExit {
+			if launchctlExitCode(err) != launchctlEIOExit {
 				return lastErr
 			}
 		}
@@ -584,22 +603,9 @@ func (c *Controller) reload(ctx context.Context, agent Agent, path string) error
 		}
 		delay *= 2
 	}
-	manager, managerErr := c.launchctl(ctx, "managername")
-	if managerErr != nil {
-		return errors.Join(lastErr, fmt.Errorf("launchctl managername: %w: %s", managerErr, strings.TrimSpace(manager)))
-	}
-	current, parseErr := ParseSessionType(manager)
-	if parseErr != nil {
-		return errors.Join(lastErr, parseErr)
-	}
-	desired, _ := agent.LimitLoadToSessionType.plistValue()
-	currentName, _ := current.plistValue()
-	if desired == "" {
-		desired = "unrestricted"
-	}
 	return fmt.Errorf(
-		"%w (launchd EIO after %d attempts; desired session %q, current manager %q)",
-		lastErr, bootstrapAttempts, desired, currentName,
+		"%w (gave up after %d attempts bootstrapping %q; launchctl exit %d covers permanent launchd denials, so check launchd's own log for the refusal)",
+		lastErr, bootstrapAttempts, path, launchctlEIOExit,
 	)
 }
 

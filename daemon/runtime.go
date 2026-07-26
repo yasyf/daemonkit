@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/yasyf/daemonkit/internal/realhome"
 	"github.com/yasyf/daemonkit/internal/runtimeauth"
 	peeridentity "github.com/yasyf/daemonkit/peer"
 	"github.com/yasyf/daemonkit/proc"
@@ -124,7 +125,7 @@ func init() {
 // extendPath appends the standard user bin directories launchd omits, so the
 // daemon and every child it spawns resolve user-installed CLIs by inheritance.
 func extendPath() {
-	home, err := os.UserHomeDir()
+	home, err := realhome.Dir()
 	if err != nil {
 		return
 	}

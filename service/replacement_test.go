@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/daemonkit/internal/realhome"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/worker"
 )
@@ -52,7 +53,7 @@ func newReplacementController(
 	agent Agent,
 ) (*Controller, *controllerStoreStub, *replacementLaunchd) {
 	t.Helper()
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	launchd := &replacementLaunchd{loaded: map[string]bool{serviceTarget(agent.Label): true}}
 	controller, _, store, _ := newTestController(t, controllerState{
 		Desired: map[string]Agent{agent.Label: agent},
@@ -362,7 +363,7 @@ func TestQuiesceRequiresExactLoadedPriorPlan(t *testing.T) {
 }
 
 func TestReplacementFenceSurvivesStoreReopen(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	path := filepath.Join(t.TempDir(), "services.db")
 	store, err := openControllerStore(t.Context(), path)
 	if err != nil {
@@ -396,7 +397,7 @@ func TestReplacementFenceSurvivesStoreReopen(t *testing.T) {
 }
 
 func TestRunningOwnedReplacementFenceLoadsAfterProgramRemoval(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	path := filepath.Join(t.TempDir(), "services.db")
 	store, err := openControllerStore(t.Context(), path)
 	if err != nil {
@@ -455,7 +456,7 @@ func TestRunningOwnedReplacementFenceLoadsAfterProgramRemoval(t *testing.T) {
 }
 
 func TestProveQuiescedIsExactAndIdempotentAfterControllerReopen(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	directory := t.TempDir()
 	config := ControllerConfig{
 		StatePath:   filepath.Join(directory, "services.db"),
@@ -510,7 +511,7 @@ func TestProveQuiescedIsExactAndIdempotentAfterControllerReopen(t *testing.T) {
 }
 
 func TestReplacementCommitSurvivesReopenAndBlocksUntilExactAcknowledgement(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	directory := t.TempDir()
 	config := ControllerConfig{
 		StatePath:   filepath.Join(directory, "services.db"),
@@ -677,7 +678,7 @@ func TestReplacementCommitSurvivesReopenAndBlocksUntilExactAcknowledgement(t *te
 }
 
 func TestReplacementHistorySurvivesRemovedPriorProgram(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	directory := t.TempDir()
 	realDirectory, err := filepath.EvalSymlinks(directory)
 	if err != nil {
@@ -792,7 +793,7 @@ func TestReplacementAcknowledgementRejectsNeverCommittedOperation(t *testing.T) 
 }
 
 func TestSharedExecutablePlanQuiescesAndReopensWithOneProofPath(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	directory := t.TempDir()
 	config := ControllerConfig{
 		StatePath:   filepath.Join(directory, "services.db"),
@@ -838,7 +839,7 @@ func TestSharedExecutablePlanQuiescesAndReopensWithOneProofPath(t *testing.T) {
 }
 
 func TestReplacementRecoverySuppressesRestartAlwaysBeforeReceipts(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	agent := controllerAgent(t, "com.example.crash-recovery")
 	plan := replacementPlan(t, agent)
 	replacement := &replacementState{

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	dkdaemon "github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/internal/realhome"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/version"
 )
@@ -83,7 +84,7 @@ func RemoveStableProgram(name string) error {
 }
 
 func stableRoot() (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := realhome.Dir()
 	if err != nil {
 		return "", fmt.Errorf("service: resolve home directory: %w", err)
 	}

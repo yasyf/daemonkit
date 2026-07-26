@@ -4,6 +4,36 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.9] - 2026-07-26
+
+### Changed
+
+- Every user-home-derived durable path — the launchd plist directory, the
+  stable program root, the `paths` defaults, the artifact store, and the
+  runtime `PATH` extension — now resolves the invoking user's home through
+  the passwd database instead of `$HOME`, so a sandboxed caller environment
+  (Homebrew postinstall's temp HOME) can no longer redirect durable machine
+  state into a throwaway directory. The `DAEMONKIT_HOME` override remains as
+  a test seam and is honored in production with a once-per-process warning.
+- `launchctl` exit 5 is no longer classified as a transient in-flux state to
+  wait out: bootstrap retries 3 times instead of 6, and the giving-up
+  diagnostic names the bootstrapped plist path and points at launchd's own
+  log, since exit 5 covers permanent launchd denials.
+
+### Fixed
+
+- launchd bootstrap no longer fails with EPERM/exit 5 under Homebrew
+  postinstall, which was rendering plists and staging binaries under the
+  sandboxed temp HOME that launchd refuses to bootstrap from; real-home
+  resolution keeps those paths stable regardless of the caller's
+  environment.
+- Controller startup recovery reconciles in a recovery mode: a persisted
+  desired agent whose install fails, or a stale agent whose removal fails,
+  is logged and left as drift for a later `Converge` to retry instead of
+  failing recovery closed — so a persisted failed desired state cannot wedge
+  the very install that would fix it. Caller-requested convergence stays
+  strict, and durable-store write failures remain fatal in both modes.
+
 ## [0.20.8] - 2026-07-26
 
 ### Fixed
@@ -650,7 +680,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.20.8...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.20.9...HEAD
+[0.20.9]: https://github.com/yasyf/daemonkit/compare/v0.20.8...v0.20.9
 [0.20.8]: https://github.com/yasyf/daemonkit/compare/v0.20.7...v0.20.8
 [0.20.7]: https://github.com/yasyf/daemonkit/compare/v0.20.6...v0.20.7
 [0.20.6]: https://github.com/yasyf/daemonkit/compare/v0.20.5...v0.20.6

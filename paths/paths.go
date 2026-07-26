@@ -1,6 +1,6 @@
 // Package paths owns the canonical state-directory layout under the user's home
-// directory and is never relocated by an environment variable, so state stays
-// stable regardless of CLAUDE_CONFIG_DIR.
+// directory, resolved through the passwd database — never the caller's HOME or
+// CLAUDE_CONFIG_DIR — so a sandboxed environment cannot relocate state.
 package paths
 
 import (
@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/yasyf/daemonkit/internal/realhome"
 )
 
 // Paths produces the state-directory layout for an application whose private
@@ -18,7 +20,7 @@ type Paths struct {
 }
 
 func mustHome() string {
-	h, err := os.UserHomeDir()
+	h, err := realhome.Dir()
 	if err != nil {
 		panic(fmt.Sprintf("resolve home dir: %v", err))
 	}

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/internal/realhome"
 	"github.com/yasyf/daemonkit/proc"
 )
 
@@ -44,7 +45,7 @@ type Store struct {
 
 // DefaultStore returns a Store rooted at ~/.daemonkit.
 func DefaultStore() (Store, error) {
-	home, err := os.UserHomeDir()
+	home, err := realhome.Dir()
 	if err != nil {
 		return Store{}, fmt.Errorf("artifact: resolve home directory: %w", err)
 	}

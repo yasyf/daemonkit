@@ -5,10 +5,12 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/yasyf/daemonkit/internal/realhome"
 )
 
 func TestControllerUpgradeSimulationKeepsStableProgramPath(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	root := stableTestRoot(t)
 	v1Bytes := "#!/bin/sh\n# release one\n"
 	v2Bytes := "#!/bin/sh\n# release two\n"

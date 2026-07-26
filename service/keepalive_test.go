@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yasyf/daemonkit/internal/realhome"
 	"github.com/yasyf/daemonkit/worker"
 )
 
@@ -186,7 +187,7 @@ func TestAppKeepAliveUninstallBootout(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("HOME", t.TempDir())
+			t.Setenv(realhome.EnvOverride, t.TempDir())
 			k := AppKeepAlive{
 				Label:         "com.example.holder",
 				AppPath:       "/Applications/x.app",
@@ -226,7 +227,7 @@ func TestAppKeepAliveUninstallBootout(t *testing.T) {
 }
 
 func TestAppKeepAliveInstallEnableBeforeBootstrap(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	k := AppKeepAlive{
 		Label:         "com.example.holder",
 		AppPath:       "/Applications/x.app",
@@ -264,7 +265,7 @@ func TestAppKeepAliveInstallEnableBeforeBootstrap(t *testing.T) {
 
 func TestAppKeepAliveWritePlist(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	t.Setenv(realhome.EnvOverride, home)
 	k := AppKeepAlive{
 		Label:         "com.yasyf.fusekit-holder",
 		AppPath:       "/Applications/fusekit-holder.app",

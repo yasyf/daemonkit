@@ -13,6 +13,8 @@ import (
 	"strings"
 	"text/template"
 	"time"
+
+	"github.com/yasyf/daemonkit/internal/realhome"
 )
 
 const plistTemplateText = `<?xml version="1.0" encoding="UTF-8"?>
@@ -132,7 +134,9 @@ type Agent struct {
 	LimitLoadToSessionType SessionType
 }
 
-// PlistPath is the LaunchAgent plist location (~/Library/LaunchAgents/<Label>.plist).
+// PlistPath is the LaunchAgent plist location (~/Library/LaunchAgents/<Label>.plist),
+// the home resolved through the passwd database so a sandboxed caller HOME
+// cannot redirect the bootstrap.
 func (a Agent) PlistPath() (string, error) {
 	if err := validateLabel(a.Label); err != nil {
 		return "", err
@@ -141,7 +145,7 @@ func (a Agent) PlistPath() (string, error) {
 }
 
 func plistPath(label string) (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := realhome.Dir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home dir: %w", err)
 	}

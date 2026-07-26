@@ -4,10 +4,12 @@ import (
 	"path/filepath"
 	"regexp"
 	"testing"
+
+	"github.com/yasyf/daemonkit/internal/realhome"
 )
 
 func TestRepoTurnsDir(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv(realhome.EnvOverride, t.TempDir())
 	p := Paths{App: ".cc-test"}
 
 	tests := []struct {

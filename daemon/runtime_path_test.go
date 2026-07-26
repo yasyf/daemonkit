@@ -4,11 +4,13 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/yasyf/daemonkit/internal/realhome"
 )
 
 func TestExtendPathAppendsMissingUserDirsOnce(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	t.Setenv(realhome.EnvOverride, home)
 	t.Setenv("PATH", "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin")
 
 	extendPath()
@@ -29,7 +31,7 @@ func TestExtendPathAppendsMissingUserDirsOnce(t *testing.T) {
 
 func TestExtendPathSeedsHermeticBaseWhenEmpty(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	t.Setenv(realhome.EnvOverride, home)
 	t.Setenv("PATH", "")
 
 	extendPath()

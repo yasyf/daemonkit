@@ -418,7 +418,7 @@ func (c *Controller) Quiesce(
 			(existing.Phase != ReplacementUnloaded && existing.Phase != ReplacementQuiesced) {
 			return QuiesceReceipt{}, ErrQuiesced
 		}
-		if err := c.reconcile(opCtx, copyAgents(c.state.Applied), c.state.Desired); err != nil {
+		if err := c.reconcile(opCtx, copyAgents(c.state.Applied), c.state.Desired, reconcileStrict); err != nil {
 			return QuiesceReceipt{}, err
 		}
 		return receiptFromReplacement(existing), nil
@@ -440,7 +440,7 @@ func (c *Controller) Quiesce(
 	if err := c.transitionReplacement(opCtx, map[string]Agent{}, replacement, nil, c.state.ReplacementAck); err != nil {
 		return QuiesceReceipt{}, err
 	}
-	if err := c.reconcile(opCtx, copyAgents(c.state.Applied), c.state.Desired); err != nil {
+	if err := c.reconcile(opCtx, copyAgents(c.state.Applied), c.state.Desired, reconcileStrict); err != nil {
 		return QuiesceReceipt{}, err
 	}
 	return receiptFromReplacement(c.state.Replacement), nil
@@ -591,7 +591,7 @@ func (c *Controller) resumeReplacement(
 
 func (c *Controller) resumeReplacementLocked(ctx context.Context, replacement *replacementState, next Plan) error {
 	if replacement.Phase == ReplacementRunningOwned && plansEqual(replacement.Current, next) {
-		return c.reconcile(ctx, copyAgents(c.state.Applied), c.state.Desired)
+		return c.reconcile(ctx, copyAgents(c.state.Applied), c.state.Desired, reconcileStrict)
 	}
 	if replacement.Phase != ReplacementQuiesced {
 		return fmt.Errorf("%w: cannot resume phase %q", ErrReplacementMismatch, replacement.Phase)
@@ -602,7 +602,7 @@ func (c *Controller) resumeReplacementLocked(ctx context.Context, replacement *r
 	if err := c.transitionReplacement(ctx, next.agents, updated, nil, c.state.ReplacementAck); err != nil {
 		return err
 	}
-	return c.reconcile(ctx, copyAgents(c.state.Applied), c.state.Desired)
+	return c.reconcile(ctx, copyAgents(c.state.Applied), c.state.Desired, reconcileStrict)
 }
 
 // Requiesce suppresses the currently deployment-owned plan before another exact stop.
@@ -638,7 +638,7 @@ func (c *Controller) Requiesce(
 	} else if replacement.Phase != ReplacementUnloaded {
 		return QuiesceReceipt{}, fmt.Errorf("%w: cannot requiesce phase %q", ErrReplacementMismatch, replacement.Phase)
 	}
-	if err := c.reconcile(opCtx, copyAgents(c.state.Applied), c.state.Desired); err != nil {
+	if err := c.reconcile(opCtx, copyAgents(c.state.Applied), c.state.Desired, reconcileStrict); err != nil {
 		return QuiesceReceipt{}, err
 	}
 	return receiptFromReplacement(c.state.Replacement), nil
