@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.8] - 2026-07-26
+
+### Fixed
+
+- Release re-cut of 0.20.7, whose tag predates the Unreleased-link retarget
+  and cannot satisfy the release gate; no code changes. The v0.20.7 tag was
+  never published as a release.
+
 ## [0.20.7] - 2026-07-26
 
 ### Added
@@ -642,7 +650,9 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.20.6...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.20.8...HEAD
+[0.20.8]: https://github.com/yasyf/daemonkit/compare/v0.20.7...v0.20.8
+[0.20.7]: https://github.com/yasyf/daemonkit/compare/v0.20.6...v0.20.7
 [0.20.6]: https://github.com/yasyf/daemonkit/compare/v0.20.5...v0.20.6
 [0.20.5]: https://github.com/yasyf/daemonkit/compare/v0.20.4...v0.20.5
 [0.20.4]: https://github.com/yasyf/daemonkit/compare/v0.20.3...v0.20.4
