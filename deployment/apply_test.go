@@ -101,6 +101,62 @@ func TestApplyInstalledCandidateRecoversEveryRollbackCheckpoint(t *testing.T) {
 	}
 }
 
+func TestApplyInstalledCandidateSupersedesRolledBackApply(t *testing.T) {
+	tests := []struct {
+		name    string
+		version string
+		wantErr string
+	}{
+		{name: "new fingerprint supersedes and converges", version: "3.0.0"},
+		{name: "same fingerprint stays rolled back", wantErr: "candidate apply rolled back"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newActivationFixture(t)
+			if _, err := fixture.controller.ActivateInstalled(t.Context(), fixture.config); err != nil {
+				t.Fatal(err)
+			}
+			rolled := newApplyConfig(t, fixture, "2.0.0", true)
+			rolled.Readiness = rollbackReadiness
+			if _, err := fixture.controller.ApplyInstalledCandidate(t.Context(), rolled); err == nil || !strings.Contains(err.Error(), "new runtime failed readiness") {
+				t.Fatalf("rollback induction error = %v", err)
+			}
+			retry := rolled
+			if test.version != "" {
+				retry = newApplyConfig(t, fixture, test.version, true)
+			}
+			result, err := fixture.controller.ApplyInstalledCandidate(t.Context(), retry)
+			if test.wantErr != "" {
+				if !errors.Is(err, ErrInstallState) || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("error = %v, want ErrInstallState with %q", err, test.wantErr)
+				}
+				active, err := readActivation(deploymentPathsForApp(fixture.appPath).activation)
+				if err != nil || active.Generation.Version != "1.0.0" {
+					t.Fatalf("activation after refused retry = %#v, %v", active, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := result.Activation().Generation().Version(); got != test.version {
+				t.Fatalf("superseding version = %q, want %q", got, test.version)
+			}
+			if got, err := bundleVersion(fixture.appPath); err != nil || got != test.version {
+				t.Fatalf("canonical version = %q, %v", got, err)
+			}
+			assertNoCandidateStage(t, fixture.appPath)
+			replay, err := fixture.controller.ApplyInstalledCandidate(t.Context(), retry)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if replay.OperationID() != result.OperationID() {
+				t.Fatal("superseding apply replay changed durable operation identity")
+			}
+		})
+	}
+}
+
 func TestDeactivateCurrentInstalledRecoversEveryPendingApplyPhase(t *testing.T) {
 	for _, point := range []string{
 		"apply:prepared", "apply:quiesced", "apply:prior_moved", "apply:candidate_moved", "apply:swapped", "apply:active",
@@ -390,7 +446,7 @@ func bundleVersion(appPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	for _, version := range []string{"1.0.0", "2.0.0"} {
+	for _, version := range []string{"1.0.0", "2.0.0", "3.0.0"} {
 		if strings.Contains(string(payload), ">"+version+"<") {
 			return version, nil
 		}

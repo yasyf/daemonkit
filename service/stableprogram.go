@@ -19,15 +19,19 @@ import (
 )
 
 const (
-	stableProgramSchema       = 1
+	stableProgramSchema       = 2
 	stableProgramLockDeadline = 2 * time.Minute
+	stableProgramPolicyBuild  = "build"
+	stableProgramPolicyDigest = "digest"
 )
 
-// stableProgramMeta lets the next call decide without hashing: digest detects
-// drifted bytes, size and mtime fingerprint the file for the fast path.
+// stableProgramMeta lets the next call decide without hashing: policy names the
+// entry point that owns the name, digest detects drifted bytes, size and mtime
+// fingerprint the file for the fast path.
 type stableProgramMeta struct {
 	Schema int    `json:"schema"`
-	Build  string `json:"build"`
+	Policy string `json:"policy"`
+	Build  string `json:"build,omitempty"`
 	Digest string `json:"digest"`
 	Size   int64  `json:"size"`
 	MTime  int64  `json:"mtime"`
@@ -40,6 +44,7 @@ type stableProgramMeta struct {
 // repaired at any build. Downgrade is manual.
 //
 // The daemon launchd started from the copy returns without touching the disk.
+// A name staged by the digest-keyed StableProgramFrom is refused.
 func StableProgram(name, build string) (string, error) {
 	self, err := CanonicalExecutable()
 	if err != nil {
@@ -50,6 +55,21 @@ func StableProgram(name, build string) (string, error) {
 		return "", err
 	}
 	return stableProgram(root, name, build, self)
+}
+
+// StableProgramFrom maintains ~/.daemonkit/bin/<name> as a byte copy of the
+// binary at source — a helper that is not the calling executable, so it
+// carries no build to order by. Digest keys replacement: source bytes that
+// differ from the staged copy replace it; identical bytes are a no-op, so a
+// versioned source path can churn across upgrades without a restage.
+//
+// A name staged by the build-keyed StableProgram is refused.
+func StableProgramFrom(name, source string) (string, error) {
+	root, err := stableRoot()
+	if err != nil {
+		return "", err
+	}
+	return stableProgramFrom(root, name, source)
 }
 
 // RemoveStableProgram deletes ~/.daemonkit/bin/<name> and its sidecar for
@@ -98,7 +118,50 @@ func stableProgram(root, name, build, self string) (string, error) {
 		return "", err
 	}
 	if replace {
-		if err := materializeStableProgram(stablePath, metaPath, build, self); err != nil {
+		data, err := os.ReadFile(self) //nolint:gosec // canonical executable path of this process
+		if err != nil {
+			return "", fmt.Errorf("service: read stable program source %q: %w", self, err)
+		}
+		if err := materializeStableProgram(stablePath, metaPath, stableProgramPolicyBuild, build, data); err != nil {
+			return "", err
+		}
+	} else if refresh != nil {
+		if err := writeStableMeta(metaPath, *refresh); err != nil {
+			return "", err
+		}
+	}
+	return canonicalStableProgram(stablePath)
+}
+
+func stableProgramFrom(root, name, source string) (string, error) {
+	if err := validateStableName(name); err != nil {
+		return "", err
+	}
+	data, err := os.ReadFile(source) //nolint:gosec // explicit program source path
+	if err != nil {
+		return "", fmt.Errorf("service: read stable program source %q: %w", source, err)
+	}
+	sum := sha256.Sum256(data)
+	sourceDigest := hex.EncodeToString(sum[:])
+	stablePath := stableProgramPath(root, name)
+	metaPath := stableMetaPath(stablePath)
+	if stableProgramFromCurrent(stablePath, metaPath, sourceDigest) {
+		return canonicalStableProgram(stablePath)
+	}
+	handle, err := stableProgramLock(root, name)
+	if err != nil {
+		return "", err
+	}
+	defer handle.Close()
+	if stableProgramFromCurrent(stablePath, metaPath, sourceDigest) {
+		return canonicalStableProgram(stablePath)
+	}
+	replace, refresh, err := stableProgramFromNeedsReplace(stablePath, metaPath, sourceDigest)
+	if err != nil {
+		return "", err
+	}
+	if replace {
+		if err := materializeStableProgram(stablePath, metaPath, stableProgramPolicyDigest, "", data); err != nil {
 			return "", err
 		}
 	} else if refresh != nil {
@@ -190,10 +253,31 @@ func stableProgramCurrent(stablePath, metaPath, build string) bool {
 		info.ModTime().UnixNano() == meta.MTime
 }
 
+func stableProgramFromCurrent(stablePath, metaPath, sourceDigest string) bool {
+	meta, err := readStableMeta(metaPath)
+	if err != nil {
+		return false
+	}
+	if meta.Policy != stableProgramPolicyDigest || meta.Digest != sourceDigest {
+		return false
+	}
+	info, err := os.Lstat(stablePath)
+	if err != nil {
+		return false
+	}
+	return info.Mode().IsRegular() &&
+		info.Mode().Perm()&0o111 != 0 &&
+		info.Size() == meta.Size &&
+		info.ModTime().UnixNano() == meta.MTime
+}
+
 func stableProgramNeedsReplace(stablePath, metaPath, build string) (bool, *stableProgramMeta, error) {
 	meta, err := readStableMeta(metaPath)
 	if err != nil {
 		return true, nil, nil
+	}
+	if meta.Policy != stableProgramPolicyBuild {
+		return false, nil, fmt.Errorf("service: stable program %q is digest-keyed; build-keyed staging refused", stablePath)
 	}
 	info, err := os.Lstat(stablePath)
 	if errors.Is(err, os.ErrNotExist) {
@@ -226,13 +310,50 @@ func stableProgramNeedsReplace(stablePath, metaPath, build string) (bool, *stabl
 	return false, nil, nil
 }
 
+func stableProgramFromNeedsReplace(stablePath, metaPath, sourceDigest string) (bool, *stableProgramMeta, error) {
+	meta, metaErr := readStableMeta(metaPath)
+	if metaErr == nil && meta.Policy != stableProgramPolicyDigest {
+		return false, nil, fmt.Errorf("service: stable program %q is build-keyed; digest-keyed staging refused", stablePath)
+	}
+	if metaErr != nil && !errors.Is(metaErr, os.ErrNotExist) {
+		// TODO: unreadable-means-foreign holds because every legacy (schema-1) sidecar is build-keyed; revisit at the next schema bump.
+		return false, nil, fmt.Errorf("service: stable program %q sidecar is unreadable; digest-keyed staging refused: %w", stablePath, metaErr)
+	}
+	info, err := os.Lstat(stablePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil, nil
+	}
+	if err != nil {
+		return false, nil, err
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		return true, nil, nil
+	}
+	digest, err := fileDigest(stablePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil, nil
+	}
+	if err != nil {
+		return false, nil, err
+	}
+	if digest != sourceDigest {
+		return true, nil, nil
+	}
+	if metaErr == nil && meta.Digest == digest && meta.Size == info.Size() && meta.MTime == info.ModTime().UnixNano() {
+		return false, nil, nil
+	}
+	return false, &stableProgramMeta{
+		Schema: stableProgramSchema,
+		Policy: stableProgramPolicyDigest,
+		Digest: digest,
+		Size:   info.Size(),
+		MTime:  info.ModTime().UnixNano(),
+	}, nil
+}
+
 // materializeStableProgram writes the binary before its sidecar: a crash between
 // the two leaves a copy the next call repairs by digest.
-func materializeStableProgram(stablePath, metaPath, build, self string) error {
-	data, err := os.ReadFile(self) //nolint:gosec // canonical executable path of this process
-	if err != nil {
-		return fmt.Errorf("service: read executable %q: %w", self, err)
-	}
+func materializeStableProgram(stablePath, metaPath, policy, build string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(stablePath), 0o700); err != nil {
 		return fmt.Errorf("service: create bin directory: %w", err)
 	}
@@ -246,6 +367,7 @@ func materializeStableProgram(stablePath, metaPath, build, self string) error {
 	sum := sha256.Sum256(data)
 	return writeStableMeta(metaPath, stableProgramMeta{
 		Schema: stableProgramSchema,
+		Policy: policy,
 		Build:  build,
 		Digest: hex.EncodeToString(sum[:]),
 		Size:   info.Size(),
@@ -278,7 +400,9 @@ func readStableMeta(metaPath string) (stableProgramMeta, error) {
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return stableProgramMeta{}, fmt.Errorf("service: stable program meta %q has trailing JSON", metaPath)
 	}
-	if meta.Schema != stableProgramSchema || meta.Build == "" || meta.Digest == "" || meta.Size <= 0 {
+	validShape := (meta.Policy == stableProgramPolicyBuild && meta.Build != "") ||
+		(meta.Policy == stableProgramPolicyDigest && meta.Build == "")
+	if meta.Schema != stableProgramSchema || !validShape || meta.Digest == "" || meta.Size <= 0 {
 		return stableProgramMeta{}, fmt.Errorf("service: stable program meta %q is not usable", metaPath)
 	}
 	return meta, nil

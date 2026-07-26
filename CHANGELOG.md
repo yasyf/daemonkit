@@ -4,6 +4,36 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.7] - 2026-07-26
+
+### Added
+
+- `service.StableProgramFrom` stages a foreign binary (one that is not the
+  calling process) into the stable root under a caller-chosen name, keyed by
+  content digest instead of build version: replacement happens exactly when
+  the source bytes differ from the staged copy, and a damaged sidecar over
+  matching bytes is repaired in place. Source bytes are read once, so the
+  digest that drives the decision and the bytes that land on disk are the
+  same snapshot.
+
+### Changed
+
+- Stable-program sidecars carry an explicit staging policy (schema 2), and
+  the two entry points refuse to overwrite each other's stages: build-keyed
+  and digest-keyed staging under one name is an error in both directions,
+  never a silent replacement. A sidecar that exists but cannot be read is
+  treated as foreign by the digest-keyed path (every schema-1 sidecar is
+  build-keyed by construction) and refused; the build-keyed path still
+  converges its own legacy sidecars on first touch.
+
+### Fixed
+
+- A rolled-back deployment apply no longer blocks a new candidate: a
+  differing-fingerprint receipt in the rolled-back phase is retired and
+  restaged like a stale active apply, instead of failing with
+  `ErrInstallConflict` on every retry. Machines wedged by a failed agent
+  bootstrap converge on the next upgrade.
+
 ## [0.20.6] - 2026-07-25
 
 ### Fixed

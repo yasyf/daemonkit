@@ -123,6 +123,13 @@ func (c *Controller) ApplyInstalledCandidate(
 		if err := c.stageInstalledCandidate(ctx, config, validated, paths); err != nil {
 			return ApplyInstalledCandidateReceipt{}, err
 		}
+	case existing.Phase == applyRolledBack:
+		if err := c.retireRolledBackApply(ctx, existing, paths); err != nil {
+			return ApplyInstalledCandidateReceipt{}, err
+		}
+		if err := c.stageInstalledCandidate(ctx, config, validated, paths); err != nil {
+			return ApplyInstalledCandidateReceipt{}, err
+		}
 	}
 	return c.applyCandidateLocked(ctx, config, validated, paths)
 }

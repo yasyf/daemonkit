@@ -3,6 +3,7 @@ package service
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -88,6 +89,7 @@ func TestStableProgramMaterializesCallingExecutable(t *testing.T) {
 	sum := sha256.Sum256([]byte("release one"))
 	wantMeta := stableProgramMeta{
 		Schema: stableProgramSchema,
+		Policy: stableProgramPolicyBuild,
 		Build:  "v1.0.0",
 		Digest: hex.EncodeToString(sum[:]),
 		Size:   info.Size(),
@@ -364,11 +366,13 @@ func TestStableProgramReplacesOnUnusableMeta(t *testing.T) {
 		meta string
 	}{
 		{name: "missing"},
-		{name: "truncated json", meta: `{"schema":1,"build":"v1.2.0"`},
-		{name: "trailing json", meta: `{"schema":1,"build":"v1.2.0","digest":"ab","size":9,"mtime":1} {}`},
-		{name: "unknown field", meta: `{"schema":1,"build":"v1.2.0","digest":"ab","size":9,"mtime":1,"extra":true}`},
-		{name: "unknown schema", meta: `{"schema":2,"build":"v1.2.0","digest":"ab","size":9,"mtime":1}`},
-		{name: "empty digest", meta: `{"schema":1,"build":"v1.2.0","digest":"","size":9,"mtime":1}`},
+		{name: "truncated json", meta: `{"schema":2,"policy":"build","build":"v1.2.0"`},
+		{name: "trailing json", meta: `{"schema":2,"policy":"build","build":"v1.2.0","digest":"ab","size":9,"mtime":1} {}`},
+		{name: "unknown field", meta: `{"schema":2,"policy":"build","build":"v1.2.0","digest":"ab","size":9,"mtime":1,"extra":true}`},
+		{name: "legacy schema", meta: `{"schema":1,"build":"v1.2.0","digest":"ab","size":9,"mtime":1}`},
+		{name: "missing policy", meta: `{"schema":2,"build":"v1.2.0","digest":"ab","size":9,"mtime":1}`},
+		{name: "digest policy with build", meta: `{"schema":2,"policy":"digest","build":"v1.2.0","digest":"ab","size":9,"mtime":1}`},
+		{name: "empty digest", meta: `{"schema":2,"policy":"build","build":"v1.2.0","digest":"","size":9,"mtime":1}`},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -518,6 +522,364 @@ func TestStableProgramSerializesConcurrentBuilds(t *testing.T) {
 	}
 	if meta.Build != "v2.0.0" {
 		t.Fatalf("meta build = %q, want %q", meta.Build, "v2.0.0")
+	}
+}
+
+func TestStableProgramFromMaterializesForeignSourceUnderLabelName(t *testing.T) {
+	root := stableTestRoot(t)
+	source := fakeExecutable(t, "reposync", "helper payload")
+	label := "com.github.yasyf.synckit.helper.reposync"
+
+	got, err := stableProgramFrom(root, label, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(root, "bin", label)
+	if got != want {
+		t.Fatalf("stableProgramFrom() = %q, want %q", got, want)
+	}
+	if body := stableBytes(t, got); body != "helper payload" {
+		t.Fatalf("stable program bytes = %q, want %q", body, "helper payload")
+	}
+	info, err := os.Stat(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Fatalf("stable program mode = %v, want %v", info.Mode().Perm(), os.FileMode(0o755))
+	}
+	if err := validateProgramTree(Agent{Program: got}); err != nil {
+		t.Fatalf("validateProgramTree(%q) = %v, want nil", got, err)
+	}
+	meta, err := readStableMeta(stableMetaPath(got))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte("helper payload"))
+	wantMeta := stableProgramMeta{
+		Schema: stableProgramSchema,
+		Policy: stableProgramPolicyDigest,
+		Digest: hex.EncodeToString(sum[:]),
+		Size:   info.Size(),
+		MTime:  info.ModTime().UnixNano(),
+	}
+	if meta != wantMeta {
+		t.Fatalf("meta = %+v, want %+v", meta, wantMeta)
+	}
+}
+
+func TestStableProgramFromKeysReplacementOnDigest(t *testing.T) {
+	tests := []struct {
+		name     string
+		second   string
+		tamper   func(t *testing.T, stable string)
+		want     string
+		replaces bool
+		locks    bool
+	}{
+		{name: "identical bytes from a moved source keep", second: "helper one", want: "helper one"},
+		{name: "changed bytes replace", second: "helper two", want: "helper two", replaces: true, locks: true},
+		{
+			name:   "drifted staged bytes repaired",
+			second: "helper one",
+			tamper: func(t *testing.T, stable string) {
+				t.Helper()
+				if err := os.WriteFile(stable, []byte("tampered"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want:     "helper one",
+			replaces: true,
+			locks:    true,
+		},
+		{
+			name:   "non-executable mode repaired",
+			second: "helper one",
+			tamper: func(t *testing.T, stable string) {
+				t.Helper()
+				if err := os.Chmod(stable, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want:     "helper one",
+			replaces: true,
+			locks:    true,
+		},
+		{
+			name:   "missing sidecar rewritten without replacing",
+			second: "helper one",
+			tamper: func(t *testing.T, stable string) {
+				t.Helper()
+				if err := os.Remove(stableMetaPath(stable)); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want:  "helper one",
+			locks: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := stableTestRoot(t)
+			stable, err := stableProgramFrom(root, "helper", fakeExecutable(t, "helper", "helper one"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			inode, mtime := stableIdentity(t, stable)
+			lock := filepath.Join(root, "locks", "stable-helper.lock")
+			if err := os.Remove(lock); err != nil {
+				t.Fatal(err)
+			}
+			if test.tamper != nil {
+				test.tamper(t, stable)
+			}
+
+			got, err := stableProgramFrom(root, "helper", fakeExecutable(t, "helper", test.second))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != stable {
+				t.Fatalf("stableProgramFrom() = %q, want %q", got, stable)
+			}
+			if body := stableBytes(t, got); body != test.want {
+				t.Fatalf("stable program bytes = %q, want %q", body, test.want)
+			}
+			info, err := os.Lstat(got)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Mode().Perm() != 0o755 {
+				t.Fatalf("stable program mode = %v, want %v", info.Mode().Perm(), os.FileMode(0o755))
+			}
+			gotInode, gotMTime := stableIdentity(t, got)
+			if replaced := gotInode != inode || gotMTime != mtime; replaced != test.replaces {
+				t.Fatalf("stable program replaced = %t, want %t", replaced, test.replaces)
+			}
+			meta, err := readStableMeta(stableMetaPath(got))
+			if err != nil {
+				t.Fatal(err)
+			}
+			sum := sha256.Sum256([]byte(test.want))
+			if meta.Digest != hex.EncodeToString(sum[:]) {
+				t.Fatalf("meta digest = %q, want the digest of %q", meta.Digest, test.want)
+			}
+			if _, err := os.Stat(lock); (err == nil) != test.locks {
+				t.Fatalf("stat %q = %v, want lock recreated %t", lock, err, test.locks)
+			}
+		})
+	}
+}
+
+func TestStableProgramFromReadsThroughSymlinkedSource(t *testing.T) {
+	root := stableTestRoot(t)
+	target := fakeExecutable(t, "helper-0.27.4", "helper payload")
+	link := filepath.Join(stableTestRoot(t), "helper")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := stableProgramFrom(root, "helper", link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := stableBytes(t, got); body != "helper payload" {
+		t.Fatalf("stable program bytes = %q, want %q", body, "helper payload")
+	}
+	if err := validateProgramTree(Agent{Program: got}); err != nil {
+		t.Fatalf("validateProgramTree(%q) = %v, want nil", got, err)
+	}
+}
+
+func TestStableProgramRefusesCrossPolicyName(t *testing.T) {
+	tests := []struct {
+		name        string
+		digestFirst bool
+		sameBytes   bool
+		wantErr     string
+	}{
+		{name: "digest staging over build-keyed name", wantErr: "digest-keyed staging refused"},
+		{name: "digest staging over build-keyed name with identical bytes", sameBytes: true, wantErr: "digest-keyed staging refused"},
+		{name: "build staging over digest-keyed name", digestFirst: true, wantErr: "build-keyed staging refused"},
+		{name: "build staging over digest-keyed name with identical bytes", digestFirst: true, sameBytes: true, wantErr: "build-keyed staging refused"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := stableTestRoot(t)
+			first := fakeExecutable(t, "helper", "first bytes")
+			var stable string
+			var err error
+			if test.digestFirst {
+				stable, err = stableProgramFrom(root, "helper", first)
+			} else {
+				stable, err = stableProgram(root, "helper", "v1.0.0", first)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantMeta, err := readStableMeta(stableMetaPath(stable))
+			if err != nil {
+				t.Fatal(err)
+			}
+			secondBytes := "second bytes"
+			if test.sameBytes {
+				secondBytes = "first bytes"
+			}
+			second := fakeExecutable(t, "helper", secondBytes)
+
+			if test.digestFirst {
+				_, err = stableProgram(root, "helper", "v2.0.0", second)
+			} else {
+				_, err = stableProgramFrom(root, "helper", second)
+			}
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("cross-policy staging error = %v, want %q", err, test.wantErr)
+			}
+			if body := stableBytes(t, stable); body != "first bytes" {
+				t.Fatalf("stable program bytes = %q, want %q", body, "first bytes")
+			}
+			meta, err := readStableMeta(stableMetaPath(stable))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if meta != wantMeta {
+				t.Fatalf("meta after refusal = %+v, want %+v", meta, wantMeta)
+			}
+		})
+	}
+}
+
+func TestStableProgramFromDistinguishesAbsentFromUnreadableSidecar(t *testing.T) {
+	tests := []struct {
+		name    string
+		sidecar string
+		wantErr string
+	}{
+		{name: "legacy build-keyed sidecar refused", sidecar: `{"schema":1,"build":"v1.0.0","digest":"ab","size":9,"mtime":1}`, wantErr: "digest-keyed staging refused"},
+		{name: "garbled sidecar refused", sidecar: `{"schema":2,"policy":`, wantErr: "digest-keyed staging refused"},
+		{name: "absent sidecar proceeds"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := stableTestRoot(t)
+			stable, err := stableProgram(root, "helper", "v1.0.0", fakeExecutable(t, "helper", "first bytes"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			metaPath := stableMetaPath(stable)
+			if test.sidecar == "" {
+				if err := os.Remove(metaPath); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(metaPath, []byte(test.sidecar), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			source := fakeExecutable(t, "helper", "second bytes")
+
+			got, err := stableProgramFrom(root, "helper", source)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("stableProgramFrom() error = %v, want %q", err, test.wantErr)
+				}
+				if body := stableBytes(t, stable); body != "first bytes" {
+					t.Fatalf("stable program bytes = %q, want %q", body, "first bytes")
+				}
+				sidecar, err := os.ReadFile(metaPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(sidecar) != test.sidecar {
+					t.Fatalf("sidecar after refusal = %q, want %q", sidecar, test.sidecar)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != stable {
+				t.Fatalf("stableProgramFrom() = %q, want %q", got, stable)
+			}
+			if body := stableBytes(t, got); body != "second bytes" {
+				t.Fatalf("stable program bytes = %q, want %q", body, "second bytes")
+			}
+			meta, err := readStableMeta(metaPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sum := sha256.Sum256([]byte("second bytes"))
+			if meta.Policy != stableProgramPolicyDigest || meta.Digest != hex.EncodeToString(sum[:]) {
+				t.Fatalf("meta after absent-sidecar stage = %+v", meta)
+			}
+		})
+	}
+}
+
+func TestStableProgramFromSerializesConcurrentSources(t *testing.T) {
+	root := stableTestRoot(t)
+	sources := []string{fakeExecutable(t, "helper", "helper one"), fakeExecutable(t, "helper", "helper two")}
+	paths := make([]string, len(sources))
+	var wg sync.WaitGroup
+	for index, source := range sources {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			got, err := stableProgramFrom(root, "helper", source)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			paths[index] = got
+		}()
+	}
+	wg.Wait()
+
+	stable := filepath.Join(root, "bin", "helper")
+	for _, got := range paths {
+		if got != stable {
+			t.Fatalf("stableProgramFrom() = %q, want %q", got, stable)
+		}
+	}
+	body := stableBytes(t, stable)
+	if body != "helper one" && body != "helper two" {
+		t.Fatalf("stable program bytes = %q, want a staged source", body)
+	}
+	meta, err := readStableMeta(stableMetaPath(stable))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(body))
+	want := stableProgramMeta{
+		Schema: stableProgramSchema,
+		Policy: stableProgramPolicyDigest,
+		Digest: hex.EncodeToString(sum[:]),
+		Size:   int64(len(body)),
+		MTime:  meta.MTime,
+	}
+	if meta != want {
+		t.Fatalf("meta = %+v, want %+v", meta, want)
+	}
+	info, err := os.Lstat(stable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != meta.Size || info.ModTime().UnixNano() != meta.MTime {
+		t.Fatalf("staged fingerprint = (%d, %d), want meta fingerprint (%d, %d)",
+			info.Size(), info.ModTime().UnixNano(), meta.Size, meta.MTime)
+	}
+}
+
+func TestStableProgramFromMissingSourceWritesNothing(t *testing.T) {
+	root := stableTestRoot(t)
+
+	_, err := stableProgramFrom(root, "helper", filepath.Join(root, "absent"))
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stableProgramFrom() error = %v, want os.ErrNotExist", err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("stableProgramFrom() wrote entries for a missing source: %v", entries)
 	}
 }
 
