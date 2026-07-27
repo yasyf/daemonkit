@@ -3,11 +3,16 @@
 package trust
 
 import (
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -205,4 +210,128 @@ func maxRSS(t *testing.T) int64 {
 		t.Fatalf("getrusage: %v", err)
 	}
 	return int64(ru.Maxrss)
+}
+
+func TestGuestLookupError(t *testing.T) {
+	tests := []struct {
+		name    string
+		status  int32
+		want    error
+		notWant error
+	}{
+		{"success", errSecSuccess, nil, nil},
+		{"departed peer", osStatusPeerGone, ErrPeerGone, ErrNoVerifier},
+		{"posix non-esrch", 100002, ErrNoVerifier, ErrPeerGone},
+		{"csreq failure", -67062, ErrNoVerifier, ErrPeerGone},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := guestLookupError(tt.status)
+			if tt.want == nil {
+				if err != nil {
+					t.Fatalf("guestLookupError(%d) = %v, want nil", tt.status, err)
+				}
+				return
+			}
+			if !errors.Is(err, tt.want) {
+				t.Errorf("guestLookupError(%d) = %v, want %v", tt.status, err, tt.want)
+			}
+			if errors.Is(err, tt.notWant) {
+				t.Errorf("guestLookupError(%d) = %v, must not match %v", tt.status, err, tt.notWant)
+			}
+			if !strings.Contains(err.Error(), fmt.Sprintf("OSStatus %d", tt.status)) {
+				t.Errorf("guestLookupError(%d) message %q lacks the OSStatus", tt.status, err)
+			}
+		})
+	}
+}
+
+func TestValidityAndSigningInfoErrorsClassifyDeadPeer(t *testing.T) {
+	sites := []struct {
+		name       string
+		classify   func(int32) error
+		failClosed error
+	}{
+		{"check validity", validityError, ErrUntrustedPeer},
+		{"signing information", signingInfoError, ErrNoVerifier},
+	}
+	tests := []struct {
+		name   string
+		status int32
+		want   func(failClosed error) error
+	}{
+		{"success", errSecSuccess, func(error) error { return nil }},
+		{"departed peer", osStatusPeerGone, func(error) error { return ErrPeerGone }},
+		{"no such guest", osStatusNoSuchCode, func(error) error { return ErrPeerGone }},
+		{"posix non-esrch", 100002, func(failClosed error) error { return failClosed }},
+		{"csreq failure", -67062, func(failClosed error) error { return failClosed }},
+	}
+	for _, site := range sites {
+		for _, tt := range tests {
+			t.Run(site.name+"/"+tt.name, func(t *testing.T) {
+				err := site.classify(tt.status)
+				want := tt.want(site.failClosed)
+				if want == nil {
+					if err != nil {
+						t.Fatalf("classify(%d) = %v, want nil", tt.status, err)
+					}
+					return
+				}
+				if !errors.Is(err, want) {
+					t.Errorf("classify(%d) = %v, want %v", tt.status, err, want)
+				}
+				for _, sentinel := range []error{ErrPeerGone, ErrNoVerifier, ErrUntrustedPeer} {
+					if sentinel != want && errors.Is(err, sentinel) {
+						t.Errorf("classify(%d) = %v, must not match %v", tt.status, err, sentinel)
+					}
+				}
+				if !strings.Contains(err.Error(), fmt.Sprintf("OSStatus %d", tt.status)) {
+					t.Errorf("classify(%d) message %q lacks the OSStatus", tt.status, err)
+				}
+			})
+		}
+	}
+}
+
+func TestRunVerifierChildReportsPeerGoneResult(t *testing.T) {
+	secOnce.Do(loadSecurity)
+	if secErr != nil {
+		t.Fatalf("load Security framework: %v", secErr)
+	}
+	original := secCodeCopyGuestWithAttributes
+	secCodeCopyGuestWithAttributes = func(_, _ uintptr, _ uint32, _ *uintptr) int32 {
+		return osStatusPeerGone
+	}
+	t.Cleanup(func() { secCodeCopyGuestWithAttributes = original })
+
+	requirement := fixtureRequirement("com.yasyf.daemonkit.fixture-a")
+	payload, err := json.Marshal(verifierRequest{
+		Protocol:    verifierProtocol,
+		Peer:        peer.Identity{UID: os.Geteuid(), Audit: make([]byte, 32)},
+		Requirement: &requirement,
+	})
+	if err != nil {
+		t.Fatalf("encode verifier request: %v", err)
+	}
+	var stdout bytes.Buffer
+	recognized, err := RunVerifierChild(
+		[]string{verifierChildMode, base64.RawURLEncoding.EncodeToString(payload)},
+		&stdout,
+	)
+	if !recognized || err != nil {
+		t.Fatalf("RunVerifierChild = %t, %v, want recognized with no error", recognized, err)
+	}
+	var response verifierResponse
+	if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
+		t.Fatalf("decode verifier child response %q: %v", stdout.String(), err)
+	}
+	if response.Protocol != verifierProtocol {
+		t.Errorf("verifier child protocol = %d, want %d", response.Protocol, verifierProtocol)
+	}
+	if response.Result != verifierResultPeerGone {
+		t.Errorf("verifier child result = %q, want %q", response.Result, verifierResultPeerGone)
+	}
+	if !strings.Contains(response.Error, fmt.Sprintf("OSStatus %d", osStatusPeerGone)) {
+		t.Errorf("verifier child error %q lacks the OSStatus", response.Error)
+	}
 }

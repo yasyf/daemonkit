@@ -21,6 +21,13 @@ const (
 
 	kCFStringEncodingUTF8 = 0x08000100
 	errSecSuccess         = 0
+
+	// kPOSIXErrorBase (100000) + ESRCH (3): the guest exited before the lookup.
+	osStatusPeerGone = 100003
+
+	// errSecCSNoSuchCode: "host has no guest with the requested attributes" —
+	// the guest exited between the lookup and this Sec call (CSCommon.h).
+	osStatusNoSuchCode = -67065
 )
 
 var (
@@ -160,10 +167,21 @@ func copyGuest(token []byte) (uintptr, error) {
 	defer cfRelease(dictionary)
 
 	var guest uintptr
-	if status := secCodeCopyGuestWithAttributes(0, dictionary, 0, &guest); status != errSecSuccess {
-		return 0, fmt.Errorf("%w: SecCodeCopyGuestWithAttributes: OSStatus %d", ErrNoVerifier, status)
+	if err := guestLookupError(secCodeCopyGuestWithAttributes(0, dictionary, 0, &guest)); err != nil {
+		return 0, err
 	}
 	return guest, nil
+}
+
+func guestLookupError(status int32) error {
+	switch status {
+	case errSecSuccess:
+		return nil
+	case osStatusPeerGone:
+		return fmt.Errorf("%w: SecCodeCopyGuestWithAttributes: OSStatus %d", ErrPeerGone, status)
+	default:
+		return fmt.Errorf("%w: SecCodeCopyGuestWithAttributes: OSStatus %d", ErrNoVerifier, status)
+	}
 }
 
 func checkValidity(guest uintptr, dr string) error {
@@ -184,10 +202,29 @@ func checkValidity(guest uintptr, dr string) error {
 	if cfError != 0 {
 		cfRelease(cfError)
 	}
-	if status != errSecSuccess {
+	return validityError(status)
+}
+
+func validityError(status int32) error {
+	switch status {
+	case errSecSuccess:
+		return nil
+	case osStatusPeerGone, osStatusNoSuchCode:
+		return fmt.Errorf("%w: SecCodeCheckValidityWithErrors: OSStatus %d", ErrPeerGone, status)
+	default:
 		return fmt.Errorf("%w: designated requirement not met (OSStatus %d)", ErrUntrustedPeer, status)
 	}
-	return nil
+}
+
+func signingInfoError(status int32) error {
+	switch status {
+	case errSecSuccess:
+		return nil
+	case osStatusPeerGone, osStatusNoSuchCode:
+		return fmt.Errorf("%w: SecCodeCopySigningInformation: OSStatus %d", ErrPeerGone, status)
+	default:
+		return fmt.Errorf("%w: SecCodeCopySigningInformation: OSStatus %d", ErrNoVerifier, status)
+	}
 }
 
 func requireCodePosture(guest uintptr) error {
@@ -195,7 +232,10 @@ func requireCodePosture(guest uintptr) error {
 	const kCFNumberSInt64Type = 4
 	var info uintptr
 	status := secCodeCopySigningInformation(guest, kSecCSDynamicInformation, &info)
-	if status != errSecSuccess || info == 0 {
+	if err := signingInfoError(status); err != nil {
+		return err
+	}
+	if info == 0 {
 		return fmt.Errorf("%w: SecCodeCopySigningInformation: OSStatus %d", ErrNoVerifier, status)
 	}
 	defer cfRelease(info)

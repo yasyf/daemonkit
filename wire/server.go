@@ -463,8 +463,11 @@ func (s *Server) startConnection(
 		s.rejectHandshakeCodec(conn, codec, ResponseCodePeerUntrusted, ErrUntrustedPeer)
 		err = fmt.Errorf("wire: verify peer: %w", err)
 		// The peer sees only PeerUntrusted; an infrastructure failure is not a
-		// policy denial and must be loud on the daemon side.
-		if !errors.Is(err, ErrUntrustedPeer) && !errors.Is(err, trust.ErrUntrustedPeer) {
+		// policy denial and must be loud on the daemon side. A peer that exited
+		// before verification completed is an expected per-connection outcome,
+		// not infrastructure — it stays on the quiet per-connection debug path.
+		if !errors.Is(err, ErrUntrustedPeer) && !errors.Is(err, trust.ErrUntrustedPeer) &&
+			!errors.Is(err, trust.ErrPeerGone) {
 			s.Log.Error("wire: peer verification infrastructure failure", "err", err)
 		}
 		return err

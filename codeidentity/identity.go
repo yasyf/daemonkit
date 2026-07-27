@@ -19,6 +19,11 @@ var ErrUntrustedPeer = errors.New("codeidentity: untrusted peer")
 // ErrNoVerifier is returned when this build cannot verify signed code.
 var ErrNoVerifier = errors.New("codeidentity: no code-identity verifier")
 
+// ErrPeerGone is returned when the peer exited before code-identity
+// verification completed: a per-connection race on an already-dead
+// connection, not a missing verifier.
+var ErrPeerGone = errors.New("codeidentity: peer exited before code-identity verification completed")
+
 // CodeIdentity is one exact Developer ID team and signing identifier.
 type CodeIdentity struct {
 	TeamID            string

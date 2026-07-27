@@ -13,6 +13,51 @@ import (
 	"github.com/yasyf/daemonkit/worker"
 )
 
+type staticVerifierRunner struct {
+	stdout string
+}
+
+func (r staticVerifierRunner) RunVerifier(context.Context, worker.CommandRequest) (worker.CommandResult, error) {
+	return worker.CommandResult{Stdout: []byte(r.stdout)}, nil
+}
+
+func TestProcessVerifierCheckClassifiesChildResults(t *testing.T) {
+	tests := []struct {
+		name     string
+		response string
+		want     error
+		notWant  error
+	}{
+		{"trusted", `{"protocol":1,"result":"trusted"}`, nil, nil},
+		{"untrusted", `{"protocol":1,"result":"untrusted","error":"denied"}`, ErrUntrustedPeer, ErrNoVerifier},
+		{"no verifier", `{"protocol":1,"result":"no_verifier","error":"absent"}`, ErrNoVerifier, ErrPeerGone},
+		{"peer gone", `{"protocol":1,"result":"peer_gone","error":"OSStatus 100003"}`, ErrPeerGone, ErrNoVerifier},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			verifier := ProcessVerifier{
+				Runner:     staticVerifierRunner{stdout: tt.response},
+				Executable: "/usr/bin/true",
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			err := verifier.Check(ctx, peer.Identity{UID: os.Geteuid()})
+			if tt.want == nil {
+				if err != nil {
+					t.Fatalf("Check() = %v, want nil", err)
+				}
+				return
+			}
+			if !errors.Is(err, tt.want) {
+				t.Errorf("Check() = %v, want %v", err, tt.want)
+			}
+			if errors.Is(err, tt.notWant) {
+				t.Errorf("Check() = %v, must not match %v", err, tt.notWant)
+			}
+		})
+	}
+}
+
 func TestRunVerifierChildHardCutsMalformedRequests(t *testing.T) {
 	if recognized, err := RunVerifierChild([]string{"consumer-mode"}, os.Stdout); err != nil || recognized {
 		t.Fatalf("consumer mode = %t, %v", recognized, err)

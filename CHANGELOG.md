@@ -4,6 +4,30 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.10] - 2026-07-27
+
+### Added
+
+- `trust.ErrPeerGone` and `codeidentity.ErrPeerGone` classify a peer that
+  exited before code-identity verification completed. OSStatus 100003
+  (kPOSIXErrorBase + ESRCH) and errSecCSNoSuchCode (-67065, "host has no
+  guest with the requested attributes") now wrap this sentinel — OSStatus
+  preserved in the message — instead of `ErrNoVerifier`, at the
+  `SecCodeCopyGuestWithAttributes` (100003 only),
+  `SecCodeCheckValidityWithErrors`, and `SecCodeCopySigningInformation`
+  failure sites in both darwin verify packages and across the verifier-child
+  protocol (a new `peer_gone` result). Every other non-zero OSStatus keeps
+  its fail-closed classification.
+
+### Fixed
+
+- The wire server no longer logs the departed-peer verification race at
+  Error under its infrastructure-must-be-loud rule, which flooded consumer
+  logs with "peer verification infrastructure failure" lines under load.
+  `trust.ErrPeerGone` now takes the same quiet path as a policy denial: one
+  debug line per rejected connection. Genuine verifier-infrastructure
+  failures stay loud at Error.
+
 ## [0.20.9] - 2026-07-26
 
 ### Changed
@@ -680,7 +704,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.20.9...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.20.10...HEAD
+[0.20.10]: https://github.com/yasyf/daemonkit/compare/v0.20.9...v0.20.10
 [0.20.9]: https://github.com/yasyf/daemonkit/compare/v0.20.8...v0.20.9
 [0.20.8]: https://github.com/yasyf/daemonkit/compare/v0.20.7...v0.20.8
 [0.20.7]: https://github.com/yasyf/daemonkit/compare/v0.20.6...v0.20.7

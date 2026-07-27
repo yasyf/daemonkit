@@ -29,6 +29,11 @@ var ErrUntrustedPeer = errors.New("trust: untrusted peer")
 // no code-identity verifier is available — never a downgrade to UID-only.
 var ErrNoVerifier = errors.New("trust: no code-identity verifier for a configured requirement")
 
+// ErrPeerGone is returned when the peer exited before code-identity
+// verification completed: a per-connection race on an already-dead
+// connection, not a missing verifier.
+var ErrPeerGone = errors.New("trust: peer exited before code-identity verification completed")
+
 const appGroupsEntitlement = "com.apple.security.application-groups"
 
 // PeerRole names one exact signed peer authority.

@@ -16,15 +16,16 @@ import (
 )
 
 const (
-	verifierChildMode     = "--daemonkit-trust-verifier-v1"
-	verifierProtocol      = 1
-	verifierMaxTotalRun   = 30 * time.Second
-	maxVerifierPayload    = 16 << 10
-	maxVerifierResponse   = 4 << 10
-	verifierResultTrusted = "trusted"
-	verifierResultDenied  = "untrusted"
-	verifierResultAbsent  = "no_verifier"
-	verifierResultFailed  = "failed"
+	verifierChildMode      = "--daemonkit-trust-verifier-v1"
+	verifierProtocol       = 1
+	verifierMaxTotalRun    = 30 * time.Second
+	maxVerifierPayload     = 16 << 10
+	maxVerifierResponse    = 4 << 10
+	verifierResultTrusted  = "trusted"
+	verifierResultDenied   = "untrusted"
+	verifierResultAbsent   = "no_verifier"
+	verifierResultPeerGone = "peer_gone"
+	verifierResultFailed   = "failed"
 )
 
 // VerifierWorkerBudgets sizes a runtime claim's verifier lane for the verifier
@@ -59,6 +60,8 @@ func (v ProcessVerifier) Check(ctx context.Context, peer peer.Identity) error {
 		return fmt.Errorf("%w: %s", ErrUntrustedPeer, response.Error)
 	case verifierResultAbsent:
 		return fmt.Errorf("%w: %s", ErrNoVerifier, response.Error)
+	case verifierResultPeerGone:
+		return fmt.Errorf("%w: %s", ErrPeerGone, response.Error)
 	case verifierResultFailed:
 		return fmt.Errorf("trust: verifier child: %s", response.Error)
 	}
@@ -132,7 +135,7 @@ func (v ProcessVerifier) exchange(ctx context.Context, peer peer.Identity) (veri
 		if response.Error != "" {
 			return verifierResponse{}, errors.New("trust: trusted verifier response included an error")
 		}
-	case verifierResultDenied, verifierResultAbsent, verifierResultFailed:
+	case verifierResultDenied, verifierResultAbsent, verifierResultPeerGone, verifierResultFailed:
 	default:
 		return verifierResponse{}, fmt.Errorf("trust: unknown verifier result %q", response.Result)
 	}
@@ -172,6 +175,8 @@ func RunVerifierChild(arguments []string, stdout io.Writer) (bool, error) {
 		response.Result, response.Error = verifierResultDenied, checkErr.Error()
 	case errors.Is(checkErr, ErrNoVerifier):
 		response.Result, response.Error = verifierResultAbsent, checkErr.Error()
+	case errors.Is(checkErr, ErrPeerGone):
+		response.Result, response.Error = verifierResultPeerGone, checkErr.Error()
 	default:
 		response.Result, response.Error = verifierResultFailed, checkErr.Error()
 	}

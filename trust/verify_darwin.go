@@ -41,6 +41,13 @@ const kCFStringEncodingUTF8 = 0x08000100
 
 const errSecSuccess = 0
 
+// kPOSIXErrorBase (100000) + ESRCH (3): the guest exited before the lookup.
+const osStatusPeerGone = 100003
+
+// errSecCSNoSuchCode: "host has no guest with the requested attributes" — the
+// guest exited between the lookup and this Sec call (CSCommon.h).
+const osStatusNoSuchCode = -67065
+
 var (
 	secOnce sync.Once
 	secErr  error
@@ -227,10 +234,21 @@ func copyGuest(token []byte) (uintptr, error) {
 	defer cfRelease(dict)
 
 	var guest uintptr
-	if st := secCodeCopyGuestWithAttributes(0, dict, 0, &guest); st != errSecSuccess {
-		return 0, fmt.Errorf("%w: SecCodeCopyGuestWithAttributes: OSStatus %d", ErrNoVerifier, st)
+	if err := guestLookupError(secCodeCopyGuestWithAttributes(0, dict, 0, &guest)); err != nil {
+		return 0, err
 	}
 	return guest, nil
+}
+
+func guestLookupError(status int32) error {
+	switch status {
+	case errSecSuccess:
+		return nil
+	case osStatusPeerGone:
+		return fmt.Errorf("%w: SecCodeCopyGuestWithAttributes: OSStatus %d", ErrPeerGone, status)
+	default:
+		return fmt.Errorf("%w: SecCodeCopyGuestWithAttributes: OSStatus %d", ErrNoVerifier, status)
+	}
 }
 
 func checkValidity(guest uintptr, dr string) error {
@@ -251,10 +269,29 @@ func checkValidity(guest uintptr, dr string) error {
 	if cfErr != 0 {
 		cfRelease(cfErr)
 	}
-	if st != errSecSuccess {
-		return fmt.Errorf("%w: designated requirement not met (OSStatus %d)", ErrUntrustedPeer, st)
+	return validityError(st)
+}
+
+func validityError(status int32) error {
+	switch status {
+	case errSecSuccess:
+		return nil
+	case osStatusPeerGone, osStatusNoSuchCode:
+		return fmt.Errorf("%w: SecCodeCheckValidityWithErrors: OSStatus %d", ErrPeerGone, status)
+	default:
+		return fmt.Errorf("%w: designated requirement not met (OSStatus %d)", ErrUntrustedPeer, status)
 	}
-	return nil
+}
+
+func signingInfoError(status int32) error {
+	switch status {
+	case errSecSuccess:
+		return nil
+	case osStatusPeerGone, osStatusNoSuchCode:
+		return fmt.Errorf("%w: SecCodeCopySigningInformation: OSStatus %d", ErrPeerGone, status)
+	default:
+		return fmt.Errorf("%w: SecCodeCopySigningInformation: OSStatus %d", ErrNoVerifier, status)
+	}
 }
 
 // CS_RUNTIME required; CS_GET_TASK_ALLOW and CS_DEBUGGED rejected; LV must hold via flags or an entitlements dict proven clean.
@@ -262,7 +299,11 @@ func requireHardenedRuntime(guest uintptr, req Requirement) error {
 	const kSecCSDynamicInformation = 1 << 3
 	const kCFNumberSInt64Type = 4
 	var info uintptr
-	if st := secCodeCopySigningInformation(guest, kSecCSDynamicInformation, &info); st != errSecSuccess || info == 0 {
+	st := secCodeCopySigningInformation(guest, kSecCSDynamicInformation, &info)
+	if err := signingInfoError(st); err != nil {
+		return err
+	}
+	if info == 0 {
 		return fmt.Errorf("%w: SecCodeCopySigningInformation: OSStatus %d", ErrNoVerifier, st)
 	}
 	defer cfRelease(info)
