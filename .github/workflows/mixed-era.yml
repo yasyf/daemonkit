@@ -1,0 +1,56 @@
+name: Mixed era
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: mixed-era-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+# EXPECTED RED until v0.21.0: the exact-WireBuild handshake gate fails the
+# skew subtests while the same-build controls pass (RC3, ccn 0771ea54).
+jobs:
+  mixed-era:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      # Full history and tags: the test resolves the mixed-era boundary by
+      # walking `git tag` for the newest release that is an ancestor of HEAD.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Build-tagged out of ./..., so ci.yml stays green while this gate is red.
+      - name: Mixed-era session gate
+        id: gate
+        run: ./scripts/test.sh -race -count=1 -tags mixedera -v ./ci/mixedera/...
+
+      - name: Explain the failure
+        if: failure() && steps.gate.outcome == 'failure'
+        run: |
+          {
+            echo "### Mixed-era gate is red"
+            echo
+            echo "\`control/*\` green + \`skew/*\` red is the KNOWN pre-v0.21.0 state:"
+            echo "\`wire/server.go\` and \`wire/client.go\` both reject a handshake on exact"
+            echo "\`WireBuild\` inequality, so normal pin skew across independently released"
+            echo "consumers is a hard failure (remediation RC3)."
+            echo
+            echo "A red \`control/*\` is a REAL break: the two eras no longer share a wire"
+            echo "format, or the harness itself is broken. Investigate that first."
+          } >>"$GITHUB_STEP_SUMMARY"

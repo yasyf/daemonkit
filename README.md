@@ -21,7 +21,7 @@ go: added github.com/yasyf/daemonkit v<version>
 Add the package to your dependencies and link the `DaemonKit` library product into your app or helper target:
 
 ```swift
-.package(url: "https://github.com/yasyf/daemonkit", exact: "0.19.1"),
+.package(url: "https://github.com/yasyf/daemonkit", exact: "0.20.10"),
 ```
 
 </details>
@@ -31,7 +31,7 @@ Driving with an agent? Paste this:
 ```text
 Add github.com/yasyf/daemonkit to my Go module (go get github.com/yasyf/daemonkit@latest),
 check the package table in its README for what has landed, and replace this repo's
-hand-rolled daemon process ownership (spawn, singleton socket, drain, stop control) with
+hand-rolled daemon process ownership (spawn, exclusive socket, drain, stop control) with
 daemonkit's primitives.
 ```
 
@@ -66,22 +66,39 @@ cancellation, settlement, and authenticated successor following.
 
 ## The packages
 
-One row per package; the Status column is each surface's live state.
+Each row below is read out of the tree by `scripts/gen-package-table.sh` — the
+package's own godoc summary and its file and line counts. CI regenerates the
+table and fails the build when it drifts from disk, so a package that ships or
+disappears cannot leave a stale row behind.
 
-| Surface | Owns | Status |
-|---|---|---|
-| `proc` | Detached spawn, single-entrant sockets, process caps, child reaping, exact epoch-1 durable process ledger | Landed |
-| `service` | Exact desired/applied/loaded LaunchAgent state with typed restart policy, durable convergence, explicit runtime stop budgets, and signed-app stop ownership | Landed |
-| `version` | Release/dev version taxonomy, newest-wins skew | Landed |
-| `paths` | The `~/<app>` state layout: daemon socket, HTTP handshake file, per-subject artifacts, start lock, sqlite database, daemon log, turn-snapshot scratch dirs | Landed |
-| `bundle` | Info.plist reads, stable `.app` path conventions | Landed |
-| `deployment` | Exact local staging, installation, activation, upgrade, deactivation, rollback, and uninstall of a fixed signed app | Landed |
-| `wire` | Exact-v1 persistent business transport, generation-aware service clients, typed product observations, receipt-authenticated stop control, and the sole composed daemon runtime constructor | Landed |
-| `trust` | Codesign peer verification (audit-token designated requirements) | Landed |
-| `daemon` | Opaque process runtime, readiness, ordered shutdown, skew observation, embedded processes, and idle exit | Landed |
-| `drain` | Drain-on-upgrade: journals, fences, dead-peer adoption | Landed |
-| `supervise` | Bounded disposable workers and managed long-lived process handles with pre-exec durable identity, readiness gating, cancellation settlement, and cross-generation orphan recovery | Landed |
-| `Sources/DaemonKit` | Swift: typed static service runtimes, generation-aware service clients, signed-process App Group resolution, peer trust (same-UID floor + designated-requirement pinning), `SMAppService` login items, snapshot watching | Landed |
+<!-- BEGIN GENERATED: package table (scripts/gen-package-table.sh) -->
+| Package | Owns | Files | Lines |
+|---|---|---|---|
+| `artifact` | resolves a version-exact executable from a declarative descriptor, for the cc-family's one central "give me the binary that matches my version" primitive. | 16 | 2230 |
+| `bundle` | reads a macOS .app's Info.plist and resolves the stable bundle paths a daemon installs to. | 5 | 200 |
+| `codeidentity` | defines daemon-safe signed-code identity and opaque policy proofs. | 7 | 633 |
+| `daemon` | is the consumer-agnostic process runtime for a detached daemon: exclusive listener ownership, readiness, ordered shutdown, skew observation, idle exit, and embedded-process coordination. | 19 | 4691 |
+| `deployment` | owns sealed installation, activation, upgrade, and removal of one fixed signed application. | 18 | 4170 |
+| `ghrelease` | queries GitHub for a repository's latest published release. | 2 | 170 |
+| `paths` | owns the canonical state-directory layout under the user's home directory, resolved through the passwd database — never the caller's HOME or CLAUDE_CONFIG_DIR — so a sandboxed environment cannot relocate state. | 2 | 137 |
+| `peer` | defines the OS-authenticated identity shared by transport and trust. | 4 | 175 |
+| `proc` | holds exact durable process identity, ownership, and reaping. | 64 | 12279 |
+| `service` | converges an exact durable set of macOS user LaunchAgents. | 26 | 10421 |
+| `templates` | — | 2 | 218 |
+| `trust` | verifies the code-signing identity of a connected unix-socket peer: a same-UID floor on every platform plus, on signed darwin builds, a designated requirement checked against the peer's audit token. | 12 | 2341 |
+| `version` | classifies and compares release and development builds for launcher-owned runtime settlement and release ordering. | 2 | 302 |
+| `wire` | is daemonkit's persistent multiplexed unix-socket transport. | 38 | 10078 |
+| `wire/wiretest` | is the in-process harness for wire's transport and peer tests: short-path socket dirs, a real client/server pair, an injectable peer, and a manually-advanced clock mirroring proc's seam. | 2 | 232 |
+| `worker` | runs bounded disposable commands under daemonkit process ownership. | 2 | 1934 |
+<!-- END GENERATED: package table -->
+
+Packages under `internal/` are module-private machinery and carry no compatibility
+promise; they are left out of the table on purpose.
+
+The Swift half lives in `Sources/DaemonKit`: typed static service runtimes,
+generation-aware service clients, signed-process App Group resolution, peer trust
+(a same-UID floor plus designated-requirement pinning), `SMAppService` login
+items, and snapshot watching.
 
 The LaunchAgents `service` writes use no socket activation — the daemon binds and flocks its own socket (`proc`); launchd only keeps the process alive. Every `Agent` and `AppKeepAlive` selects `RestartAlways`, `RestartOnFailure`, or `NoRestart`; the policy is rendered directly into the launchd plist. On the Swift side, `DaemonKit` reconciles `SMAppService` login items (opening the Login Items settings pane when the item needs approval), watches snapshot directories, and rides the signed `.app` bundle for a stable bundle + TCC identity.
 
@@ -131,7 +148,8 @@ executable skips the dispatch refuses to start with
 `daemon.ErrTrustVerifierProbe` instead of silently rejecting every peer as
 untrusted.
 
-Status: v0.19.1 is the hard-cut release line. Protocol and durable-state epochs
-begin at 1 with exact equality; the API stabilizes at v1.0.0.
+Status: the module is pre-1.0 and hard-cut — no release carries a compatibility
+shim for the one before it. Protocol and durable-state epochs begin at 1 with
+exact equality; the API stabilizes at v1.0.0.
 
 Licensed under [PolyForm-Noncommercial-1.0.0](LICENSE).

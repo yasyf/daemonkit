@@ -91,12 +91,12 @@ workarounds, or disabled code — never to restate the signature.
 
 ```go
 // Good — exported, starts with the name, says what's not obvious from the signature
-// NewSingleEntrant claims <socket>.lock for the listener's lifetime; losers get ErrPeerStarting.
-func NewSingleEntrant(path string) (*SingleEntrant, error) { ... }
+// TryAcquire attempts ownership once and returns ErrLockBusy on contention.
+func (s FileLockSpec) TryAcquire() (*FileLockHandle, error) { ... }
 
 // Bad — restates the signature
-// NewSingleEntrant returns a new SingleEntrant.
-func NewSingleEntrant(path string) (*SingleEntrant, error) { ... }
+// TryAcquire tries to acquire the file lock.
+func (s FileLockSpec) TryAcquire() (*FileLockHandle, error) { ... }
 ```
 
 ## Testing

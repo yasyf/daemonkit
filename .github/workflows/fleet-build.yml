@@ -1,0 +1,76 @@
+name: Fleet build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: fleet-build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+# Compiles every consumer against this tree via a generated go.work overlay, so
+# a breaking surface change goes red before a release exists. One leg per
+# consumer: a break names its own consumer in the checks list.
+jobs:
+  fleet-build:
+    name: fleet-build (${{ matrix.repo }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        repo:
+          - synckit
+          - reposync
+          - captain-hook
+          - cc-notes
+          - cc-patch
+          - cc-orchestrate
+          - cc-interact
+          - binrun
+          - cc-present
+          - cc-review
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - name: Check out daemonkit
+        uses: actions/checkout@v7
+        with:
+          path: daemonkit
+
+      # FLEET_TOKEN reaches private consumers; GITHUB_TOKEN covers the public
+      # ones. A denied checkout skips the leg with a loud warning instead of
+      # passing as though the consumer had built.
+      - name: Check out ${{ matrix.repo }}
+        id: consumer
+        continue-on-error: true
+        uses: actions/checkout@v7
+        with:
+          repository: yasyf/${{ matrix.repo }}
+          token: ${{ secrets.FLEET_TOKEN || secrets.GITHUB_TOKEN }}
+          path: ${{ matrix.repo }}
+          persist-credentials: false
+
+      - name: Report an unreachable consumer
+        if: steps.consumer.outcome != 'success'
+        run: |
+          echo "::warning title=fleet-build skipped ${{ matrix.repo }}::checkout of yasyf/${{ matrix.repo }} was denied — this consumer was NOT built against daemonkit. Grant a FLEET_TOKEN with read access to it."
+          echo "### :warning: fleet-build skipped \`${{ matrix.repo }}\`" >>"$GITHUB_STEP_SUMMARY"
+          echo "Checkout was denied, so this consumer was not compiled against daemonkit." >>"$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/setup-go@v6
+        if: steps.consumer.outcome == 'success'
+        with:
+          go-version-file: daemonkit/go.mod
+          cache-dependency-path: |
+            daemonkit/go.sum
+            ${{ matrix.repo }}/go.sum
+
+      - name: Build ${{ matrix.repo }} against the daemonkit tree
+        if: steps.consumer.outcome == 'success'
+        working-directory: daemonkit
+        run: ./scripts/fleet-build.sh --only ${{ matrix.repo }}
