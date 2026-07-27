@@ -265,6 +265,13 @@ public actor ServiceSocketClient {
                     try await waitForRetry(deadline: request.deadline, progress: progress)
                     continue
                 }
+                if Self.isDeadlineExpiry(error) {
+                    try checkBound(request.deadline, progress: progress)
+                    if let generation {
+                        await retire(generation)
+                    }
+                    continue
+                }
                 if let validation = error as? RuntimeReadinessValidationError,
                    case .draining = validation, !request.allowsSuccessor
                 {
@@ -338,6 +345,13 @@ public actor ServiceSocketClient {
             } catch {
                 if Self.provesTransientConnect(error) {
                     try await waitForRetry(deadline: deadline, progress: progress)
+                    continue
+                }
+                if Self.isDeadlineExpiry(error) {
+                    try checkBound(deadline, progress: progress)
+                    if let generation {
+                        await retire(generation)
+                    }
                     continue
                 }
                 await retainIfTerminal(error)
@@ -685,34 +699,37 @@ private extension ServiceSocketClient {
             }
         case .preSendFailure:
             let error = try attemptError(attempt)
-            if error is SocketCallDeadlineExceededError {
-                throw ServiceSocketClientError.deadlineExceeded
-            }
-            if error is CancellationError || Self.isLocalCallFailure(error) {
-                throw error
-            }
-            guard Self.provesSessionTransition(error) else {
-                await fail(error)
-                throw error
-            }
-            await retire(generation)
-            return nil
+            return try await handleCallFailure(error, request: request, generation: generation, sent: false)
         case .postSendFailure, .deliveryUnknown:
             let error = try attemptError(attempt)
-            if error is SocketCallDeadlineExceededError {
+            return try await handleCallFailure(error, request: request, generation: generation, sent: true)
+        }
+    }
+
+    func handleCallFailure(
+        _ error: any Error,
+        request: ServiceSocketCall,
+        generation: Generation,
+        sent: Bool
+    ) async throws -> SocketTerminal? {
+        if Self.isDeadlineExpiry(error) {
+            guard request.deadline > Date() else {
                 throw ServiceSocketClientError.deadlineExceeded
             }
-            if error is CancellationError {
-                throw error
-            }
-            guard Self.provesSessionTransition(error) else {
-                await fail(error)
-                throw error
-            }
             await retire(generation)
-            guard request.replay == .idempotent else { throw error }
+            guard !sent || request.replay == .idempotent else { throw error }
             return nil
         }
+        if error is CancellationError || (!sent && Self.isLocalCallFailure(error)) {
+            throw error
+        }
+        guard Self.provesSessionTransition(error) else {
+            await fail(error)
+            throw error
+        }
+        await retire(generation)
+        guard !sent || request.replay == .idempotent else { throw error }
+        return nil
     }
 
     func handleReadinessFailure(
@@ -725,7 +742,7 @@ private extension ServiceSocketClient {
         if error is CancellationError {
             throw error
         }
-        if error is SocketCallDeadlineExceededError {
+        if Self.isDeadlineExpiry(error) {
             try checkBound(deadline, progress: progress)
             throw ServiceSocketClientError.deadlineExceeded
         }
@@ -846,9 +863,14 @@ private extension ServiceSocketClient {
     func effectiveDeadline(_ deadline: Date, progress: RuntimeProgressTracker) throws -> Date {
         try min(deadline, Date().addingTimeInterval(progress.remainingTimeInterval()))
     }
+}
 
+extension ServiceSocketClient {
     static func isLifetimeTerminal(_ error: any Error) -> Bool {
         if error is CancellationError || error is ReadinessNoProgressError {
+            return false
+        }
+        if isDeadlineExpiry(error) {
             return false
         }
         if let client = error as? ServiceSocketClientError {
@@ -892,13 +914,21 @@ private extension ServiceSocketClient {
         case let .systemCall(operation, code):
             let peerIO = operation == "read" || operation == "send" || operation == "poll"
             let peerEnd = code == ECONNRESET || code == ECONNABORTED || code == EPIPE
-                || code == ENOTCONN || code == ETIMEDOUT || code == EAGAIN
+                || code == ENOTCONN
             return peerIO && peerEnd
         case .cancellationDidNotSettle, .disconnected:
             return true
         default:
             return false
         }
+    }
+
+    static func isDeadlineExpiry(_ error: any Error) -> Bool {
+        if error is SocketCallDeadlineExceededError {
+            return true
+        }
+        guard case let SessionTransportError.systemCall(_, code) = error else { return false }
+        return code == ETIMEDOUT
     }
 
     static func isLocalCallFailure(_ error: any Error) -> Bool {

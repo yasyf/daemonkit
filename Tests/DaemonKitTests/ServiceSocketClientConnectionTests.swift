@@ -264,7 +264,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
             }
         }
         let started = ContinuousClock.now
-        await #expect(throws: SessionTransportError.systemCall(operation: "read", errno: EAGAIN)) {
+        await #expect(throws: SessionTransportError.systemCall(operation: "read", errno: ETIMEDOUT)) {
             _ = try await SocketClient(
                 path: path,
                 wireBuild: "service.v1",
@@ -330,6 +330,80 @@ extension SocketTransportTests.ServiceSocketClientTests {
             ))
             #expect(terminal.payload == payload)
             #expect(await client.startedGenerations == 1)
+        }
+    }
+
+    @Test func handshakeExpiryRetiresGenerationAndRecoversOnRetry() async throws {
+        let directory = try shortSocketDir()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("s.sock").path
+        var address = try #require(makeAddress(path: path))
+        let listener = socket(AF_UNIX, SOCK_STREAM, 0)
+        try #require(listener >= 0)
+        defer { Darwin.close(listener) }
+        try #require(withServiceAddress(&address) { Darwin.bind(listener, $0, $1) } == 0)
+        try #require(listen(listener, 2) == 0)
+        let peer = Task {
+            try await DispatchQueue(label: "com.yasyf.daemonkit.tests.silent-then-live-peer").performIO {
+                let silent = accept(listener, nil, nil)
+                guard silent >= 0 else {
+                    throw SessionTransportError.systemCall(operation: "accept", errno: errno)
+                }
+                defer { Darwin.close(silent) }
+                let live = accept(listener, nil, nil)
+                guard live >= 0 else {
+                    throw SessionTransportError.systemCall(operation: "accept", errno: errno)
+                }
+                do {
+                    let codec = SessionFrameCodec(descriptor: live)
+                    let hello = try codec.read(timeout: 5)
+                    _ = try SessionHandshakeCodec.decodeHello(hello.payload)
+                    try codec.write(SessionFrame(
+                        kind: .helloAck,
+                        flags: .end,
+                        payload: SessionHandshakeCodec.encodeSuccess(
+                            wireBuild: "service.v1",
+                            session: Data(repeating: 2, count: 16)
+                        )
+                    ))
+                    let subscription = try nextRequest(codec)
+                    guard subscription.operation == readinessSubscribeOperation else {
+                        throw SessionTransportError.invalidFrame("expected readiness subscription")
+                    }
+                    try writeRawTerminal(readinessSubscribeAck, for: subscription, to: codec)
+                    try codec.write(SessionFrame(
+                        kind: .lifecycle,
+                        flags: .end,
+                        payload: lifecyclePayload(.ready, sequence: 2)
+                    ))
+                    let business = try nextRequest(codec)
+                    try writeRawTerminal(Data(#"{"ok":true}"#.utf8), for: business, to: codec)
+                    Darwin.close(live)
+                } catch {
+                    Darwin.close(live)
+                    throw error
+                }
+            }
+        }
+        let client = try serviceTestClient(
+            path: path,
+            wireBuild: "service.v1",
+            role: SessionPeerRole.unprotected,
+            noProgressTimeout: 5,
+            configuration: .init(handshakeTimeout: 0.2)
+        )
+        let terminal = try await client.call(genericServiceCall(
+            operation: "work",
+            deadline: Date().addingTimeInterval(10)
+        ))
+        #expect(terminal.payload == Data(#"{"ok":true}"#.utf8))
+        #expect(await client.startedGenerations == 2)
+        try await peer.value
+        await client.close()
+        let termination = await client.termination.wait()
+        guard case .closed = termination else {
+            Issue.record("handshake expiry was retained as a lifetime terminal")
+            return
         }
     }
 }

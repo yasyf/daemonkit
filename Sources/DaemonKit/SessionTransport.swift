@@ -581,9 +581,11 @@ extension SessionFrameCodec {
                 return
             }
             if ready == 0 {
-                throw SessionTransportError.systemCall(operation: operation, errno: EAGAIN)
+                throw SessionTransportError.systemCall(operation: operation, errno: ETIMEDOUT)
             }
-            if errno == EINTR {
+            // EAGAIN: poll(2) failed to allocate internal data structures — a
+            // documented retriable transient, bounded by the same deadline.
+            if errno == EINTR || errno == EAGAIN {
                 continue
             }
             throw SessionTransportError.systemCall(operation: "poll", errno: errno)

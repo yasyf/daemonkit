@@ -554,4 +554,150 @@ extension SocketTransportTests.ServiceSocketClientTests {
             #expect(error as? RuntimeReadinessValidationError == expected)
         }
     }
+
+    @Test func deadlineExpiryClassifiesAsDeadlineNotSessionTransition() {
+        let readExpiry = SessionTransportError.systemCall(operation: "read", errno: ETIMEDOUT)
+        #expect(ServiceSocketClient.isDeadlineExpiry(readExpiry))
+        #expect(ServiceSocketClient.isDeadlineExpiry(SocketCallDeadlineExceededError()))
+        #expect(!ServiceSocketClient.isDeadlineExpiry(
+            SessionTransportError.systemCall(operation: "read", errno: ECONNRESET)
+        ))
+        #expect(!ServiceSocketClient.isLifetimeTerminal(readExpiry))
+        #expect(!ServiceSocketClient.provesSessionTransition(readExpiry))
+        #expect(!ServiceSocketClient.provesSessionTransition(
+            SessionTransportError.systemCall(operation: "read", errno: EAGAIN)
+        ))
+        #expect(ServiceSocketClient.provesSessionTransition(
+            SessionTransportError.systemCall(operation: "read", errno: ECONNRESET)
+        ))
+        #expect(ServiceSocketClient.provesSessionTransition(
+            SessionTransportError.systemCall(operation: "send", errno: EPIPE)
+        ))
+        #expect(ServiceSocketClient.provesSessionTransition(SessionTransportError.disconnected))
+    }
+
+    @Test func writeTimeoutWithOpenDeadlineReplaysIdempotentCallOnSuccessor() async throws {
+        let directory = try shortSocketDir()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("s.sock").path
+        var address = try #require(makeAddress(path: path))
+        let listener = socket(AF_UNIX, SOCK_STREAM, 0)
+        try #require(listener >= 0)
+        defer { Darwin.close(listener) }
+        try #require(withServiceAddress(&address) { Darwin.bind(listener, $0, $1) } == 0)
+        try #require(listen(listener, 2) == 0)
+        let peer = Task {
+            try await DispatchQueue(label: "com.yasyf.daemonkit.tests.stalled-then-live-peer").performIO {
+                let stalled = accept(listener, nil, nil)
+                guard stalled >= 0 else {
+                    throw SessionTransportError.systemCall(operation: "accept", errno: errno)
+                }
+                defer { Darwin.close(stalled) }
+                let stalledCodec = SessionFrameCodec(descriptor: stalled)
+                let stalledHello = try stalledCodec.read(timeout: 5)
+                _ = try SessionHandshakeCodec.decodeHello(stalledHello.payload)
+                try stalledCodec.write(SessionFrame(
+                    kind: .helloAck,
+                    flags: .end,
+                    payload: SessionHandshakeCodec.encodeSuccess(
+                        wireBuild: "service.v1",
+                        session: Data(repeating: 1, count: 16)
+                    )
+                ))
+                let stalledSubscription = try nextRequest(stalledCodec)
+                guard stalledSubscription.operation == readinessSubscribeOperation else {
+                    throw SessionTransportError.invalidFrame("expected readiness subscription")
+                }
+                try writeRawTerminal(readinessSubscribeAck, for: stalledSubscription, to: stalledCodec)
+                try stalledCodec.write(SessionFrame(
+                    kind: .lifecycle,
+                    flags: .end,
+                    payload: lifecyclePayload(.ready, sequence: 2)
+                ))
+                let live = accept(listener, nil, nil)
+                guard live >= 0 else {
+                    throw SessionTransportError.systemCall(operation: "accept", errno: errno)
+                }
+                do {
+                    let codec = SessionFrameCodec(descriptor: live)
+                    let hello = try codec.read(timeout: 5)
+                    _ = try SessionHandshakeCodec.decodeHello(hello.payload)
+                    try codec.write(SessionFrame(
+                        kind: .helloAck,
+                        flags: .end,
+                        payload: SessionHandshakeCodec.encodeSuccess(
+                            wireBuild: "service.v1",
+                            session: Data(repeating: 2, count: 16)
+                        )
+                    ))
+                    let subscription = try nextRequest(codec)
+                    guard subscription.operation == readinessSubscribeOperation else {
+                        throw SessionTransportError.invalidFrame("expected readiness subscription")
+                    }
+                    try writeRawTerminal(readinessSubscribeAck, for: subscription, to: codec)
+                    try codec.write(SessionFrame(
+                        kind: .lifecycle,
+                        flags: .end,
+                        payload: lifecyclePayload(.ready, sequence: 2)
+                    ))
+                    let business = try nextRequest(codec)
+                    try writeRawTerminal(Data(#"{"replayed":true}"#.utf8), for: business, to: codec)
+                    Darwin.close(live)
+                } catch {
+                    Darwin.close(live)
+                    throw error
+                }
+            }
+        }
+        let client = try serviceTestClient(
+            path: path,
+            wireBuild: "service.v1",
+            role: SessionPeerRole.unprotected,
+            noProgressTimeout: 5,
+            configuration: .init(handshakeTimeout: 2, writeTimeout: 0.2)
+        )
+        let terminal = try await client.call(genericServiceCall(
+            operation: "work",
+            payload: Data(repeating: 7, count: 256 * 1024),
+            replay: .idempotent,
+            deadline: Date().addingTimeInterval(10)
+        ))
+        #expect(terminal.payload == Data(#"{"replayed":true}"#.utf8))
+        #expect(await client.startedGenerations == 2)
+        try await peer.value
+        await client.close()
+        let termination = await client.termination.wait()
+        guard case .closed = termination else {
+            Issue.record("per-frame write expiry was retained as a lifetime terminal")
+            return
+        }
+    }
+
+    @Test func noProgressExpiryWithOpenDeadlineIsReadinessNoProgress() async throws {
+        let directory = try shortSocketDir()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("s.sock").path
+        var address = try #require(makeAddress(path: path))
+        let listener = socket(AF_UNIX, SOCK_STREAM, 0)
+        try #require(listener >= 0)
+        defer { Darwin.close(listener) }
+        try #require(withServiceAddress(&address) { Darwin.bind(listener, $0, $1) } == 0)
+        try #require(listen(listener, 8) == 0)
+        let client = try serviceTestClient(
+            path: path,
+            wireBuild: "service.v1",
+            role: SessionPeerRole.unprotected,
+            noProgressTimeout: 0.3
+        )
+        let clock = ContinuousClock()
+        let started = clock.now
+        await #expect(throws: ReadinessNoProgressError(snapshot: nil)) {
+            try await client.call(genericServiceCall(
+                operation: "work",
+                deadline: Date().addingTimeInterval(30)
+            ))
+        }
+        #expect(started.duration(to: clock.now) < .seconds(5))
+        await client.close()
+    }
 }

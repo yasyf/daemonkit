@@ -99,6 +99,13 @@ private let brokerHandoffLog = Logger(
     subsystem: DaemonKit.loggingSubsystem,
     category: "BrokerSocketBridge"
 )
+
+private func reportBridgeFailure(_ message: String) {
+    brokerHandoffLog.error("\(message, privacy: .public)")
+    let line = "\(ISO8601DateFormatter().string(from: Date())) [BrokerSocketBridge] \(message)\n"
+    try? FileHandle.standardError.write(contentsOf: Data(line.utf8))
+}
+
 private let descriptorInheritanceLock = NSLock()
 
 actor BrokerHandoffClient {
@@ -408,7 +415,7 @@ public final class BrokerSocketBridge: @unchecked Sendable {
                                     parentDeadline: deadline
                                 )
                             } catch {
-                                brokerHandoffLog.error("connected socket handoff failed: \(String(describing: error), privacy: .public)")
+                                reportBridgeFailure("connected socket handoff failed: \(String(describing: error))")
                             }
                         }
                     }

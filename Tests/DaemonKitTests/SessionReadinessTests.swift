@@ -98,7 +98,7 @@ struct SessionReadinessTests {
             _ = try codec.read(timeout: 0.05)
             Issue.record("expected the readiness deadline to expire")
         } catch let error as SessionTransportError {
-            #expect(error == .systemCall(operation: "read", errno: EAGAIN))
+            #expect(error == .systemCall(operation: "read", errno: ETIMEDOUT))
         }
         #expect(start.duration(to: .now) >= .milliseconds(40))
     }
@@ -126,7 +126,7 @@ struct SessionReadinessTests {
             try codec.write(SessionFrame(kind: .event, flags: .end, operation: "large", payload: payload))
             Issue.record("expected the readiness deadline to expire")
         } catch let error as SessionTransportError {
-            #expect(error == .systemCall(operation: "send", errno: EAGAIN))
+            #expect(error == .systemCall(operation: "send", errno: ETIMEDOUT))
         }
         #expect(start.duration(to: .now) >= .milliseconds(40))
     }

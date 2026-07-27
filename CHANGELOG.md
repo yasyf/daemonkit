@@ -27,6 +27,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `trust.ErrPeerGone` now takes the same quiet path as a policy denial: one
   debug line per rejected connection. Genuine verifier-infrastructure
   failures stay loud at Error.
+- The Swift session transport no longer mislabels a poll deadline expiry as
+  `systemCall(operation:, errno: EAGAIN)`: `waitUntilReady` surfaces expiry
+  as `ETIMEDOUT`, the transport's existing deadline convention, so a read
+  that runs out of time reports a timeout instead of errno 35. A `poll(2)`
+  call that itself fails with `EAGAIN` — a documented internal-allocation
+  transient — retries like `EINTR`, bounded by the same deadline, instead of
+  surfacing a permanent-looking system-call failure. Deadline timing is
+  unchanged.
+- `ServiceSocketClient` no longer counts a deadline expiry as
+  session-teardown proof: `EAGAIN` and `ETIMEDOUT` are out of the peer-end
+  errno set, and an expiry during session establishment is no longer
+  retained as a permanent lifetime failure. Under load, one expired
+  handshake bricked the broker bridge's lifecycle client — every later probe
+  reported "bridge failed: disconnected" until the process restarted.
+- `ServiceSocketClient` treats a transport-internal handshake or per-frame
+  write timeout that fires while the caller's deadline is still open as a
+  session transition, not a call failure: the current generation retires and
+  the call retries on a successor session (replaying an in-flight request
+  only under the `.idempotent` policy). `deadlineExceeded` now surfaces only
+  when the call's own deadline has passed, and a no-progress expiry surfaces
+  as `ReadinessNoProgressError` with its last lifecycle snapshot.
+- `BrokerSocketBridge` duplicates its connected-socket handoff failure line
+  to standard error beside the os_log call, so daemon plists that capture
+  stderr surface bridge failures in the file log instead of only in os_log.
 
 ## [0.20.9] - 2026-07-26
 
