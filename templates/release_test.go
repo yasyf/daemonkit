@@ -13,7 +13,7 @@ func TestReleaseTemplateOwnsAtomicReleaseAndStableCaskPublication(t *testing.T) 
 	}
 	workflow := string(payload)
 	const (
-		workflowRef           = "83ee384b1d4fe25a8e4aa7258bb76d55e1593735"
+		workflowRef           = "41f8de6765b3b833ef333b0b98f5683f0e46685b"
 		stageDraftActionRef   = "e4c3108e693681df1a3c666bae80e890bc44cf3e"
 		publishDraftActionRef = "54e3e194bda69896894a82c17fcdb2822beefab5"
 		renderFormulaRef      = "19c3d5013032ad9c88f9a8f1170d1f366c19b8d9"

@@ -15,7 +15,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      - uses: yasyf/homebrew-tap/.github/actions/verify-tag-on-main@a4179241558456339fa2e41b97693a6cebae2e36
+      - uses: yasyf/homebrew-tap/.github/actions/verify-tag-on-main@2281a3ea884422db190de44fad65ce9bc08b19c4
       - name: Verify exact source release contract
         run: ./scripts/release-check.sh "${GITHUB_REF_NAME}"
 
