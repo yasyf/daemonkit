@@ -92,6 +92,7 @@ func canonicalPlanAgents(agents []Agent) (map[string]Agent, error) {
 		if _, duplicate := canonical[agent.Label]; duplicate {
 			return nil, fmt.Errorf("service: duplicate plan agent label %q", agent.Label)
 		}
+		acceptIgnoredSessionType(&agent)
 		agent.Args = append([]string(nil), agent.Args...)
 		agent.Env = cloneStrings(agent.Env)
 		agent.AssociatedBundleIdentifiers, _ = canonicalAssociatedBundleIdentifiers(

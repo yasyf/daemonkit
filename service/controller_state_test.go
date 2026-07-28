@@ -5,9 +5,11 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -193,6 +195,75 @@ func TestControllerStateCanonicalizesAndClonesAssociatedBundleIdentifiers(t *tes
 	}
 }
 
+func TestControllerStoreNeverPersistsSessionType(t *testing.T) {
+	captureDefaultLog(t)
+	agent := controllerAgent(t, "com.example.session-type")
+	agent.LimitLoadToSessionType = SessionTypeBackground
+	payload, err := encodeControllerAgent(agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(payload), `"LimitLoadToSessionType":`) {
+		t.Fatalf("stored agent carries the ignored field\n%s", payload)
+	}
+
+	desired, err := desiredAgents([]Agent{agent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "services.db")
+	store, err := openControllerStore(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.ReplaceDesired(context.Background(), desired); err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := state.Desired[agent.Label].LimitLoadToSessionType; got != sessionTypeUnset {
+		t.Fatalf("loaded session type = %d, want unset", got)
+	}
+	if got := state.Desired[agent.Label]; !reflect.DeepEqual(got, desired[agent.Label]) {
+		t.Fatalf("loaded agent = %#v, want the canonical desired agent %#v", got, desired[agent.Label])
+	}
+}
+
+func TestSessionTypeNeverSplitsPlanEquality(t *testing.T) {
+	captureDefaultLog(t)
+	agent := controllerAgent(t, "com.example.plan-equality")
+	agent.LimitLoadToSessionType = SessionTypeAqua
+	live, err := NewPlan([]Agent{agent})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(t.TempDir(), "services.db")
+	store, err := openControllerStore(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.ReplaceDesired(context.Background(), live.agents); err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := RestorePlan(slices.Collect(maps.Values(state.Desired)), live.Digest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plansEqual(live, restored) {
+		t.Fatalf("stored plan is unequal to the live plan it round-tripped from\nlive %#v\nrestored %#v",
+			live.agents, restored.agents)
+	}
+}
+
 func TestControllerStoreRejectsConcurrentOwner(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "services.db")
 	first, err := openControllerStore(context.Background(), path)
@@ -207,30 +278,28 @@ func TestControllerStoreRejectsConcurrentOwner(t *testing.T) {
 	}
 }
 
-func TestControllerStoreRejectsEveryPreexistingSchemaLessLayout(t *testing.T) {
+func TestControllerStoreArchivesEveryPreexistingSchemaLessLayout(t *testing.T) {
 	tests := []struct {
 		name    string
 		buckets [][]byte
-		want    string
 	}{
 		{
 			name: "expected buckets without metadata",
 			buckets: [][]byte{
 				controllerDesiredBucket, controllerAppliedBucket, controllerReplacementBucket,
 			},
-			want: "schema-less",
 		},
 		{
 			name: "empty expected metadata and buckets",
 			buckets: [][]byte{
 				controllerMetaBucket, controllerDesiredBucket, controllerAppliedBucket, controllerReplacementBucket,
 			},
-			want: "schema-less",
 		},
-		{name: "unknown bucket", buckets: [][]byte{[]byte("legacy")}, want: "unknown"},
+		{name: "unknown bucket", buckets: [][]byte{[]byte("legacy")}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			captureDefaultLog(t)
 			path := filepath.Join(t.TempDir(), "services.db")
 			db, err := bolt.Open(path, 0o600, nil)
 			if err != nil {
@@ -250,9 +319,13 @@ func TestControllerStoreRejectsEveryPreexistingSchemaLessLayout(t *testing.T) {
 			if err := db.Close(); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := openControllerStore(context.Background(), path); err == nil ||
-				!strings.Contains(err.Error(), test.want) {
-				t.Fatalf("openControllerStore() error = %v, want %s rejection", err, test.want)
+			store, err := openControllerStore(context.Background(), path)
+			if err != nil {
+				t.Fatalf("openControllerStore() error = %v, want archive aside", err)
+			}
+			defer store.Close()
+			if backups := controllerStoreBackups(t, path); len(backups) != 1 {
+				t.Fatalf("archived backups = %v, want exactly one", backups)
 			}
 		})
 	}
@@ -282,27 +355,26 @@ func TestControllerStoreInitializesOnlyTrulyEmptyBoltFile(t *testing.T) {
 	}
 }
 
-func TestControllerStoreRejectsUnknownSchemaSurfaces(t *testing.T) {
+func TestControllerStoreArchivesUnknownSchemaSurfaces(t *testing.T) {
 	tests := []struct {
 		name   string
-		want   string
 		mutate func(*bolt.Tx) error
 	}{
 		{
-			name: "bucket", want: "unknown",
+			name: "bucket",
 			mutate: func(tx *bolt.Tx) error {
 				_, err := tx.CreateBucket([]byte("future"))
 				return err
 			},
 		},
 		{
-			name: "metadata", want: "unknown",
+			name: "metadata",
 			mutate: func(tx *bolt.Tx) error {
 				return tx.Bucket(controllerMetaBucket).Put([]byte("future"), []byte("1"))
 			},
 		},
 		{
-			name: "foreign epoch", want: "unsupported",
+			name: "foreign epoch",
 			mutate: func(tx *bolt.Tx) error {
 				var schema [8]byte
 				binary.BigEndian.PutUint64(schema[:], 2)
@@ -310,19 +382,19 @@ func TestControllerStoreRejectsUnknownSchemaSurfaces(t *testing.T) {
 			},
 		},
 		{
-			name: "foreign identity", want: "identity",
+			name: "foreign identity",
 			mutate: func(tx *bolt.Tx) error {
 				return tx.Bucket(controllerMetaBucket).Put(controllerIdentityKey, []byte("foreign"))
 			},
 		},
 		{
-			name: "foreign fingerprint", want: "fingerprint",
+			name: "foreign fingerprint",
 			mutate: func(tx *bolt.Tx) error {
 				return tx.Bucket(controllerMetaBucket).Put(controllerFingerprintKey, []byte("foreign"))
 			},
 		},
 		{
-			name: "missing identity", want: "identity",
+			name: "missing identity",
 			mutate: func(tx *bolt.Tx) error {
 				return tx.Bucket(controllerMetaBucket).Delete(controllerIdentityKey)
 			},
@@ -330,6 +402,7 @@ func TestControllerStoreRejectsUnknownSchemaSurfaces(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			captureDefaultLog(t)
 			path := filepath.Join(t.TempDir(), "services.db")
 			store, err := openControllerStore(context.Background(), path)
 			if err != nil {
@@ -349,9 +422,20 @@ func TestControllerStoreRejectsUnknownSchemaSurfaces(t *testing.T) {
 			if err := db.Close(); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := openControllerStore(context.Background(), path); err == nil ||
-				!strings.Contains(err.Error(), test.want) {
-				t.Fatalf("openControllerStore() error = %v, want %s schema rejection", err, test.want)
+			store, err = openControllerStore(context.Background(), path)
+			if err != nil {
+				t.Fatalf("openControllerStore() error = %v, want archive aside", err)
+			}
+			defer store.Close()
+			if backups := controllerStoreBackups(t, path); len(backups) != 1 {
+				t.Fatalf("archived backups = %v, want exactly one", backups)
+			}
+			state, err := store.Load(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(state.Desired) != 0 || len(state.Applied) != 0 {
+				t.Fatalf("state after archive = %#v, want empty", state)
 			}
 		})
 	}

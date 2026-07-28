@@ -1169,7 +1169,6 @@ func TestControllerVerifyPropagatesUnexpectedLaunchctlFailure(t *testing.T) {
 func TestControllerRetriesWholeLoadSequenceOnlyWhileLaunchdReportsInProgress(t *testing.T) {
 	t.Setenv(realhome.EnvOverride, t.TempDir())
 	agent := controllerAgent(t, "com.example.retry")
-	agent.LimitLoadToSessionType = SessionTypeBackground
 	tests := []struct {
 		name    string
 		failure string
@@ -1234,7 +1233,6 @@ func TestControllerRetriesWholeLoadSequenceOnlyWhileLaunchdReportsInProgress(t *
 func TestControllerSettlesEveryNonInFluxBootoutOnFirstObservation(t *testing.T) {
 	t.Setenv(realhome.EnvOverride, t.TempDir())
 	agent := controllerAgent(t, "com.example.no-retry")
-	agent.LimitLoadToSessionType = SessionTypeBackground
 	tests := []struct {
 		name     string
 		out      string

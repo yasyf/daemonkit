@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -107,7 +108,6 @@ func TestAgentOptionalLaunchPolicy(t *testing.T) {
 	agent := testAgent(t)
 	agent.StartInterval = 15 * time.Minute
 	agent.ProcessType = ProcessTypeBackground
-	agent.LimitLoadToSessionType = SessionTypeAqua
 	body, err := agent.Plist()
 	if err != nil {
 		t.Fatal(err)
@@ -116,7 +116,6 @@ func TestAgentOptionalLaunchPolicy(t *testing.T) {
 	for _, want := range []string{
 		"<key>StartInterval</key>\n    <integer>900</integer>",
 		"<key>ProcessType</key>\n    <string>Background</string>",
-		"<key>LimitLoadToSessionType</key>\n    <string>Aqua</string>",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("plist missing %q\n%s", want, text)
@@ -172,7 +171,6 @@ func TestAgentOptionalLaunchPolicyRejectsInvalidValues(t *testing.T) {
 	}{
 		{edit: func(agent *Agent) { agent.StartInterval = 500 * time.Millisecond }, want: "positive whole number of seconds"},
 		{edit: func(agent *Agent) { agent.ProcessType = ProcessType(99) }, want: "invalid process type 99"},
-		{edit: func(agent *Agent) { agent.LimitLoadToSessionType = SessionType(99) }, want: "invalid session type 99"},
 	}
 	for _, test := range tests {
 		agent := testAgent(t)
@@ -180,6 +178,69 @@ func TestAgentOptionalLaunchPolicyRejectsInvalidValues(t *testing.T) {
 		if _, err := agent.Plist(); err == nil || !strings.Contains(err.Error(), test.want) {
 			t.Fatalf("Plist error = %v, want %q", err, test.want)
 		}
+	}
+}
+
+func TestAgentRendersEverySessionTypeIdentically(t *testing.T) {
+	agent := testAgent(t)
+	unset, err := agent.Plist()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, session := range []SessionType{
+		SessionTypeAqua, SessionTypeBackground, SessionTypeLoginWindow,
+		SessionTypeStandardIO, SessionTypeSystem, SessionType(99),
+	} {
+		agent.LimitLoadToSessionType = session
+		body, err := agent.Plist()
+		if err != nil {
+			t.Fatalf("Plist() with session type %d error = %v", session, err)
+		}
+		if bytes.Contains(body, []byte("<key>LimitLoadToSessionType</key>")) {
+			t.Fatalf("session type %d rendered the launchd key\n%s", session, body)
+		}
+		if !bytes.Equal(body, unset) {
+			t.Fatalf("session type %d changed the rendered plist\n%s", session, body)
+		}
+	}
+}
+
+func TestDesiredAgentsWarnsOnlyForPermanentlyRefusedSessionTypes(t *testing.T) {
+	tests := []struct {
+		name    string
+		session SessionType
+		want    bool
+	}{
+		{name: "unset", session: sessionTypeUnset},
+		{name: "aqua", session: SessionTypeAqua},
+		{name: "background", session: SessionTypeBackground, want: true},
+		{name: "login window", session: SessionTypeLoginWindow, want: true},
+		{name: "standard io", session: SessionTypeStandardIO, want: true},
+		{name: "system", session: SessionTypeSystem, want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			logs := captureDefaultLog(t)
+			agent := testAgent(t)
+			agent.LimitLoadToSessionType = test.session
+			if _, err := desiredAgents([]Agent{agent}); err != nil {
+				t.Fatal(err)
+			}
+			logged := logs.String()
+			if got := strings.Contains(
+				logged, "LimitLoadToSessionType is accepted and ignored",
+			); got != test.want {
+				t.Fatalf("warned = %t, want %t\n%s", got, test.want, logged)
+			}
+			if !test.want {
+				return
+			}
+			for _, want := range []string{"label=" + agent.Label, "session_type=" + test.session.name()} {
+				if !strings.Contains(logged, want) {
+					t.Fatalf("warning missing %q\n%s", want, logged)
+				}
+			}
+		})
 	}
 }
 

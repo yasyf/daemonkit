@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"maps"
 	"os"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	dkdaemon "github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/proc"
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -39,7 +41,7 @@ var (
 	controllerSchemaKey            = []byte("schema")
 	controllerFingerprintKey       = []byte("fingerprint")
 	controllerIdentity             = []byte("daemonkit.service.controller-store.v1")
-	controllerFingerprint          = []byte("2f828880de0cd3fb5f645bc6c859064fddf5a401fe088c782c22577c59e14be0")
+	controllerFingerprint          = []byte("534984a1023ec0f6b20039baaf4a6c17c734f0022d06bae9b7583cbd0029b4b9")
 	stopRuntimeIntentIdentity      = "daemonkit.service.stop-runtime-intent.v1"
 	stopRuntimeIntentFingerprint   = "ba0705f6c3151c87950d0efd99ac7dac3c956e3cc311ef93677490bc743506da"
 	stopRuntimeReceiptIdentity     = "daemonkit.service.stop-runtime-receipt.v1"
@@ -104,11 +106,18 @@ func openControllerStore(ctx context.Context, path string) (*boltControllerStore
 	if err != nil {
 		return nil, fmt.Errorf("service: open controller state: %w", err)
 	}
-	store := &boltControllerStore{db: db}
-	if err := db.Update(initializeControllerState); err != nil {
+	if initErr := db.Update(initializeControllerState); initErr != nil {
+		if !errors.Is(initErr, proc.ErrRecordSchema) {
+			_ = db.Close()
+			return nil, initErr
+		}
 		_ = db.Close()
-		return nil, err
+		if db, err = archiveControllerStore(ctx, path, timeout, initErr); err != nil {
+			return nil, err
+		}
+		created = true
 	}
+	store := &boltControllerStore{db: db}
 	info, err = os.Lstat(path)
 	if err != nil {
 		_ = db.Close()
@@ -127,6 +136,73 @@ func openControllerStore(ctx context.Context, path string) (*boltControllerStore
 	return store, nil
 }
 
+// archiveControllerStore serializes detect→archive→create on a sidecar lock so
+// concurrent openers produce exactly one backup: losers re-check inside the lock
+// and proceed onto the winner's fresh store. mismatch is the original schema
+// error, reported if the rename itself fails.
+func archiveControllerStore(
+	ctx context.Context, path string, timeout time.Duration, mismatch error,
+) (*bolt.DB, error) {
+	lock, err := (proc.FileLockSpec{
+		Path: path + ".archive.lock", Mode: proc.FileLockExclusive, Deadline: timeout,
+	}).Acquire(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("service: lock controller state for archive: %w", err)
+	}
+	defer func() { _ = lock.Close() }()
+
+	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: timeout})
+	if err != nil {
+		return nil, fmt.Errorf("service: reopen controller state for archive: %w", err)
+	}
+	switch initErr := db.Update(initializeControllerState); {
+	case initErr == nil:
+		return db, nil
+	case !errors.Is(initErr, proc.ErrRecordSchema):
+		_ = db.Close()
+		return nil, initErr
+	default:
+		logAbandonedControllerAgents(db, path)
+		_ = db.Close()
+	}
+
+	backup, err := proc.ArchiveUnsupportedStore(path)
+	if err != nil {
+		return nil, errors.Join(mismatch, err)
+	}
+	slog.Warn("service: archived unsupported-schema controller state",
+		"path", path, "backup", backup, "schema", controllerStateSchema)
+	db, err = bolt.Open(path, 0o600, &bolt.Options{Timeout: timeout})
+	if err != nil {
+		return nil, fmt.Errorf("service: reopen controller state after archive: %w", err)
+	}
+	if err := db.Update(initializeControllerState); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+// logAbandonedControllerAgents reports what the archive orphans: every applied
+// agent may still be loaded in launchd once its bookkeeping is gone.
+func logAbandonedControllerAgents(db *bolt.DB, path string) {
+	_ = db.View(func(tx *bolt.Tx) error {
+		applied := tx.Bucket(controllerAppliedBucket)
+		if applied == nil {
+			return nil
+		}
+		return applied.ForEach(func(key, _ []byte) error {
+			plist, err := plistPath(string(key))
+			if err != nil {
+				return err
+			}
+			slog.Warn("service: abandoning applied LaunchAgent bookkeeping",
+				"path", path, "label", string(key), "plist", plist)
+			return nil
+		})
+	})
+}
+
 func exactControllerPath(path string) error {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return fmt.Errorf("service: controller state path %q is not exact and absolute", path)
@@ -143,7 +219,7 @@ func initializeControllerState(tx *bolt.Tx) error {
 	present := make(map[string]bool, len(expected))
 	if err := tx.ForEach(func(name []byte, _ *bolt.Bucket) error {
 		if !expected[string(name)] {
-			return fmt.Errorf("service: unknown controller state bucket %q", name)
+			return fmt.Errorf("%w: unknown controller state bucket %q", proc.ErrRecordSchema, name)
 		}
 		present[string(name)] = true
 		return nil
@@ -157,7 +233,7 @@ func initializeControllerState(tx *bolt.Tx) error {
 	}
 	if schema == nil {
 		if len(present) != 0 {
-			return errors.New("service: preexisting schema-less controller state is not supported")
+			return fmt.Errorf("%w: preexisting schema-less controller state is not supported", proc.ErrRecordSchema)
 		}
 		var err error
 		meta, err = tx.CreateBucketIfNotExists(controllerMetaBucket)
@@ -184,16 +260,16 @@ func initializeControllerState(tx *bolt.Tx) error {
 	}
 	for name := range expected {
 		if !present[name] {
-			return fmt.Errorf("service: initialized controller state is missing bucket %q", name)
+			return fmt.Errorf("%w: initialized controller state is missing bucket %q", proc.ErrRecordSchema, name)
 		}
 	}
 	if len(schema) != 8 || binary.BigEndian.Uint64(schema) != controllerStateSchema {
-		return errors.New("service: unsupported controller state schema")
+		return fmt.Errorf("%w: unsupported controller state schema", proc.ErrRecordSchema)
 	}
 	if err := meta.ForEach(func(key, _ []byte) error {
 		if !bytes.Equal(key, controllerIdentityKey) && !bytes.Equal(key, controllerSchemaKey) &&
 			!bytes.Equal(key, controllerFingerprintKey) {
-			return fmt.Errorf("service: unknown controller metadata key %q", key)
+			return fmt.Errorf("%w: unknown controller metadata key %q", proc.ErrRecordSchema, key)
 		}
 		return nil
 	}); err != nil {
@@ -201,7 +277,7 @@ func initializeControllerState(tx *bolt.Tx) error {
 	}
 	if !bytes.Equal(meta.Get(controllerIdentityKey), controllerIdentity) ||
 		!bytes.Equal(meta.Get(controllerFingerprintKey), controllerFingerprint) {
-		return errors.New("service: controller state identity or fingerprint mismatch")
+		return fmt.Errorf("%w: controller state identity or fingerprint mismatch", proc.ErrRecordSchema)
 	}
 	return nil
 }
@@ -904,7 +980,7 @@ func decodeControllerAgent(payload []byte) (Agent, error) {
 	expected := []string{
 		"Label", "Program", "Args", "LogPath", "Env", "AssociatedBundleIdentifiers",
 		"RestartPolicy", "StartInterval", "WatchPaths", "StartCalendarInterval",
-		"ProcessType", "LimitLoadToSessionType",
+		"ProcessType",
 	}
 	if len(fields) != len(expected) {
 		return Agent{}, errors.New("stored agent field set is not exact")

@@ -47,9 +47,6 @@ const plistTemplateText = `<?xml version="1.0" encoding="UTF-8"?>
 {{if .ProcessType}}
     <key>ProcessType</key>
     <string>{{.ProcessType}}</string>
-{{end}}{{if .LimitLoadToSessionType}}
-    <key>LimitLoadToSessionType</key>
-    <string>{{.LimitLoadToSessionType}}</string>
 {{end}}
     <key>StandardOutPath</key>
     <string>{{.Log}}</string>
@@ -89,7 +86,6 @@ type plistData struct {
 	WatchPaths                  []string
 	StartCalendarInterval       []string
 	ProcessType                 string
-	LimitLoadToSessionType      string
 	AssociatedBundleIdentifiers []string
 }
 
@@ -125,13 +121,17 @@ type Agent struct {
 	// ProcessType declares launchd's resource policy. The zero value omits the
 	// launchd key.
 	ProcessType ProcessType
-	// LimitLoadToSessionType restricts the job to one launchd session type. The
-	// zero value omits the launchd key. launchctl bootstrap refuses some
-	// key-bearing configurations with EIO (observed: .app Programs in Aqua
-	// sessions; Background bootstrapped from SSH contexts) — prefer ProcessType
-	// for background intent and omit this field unless the exact configuration
-	// is proven to load.
-	LimitLoadToSessionType SessionType
+	// LimitLoadToSessionType is accepted and dropped: never rendered into the
+	// plist, never stored with the agent, and cleared from every agent daemonkit
+	// canonicalizes, so a Plan reads it back as the zero value.
+	//
+	// Deprecated: launchd refuses any job whose session type names a domain
+	// other than the bootstrap domain's own (error 134, "Service cannot load in
+	// requested session"), and daemonkit bootstraps only into gui/<uid> — so
+	// SessionTypeAqua was always a no-op and every other value was a guaranteed
+	// permanent refusal. Setting anything but SessionTypeAqua logs a warning.
+	// Removed in a future breaking release.
+	LimitLoadToSessionType SessionType `json:"-"`
 }
 
 // PlistPath is the LaunchAgent plist location (~/Library/LaunchAgents/<Label>.plist),
@@ -166,10 +166,6 @@ func (a Agent) Plist() ([]byte, error) {
 		return nil, err
 	}
 	processType, err := a.ProcessType.plistValue()
-	if err != nil {
-		return nil, err
-	}
-	sessionType, err := a.LimitLoadToSessionType.plistValue()
 	if err != nil {
 		return nil, err
 	}
@@ -212,7 +208,6 @@ func (a Agent) Plist() ([]byte, error) {
 		WatchPaths:                  watchPaths,
 		StartCalendarInterval:       calendar,
 		ProcessType:                 processType,
-		LimitLoadToSessionType:      sessionType,
 		AssociatedBundleIdentifiers: associated,
 	}); err != nil {
 		return nil, fmt.Errorf("render plist: %w", err)

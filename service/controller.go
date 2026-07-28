@@ -51,9 +51,10 @@ type ControllerConfig struct {
 	// UnsupportedSchema governs the durable worker/process-record store at
 	// ProcessPath when it is not the exact current schema. The zero value fails
 	// closed; ArchiveUnsupportedSchema renames the wedged store aside and starts
-	// fresh, trading best-effort recovery receipts for liveness. It never governs
-	// the controller state store at StatePath, whose desired agent set must not
-	// be silently discarded.
+	// fresh, trading best-effort recovery receipts for liveness. It does not
+	// govern the controller state store at StatePath, which always archives a
+	// wrong-schema store aside — naming every abandoned applied LaunchAgent and
+	// the backup path in the log — rather than wedging the open.
 	UnsupportedSchema proc.UnsupportedSchemaPolicy
 }
 
@@ -618,6 +619,7 @@ func desiredAgents(agents []Agent) (map[string]Agent, error) {
 		if _, duplicate := desired[agent.Label]; duplicate {
 			return nil, fmt.Errorf("service: duplicate agent label %q", agent.Label)
 		}
+		acceptIgnoredSessionType(&agent)
 		agent.Args = append([]string(nil), agent.Args...)
 		agent.Env = cloneStrings(agent.Env)
 		agent.AssociatedBundleIdentifiers, _ = canonicalAssociatedBundleIdentifiers(
