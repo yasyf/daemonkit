@@ -93,12 +93,13 @@ type AuthenticatedAppPeer struct {
 	PolicyDigest     codeidentity.PolicyDigest
 }
 
-func (k AppKeepAlive) launchctl(ctx context.Context, args ...string) (string, error) {
+func (k AppKeepAlive) launchctl(ctx context.Context, args ...string) launchctlResult {
 	runner := taskRunner(k.Runner)
 	if k.runner != nil {
 		runner = k.runner
 	}
-	return runCombined(ctx, runner, "/bin/launchctl", args...)
+	out, err := runCombined(ctx, runner, "/bin/launchctl", args...)
+	return launchctlOutcome(args[0], out, err)
 }
 
 // NewAuthenticatedAppPeer binds one signed-side accepted identity to an exact
@@ -195,19 +196,16 @@ func (k AppKeepAlive) Install(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	_, _ = k.launchctl(ctx, "bootout", serviceTarget(k.Label))
+	_ = k.launchctl(ctx, "bootout", serviceTarget(k.Label))
 	// enable before bootstrap: it clears a user/MDM disable, and a disabled label fails bootstrap.
-	if out, err := k.launchctl(ctx, "enable", serviceTarget(k.Label)); err != nil {
-		return fmt.Errorf("launchctl enable: %w: %s", err, out)
+	if err := k.launchctl(ctx, "enable", serviceTarget(k.Label)).fail(); err != nil {
+		return err
 	}
-	if out, err := k.launchctl(ctx, "bootstrap", domainTarget(), plist); err != nil {
-		return fmt.Errorf("launchctl bootstrap: %w: %s", err, out)
+	if err := k.launchctl(ctx, "bootstrap", domainTarget(), plist).fail(); err != nil {
+		return err
 	}
 	// Plain kickstart (no -k) covers the loaded-but-not-running race and no-ops when already running.
-	if out, err := k.launchctl(ctx, "kickstart", serviceTarget(k.Label)); err != nil {
-		return fmt.Errorf("launchctl kickstart: %w: %s", err, out)
-	}
-	return nil
+	return k.launchctl(ctx, "kickstart", serviceTarget(k.Label)).fail()
 }
 
 // Stop settles prior durable workers, authenticates and terminates every exact
@@ -425,8 +423,8 @@ func (s AppStopSpec) check(peer wire.Peer) error {
 }
 
 func (k AppKeepAlive) bootout(ctx context.Context) error {
-	if out, err := k.launchctl(ctx, "bootout", serviceTarget(k.Label)); err != nil && !notLoaded(err) {
-		return fmt.Errorf("launchctl bootout: %w: %s", err, out)
+	if bootout := k.launchctl(ctx, "bootout", serviceTarget(k.Label)); !bootout.settled() {
+		return bootout.fail()
 	}
 	return nil
 }
@@ -453,14 +451,14 @@ func (k AppKeepAlive) ensureUnloaded(ctx context.Context) (bool, error) {
 }
 
 func (k AppKeepAlive) loaded(ctx context.Context) (bool, error) {
-	out, err := k.launchctl(ctx, "print", serviceTarget(k.Label))
-	if err == nil {
-		return true, nil
-	}
-	if notLoaded(err) {
+	outcome := k.launchctl(ctx, "print", serviceTarget(k.Label))
+	if outcome.kind == launchctlNotLoaded {
 		return false, nil
 	}
-	return false, fmt.Errorf("launchctl print: %w: %s", err, out)
+	if outcome.kind != launchctlLoaded {
+		return false, outcome.fail()
+	}
+	return true, nil
 }
 
 func (s AppStopSpec) timeNow() time.Time {
@@ -525,17 +523,8 @@ func (k AppKeepAlive) Uninstall(ctx context.Context) error {
 	return nil
 }
 
-// bootout exits 3 ("No such process") for an unloaded service target.
-func notLoaded(err error) bool {
-	var exit interface{ ExitCode() int }
-	if !errors.As(err, &exit) {
-		return false
-	}
-	return exit.ExitCode() == launchctlNotLoadedExit || exit.ExitCode() == launchctlNotFoundExit
-}
-
 // Loaded reports whether launchd currently knows about the agent.
 func (k AppKeepAlive) Loaded(ctx context.Context) bool {
-	_, err := k.launchctl(ctx, "print", serviceTarget(k.Label))
-	return err == nil
+	loaded, err := k.loaded(ctx)
+	return err == nil && loaded
 }

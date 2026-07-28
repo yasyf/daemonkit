@@ -21,16 +21,12 @@ import (
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
-	"github.com/yasyf/daemonkit/worker"
 )
 
 const (
-	controllerCloseBound   = 30 * time.Second
-	bootstrapAttempts      = 3
-	bootstrapBaseDelay     = 200 * time.Millisecond
-	launchctlNotLoadedExit = 3
-	launchctlNotFoundExit  = 113
-	launchctlEIOExit       = 5
+	controllerCloseBound = 30 * time.Second
+	bootstrapAttempts    = 3
+	bootstrapBaseDelay   = 200 * time.Millisecond
 )
 
 // reconcileMode distinguishes open-path recovery, where a failing install or
@@ -284,12 +280,12 @@ func (c *Controller) Status(ctx context.Context, label string) (Status, error) {
 	desired, isDesired := c.state.Desired[label]
 	applied, isApplied := c.state.Applied[label]
 	status := Status{Label: label, Desired: isDesired, Applied: isApplied}
-	_, printErr := c.launchctl(opCtx, "print", serviceTarget(label))
-	switch {
-	case launchctlNotLoaded(printErr):
+	outcome := c.launchctl(opCtx, "print", serviceTarget(label))
+	if outcome.kind == launchctlNotLoaded {
 		return status, nil
-	case printErr != nil:
-		return Status{}, fmt.Errorf("service: inspect agent %q: %w", label, printErr)
+	}
+	if outcome.kind != launchctlLoaded {
+		return Status{}, fmt.Errorf("service: inspect agent %q: %w", label, outcome.fail())
 	}
 	status.Loaded = true
 	if !isDesired || !isApplied || !reflect.DeepEqual(desired, applied) {
@@ -436,8 +432,9 @@ func (c *Controller) reconcile(
 	return nil
 }
 
-// verify reports stale stored programs as drift so a later Converge with a
-// serviceable program can heal them.
+// verify observes without mutating: it reports stale stored programs as drift
+// so a later Converge with a serviceable program can heal them, and leaves
+// every launchd mutation to install.
 func (c *Controller) verify(ctx context.Context, agent Agent) (bool, error) {
 	if err := validateProgramTree(agent); err != nil {
 		if programMissing(err) {
@@ -467,16 +464,12 @@ func (c *Controller) verify(ctx context.Context, agent Agent) (bool, error) {
 	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 || !bytes.Equal(got, want) {
 		return false, nil
 	}
-	out, err := c.launchctl(ctx, "print", serviceTarget(agent.Label))
-	if err != nil {
-		if launchctlNotLoaded(err) {
-			return false, nil
-		}
-		return false, fmt.Errorf("launchctl print: %w: %s", err, strings.TrimSpace(out))
+	outcome := c.launchctl(ctx, "print", serviceTarget(agent.Label))
+	if outcome.kind == launchctlNotLoaded {
+		return false, nil
 	}
-	out, err = c.launchctl(ctx, "enable", serviceTarget(agent.Label))
-	if err != nil {
-		return false, fmt.Errorf("launchctl enable: %w: %s", err, strings.TrimSpace(out))
+	if outcome.kind != launchctlLoaded {
+		return false, outcome.fail()
 	}
 	return true, nil
 }
@@ -549,9 +542,8 @@ func validateProgramTree(agent Agent) error {
 }
 
 func (c *Controller) uninstall(ctx context.Context, agent Agent) error {
-	if out, err := c.launchctl(ctx, "bootout", serviceTarget(agent.Label)); err != nil &&
-		!launchctlNotLoaded(err) {
-		return fmt.Errorf("launchctl bootout: %w: %s", err, strings.TrimSpace(out))
+	if bootout := c.launchctl(ctx, "bootout", serviceTarget(agent.Label)); !bootout.settled() {
+		return bootout.fail()
 	}
 	path, err := agent.PlistPath()
 	if err != nil {
@@ -571,29 +563,13 @@ func (c *Controller) reload(ctx context.Context, agent Agent, path string) error
 	delay := bootstrapBaseDelay
 	var lastErr error
 	for attempt := 1; attempt <= bootstrapAttempts; attempt++ {
-		out, err := c.launchctl(ctx, "bootout", serviceTarget(agent.Label))
-		if err != nil && !launchctlNotLoaded(err) {
-			lastErr = fmt.Errorf("launchctl bootout before bootstrap: %w: %s", err, strings.TrimSpace(out))
-			if launchctlExitCode(err) != launchctlEIOExit {
-				return lastErr
-			}
-		} else {
-			out, err = c.launchctl(ctx, "enable", serviceTarget(agent.Label))
-			if err != nil {
-				return fmt.Errorf("launchctl enable: %w: %s", err, strings.TrimSpace(out))
-			}
-			out, err = c.launchctl(ctx, "bootstrap", domainTarget(), path)
-			if err == nil {
-				out, err = c.launchctl(ctx, "kickstart", serviceTarget(agent.Label))
-				if err != nil {
-					return fmt.Errorf("launchctl kickstart: %w: %s", err, strings.TrimSpace(out))
-				}
-				return nil
-			}
-			lastErr = fmt.Errorf("launchctl bootstrap: %w: %s", err, strings.TrimSpace(out))
-			if launchctlExitCode(err) != launchctlEIOExit {
-				return lastErr
-			}
+		outcome := c.loadOnce(ctx, agent, path)
+		lastErr = outcome.fail()
+		if lastErr == nil {
+			return nil
+		}
+		if outcome.kind != launchctlInFlux {
+			return lastErr
 		}
 		if attempt == bootstrapAttempts {
 			break
@@ -604,13 +580,30 @@ func (c *Controller) reload(ctx context.Context, agent Agent, path string) error
 		delay *= 2
 	}
 	return fmt.Errorf(
-		"%w (gave up after %d attempts bootstrapping %q; launchctl exit %d covers permanent launchd denials, so check launchd's own log for the refusal)",
-		lastErr, bootstrapAttempts, path, launchctlEIOExit,
+		"%w (gave up after %d attempts bootstrapping %q; launchd reported the operation still in progress every time)",
+		lastErr, bootstrapAttempts, path,
 	)
 }
 
-func (c *Controller) launchctl(ctx context.Context, args ...string) (string, error) {
-	return runCombined(ctx, c.runtime, "/bin/launchctl", args...)
+// loadOnce runs one bootout → enable → bootstrap → kickstart pass and returns
+// the classified outcome that stopped it, or the successful kickstart.
+func (c *Controller) loadOnce(ctx context.Context, agent Agent, path string) launchctlResult {
+	bootout := c.launchctl(ctx, "bootout", serviceTarget(agent.Label))
+	if !bootout.settled() {
+		return bootout
+	}
+	if enable := c.launchctl(ctx, "enable", serviceTarget(agent.Label)); enable.fail() != nil {
+		return enable
+	}
+	if bootstrap := c.launchctl(ctx, "bootstrap", domainTarget(), path); bootstrap.fail() != nil {
+		return bootstrap
+	}
+	return c.launchctl(ctx, "kickstart", serviceTarget(agent.Label))
+}
+
+func (c *Controller) launchctl(ctx context.Context, args ...string) launchctlResult {
+	out, err := runCombined(ctx, c.runtime, "/bin/launchctl", args...)
+	return launchctlOutcome(args[0], out, err)
 }
 
 func desiredAgents(agents []Agent) (map[string]Agent, error) {
@@ -633,21 +626,6 @@ func desiredAgents(agents []Agent) (map[string]Agent, error) {
 		desired[agent.Label] = agent
 	}
 	return desired, nil
-}
-
-func launchctlExitCode(err error) int {
-	var exitErr *worker.ExitError
-	if errors.As(err, &exitErr) {
-		return exitErr.ExitCode
-	}
-	return -1
-}
-
-// launchctlNotLoaded reports a launchctl failure that means the service is not
-// known to launchd: bootout exits 3, print exits 113 on current macOS.
-func launchctlNotLoaded(err error) bool {
-	code := launchctlExitCode(err)
-	return code == launchctlNotLoadedExit || code == launchctlNotFoundExit
 }
 
 func waitServiceRetry(ctx context.Context, delay time.Duration) error {

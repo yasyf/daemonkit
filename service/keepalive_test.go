@@ -3,9 +3,7 @@ package service
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -164,16 +162,6 @@ func launchctlRunner(fn func(context.Context, ...string) (string, error)) taskRu
 	})
 }
 
-func shExit(t *testing.T, code int) error {
-	t.Helper()
-	err := exec.Command("/bin/sh", "-c", fmt.Sprintf("exit %d", code)).Run()
-	var exit *exec.ExitError
-	if !errors.As(err, &exit) || exit.ExitCode() != code {
-		t.Fatalf("fabricate exit %d: %v", code, err)
-	}
-	return err
-}
-
 func TestAppKeepAliveUninstallBootout(t *testing.T) {
 	errDenied := errors.New("bootout: Operation not permitted")
 	cases := []struct {
@@ -181,8 +169,9 @@ func TestAppKeepAliveUninstallBootout(t *testing.T) {
 		bootoutErr error
 		wantGone   bool
 	}{
-		{"exit 3 not loaded succeeds and removes plist", shExit(t, 3), true},
-		{"other exit code fails and keeps plist", shExit(t, 5), false},
+		{"bootout exit 3 not loaded succeeds and removes plist", launchctlExit(launchctlNotLoadedExit), true},
+		{"print exit 113 not found succeeds and removes plist", launchctlExit(launchctlNotFoundExit), true},
+		{"aggregate exit code fails and keeps plist", launchctlExit(launchctlAggregateExit), false},
 		{"non-exit failure fails and keeps plist", errDenied, false},
 	}
 	for _, tc := range cases {

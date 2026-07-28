@@ -761,12 +761,12 @@ func (c *Controller) transitionReplacement(
 
 func (c *Controller) requireReplacementUnloaded(ctx context.Context, plan Plan) error {
 	for _, agent := range plan.Agents() {
-		_, err := c.launchctl(ctx, "print", serviceTarget(agent.Label))
-		if err == nil {
+		outcome := c.launchctl(ctx, "print", serviceTarget(agent.Label))
+		if outcome.kind == launchctlLoaded {
 			return fmt.Errorf("%w: agent %q remains loaded", ErrNotQuiesced, agent.Label)
 		}
-		if !launchctlNotLoaded(err) {
-			return fmt.Errorf("service: inspect quiesced agent %q: %w", agent.Label, err)
+		if outcome.kind != launchctlNotLoaded {
+			return fmt.Errorf("service: inspect quiesced agent %q: %w", agent.Label, outcome.fail())
 		}
 	}
 	return nil

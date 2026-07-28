@@ -143,7 +143,7 @@ func fixedAppFixture(t *testing.T) (AppKeepAlive, AppStopSpec, AuthenticatedAppP
 
 func launchState(t *testing.T, keepalive *AppKeepAlive, events *[]string, loaded *bool) {
 	t.Helper()
-	notLoadedErr := shExit(t, 3)
+	notLoadedErr := launchctlExit(launchctlNotLoadedExit)
 	keepalive.runner = launchctlRunner(func(_ context.Context, args ...string) (string, error) {
 		switch args[0] {
 		case "print":

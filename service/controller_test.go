@@ -502,7 +502,7 @@ func TestControllerRecoveryVerifiesExactAgentWithoutRelaunch(t *testing.T) {
 	}
 	var events []string
 	run := launchctlStub(func(args []string) (string, error) {
-		if args[0] != "print" && args[0] != "enable" {
+		if args[0] != "print" {
 			return "", fmt.Errorf("unexpected launchctl mutation: %v", args)
 		}
 		return "loaded", nil
@@ -514,7 +514,6 @@ func TestControllerRecoveryVerifiesExactAgentWithoutRelaunch(t *testing.T) {
 	_ = controller
 	want := []string{
 		"start", "load", "run:print " + serviceTarget(agent.Label),
-		"run:enable " + serviceTarget(agent.Label),
 		fmt.Sprintf("recover-receipts:%s", proc.RecoveryServiceID),
 		fmt.Sprintf("recover-receipts:%s", proc.RecoveryStopControlID),
 	}
@@ -803,10 +802,7 @@ func TestControllerRecoverySkipsStaleLabelAndVerifiesHealthyLabel(t *testing.T) 
 		Desired: map[string]Agent{stale.Label: stale, healthy.Label: healthy},
 		Applied: map[string]Agent{stale.Label: stale, healthy.Label: healthy},
 	}, run, nil)
-	want := [][]string{
-		{"print", serviceTarget(healthy.Label)},
-		{"enable", serviceTarget(healthy.Label)},
-	}
+	want := [][]string{{"print", serviceTarget(healthy.Label)}}
 	if !reflect.DeepEqual(calls, want) {
 		t.Fatalf("recovery launchctl calls = %v, want %v", calls, want)
 	}
@@ -955,7 +951,7 @@ func TestControllerInstallEnableFailureStopsAndRetryRestartsAtBootout(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	errEnable := launchctlExit(launchctlEIOExit)
+	errEnable := launchctlExit(launchctlAggregateExit)
 	failEnable := true
 	var calls [][]string
 	run := launchctlStub(func(args []string) (string, error) {
@@ -965,7 +961,7 @@ func TestControllerInstallEnableFailureStopsAndRetryRestartsAtBootout(t *testing
 			return "not loaded", launchctlExit(launchctlNotLoadedExit)
 		case "enable":
 			if failEnable {
-				return "in flux", errEnable
+				return "Enable failed: 5: Input/output error", errEnable
 			}
 		}
 		return "", nil
@@ -1020,7 +1016,7 @@ func TestControllerInstallRetryRepeatsSequenceBeforeKickstart(t *testing.T) {
 		case "bootstrap":
 			bootstrapCalls++
 			if bootstrapCalls == 1 {
-				return "in flux", launchctlExit(launchctlEIOExit)
+				return "Bootstrap failed: 36: Operation now in progress", launchctlExit(launchctlInProgressExit)
 			}
 		}
 		return "", nil
@@ -1103,10 +1099,7 @@ func TestControllerSameSetVerifiesAndRepairsDrift(t *testing.T) {
 	if err := controller.Converge(context.Background(), []Agent{agent}); err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{
-		"run:print " + serviceTarget(agent.Label),
-		"run:enable " + serviceTarget(agent.Label),
-	}; !reflect.DeepEqual(events, want) {
+	if want := []string{"run:print " + serviceTarget(agent.Label)}; !reflect.DeepEqual(events, want) {
 		t.Fatalf("exact-state events = %v, want %v", events, want)
 	}
 	path, err := agent.PlistPath()
@@ -1125,88 +1118,28 @@ func TestControllerSameSetVerifiesAndRepairsDrift(t *testing.T) {
 	}
 }
 
-func TestControllerVerifyEnablesExactLoadedAgentForRelaunch(t *testing.T) {
+func TestControllerVerifyIssuesNoLaunchdMutation(t *testing.T) {
 	t.Setenv(realhome.EnvOverride, t.TempDir())
-	agent := controllerAgent(t, "com.example.verify-disabled")
-	disabled := false
+	agent := controllerAgent(t, "com.example.verify-readonly")
 	var calls [][]string
 	run := launchctlStub(func(args []string) (string, error) {
 		calls = append(calls, append([]string(nil), args...))
-		switch args[0] {
-		case "bootout":
+		if args[0] == "bootout" {
 			return "not loaded", launchctlExit(launchctlNotLoadedExit)
-		case "enable":
-			disabled = false
 		}
 		return "", nil
 	})
 	controller, _, _, _ := newTestController(t, controllerState{
 		Desired: map[string]Agent{agent.Label: agent}, Applied: map[string]Agent{agent.Label: agent},
 	}, run, nil)
-	disabled = true
 	calls = nil
 
 	if err := controller.Converge(context.Background(), []Agent{agent}); err != nil {
 		t.Fatalf("Converge() = %v", err)
 	}
-	want := [][]string{
-		{"print", serviceTarget(agent.Label)},
-		{"enable", serviceTarget(agent.Label)},
-	}
+	want := [][]string{{"print", serviceTarget(agent.Label)}}
 	if !reflect.DeepEqual(calls, want) {
 		t.Fatalf("launchctl calls = %v, want %v", calls, want)
-	}
-	if disabled {
-		t.Fatal("exact loaded agent remains disabled after convergence")
-	}
-}
-
-func TestControllerVerifyEnableFailureIsNotConverged(t *testing.T) {
-	t.Setenv(realhome.EnvOverride, t.TempDir())
-	agent := controllerAgent(t, "com.example.verify-enable-failure")
-	errEnable := launchctlExit(77)
-	failEnable := false
-	var calls [][]string
-	run := launchctlStub(func(args []string) (string, error) {
-		calls = append(calls, append([]string(nil), args...))
-		switch args[0] {
-		case "bootout":
-			return "not loaded", launchctlExit(launchctlNotLoadedExit)
-		case "enable":
-			if failEnable {
-				return "denied", errEnable
-			}
-		}
-		return "", nil
-	})
-	controller, _, store, _ := newTestController(t, controllerState{
-		Desired: map[string]Agent{agent.Label: agent}, Applied: map[string]Agent{agent.Label: agent},
-	}, run, nil)
-	failEnable = true
-	calls = nil
-
-	err := controller.Converge(context.Background(), []Agent{agent})
-	if !errors.Is(err, errEnable) || !strings.Contains(err.Error(), "verify agent") {
-		t.Fatalf("Converge() = %v, want enable verification failure", err)
-	}
-	want := [][]string{
-		{"print", serviceTarget(agent.Label)},
-		{"enable", serviceTarget(agent.Label)},
-	}
-	if !reflect.DeepEqual(calls, want) {
-		t.Fatalf("launchctl calls = %v, want %v", calls, want)
-	}
-	if got := store.state.Applied[agent.Label]; !reflect.DeepEqual(got, agent) {
-		t.Fatalf("applied agent changed after verification failure: %#v", got)
-	}
-
-	failEnable = false
-	calls = nil
-	if err := controller.Converge(context.Background(), []Agent{agent}); err != nil {
-		t.Fatalf("retry Converge() = %v", err)
-	}
-	if !reflect.DeepEqual(calls, want) {
-		t.Fatalf("retry launchctl calls = %v, want %v", calls, want)
 	}
 }
 
@@ -1233,16 +1166,18 @@ func TestControllerVerifyPropagatesUnexpectedLaunchctlFailure(t *testing.T) {
 	}
 }
 
-func TestControllerRetriesWholeLoadSequenceOnLaunchdEIO(t *testing.T) {
+func TestControllerRetriesWholeLoadSequenceOnlyWhileLaunchdReportsInProgress(t *testing.T) {
 	t.Setenv(realhome.EnvOverride, t.TempDir())
 	agent := controllerAgent(t, "com.example.retry")
 	agent.LimitLoadToSessionType = SessionTypeBackground
 	tests := []struct {
 		name    string
 		failure string
+		out     string
+		code    int
 	}{
-		{name: "bootout", failure: "bootout"},
-		{name: "bootstrap", failure: "bootstrap"},
+		{name: "bootout in progress", failure: "bootout", out: "Boot-out failed: 36: Operation now in progress", code: launchctlInProgressExit},
+		{name: "bootstrap already in progress", failure: "bootstrap", out: "Bootstrap failed: 37: Operation already in progress", code: launchctlAlreadyExit},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1252,11 +1187,11 @@ func TestControllerRetriesWholeLoadSequenceOnLaunchdEIO(t *testing.T) {
 				switch args[0] {
 				case "bootout":
 					if test.failure == "bootout" {
-						return "in flux", launchctlExit(launchctlEIOExit)
+						return test.out, launchctlExit(test.code)
 					}
 					return "not loaded", launchctlExit(launchctlNotLoadedExit)
 				case "bootstrap":
-					return "Bootstrap failed: 5: Input/output error", launchctlExit(launchctlEIOExit)
+					return test.out, launchctlExit(test.code)
 				default:
 					return "", nil
 				}
@@ -1296,26 +1231,67 @@ func TestControllerRetriesWholeLoadSequenceOnLaunchdEIO(t *testing.T) {
 	}
 }
 
-func TestControllerDoesNotRetryNonEIO(t *testing.T) {
+func TestControllerSettlesEveryNonInFluxBootoutOnFirstObservation(t *testing.T) {
 	t.Setenv(realhome.EnvOverride, t.TempDir())
 	agent := controllerAgent(t, "com.example.no-retry")
-	var calls int
-	run := launchctlStub(func([]string) (string, error) {
-		calls++
-		return "denied", launchctlExit(77)
-	})
-	controller, _, _, _ := newTestController(t, controllerState{
-		Desired: map[string]Agent{}, Applied: map[string]Agent{},
-	}, run, nil)
-	controller.retryWait = func(context.Context, time.Duration) error {
-		t.Fatal("non-EIO failure waited for retry")
-		return nil
+	agent.LimitLoadToSessionType = SessionTypeBackground
+	tests := []struct {
+		name     string
+		out      string
+		code     int
+		wantText []string
+	}{
+		{
+			name:     "aggregate status names no condition",
+			out:      "Boot-out failed: 5: Input/output error",
+			code:     launchctlAggregateExit,
+			wantText: []string{"unclassified launchctl status 5", "launchctl error 5"},
+		},
+		{
+			name:     "refusal carries launchd's own reason",
+			out:      "Boot-out failed: 1: Operation not permitted",
+			code:     1,
+			wantText: []string{"launchd refused: Operation not permitted"},
+		},
+		{
+			name:     "unobserved status is named unknown",
+			out:      "denied",
+			code:     77,
+			wantText: []string{"unclassified launchctl status 77", "launchctl error 77"},
+		},
 	}
-	if err := controller.reload(context.Background(), agent, "/tmp/no-retry.plist"); err == nil {
-		t.Fatal("reload() succeeded")
-	}
-	if calls != 1 {
-		t.Fatalf("launchctl calls = %d, want 1", calls)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var calls int
+			run := launchctlStub(func([]string) (string, error) {
+				calls++
+				return test.out, launchctlExit(test.code)
+			})
+			controller, _, _, _ := newTestController(t, controllerState{
+				Desired: map[string]Agent{}, Applied: map[string]Agent{},
+			}, run, nil)
+			controller.retryWait = func(context.Context, time.Duration) error {
+				t.Fatal("a settled launchd outcome waited for retry")
+				return nil
+			}
+			err := controller.reload(context.Background(), agent, "/tmp/no-retry.plist")
+			if err == nil {
+				t.Fatal("reload() succeeded")
+			}
+			if calls != 1 {
+				t.Fatalf("launchctl calls = %d, want 1", calls)
+			}
+			for _, want := range test.wantText {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("reload() error = %v, want it to name %q", err, want)
+				}
+			}
+			for _, banned := range []string{"session", "attempts"} {
+				if strings.Contains(err.Error(), banned) {
+					t.Errorf("reload() error = %v, must not mention %q", err, banned)
+				}
+			}
+		})
 	}
 }
 
