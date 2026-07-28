@@ -70,9 +70,14 @@ func waitManagerUntracked(t *testing.T, store *memStore) {
 
 func waitManagerChild(t *testing.T, child *PreparedChild) ProcessExit {
 	t.Helper()
+	return waitManagerChildWithin(t, child, 3*time.Second)
+}
+
+func waitManagerChildWithin(t *testing.T, child *PreparedChild, budget time.Duration) ProcessExit {
+	t.Helper()
 	select {
 	case <-child.Done():
-	case <-time.After(3 * time.Second):
+	case <-time.After(budget):
 		t.Fatal("prepared child did not settle")
 	}
 	exit, ok := child.Exit()
@@ -713,6 +718,64 @@ func TestManagerStopEscalatesAfterFixedGrace(t *testing.T) {
 	elapsed := time.Since(started)
 	if elapsed < 400*time.Millisecond || elapsed > 2*time.Second {
 		t.Fatalf("TERM/KILL grace elapsed = %s", elapsed)
+	}
+}
+
+func TestManagerParkedChildDiesOnTerm(t *testing.T) {
+	manager, store := newManagerTest(t, 1)
+	marker := filepath.Join(t.TempDir(), "executed")
+	request := managerTestRequest(t, `printf yes > "$1"`)
+	request.args = append(request.args, "manager-test", marker)
+	child, receipt, err := manager.Prepare(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Kill(receipt.ProcessIdentity().PID, syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	exit := waitManagerChildWithin(t, child, 20*time.Second)
+	if exit.Code != -1 || exit.Stopped {
+		t.Fatalf("exit = %+v, want a TERM-signaled parked wrapper", exit)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("parked target executed: %v", err)
+	}
+	waitManagerUntracked(t, store)
+}
+
+func TestChildWrapperGateEOFExitsWithoutSpinning(t *testing.T) {
+	command, pipes, err := prepareCommand(managerTestRequest(t, "exit 0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := withChildNprocCap(command.Start); err != nil {
+		t.Fatal(err)
+	}
+	pipes.closeChildEnds()
+	waited := make(chan error, 1)
+	go func() { waited <- command.Wait() }()
+	if err := awaitPrepared(context.Background(), pipes.readyRead); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	if err := pipes.gateWrite.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var waitErr error
+	select {
+	case waitErr = <-waited:
+	case <-time.After(20 * time.Second):
+		_ = command.Process.Kill()
+		t.Fatal("gate EOF left the wrapper parked")
+	}
+	elapsed := time.Since(started)
+	var exitErr *exec.ExitError
+	if !errors.As(waitErr, &exitErr) || exitErr.ExitCode() != 125 {
+		t.Fatalf("gate EOF wait = %v, want exit status 125", waitErr)
+	}
+	cpu := command.ProcessState.UserTime() + command.ProcessState.SystemTime()
+	if elapsed > 5*time.Second || cpu > 250*time.Millisecond {
+		t.Fatalf("gate EOF elapsed=%s cpu=%s, want a blocking read", elapsed, cpu)
 	}
 }
 

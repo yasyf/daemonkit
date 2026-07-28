@@ -21,12 +21,10 @@ import (
 )
 
 const childWrapper = `
-trap ':' TERM
 printf r >&3
 exec 3>&-
 if ! IFS= read -r marker <&4 || [ "$marker" != start ]; then exit 125; fi
 exec 4<&-
-trap - TERM
 exec "$@"
 `
 
