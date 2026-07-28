@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 
@@ -22,5 +23,17 @@ func main() {
 		PolicyDigest:   digest,
 	}
 	peer := wire.Peer{UID: os.Geteuid(), Audit: []byte(os.Getenv("DAEMONKIT_AUDIT_TOKEN"))}
-	fmt.Println(stop, codeidentity.CodePolicy{Identity: identity}.Check(peer))
+	keepAlive := service.AppKeepAlive{
+		Label:    identity.SigningIdentifier,
+		AppPath:  "/Applications/DaemonKitBroker.app",
+		BundleID: identity.SigningIdentifier,
+	}
+	expected := service.AuthenticatedAppPeer{
+		PID:          peer.PID,
+		UID:          peer.UID,
+		Executable:   stop.ExecutableName,
+		CodeIdentity: identity,
+		PolicyDigest: digest,
+	}
+	fmt.Println(keepAlive.Stop(context.Background(), stop, expected), codeidentity.CodePolicy{Identity: identity}.Check(peer))
 }
