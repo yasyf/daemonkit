@@ -339,7 +339,7 @@ func (c *ServiceClient) monitorSession(
 	started chan<- struct{},
 ) {
 	for {
-		event, ok, err := tryRuntimeReadiness(session.client, c.config.Client.WireBuild)
+		event, ok, err := tryRuntimeReadiness(session.client)
 		if !ok {
 			close(started)
 			break
@@ -350,7 +350,7 @@ func (c *ServiceClient) monitorSession(
 		}
 	}
 	for {
-		event, err := nextRuntimeReadiness(c.ctx, session.client, c.config.Client.WireBuild)
+		event, err := nextRuntimeReadiness(c.ctx, session.client)
 		if !c.observeSession(session, progress, event, err) {
 			return
 		}

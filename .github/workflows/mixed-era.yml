@@ -13,11 +13,18 @@ permissions:
   contents: read
 
 env:
-  # Whether `skew/*` is expected to pass. The exact-WireBuild handshake gate
-  # makes ordinary pin skew a hard failure (RC3, ccn 0771ea54), so it is `fail`
-  # until v0.21.0 demotes WireBuild to a Health diagnostic. Flipping this to
-  # `pass` belongs in that release's diff — the contract change is then visible
-  # in review rather than implied by a badge quietly turning green.
+  # Whether `skew/*` is expected to pass. This tree gates on ProtocolVersion
+  # alone and treats WireBuild as a diagnostic, so it accepts build skew — that
+  # contract is proven in-process by wire.TestSessionSurvivesBuildSkew, which is
+  # where a re-tightening would show up first.
+  #
+  # It stays `fail` anyway, because a session needs BOTH ends to accept and the
+  # boundary release this job builds still enforces the old exact-match gate. No
+  # change to this tree can make an already-released client accept skew.
+  #
+  # Flip to `pass` on the first run whose newest release ancestor is itself
+  # post-demotion (>= v0.21.0). The job reports "the expectation is stale" and
+  # goes red at exactly that moment, so this does not need watching for.
   SKEW_EXPECT: fail
 
 jobs:

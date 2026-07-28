@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/trust"
@@ -135,6 +136,20 @@ type HandshakeRejectionError struct {
 func (e *HandshakeRejectionError) Error() string { return e.Reason }
 
 func (e *HandshakeRejectionError) Unwrap() error { return responseCodeCause(e.Code) }
+
+// ProtocolMismatchError is the handshake's terminal answer to a peer speaking
+// another wire protocol. ProtocolVersion is the whole compatibility axis: the
+// build strings either side presents are diagnostics, never gates.
+type ProtocolMismatchError struct {
+	Theirs uint16
+	Ours   uint16
+}
+
+func (e *ProtocolMismatchError) Error() string {
+	return fmt.Sprintf("%s: peer=%d self=%d", ErrProtocolVersion, e.Theirs, e.Ours)
+}
+
+func (*ProtocolMismatchError) Unwrap() error { return ErrProtocolVersion }
 
 func responseCodeCause(code ResponseCode) error {
 	switch code {

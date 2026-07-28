@@ -115,7 +115,11 @@ type sessionCapacity struct {
 // Server serves persistent, multiplexed v1 sessions on a listener owned by its caller.
 // Register business, observation, and stop-control handlers before Serve.
 type Server struct {
-	// WireBuild is the stable schema identity sent during the mandatory handshake.
+	// WireBuild identifies the caller's own schema. It is required, exchanged
+	// during the mandatory handshake, and reported as a diagnostic — never
+	// compared as a gate, because a schema identity cannot gate a transport it
+	// does not describe. A caller needing schema equality enforces it itself, on
+	// Request.WireBuild.
 	WireBuild string
 	// Ladder supplies per-operation server deadlines.
 	Ladder Ladder
@@ -444,12 +448,11 @@ func (s *Server) startConnection(
 	}
 	identity, err := s.readClientHello(codec)
 	if err != nil {
-		code := ResponseCodePeerUntrusted
-		if errors.Is(err, ErrBuildMismatch) {
-			code = ResponseCodeBuildMismatch
-		}
-		s.rejectHandshakeCodec(conn, codec, code, err)
+		s.rejectHandshakeCodec(conn, codec, ResponseCodePeerUntrusted, err)
 		return err
+	}
+	if identity.WireBuild != s.WireBuild {
+		s.Log.Info("wire: peer build skew", "peer", identity.WireBuild, "server", s.WireBuild)
 	}
 	peer, err := PeerFromConn(conn)
 	if err != nil {
@@ -603,7 +606,7 @@ func (s *Server) readClientHello(codec *Codec) (handshakeIdentity, error) {
 		return handshakeIdentity{}, fmt.Errorf("%w: identity: %w", ErrHandshake, err)
 	}
 	if identity.Protocol != ProtocolVersion {
-		return handshakeIdentity{}, fmt.Errorf("%w: identity got %d", ErrProtocolVersion, identity.Protocol)
+		return handshakeIdentity{}, &ProtocolMismatchError{Theirs: identity.Protocol, Ours: ProtocolVersion}
 	}
 	if identity.WireBuild == "" {
 		return handshakeIdentity{}, fmt.Errorf("%w: empty wire build", ErrHandshake)
@@ -613,9 +616,6 @@ func (s *Server) readClientHello(codec *Codec) (handshakeIdentity, error) {
 	}
 	if len(identity.Session) != 0 {
 		return handshakeIdentity{}, fmt.Errorf("%w: client supplied a session generation", ErrHandshake)
-	}
-	if identity.WireBuild != s.WireBuild {
-		return handshakeIdentity{}, ErrBuildMismatch
 	}
 	return identity, nil
 }

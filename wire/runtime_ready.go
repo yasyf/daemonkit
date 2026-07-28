@@ -270,11 +270,7 @@ func waitRuntimeReadyTracked(
 			return nil, err
 		}
 		client, err := withinProgress(ctx, progress, func(attemptCtx context.Context) (*Client, error) {
-			return newLifecycleClient(
-				attemptCtx,
-				config.Client,
-				newRuntimeLifecycleValidator(config.Client.WireBuild, expected),
-			)
+			return newLifecycleClient(attemptCtx, config.Client, newRuntimeLifecycleValidator(expected))
 		})
 		if err != nil {
 			if provesNoListener(err) || errors.Is(err, ErrSessionCapacity) {
@@ -298,7 +294,7 @@ func waitRuntimeReadyTracked(
 		}
 		for {
 			event, eventErr := withinProgress(ctx, progress, func(eventCtx context.Context) (runtimeReadinessEvent, error) {
-				return nextRuntimeReadiness(eventCtx, client, config.Client.WireBuild)
+				return nextRuntimeReadiness(eventCtx, client)
 			})
 			if eventErr != nil {
 				_ = client.Abort(eventErr)
@@ -359,11 +355,7 @@ func subscribeRuntimeReadiness(ctx context.Context, client *Client) error {
 	return nil
 }
 
-func nextRuntimeReadiness(
-	ctx context.Context,
-	client *Client,
-	wireBuild string,
-) (runtimeReadinessEvent, error) {
+func nextRuntimeReadiness(ctx context.Context, client *Client) (runtimeReadinessEvent, error) {
 	payload, transportErr := client.nextLifecycle(ctx)
 	if len(payload) == 0 {
 		if transportErr != nil {
@@ -371,7 +363,7 @@ func nextRuntimeReadiness(
 		}
 		return runtimeReadinessEvent{}, fmt.Errorf("%w: empty lifecycle payload", ErrReadinessProgress)
 	}
-	event, decodeErr := decodeRuntimeReadiness(payload, wireBuild)
+	event, decodeErr := decodeRuntimeReadiness(payload)
 	if decodeErr != nil {
 		return runtimeReadinessEvent{}, decodeErr
 	}
@@ -381,7 +373,7 @@ func nextRuntimeReadiness(
 	return event, nil
 }
 
-func tryRuntimeReadiness(client *Client, wireBuild string) (runtimeReadinessEvent, bool, error) {
+func tryRuntimeReadiness(client *Client) (runtimeReadinessEvent, bool, error) {
 	payload, ok, transportErr := client.tryLifecycle()
 	if !ok {
 		return runtimeReadinessEvent{}, false, nil
@@ -392,7 +384,7 @@ func tryRuntimeReadiness(client *Client, wireBuild string) (runtimeReadinessEven
 		}
 		return runtimeReadinessEvent{}, true, fmt.Errorf("%w: empty lifecycle payload", ErrReadinessProgress)
 	}
-	event, decodeErr := decodeRuntimeReadiness(payload, wireBuild)
+	event, decodeErr := decodeRuntimeReadiness(payload)
 	if decodeErr != nil {
 		return runtimeReadinessEvent{}, true, decodeErr
 	}
@@ -409,16 +401,13 @@ func runtimeLifecycleTransportError(err error) error {
 	return err
 }
 
-func newRuntimeLifecycleValidator(
-	wireBuild string,
-	expected *RuntimeIdentity,
-) func([]byte) (bool, error) {
+func newRuntimeLifecycleValidator(expected *RuntimeIdentity) func([]byte) (bool, error) {
 	tracker := &runtimeProgressTracker{
 		clock: realReadinessClock{}, expected: cloneRuntimeIdentity(expected),
 		progress: ReadinessProgress{Detail: []byte{}},
 	}
 	return func(payload []byte) (bool, error) {
-		event, err := decodeRuntimeReadiness(payload, wireBuild)
+		event, err := decodeRuntimeReadiness(payload)
 		if err != nil {
 			return false, err
 		}
@@ -434,20 +423,13 @@ func newRuntimeLifecycleValidator(
 	}
 }
 
-func decodeRuntimeReadiness(payload []byte, wireBuild string) (runtimeReadinessEvent, error) {
+func decodeRuntimeReadiness(payload []byte) (runtimeReadinessEvent, error) {
 	var event runtimeReadinessEvent
 	if err := decodeStrict(payload, &event); err != nil {
 		return runtimeReadinessEvent{}, fmt.Errorf("%w: decode runtime readiness event: %w", ErrReadinessProgress, err)
 	}
 	if event.Protocol != ProtocolVersion {
-		return runtimeReadinessEvent{}, fmt.Errorf(
-			"%w: readiness protocol=%d want=%d", ErrProtocolVersion, event.Protocol, ProtocolVersion,
-		)
-	}
-	if event.WireBuild != wireBuild {
-		return runtimeReadinessEvent{}, fmt.Errorf(
-			"%w: readiness server=%q client=%q", ErrBuildMismatch, event.WireBuild, wireBuild,
-		)
+		return runtimeReadinessEvent{}, &ProtocolMismatchError{Theirs: event.Protocol, Ours: ProtocolVersion}
 	}
 	return event, nil
 }

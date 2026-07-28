@@ -645,12 +645,6 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 
 	switch entry.route {
 	case routeHandoff:
-		if s.wireBuild != s.server.WireBuild {
-			if err := s.sendRejectedCode(sessionCtx, frame.ID, ResponseCodeBuildMismatch, ErrBuildMismatch.Error()); err != nil {
-				s.closeOnRequestError()
-			}
-			return
-		}
 		var err error
 		handoffEnvelope, err = s.server.authorizeBrokerHandoff(s.role, frame.Payload)
 		if err != nil {
@@ -678,12 +672,6 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 			return
 		}
 	case routeStopPrepare:
-		if s.wireBuild != s.server.WireBuild {
-			if err := s.sendRejected(sessionCtx, frame.ID, ErrBuildMismatch.Error()); err != nil {
-				s.closeOnRequestError()
-			}
-			return
-		}
 		if err := s.server.authorizeStopPreparation(s.role, frame.Payload); err != nil {
 			code := ResponseCode("")
 			if errors.Is(err, ErrPermissionDenied) {
@@ -695,12 +683,6 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 			return
 		}
 	case routeStop:
-		if s.wireBuild != s.server.WireBuild {
-			if err := s.sendRejected(sessionCtx, frame.ID, ErrBuildMismatch.Error()); err != nil {
-				s.closeOnRequestError()
-			}
-			return
-		}
 		var err error
 		requestCtx, err = s.server.authorizeStopControl(requestCtx, s, s.peer, s.role, frame.Payload)
 		if err != nil {
@@ -714,12 +696,6 @@ func (s *session) execute(sessionCtx, requestCtx context.Context, frame Frame, e
 			return
 		}
 	case routeBusiness, routeObservation, routeLifecycle:
-		if s.wireBuild != s.server.WireBuild {
-			if err := s.sendRejected(sessionCtx, frame.ID, ErrBuildMismatch.Error()); err != nil {
-				s.closeOnRequestError()
-			}
-			return
-		}
 		if entry.route == routeLifecycle {
 			if err := s.server.authorizeLifecycleControl(frame.Op, s.role); err != nil {
 				if err := s.sendRejectedCode(sessionCtx, frame.ID, ResponseCodePermissionDenied, err.Error()); err != nil {

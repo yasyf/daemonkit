@@ -1051,6 +1051,11 @@ wire	method	PreparedStop.Process	all
 wire	method	PreparedStop.RuntimeProtocol	all
 wire	method	PreparedStop.StopSession	all
 wire	method	PreparedStop.Target	all
+wire	type	ProtocolMismatchError	all
+wire	method	ProtocolMismatchError.Error	all
+wire	field	ProtocolMismatchError.Ours	all
+wire	field	ProtocolMismatchError.Theirs	all
+wire	method	ProtocolMismatchError.Unwrap	all
 wire	const	ProtocolVersion	all
 wire	type	ReadinessNoProgressError	all
 wire	method	ReadinessNoProgressError.Error	all

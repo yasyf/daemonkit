@@ -750,15 +750,10 @@ func clientHandshake(codec *Codec, wireBuild string, role trust.PeerRole) (WireI
 		return WireIdentity{}, fmt.Errorf("%w: acknowledge: %w", ErrHandshake, err)
 	}
 	if ack.Protocol != ProtocolVersion {
-		return WireIdentity{}, fmt.Errorf("%w: acknowledge got %d", ErrProtocolVersion, ack.Protocol)
+		return WireIdentity{}, &ProtocolMismatchError{Theirs: ack.Protocol, Ours: ProtocolVersion}
 	}
 	if ack.WireBuild == "" {
 		return WireIdentity{}, fmt.Errorf("%w: empty server wire build", ErrHandshake)
-	}
-	if ack.WireBuild != wireBuild {
-		return WireIdentity{}, fmt.Errorf(
-			"%w: server=%q client=%q", ErrBuildMismatch, ack.WireBuild, wireBuild,
-		)
 	}
 	if ack.Rejected {
 		if len(ack.Session) != 0 || ack.Code == "" || ack.Reason == "" {
