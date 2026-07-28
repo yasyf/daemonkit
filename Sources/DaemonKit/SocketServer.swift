@@ -5,7 +5,6 @@ import os
 /// A unix-domain persistent v1 session server.
 final class SocketServer: @unchecked Sendable {
     struct SessionPolicy: Sendable {
-        let effectiveUserID: uid_t
         let role: String
         let operation: String
         let tenant: String
@@ -138,6 +137,7 @@ final class SocketServer: @unchecked Sendable {
     private let configuration: Configuration
     private let runtimeLifecycle: RuntimeLifecycleController?
     private let controlOperations: Set<String>
+    private let serviceOwnerUserID: uid_t
     private let sessionPolicy: SessionPolicy?
     private let handler: @Sendable (SocketRequest) async -> SocketResponse
     private let acceptQueue = DispatchQueue(label: "com.yasyf.daemonkit.SocketServer.accept")
@@ -162,6 +162,7 @@ final class SocketServer: @unchecked Sendable {
         path: String,
         wireBuild: String,
         configuration: Configuration = .init(),
+        serviceOwnerUserID: uid_t = geteuid(),
         sessionPolicy: SessionPolicy? = nil,
         handler: @escaping @Sendable (SocketRequest) async -> SocketResponse
     ) {
@@ -170,6 +171,7 @@ final class SocketServer: @unchecked Sendable {
         self.configuration = configuration
         runtimeLifecycle = nil
         controlOperations = []
+        self.serviceOwnerUserID = serviceOwnerUserID
         self.sessionPolicy = sessionPolicy
         self.handler = handler
     }
@@ -180,6 +182,7 @@ final class SocketServer: @unchecked Sendable {
         configuration: Configuration = .init(),
         runtimeLifecycle: RuntimeLifecycleController,
         controlOperations: Set<String> = [],
+        serviceOwnerUserID: uid_t = geteuid(),
         sessionPolicy: SessionPolicy? = nil,
         handler: @escaping @Sendable (SocketRequest) async -> SocketResponse
     ) {
@@ -188,6 +191,7 @@ final class SocketServer: @unchecked Sendable {
         self.configuration = configuration
         self.runtimeLifecycle = runtimeLifecycle
         self.controlOperations = controlOperations
+        self.serviceOwnerUserID = serviceOwnerUserID
         self.sessionPolicy = sessionPolicy
         self.handler = handler
     }
@@ -551,7 +555,7 @@ extension SocketServer {
                 }
                 return SocketPeer(effectiveUserID: user, effectiveGroupID: group)
             }
-            if let sessionPolicy, peer.effectiveUserID != sessionPolicy.effectiveUserID {
+            guard peer.effectiveUserID == serviceOwnerUserID else {
                 try? await rejectHandshake(
                     descriptor: descriptor,
                     queue: setupQueue,

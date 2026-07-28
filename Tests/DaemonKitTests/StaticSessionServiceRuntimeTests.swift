@@ -152,8 +152,8 @@ struct StaticSessionServiceRuntimeTests {
         let server = SocketServer(
             path: path,
             wireBuild: "service.v1",
+            serviceOwnerUserID: geteuid() &+ 1,
             sessionPolicy: SocketServer.SessionPolicy(
-                effectiveUserID: geteuid() &+ 1,
                 role: "dev.yasyf.test.client.v1",
                 operation: "echo",
                 tenant: ""
@@ -174,6 +174,34 @@ struct StaticSessionServiceRuntimeTests {
             Issue.record("untrusted peer connected")
         } catch let error as SocketHandshakeRejectionError {
             #expect(error.code == .peerUntrusted)
+        }
+    }
+
+    @Test func wrongEffectiveUserIsRejectedWithoutASessionPolicy() async throws {
+        let directory = try shortSocketDir()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("floor.sock").path
+        let server = SocketServer(
+            path: path,
+            wireBuild: "service.v1",
+            serviceOwnerUserID: geteuid() &+ 1
+        ) { _ in
+            Issue.record("untrusted peer reached handler")
+            return .terminal(SocketTerminal(payload: Data()))
+        }
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        do {
+            _ = try await SocketClient(
+                path: path,
+                wireBuild: "service.v1",
+                role: "dev.yasyf.test.client.v1"
+            )
+            Issue.record("untrusted peer connected")
+        } catch let error as SocketHandshakeRejectionError {
+            #expect(error.code == .peerUntrusted)
+            #expect(error.reason == "wire: peer effective user does not match service owner")
         }
     }
 

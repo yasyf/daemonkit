@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// RuntimeShutdownError reports a bounded shutdown that could not settle safely.
@@ -35,6 +36,7 @@ final class DaemonRuntime: @unchecked Sendable {
         wireBuild: String,
         identity: RuntimeIdentity,
         configuration: SocketServer.Configuration = .init(),
+        serviceOwnerUserID: uid_t = geteuid(),
         sessionPolicy: SocketServer.SessionPolicy? = nil,
         handler: RuntimeHandlerSpec
     ) throws {
@@ -51,6 +53,7 @@ final class DaemonRuntime: @unchecked Sendable {
             configuration: configuration,
             runtimeLifecycle: controller,
             controlOperations: [runtimeReadinessSubscribeOperation, runtimeReceiptOperation],
+            serviceOwnerUserID: serviceOwnerUserID,
             sessionPolicy: sessionPolicy,
             handler: { request in
                 if let response = controller.handleControl(request) {

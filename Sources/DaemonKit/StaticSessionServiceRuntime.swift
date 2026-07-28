@@ -139,7 +139,7 @@ public final class StaticSessionServiceRuntime<Request: Sendable, Response: Send
             handle: handler.handle
         )
         let dispatch = SessionServiceDispatch<Request, Response>()
-        let effectiveUserID: uid_t = switch trust {
+        let serviceOwnerUserID: uid_t = switch trust {
         case .sameEffectiveUser:
             geteuid()
         }
@@ -156,8 +156,8 @@ public final class StaticSessionServiceRuntime<Request: Sendable, Response: Send
                 handshakeTimeout: configuration.handshakeTimeout,
                 writeTimeout: configuration.writeTimeout
             ),
+            serviceOwnerUserID: serviceOwnerUserID,
             sessionPolicy: SocketServer.SessionPolicy(
-                effectiveUserID: effectiveUserID,
                 role: role,
                 operation: handler.operation,
                 tenant: handler.tenant
