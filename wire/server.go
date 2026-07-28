@@ -682,12 +682,7 @@ func (s *Server) dispatch(ctx context.Context, e entry, req Request) (any, error
 			return nil, ErrQueueFull
 		}
 		j := job{ctx: ctx, req: req, h: e.h, done: make(chan result, 1)}
-		select {
-		case s.queue <- j:
-		case <-ctx.Done():
-			<-s.slots
-			return nil, ctx.Err()
-		}
+		s.queue <- j
 		select {
 		case r := <-j.done:
 			return r.val, r.err
