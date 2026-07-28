@@ -15,6 +15,8 @@ import (
 const (
 	csGetTaskAllow = 0x00000004
 	csForcedLV     = 0x00000010
+	csHard         = 0x00000100
+	csEnforcement  = 0x00001000
 	csRequireLV    = 0x00002000
 	csRuntime      = 0x00010000
 	csDebugged     = 0x10000000
@@ -254,6 +256,12 @@ func requireCodePosture(guest uintptr) error {
 func checkCodeStatus(flags int64) error {
 	if flags&csRuntime == 0 {
 		return fmt.Errorf("%w: peer lacks the Hardened Runtime (status 0x%x)", ErrUntrustedPeer, flags)
+	}
+	if flags&csHard == 0 {
+		return fmt.Errorf("%w: peer disables executable page protection (CS_HARD clear, status 0x%x)", ErrUntrustedPeer, flags)
+	}
+	if flags&csEnforcement == 0 {
+		return fmt.Errorf("%w: peer permits unsigned executable memory (CS_ENFORCEMENT clear, status 0x%x)", ErrUntrustedPeer, flags)
 	}
 	if flags&csGetTaskAllow != 0 {
 		return fmt.Errorf("%w: peer permits debugger attachment (CS_GET_TASK_ALLOW, status 0x%x)", ErrUntrustedPeer, flags)

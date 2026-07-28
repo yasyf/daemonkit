@@ -9,11 +9,13 @@ import (
 	"testing"
 )
 
+const hardenedPosture = csRuntime | csEnforcement | csHard
+
 func TestCodeStatusRequiresHardenedRuntimeAndProvenLibraryValidation(t *testing.T) {
 	for _, flags := range []int64{
-		csRuntime | csRequireLV,
-		csRuntime | csForcedLV,
-		csRuntime | csRequireLV | csForcedLV,
+		hardenedPosture | csRequireLV,
+		hardenedPosture | csForcedLV,
+		hardenedPosture | csRequireLV | csForcedLV,
 	} {
 		if err := checkCodeStatus(flags); err != nil {
 			t.Errorf("checkCodeStatus(0x%x) = %v, want nil", flags, err)
@@ -23,15 +25,43 @@ func TestCodeStatusRequiresHardenedRuntimeAndProvenLibraryValidation(t *testing.
 
 func TestCodeStatusRejectsUnsafeOrUnprovenPosture(t *testing.T) {
 	for _, flags := range []int64{
-		csRequireLV,
-		csRuntime | csRequireLV | csGetTaskAllow,
-		csRuntime | csRequireLV | csDebugged,
-		csRuntime,
+		csEnforcement | csHard | csRequireLV,
+		hardenedPosture | csRequireLV | csGetTaskAllow,
+		hardenedPosture | csRequireLV | csDebugged,
+		hardenedPosture,
 	} {
 		err := checkCodeStatus(flags)
 		if !errors.Is(err, ErrUntrustedPeer) {
 			t.Errorf("checkCodeStatus(0x%x) = %v, want ErrUntrustedPeer", flags, err)
 		}
+	}
+}
+
+func TestCodeStatusRequiresSignatureEnforcement(t *testing.T) {
+	const clean int64 = hardenedPosture | csForcedLV
+	tests := []struct {
+		name  string
+		flags int64
+		want  error
+	}{
+		{"clean hardened runtime", clean, nil},
+		{"allow-unsigned-executable-memory clears CS_ENFORCEMENT", clean &^ csEnforcement, ErrUntrustedPeer},
+		{"disable-executable-page-protection clears CS_ENFORCEMENT and CS_HARD", clean &^ (csEnforcement | csHard), ErrUntrustedPeer},
+		{"CS_HARD alone cleared", clean &^ csHard, ErrUntrustedPeer},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := checkCodeStatus(tt.flags)
+			if tt.want == nil {
+				if err != nil {
+					t.Fatalf("checkCodeStatus(0x%x) = %v, want nil", tt.flags, err)
+				}
+				return
+			}
+			if !errors.Is(err, tt.want) {
+				t.Errorf("checkCodeStatus(0x%x) = %v, want %v", tt.flags, err, tt.want)
+			}
+		})
 	}
 }
 
