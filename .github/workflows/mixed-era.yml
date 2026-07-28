@@ -12,8 +12,14 @@ concurrency:
 permissions:
   contents: read
 
-# EXPECTED RED until v0.21.0: the exact-WireBuild handshake gate fails the
-# skew subtests while the same-build controls pass (RC3, ccn 0771ea54).
+env:
+  # Whether `skew/*` is expected to pass. The exact-WireBuild handshake gate
+  # makes ordinary pin skew a hard failure (RC3, ccn 0771ea54), so it is `fail`
+  # until v0.21.0 demotes WireBuild to a Health diagnostic. Flipping this to
+  # `pass` belongs in that release's diff — the contract change is then visible
+  # in review rather than implied by a badge quietly turning green.
+  SKEW_EXPECT: fail
+
 jobs:
   mixed-era:
     runs-on: ${{ matrix.os }}
@@ -35,22 +41,36 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # Build-tagged out of ./..., so ci.yml stays green while this gate is red.
-      - name: Mixed-era session gate
-        id: gate
-        run: ./scripts/test.sh -race -count=1 -tags mixedera -v ./ci/mixedera/...
+      # Build-tagged out of ./..., so ci.yml never inherits this gate.
+      - name: Same-era control
+        run: ./scripts/test.sh -race -count=1 -tags mixedera -v -run 'TestMixedEraSessionSurvivesBuildSkew/control' ./ci/mixedera/...
 
-      - name: Explain the failure
-        if: failure() && steps.gate.outcome == 'failure'
+      - name: Cross-era skew matches SKEW_EXPECT
         run: |
-          {
-            echo "### Mixed-era gate is red"
-            echo
-            echo "\`control/*\` green + \`skew/*\` red is the KNOWN pre-v0.21.0 state:"
-            echo "\`wire/server.go\` and \`wire/client.go\` both reject a handshake on exact"
-            echo "\`WireBuild\` inequality, so normal pin skew across independently released"
-            echo "consumers is a hard failure (remediation RC3)."
-            echo
-            echo "A red \`control/*\` is a REAL break: the two eras no longer share a wire"
-            echo "format, or the harness itself is broken. Investigate that first."
-          } >>"$GITHUB_STEP_SUMMARY"
+          set +e
+          ./scripts/test.sh -race -count=1 -tags mixedera -v -run 'TestMixedEraSessionSurvivesBuildSkew/skew' ./ci/mixedera/...
+          code=$?
+          set -e
+          actual=pass
+          [ "$code" -eq 0 ] || actual=fail
+          echo "skew: expected=$SKEW_EXPECT actual=$actual (go test exit $code)"
+          if [ "$actual" = "$SKEW_EXPECT" ]; then
+            exit 0
+          fi
+          if [ "$actual" = pass ]; then
+            {
+              echo "### Mixed-era skew now passes — the expectation is stale"
+              echo
+              echo "A daemon and client whose build strings differ now share a session."
+              echo "That is the v0.21.0 contract, so set \`SKEW_EXPECT: pass\` in this"
+              echo "workflow as part of the change that demoted \`WireBuild\`."
+            } >>"$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "### Mixed-era skew regressed"
+              echo
+              echo "\`SKEW_EXPECT\` says cross-era sessions should work, and they do not."
+              echo "Something re-tightened the handshake into an exact-match gate."
+            } >>"$GITHUB_STEP_SUMMARY"
+          fi
+          exit 1
