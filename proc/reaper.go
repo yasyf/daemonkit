@@ -1028,32 +1028,24 @@ func (r *Reaper) signalVerifiedSessionGroups(
 }
 
 func (r *Reaper) verifiedGroupMembers(rec Record) ([]groupMember, error) {
-	for range 3 {
-		members, err := r.prb().groupMembers(rec.PID, rec.SessionID)
-		if err != nil {
-			return nil, fmt.Errorf("enumerate dedicated session %d: %w", rec.SessionID, err)
-		}
-		stable := make([]groupMember, 0, len(members))
-		changed := false
-		for _, member := range members {
-			info, err := r.prb().probe(member.pid)
-			switch {
-			case errors.Is(err, errNoProc):
-				changed = true
-			case err != nil:
-				return nil, fmt.Errorf("revalidate process-group member %d: %w", member.pid, err)
-			case info.startTime != member.info.startTime || info.sessionID != rec.SessionID:
-				changed = true
-			case info.zombie:
-			default:
-				stable = append(stable, groupMember{pid: member.pid, info: info})
-			}
-		}
-		if !changed {
-			return stable, nil
+	members, err := r.prb().groupMembers(rec.PID, rec.SessionID)
+	if err != nil {
+		return nil, fmt.Errorf("enumerate dedicated session %d: %w", rec.SessionID, err)
+	}
+	stable := make([]groupMember, 0, len(members))
+	for _, member := range members {
+		info, err := r.prb().probe(member.pid)
+		switch {
+		case errors.Is(err, errNoProc):
+		case err != nil:
+			return nil, fmt.Errorf("revalidate process-group member %d: %w", member.pid, err)
+		case info.startTime != member.info.startTime || info.sessionID != rec.SessionID:
+		case info.zombie:
+		default:
+			stable = append(stable, groupMember{pid: member.pid, info: info})
 		}
 	}
-	return nil, errors.New("dedicated-session membership changed during identity verification")
+	return stable, nil
 }
 
 func (r *Reaper) signalSessionGroups(members []groupMember, signal syscall.Signal) (bool, error) {

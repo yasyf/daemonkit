@@ -1175,6 +1175,41 @@ func TestReapAcceptsDeniedKillOnlyAfterExactSessionAbsence(t *testing.T) {
 	}
 }
 
+func TestReapSettlesSessionWhoseMembersExitDuringEnumeration(t *testing.T) {
+	store := &memStore{}
+	record := matchingGroupRecord(4191, "old-gen")
+	mustAdd(t, store, record)
+	leader := groupInfo(record.PID, record.StartTime, record.Comm)
+	leaderMember := groupMember{pid: record.PID, info: leader}
+	byPID := map[int]probeResult{record.PID: {info: leader}}
+	enumerations := make([][]groupMember, 0, 4)
+	for _, exiting := range []int{4192, 4193, 4194} {
+		byPID[exiting] = probeResult{err: errNoProc}
+		member := groupMember{pid: exiting, info: groupInfo(exiting, "555.666", "descendant")}
+		enumerations = append(enumerations, []groupMember{leaderMember, member})
+	}
+	prober := &fakeProber{info: leader, byPID: byPID, memberSets: append(enumerations, nil)}
+	signals := &recSignaler{}
+	reaper := &Reaper{
+		Store: store, Generation: testOwnerGeneration("new-gen"), prober: prober, signaler: signals,
+		clock: newFakeClock(), Grace: settlementPollInterval,
+	}
+
+	if err := reaper.Reap(t.Context()); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	want := []signalCall{
+		{pid: -record.PID, sig: syscall.SIGTERM},
+		{pid: -record.PID, sig: syscall.SIGKILL},
+	}
+	if got := signals.calls(); !slices.Equal(got, want) {
+		t.Fatalf("signals = %v, want %v", got, want)
+	}
+	if store.len() != 0 {
+		t.Fatalf("store size = %d, want settled session record removed", store.len())
+	}
+}
+
 func TestReapLeaderlessGroupUsesDurableSessionMembers(t *testing.T) {
 	ctx := context.Background()
 	store := &memStore{}

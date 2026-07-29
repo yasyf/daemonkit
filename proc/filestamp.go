@@ -12,13 +12,7 @@ import (
 // ErrInvalidFileStamp means a file-stamp specification is incomplete or unsafe.
 var ErrInvalidFileStamp = errors.New("proc: invalid file stamp")
 
-const (
-	fileStampLockDeadline = 5 * time.Second
-	// fileStampFutureSlack bounds clock skew: a stamp whose mtime is further than
-	// this into the future is a crashed writer plus a corrected clock, not a
-	// recent claim, so it is reclaimed rather than blocking every caller.
-	fileStampFutureSlack = 5 * time.Second
-)
+const fileStampLockDeadline = 5 * time.Second
 
 // FileStamp is a cross-process throttle: at most one Claim succeeds per Window at
 // Path. It answers "has enough time passed since the last claim" with the stamp
@@ -40,8 +34,8 @@ func (s FileStamp) clock() time.Time {
 // Claim atomically claims the stamp; it reports true when this caller won the
 // current Window and may proceed. A sidecar file lock serializes the whole
 // check-and-refresh, so racing callers resolve to one winner: an absent stamp, a
-// stamp older than Window, or a stamp whose mtime is implausibly far in the
-// future is claimed and refreshed to now; any other stamp loses.
+// stamp older than Window, or a stamp whose mtime lies in the future is claimed
+// and refreshed to now; any other stamp loses.
 func (s FileStamp) Claim() (bool, error) {
 	if !filepath.IsAbs(s.Path) || filepath.Clean(s.Path) != s.Path {
 		return false, fmt.Errorf("%w: path %q is not exact and absolute", ErrInvalidFileStamp, s.Path)
@@ -69,10 +63,9 @@ func (s FileStamp) claimLocked(directory string) (bool, error) {
 	case err != nil:
 		return false, fmt.Errorf("proc: inspect file stamp: %w", err)
 	}
-	// A stamp older than the window is stale; one implausibly far in the future
-	// is a crashed writer, also stale. A minor future skew stays a recent claim
-	// (an early extra fire on a forward clock jump is acceptable for a throttle).
-	if age := s.clock().Sub(info.ModTime()); age >= s.Window || age < -fileStampFutureSlack {
+	// A stamp older than the window is stale; one in the future is a crashed
+	// writer or a corrected clock, also stale.
+	if age := s.clock().Sub(info.ModTime()); age >= s.Window || age < 0 {
 		return s.refresh(directory)
 	}
 	return false, nil

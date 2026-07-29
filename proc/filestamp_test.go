@@ -104,18 +104,17 @@ func TestFileStampReclaimsFarFutureStamp(t *testing.T) {
 	}
 }
 
-func TestFileStampNearFutureStampStillLoses(t *testing.T) {
+func TestFileStampReclaimsNearFutureStamp(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "job.stamp")
 	if won, err := (FileStamp{Path: path, Window: time.Hour}).Claim(); err != nil || !won {
 		t.Fatalf("seed Claim() = %v, %v; want true, nil", won, err)
 	}
-	// A small forward skew stays a recent claim; the throttle does not fire early.
 	near := time.Now().Add(2 * time.Second)
 	if err := os.Chtimes(path, near, near); err != nil {
 		t.Fatal(err)
 	}
-	if won, err := (FileStamp{Path: path, Window: time.Hour}).Claim(); err != nil || won {
-		t.Fatalf("Claim() on a near-future stamp = %v, %v; want false (within slack)", won, err)
+	if won, err := (FileStamp{Path: path, Window: time.Hour}).Claim(); err != nil || !won {
+		t.Fatalf("Claim() on a near-future stamp = %v, %v; want true (treated as stale)", won, err)
 	}
 }
 
