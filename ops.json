@@ -1,1 +1,1 @@
-{"v":1,"lamport":6,"session":"cfa0f537-f63b-4af9-844c-1efcf2ab6814","ops":[{"kind":"remove_criterion","id":"620adff974011357f0b3f88c88fdad4e"}]}
+{"v":1,"lamport":7,"session":"cfa0f537-f63b-4af9-844c-1efcf2ab6814","ops":[{"kind":"add_comment","body":"Criterion 620adff removed from this task rather than marked failed: it was never attempted here and now lives verbatim on task 7b93780. Leaving an open P0 SECURITY item for a Phase-3 regression guard would make the backlog assert an open security hole that is in fact closed."}]}
