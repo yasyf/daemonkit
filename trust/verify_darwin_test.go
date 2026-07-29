@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/daemonkit/internal/csposture/csposturetest"
 	"github.com/yasyf/daemonkit/peer"
 	"golang.org/x/sys/unix"
 )
@@ -210,6 +211,26 @@ func maxRSS(t *testing.T) int64 {
 		t.Fatalf("getrusage: %v", err)
 	}
 	return int64(ru.Maxrss)
+}
+
+func TestCodeStatusMatchesSharedPostureUnderEntitlementLibraryValidation(t *testing.T) {
+	for _, tt := range csposturetest.Cases() {
+		t.Run(tt.Name, func(t *testing.T) {
+			err := checkCodeStatus(tt.Status)
+			if !tt.EntitlementLVDenies {
+				if err != nil {
+					t.Fatalf("checkCodeStatus(0x%x) = %v, want nil", tt.Status, err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrUntrustedPeer) {
+				t.Fatalf("checkCodeStatus(0x%x) = %v, want ErrUntrustedPeer", tt.Status, err)
+			}
+			if !strings.Contains(err.Error(), fmt.Sprintf("status 0x%x", tt.Status)) {
+				t.Errorf("checkCodeStatus(0x%x) message %q lacks the status word", tt.Status, err)
+			}
+		})
+	}
 }
 
 func TestGuestLookupError(t *testing.T) {

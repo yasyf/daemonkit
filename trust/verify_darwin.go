@@ -10,16 +10,8 @@ import (
 	"sync"
 
 	"github.com/ebitengine/purego"
+	"github.com/yasyf/daemonkit/internal/csposture"
 	peer "github.com/yasyf/daemonkit/peer"
-)
-
-// Dynamic code-signing status bits, verified against xnu's cs_blobs.h.
-const (
-	csGetTaskAllow = 0x00000004 // CS_GET_TASK_ALLOW: get-task-allow entitlement
-	csForcedLV     = 0x00000010 // CS_FORCED_LV: library validation forced by system policy
-	csRequireLV    = 0x00002000 // CS_REQUIRE_LV: library validation required
-	csRuntime      = 0x00010000 // CS_RUNTIME: Hardened Runtime (codesign --options runtime)
-	csDebugged     = 0x10000000 // CS_DEBUGGED: ran with invalid pages under a debugger
 )
 
 // entDisableLV turns off library validation unless CS_REQUIRE_LV/CS_FORCED_LV
@@ -294,7 +286,6 @@ func signingInfoError(status int32) error {
 	}
 }
 
-// CS_RUNTIME required; CS_GET_TASK_ALLOW and CS_DEBUGGED rejected; LV must hold via flags or an entitlements dict proven clean.
 func requireHardenedRuntime(guest uintptr, req Requirement) error {
 	const kSecCSDynamicInformation = 1 << 3
 	const kCFNumberSInt64Type = 4
@@ -316,19 +307,22 @@ func requireHardenedRuntime(guest uintptr, req Requirement) error {
 	if !cfNumberGetValue(statusNum, kCFNumberSInt64Type, &status) {
 		return fmt.Errorf("%w: unreadable code-signing status", ErrNoVerifier)
 	}
-	if status&csRuntime == 0 {
-		return fmt.Errorf("%w: peer lacks the Hardened Runtime (status 0x%x)", ErrUntrustedPeer, status)
+	if err := checkCodeStatus(status); err != nil {
+		return err
 	}
-	if status&csGetTaskAllow != 0 {
-		return fmt.Errorf("%w: peer permits debugger attachment (CS_GET_TASK_ALLOW, status 0x%x)", ErrUntrustedPeer, status)
-	}
-	if status&csDebugged != 0 {
-		return fmt.Errorf("%w: peer ran under a debugger (CS_DEBUGGED, status 0x%x)", ErrUntrustedPeer, status)
-	}
-	if err := rejectInjectionEntitlements(info, status&(csRequireLV|csForcedLV) != 0); err != nil {
+	if err := rejectInjectionEntitlements(info, csposture.LibraryValidationEnforced(status)); err != nil {
 		return err
 	}
 	return requireEntitlements(info, req.entitlementRequirements())
+}
+
+// The entitlements dict is this package's second posture oracle, so the
+// library-validation clause is left to rejectInjectionEntitlements.
+func checkCodeStatus(status int64) error {
+	if err := csposture.Check(status, csposture.LibraryValidationByEntitlement); err != nil {
+		return fmt.Errorf("%w: %w", ErrUntrustedPeer, err)
+	}
+	return nil
 }
 
 func rejectInjectionEntitlements(info uintptr, lvProven bool) error {
