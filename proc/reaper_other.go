@@ -12,7 +12,7 @@ import (
 
 func probeProc(pid int) (procInfo, error) {
 	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-	if errors.Is(err, os.ErrNotExist) {
+	if procGone(err) {
 		return procInfo{}, errNoProc
 	}
 	if err != nil {

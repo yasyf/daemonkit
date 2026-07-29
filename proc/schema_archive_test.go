@@ -147,6 +147,52 @@ func TestFileStoreArchiveIsSingleFlight(t *testing.T) {
 	}
 }
 
+// The in-process gate serializes Load, so only a separate process reaches
+// archiveUnderLock while another opener holds the sidecar lock. Driving it
+// directly is how that loser branch stays covered.
+func TestFileStoreArchiveLosersAdoptTheFreshStore(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "workers.db")
+	seed := &FileStore{Path: path}
+	if err := seed.Add(t.Context(), storeRecord(RecoveryTaskID, 42)); err != nil {
+		t.Fatal(err)
+	}
+	wedgeSchemaFingerprint(t, path)
+
+	const openers = 8
+	var wg sync.WaitGroup
+	errs := make([]error, openers)
+	records := make([]int, openers)
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			store := &FileStore{Path: path, UnsupportedSchema: ArchiveUnsupportedSchema}
+			db, err := store.archiveUnderLock(t.Context(), fileStoreOpenTimeout, ErrRecordSchema)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			errs[i] = db.View(func(tx *bolt.Tx) error {
+				records[i] = tx.Bucket(fileStoreRecordsBucket).Stats().KeyN
+				return nil
+			})
+			errs[i] = errors.Join(errs[i], db.Close())
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("archive opener %d: %v", i, err)
+		}
+		if records[i] != 0 {
+			t.Fatalf("archive opener %d adopted a store holding %d records, want the fresh one", i, records[i])
+		}
+	}
+	if bak := storeBackups(t, path); len(bak) != 1 {
+		t.Fatalf("concurrent archive must leave exactly one .bak, found %d: %v", len(bak), bak)
+	}
+}
+
 func TestArchiveUnsupportedStoreRenamesAside(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "workers.db")

@@ -13,9 +13,11 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
+	bolterrors "go.etcd.io/bbolt/errors"
 )
 
 const (
@@ -67,13 +69,84 @@ func (s *FileStore) maximumOutstanding() uint64 {
 	return s.MaxOutstanding
 }
 
-func (s *FileStore) open(ctx context.Context) (*bolt.DB, error) {
+// fileStoreGates hands one store path over in FIFO order; bbolt's queueless
+// flock polls at 50ms and costs seconds under contention. Keyed by the literal
+// path, so the flock stays authoritative.
+var fileStoreGates sync.Map
+
+func acquireFileStoreGate(ctx context.Context, path string) (func(), error) {
+	entry, ok := fileStoreGates.Load(path)
+	if !ok {
+		entry, _ = fileStoreGates.LoadOrStore(path, make(chan struct{}, 1))
+	}
+	gate := entry.(chan struct{})
+	// A caller's own deadline arrives on ctx.Done; the timer is the module's fixed
+	// ceiling, the only bound a deadline-less open ever gets.
+	ceiling := time.NewTimer(fileStoreOpenTimeout)
+	defer ceiling.Stop()
+	select {
+	case gate <- struct{}{}:
+		return func() { <-gate }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-ceiling.C:
+		return nil, fmt.Errorf("proc: open keyed file store: %w", bolterrors.ErrTimeout)
+	}
+}
+
+// fileStoreOpenBudget splits one bounded open across the in-process gate and
+// bbolt's flock, capped again by whatever is left of the caller's own budget.
+func fileStoreOpenBudget(ctx context.Context, budget time.Duration) (time.Duration, error) {
+	if budget <= 0 {
+		return 0, fmt.Errorf("proc: open keyed file store: %w", bolterrors.ErrTimeout)
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return budget, nil
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return 0, context.DeadlineExceeded
+	}
+	return min(budget, remaining), nil
+}
+
+// fileStoreHandle owns the store path for one operation. Close is idempotent
+// like the *bolt.DB.Close it shadows: a second release would take a gate token
+// this handle never held.
+type fileStoreHandle struct {
+	*bolt.DB
+	release  func()
+	released sync.Once
+}
+
+func (h *fileStoreHandle) Close() error {
+	err := h.DB.Close()
+	h.released.Do(h.release)
+	return err
+}
+
+func (s *FileStore) open(ctx context.Context) (*fileStoreHandle, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if s == nil || !filepath.IsAbs(s.Path) || filepath.Clean(s.Path) != s.Path {
 		return nil, fmt.Errorf("proc: file store path %q is not exact and absolute", s.Path)
 	}
+	began := time.Now()
+	release, err := acquireFileStoreGate(ctx, s.Path)
+	if err != nil {
+		return nil, err
+	}
+	db, err := s.openLocked(ctx, fileStoreOpenTimeout-time.Since(began))
+	if err != nil {
+		release()
+		return nil, err
+	}
+	return &fileStoreHandle{DB: db, release: release}, nil
+}
+
+func (s *FileStore) openLocked(ctx context.Context, budget time.Duration) (*bolt.DB, error) {
 	directory := filepath.Dir(s.Path)
 	if err := mkdirAllDurable(directory, 0o700, fsyncDir); err != nil {
 		return nil, fmt.Errorf("proc: create file store directory: %w", err)
@@ -83,21 +156,15 @@ func (s *FileStore) open(ctx context.Context) (*bolt.DB, error) {
 	if statErr != nil && !created {
 		return nil, fmt.Errorf("proc: inspect keyed file store: %w", statErr)
 	}
-	timeout := fileStoreOpenTimeout
-	if deadline, ok := ctx.Deadline(); ok {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return nil, context.DeadlineExceeded
-		}
-		if remaining < timeout {
-			timeout = remaining
-		}
+	timeout, err := fileStoreOpenBudget(ctx, budget)
+	if err != nil {
+		return nil, err
 	}
 	db, err := bolt.Open(s.Path, 0o600, &bolt.Options{Timeout: timeout})
 	if err != nil {
 		return nil, fmt.Errorf("proc: open keyed file store: %w", err)
 	}
-	if err := db.Update(initializeFileStore); err != nil {
+	if err := openFileStore(db); err != nil {
 		_ = db.Close()
 		if s.UnsupportedSchema != ArchiveUnsupportedSchema || !errors.Is(err, ErrRecordSchema) {
 			return nil, err
@@ -141,7 +208,7 @@ func (s *FileStore) archiveUnderLock(ctx context.Context, timeout time.Duration,
 	if err != nil {
 		return nil, fmt.Errorf("proc: reopen keyed file store for archive: %w", err)
 	}
-	switch initErr := db.Update(initializeFileStore); {
+	switch initErr := openFileStore(db); {
 	case initErr == nil:
 		return db, nil
 	case !errors.Is(initErr, ErrRecordSchema):
@@ -161,54 +228,75 @@ func (s *FileStore) archiveUnderLock(ctx context.Context, timeout time.Duration,
 	if err != nil {
 		return nil, fmt.Errorf("proc: reopen keyed file store after archive: %w", err)
 	}
-	if err := db.Update(initializeFileStore); err != nil {
+	if err := openFileStore(db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return db, nil
 }
 
-func initializeFileStore(tx *bolt.Tx) error {
-	buckets := [][]byte{
-		fileStoreMetaBucket, fileStoreRecordsBucket, fileStoreClaimsBucket,
-		fileStoreStopConsumedBucket,
-		fileStoreReceiptsBucket, fileStoreReceiptIndexBucket,
-		fileStoreSequencesBucket, fileStoreFloorsBucket,
+var fileStoreBuckets = [][]byte{
+	fileStoreMetaBucket, fileStoreRecordsBucket, fileStoreClaimsBucket,
+	fileStoreStopConsumedBucket,
+	fileStoreReceiptsBucket, fileStoreReceiptIndexBucket,
+	fileStoreSequencesBucket, fileStoreFloorsBucket,
+}
+
+var errFileStoreUninitialized = errors.New("proc: keyed file store has no metadata bucket")
+
+// openFileStore validates an existing store under a read transaction: an
+// established store is the overwhelmingly common case, and a bbolt write
+// transaction commits and fsyncs even when it changes nothing.
+func openFileStore(db *bolt.DB) error {
+	if err := db.View(validateFileStore); !errors.Is(err, errFileStoreUninitialized) {
+		return err
+	}
+	return db.Update(func(tx *bolt.Tx) error {
+		if err := validateFileStore(tx); !errors.Is(err, errFileStoreUninitialized) {
+			return err
+		}
+		return createFileStore(tx)
+	})
+}
+
+func createFileStore(tx *bolt.Tx) error {
+	for _, name := range fileStoreBuckets {
+		if _, err := tx.CreateBucket(name); err != nil {
+			return fmt.Errorf("proc: create keyed store bucket %q: %w", name, err)
+		}
 	}
 	meta := tx.Bucket(fileStoreMetaBucket)
+	if err := meta.Put(fileStoreIdentityKey, fileStoreIdentity); err != nil {
+		return err
+	}
+	if err := meta.Put(fileStoreSchemaKey, uint64Bytes(recordSchemaVersion)); err != nil {
+		return err
+	}
+	if err := meta.Put(fileStoreFingerprintKey, fileStoreFingerprint); err != nil {
+		return err
+	}
+	var ledger ReceiptLedgerID
+	for ledger == (ReceiptLedgerID{}) {
+		if _, err := rand.Read(ledger[:]); err != nil {
+			return fmt.Errorf("proc: create receipt ledger identity: %w", err)
+		}
+	}
+	if err := meta.Put(fileStoreLedgerKey, ledger[:]); err != nil {
+		return err
+	}
+	return meta.Put(fileStoreOutstandingKey, uint64Bytes(0))
+}
+
+func validateFileStore(tx *bolt.Tx) error {
+	meta := tx.Bucket(fileStoreMetaBucket)
 	if meta == nil {
-		key, _ := tx.Cursor().First()
-		if key != nil {
+		if key, _ := tx.Cursor().First(); key != nil {
 			return fmt.Errorf("%w: uninitialized keyed store is not empty", ErrRecordSchema)
 		}
-		for _, name := range buckets {
-			if _, err := tx.CreateBucket(name); err != nil {
-				return fmt.Errorf("proc: create keyed store bucket %q: %w", name, err)
-			}
-		}
-		meta = tx.Bucket(fileStoreMetaBucket)
-		if err := meta.Put(fileStoreIdentityKey, fileStoreIdentity); err != nil {
-			return err
-		}
-		if err := meta.Put(fileStoreSchemaKey, uint64Bytes(recordSchemaVersion)); err != nil {
-			return err
-		}
-		if err := meta.Put(fileStoreFingerprintKey, fileStoreFingerprint); err != nil {
-			return err
-		}
-		var ledger ReceiptLedgerID
-		for ledger == (ReceiptLedgerID{}) {
-			if _, err := rand.Read(ledger[:]); err != nil {
-				return fmt.Errorf("proc: create receipt ledger identity: %w", err)
-			}
-		}
-		if err := meta.Put(fileStoreLedgerKey, ledger[:]); err != nil {
-			return err
-		}
-		return meta.Put(fileStoreOutstandingKey, uint64Bytes(0))
+		return errFileStoreUninitialized
 	}
-	expected := make(map[string]struct{}, len(buckets))
-	for _, name := range buckets {
+	expected := make(map[string]struct{}, len(fileStoreBuckets))
+	for _, name := range fileStoreBuckets {
 		expected[string(name)] = struct{}{}
 		if tx.Bucket(name) == nil {
 			return fmt.Errorf("%w: keyed store bucket %q is missing", ErrRecordSchema, name)

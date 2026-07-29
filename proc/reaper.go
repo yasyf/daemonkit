@@ -43,6 +43,13 @@ const (
 // errNoProc is a definitive "gone", distinct from a probe failure (Undetermined, fails closed).
 var errNoProc = errors.New("no such process")
 
+// procGone reports whether a process-table probe error definitively proves the
+// process is gone: an absent entry, or ESRCH from a probe that raced the exit.
+// Every other error is Undetermined and never reads as dead.
+func procGone(err error) bool {
+	return errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH)
+}
+
 var (
 	// ErrInvalidRecord means a durable process record lacks required identity.
 	ErrInvalidRecord = errors.New("proc: invalid durable process record")

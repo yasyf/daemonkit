@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1899,5 +1901,27 @@ func TestFileStoreRemoveByInstance(t *testing.T) {
 	}
 	if len(got) != 1 || got[0] != current {
 		t.Errorf("Load = %v, want only current-boot instance %v", got, current)
+	}
+}
+
+func TestProcGoneClassifiesRacedProbeErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "no error", err: nil, want: false},
+		{name: "absent entry", err: &fs.PathError{Op: "open", Path: "/proc/9691/stat", Err: syscall.ENOENT}, want: true},
+		{name: "read raced the exit", err: &fs.PathError{Op: "read", Path: "/proc/9691/stat", Err: syscall.ESRCH}, want: true},
+		{name: "wrapped read raced the exit", err: fmt.Errorf("read /proc/9691/stat: %w", syscall.ESRCH), want: true},
+		{name: "denied", err: &fs.PathError{Op: "open", Path: "/proc/9691/stat", Err: syscall.EACCES}, want: false},
+		{name: "undetermined", err: errors.New("sysctl kern.proc.pid 9691: broken"), want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := procGone(tt.err); got != tt.want {
+				t.Errorf("procGone(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
 	}
 }

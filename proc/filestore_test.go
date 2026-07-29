@@ -7,10 +7,12 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
+	bolterrors "go.etcd.io/bbolt/errors"
 )
 
 type unpublishedDeadlineContext struct {
@@ -283,6 +285,196 @@ func seedStoreReceipts(t *testing.T, store *FileStore, id RecoveryID, count int)
 		t.Fatal(err)
 	}
 	return receipts
+}
+
+// workerSettlementReserve mirrors worker's per-child settlement budget: a
+// contended untrack that overruns it terminalizes the runtime claim.
+const workerSettlementReserve = time.Second
+
+func TestFileStoreConcurrentUntrackStaysWithinSettlementReserve(t *testing.T) {
+	const writers = 16
+	path := filepath.Join(t.TempDir(), "recovery.db")
+	store := &FileStore{Path: path}
+	records := make([]Record, writers+1)
+	for index := range records {
+		records[index] = storeRecord(RecoveryTaskID, 3000+index)
+		if err := store.Add(t.Context(), records[index]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	uncontended := time.Now()
+	if err := store.Remove(t.Context(), records[writers:]); err != nil {
+		t.Fatal(err)
+	}
+	perOperation := time.Since(uncontended)
+
+	start := make(chan struct{})
+	spent := make([]time.Duration, writers)
+	failures := make([]error, writers)
+	var writing sync.WaitGroup
+	for index := range writers {
+		writing.Add(1)
+		go func() {
+			defer writing.Done()
+			<-start
+			began := time.Now()
+			failures[index] = store.Remove(t.Context(), records[index:index+1])
+			spent[index] = time.Since(began)
+		}()
+	}
+
+	outsider := &FileStore{Path: path}
+	outsiderSpent := make(chan time.Duration, 1)
+	outsiderFailure := make(chan error, 1)
+	var reading sync.WaitGroup
+	reading.Add(1)
+	go func() {
+		defer reading.Done()
+		<-start
+		began := time.Now()
+		_, err := outsider.Load(t.Context())
+		outsiderSpent <- time.Since(began)
+		outsiderFailure <- err
+	}()
+
+	close(start)
+	writing.Wait()
+	reading.Wait()
+
+	worst := time.Duration(0)
+	for index, err := range failures {
+		if err != nil {
+			t.Errorf("untrack %d: %v", index, err)
+		}
+		worst = max(worst, spent[index])
+	}
+	outsiderWorst := <-outsiderSpent
+	if err := <-outsiderFailure; err != nil {
+		t.Errorf("independent opener: %v", err)
+	}
+	// The gate is fair, so the outsider queues behind at most every writer ahead
+	// of it: its bound is a measured per-operation cost, not a machine constant.
+	operation := max(perOperation, worst/writers)
+	starvation := worst + 3*operation
+	t.Logf("%d concurrent untracks: max=%v; independent Load=%v; per-operation=%v; queueing bound=%v",
+		writers, worst, outsiderWorst, operation, starvation)
+	if worst >= workerSettlementReserve/2 {
+		t.Errorf("worst untrack = %v, want well under the %v settlement reserve", worst, workerSettlementReserve)
+	}
+	if outsiderWorst >= starvation {
+		t.Errorf("independent Load = %v, want within three operations of the last writer (%v)",
+			outsiderWorst, starvation)
+	}
+	remaining, err := store.Load(t.Context())
+	if err != nil || len(remaining) != 0 {
+		t.Fatalf("records after concurrent untrack = %d, %v", len(remaining), err)
+	}
+}
+
+func TestFileStoreHandleCloseReleasesTheGateExactlyOnce(t *testing.T) {
+	store := &FileStore{Path: filepath.Join(t.TempDir(), "recovery.db")}
+	spent, err := store.open(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := spent.Close(); err != nil {
+		t.Fatal(err)
+	}
+	held, err := store.open(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- spent.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("second Close = %v, want the idempotent shape of *bolt.DB.Close", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("second Close blocked taking a gate token it no longer owned")
+	}
+
+	// held stays open until the assertions land: releasing it after a stolen token
+	// would block on an empty gate and turn a failure into a deadlock.
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+	intruder, openErr := store.open(ctx)
+	if openErr == nil {
+		_ = intruder.Close()
+		t.Fatal("a double Close handed the gate to a second concurrent holder")
+	}
+	if errors.Is(openErr, bolterrors.ErrTimeout) {
+		t.Fatalf("contended open reached bbolt's flock (%v): the gate handed out a stolen token", openErr)
+	}
+	if !errors.Is(openErr, context.DeadlineExceeded) {
+		t.Fatalf("contended open = %v, want the caller's deadline", openErr)
+	}
+	if err := held.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFileStoreOpenBudgetSplitsOneBoundedOpen(t *testing.T) {
+	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	tests := []struct {
+		name    string
+		ctx     context.Context
+		budget  time.Duration
+		want    time.Duration
+		wantErr error
+	}{
+		{name: "no caller deadline", ctx: context.Background(), budget: time.Second, want: time.Second},
+		{name: "module ceiling spent", ctx: context.Background(), budget: 0, wantErr: bolterrors.ErrTimeout},
+		{name: "caller deadline elapsed", ctx: expired, budget: time.Second, wantErr: context.DeadlineExceeded},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := fileStoreOpenBudget(tt.ctx, tt.budget)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("budget = %v, want %v", got, tt.want)
+			}
+		})
+	}
+	ctx, cancelSoon := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelSoon()
+	got, err := fileStoreOpenBudget(ctx, time.Hour)
+	if err != nil || got > 50*time.Millisecond {
+		t.Fatalf("budget = %v, %v; want the caller's remaining budget to cap the ceiling", got, err)
+	}
+}
+
+func TestFileStoreOpenBoundsTheGateWaitWithoutACallerDeadline(t *testing.T) {
+	store := &FileStore{Path: filepath.Join(t.TempDir(), "recovery.db")}
+	held, err := store.open(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = held.Close() }()
+
+	blocked := make(chan error, 1)
+	go func() {
+		//nolint:usetesting // A ctx whose Done is nil is exactly what must stay bounded.
+		opened, err := store.open(context.Background())
+		if err == nil {
+			_ = opened.Close()
+		}
+		blocked <- err
+	}()
+	select {
+	case err := <-blocked:
+		if !errors.Is(err, bolterrors.ErrTimeout) {
+			t.Fatalf("contended open = %v, want the bounded open timeout", err)
+		}
+	case <-time.After(fileStoreOpenTimeout + 5*time.Second):
+		t.Fatal("open without a caller deadline hung on the gate")
+	}
 }
 
 func TestFileStoreAddIsExactIdempotent(t *testing.T) {
