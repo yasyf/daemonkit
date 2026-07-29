@@ -4,6 +4,93 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Breaking.** The wire handshake gates on `ProtocolVersion` alone. `WireBuild`
+  is still required and still exchanged, but it is now a diagnostic rather than a
+  gate, and the four post-handshake re-checks and the readiness-path build gate
+  are gone with it. A protocol mismatch returns a typed
+  `wire.ProtocolMismatchError{Theirs, Ours}` unwrapping to `ErrProtocolVersion`.
+  `ErrBuildMismatch` and `ResponseCodeBuildMismatch` stay exported, since a new
+  client still meets servers that reject on those terms. **A consumer needing
+  schema equality must now enforce it itself, on `Request.WireBuild`.**
+
+  Gating a transport on a schema identity was self-wedging. `WireBuild` is a
+  digest of the consumer's own RPC schema, generated into the consumer's repo, so
+  a mismatch means one consumer's long-lived daemon has outlived a client upgrade.
+  The client then could not complete a handshake to tell that stale daemon to
+  drain and exit, which is the one action that repairs it.
+- `Controller.verify` issues no launchctl mutation. It previously ran
+  `launchctl enable` as a side effect of a read, which also wrote a permanent
+  root-owned override-database entry per label that uninstall never removes. A
+  loaded-but-disabled agent is therefore no longer silently re-enabled.
+
+### Fixed
+
+- Every admitted wire request runs. `Server.dispatch` raced the request context
+  against the queue send after admission, so an admitted job could be dropped
+  without ever running — and the terminal the peer received was byte-identical to
+  an executed request's, so a client could not tell whether its mutation had been
+  applied. Measured at 191 of 400 dispatches with the queue empty: Go picks
+  uniformly among ready `select` cases, so a done context was a coin flip against
+  a healthy buffered send.
+- launchctl outcomes are classified in exactly one place, as loaded, not loaded,
+  refused with launchd's own reason, in flux, or unknown, and only the in-flux
+  case retries. `AppKeepAlive.Uninstall` now removes the plist when the agent is
+  already unloaded, and `Stop` no longer fails whenever the agent is not loaded.
+  The classifier meant to cover those cases asserted an interface the producer
+  never satisfied, so it could never fire. Exit 5 is an aggregate batch code and
+  is never read as a specific condition.
+- A spawned child parked at the readiness gate dies on `SIGTERM`. The wrapper
+  masked the signal for the whole gate wait, unbounded and untested.
+- `FileStore` serializes in-process operations on one store path behind a FIFO
+  gate and validates an established store under a read transaction rather than an
+  empty write commit. bbolt guards the file with a queueless whole-file flock
+  retried on a 50ms poll, so uncoordinated openers paid seconds under contention;
+  sixteen concurrent untracks now stay well inside worker's settlement reserve,
+  and a concurrent independent `Load` drops to single-digit milliseconds.
+- A process-table probe that races a child's exit fails with `ESRCH` rather than
+  `ENOENT`, and only `ENOENT` settled it — so a child the kernel had already
+  reaped surfaced as `settlement incomplete`. Either now settles it, mirroring the
+  tri-state `Liveness` rule in the other direction: Undetermined never reads as
+  dead, and provably gone never reads as incomplete.
+- A LaunchAgent declaring `Agent.LimitLoadToSessionType` loads. launchd refuses
+  any job whose session type names a domain other than the bootstrap domain's own
+  (error 134, "Service cannot load in requested session") and daemonkit bootstraps
+  only into `gui/<uid>`, so every value but `SessionTypeAqua` rendered a plist
+  launchd permanently refused. The key is no longer emitted.
+- A controller state store whose schema, identity, or fingerprint is not the exact
+  current one archives aside — naming the backup path and every abandoned applied
+  LaunchAgent in the log — and the controller opens onto a fresh store, instead of
+  wedging every open of an upgraded daemon.
+
+### Security
+
+- Swift daemons apply the same-UID floor unconditionally. It was guarded behind an
+  optional session policy that defaults to nil, so `getpeereid` ran and its result
+  was discarded: a default-configured Swift daemon had no floor at all, while Go
+  treats it as unconditional on every platform. The authoritative uid is now a
+  non-optional property, so a caller may relocate the floor but no value removes it.
+- `codeidentity` requires `CS_ENFORCEMENT` and `CS_HARD`, rejecting a peer whose
+  code-signature enforcement has been switched off by the
+  `allow-unsigned-executable-memory` or `disable-executable-page-protection`
+  entitlements.
+- `trust` and `codeidentity` share one code-status check, so a clause added to one
+  verifier cannot be missing from the other. They had diverged: `codeidentity`
+  checked six clauses and `trust` three. Unifying adds the two enforcement clauses
+  to `trust`, which already denied the responsible entitlements by name — the
+  status check is a backstop for a peer that exposes no entitlement dictionary.
+
+### Deprecated
+
+- `service.SessionType`, its five constants, `service.ParseSessionType`, and
+  `service.Agent.LimitLoadToSessionType` are accepted and ignored: the field is
+  neither rendered into the plist nor stored with the agent, and setting anything
+  but `SessionTypeAqua` logs a warning naming the value. They are removed in a
+  future breaking release; drop the field.
+
 ## [0.20.10] - 2026-07-27
 
 ### Added
