@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/internal/flock"
 )
 
 const exactStateSchema = 1
@@ -50,9 +50,9 @@ func (s ExactStateFile[T]) Update(ctx context.Context, mutate func(*T) error) er
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	lock, err := (proc.FileLockSpec{
+	lock, err := (flock.Spec{
 		Path:     s.Path + ".lock",
-		Mode:     proc.FileLockExclusive,
+		Mode:     flock.Exclusive,
 		Deadline: time.Second,
 	}).TryAcquire()
 	if err != nil {

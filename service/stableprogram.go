@@ -14,8 +14,8 @@ import (
 	"time"
 
 	dkdaemon "github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/internal/flock"
 	"github.com/yasyf/daemonkit/internal/realhome"
-	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/version"
 )
 
@@ -217,14 +217,14 @@ func stableProgramPath(root, name string) string { return filepath.Join(root, "b
 
 func stableMetaPath(stablePath string) string { return stablePath + ".meta.json" }
 
-func stableProgramLock(root, name string) (*proc.FileLockHandle, error) {
+func stableProgramLock(root, name string) (*flock.Handle, error) {
 	locks := filepath.Join(root, "locks")
 	if err := os.MkdirAll(locks, 0o700); err != nil {
 		return nil, fmt.Errorf("service: create locks directory: %w", err)
 	}
-	spec := proc.FileLockSpec{
+	spec := flock.Spec{
 		Path:     filepath.Join(locks, "stable-"+name+".lock"),
-		Mode:     proc.FileLockExclusive,
+		Mode:     flock.Exclusive,
 		Deadline: stableProgramLockDeadline,
 	}
 	handle, err := spec.Acquire(context.Background())

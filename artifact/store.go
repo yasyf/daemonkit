@@ -16,8 +16,8 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/internal/flock"
 	"github.com/yasyf/daemonkit/internal/realhome"
-	"github.com/yasyf/daemonkit/proc"
 )
 
 const materializeLockDeadline = 5 * time.Minute
@@ -107,7 +107,7 @@ func (s Store) withLock(ctx context.Context, key string, fn func() error) error 
 	}
 	sum := sha256.Sum256([]byte(key))
 	lockPath := filepath.Join(s.locksDir(), hex.EncodeToString(sum[:16])+".lock")
-	handle, err := (proc.FileLockSpec{Path: lockPath, Mode: proc.FileLockExclusive, Deadline: materializeLockDeadline}).Acquire(ctx)
+	handle, err := (flock.Spec{Path: lockPath, Mode: flock.Exclusive, Deadline: materializeLockDeadline}).Acquire(ctx)
 	if err != nil {
 		return fmt.Errorf("artifact: lock %q: %w", key, err)
 	}

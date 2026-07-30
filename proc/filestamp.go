@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/yasyf/daemonkit/internal/flock"
 )
 
 // ErrInvalidFileStamp means a file-stamp specification is incomplete or unsafe.
@@ -47,7 +49,7 @@ func (s FileStamp) Claim() (bool, error) {
 	if err := mkdirAllDurable(directory, 0o700, fsyncDir); err != nil {
 		return false, fmt.Errorf("proc: create file stamp directory: %w", err)
 	}
-	lock, err := (FileLockSpec{Path: s.Path + ".lock", Mode: FileLockExclusive, Deadline: fileStampLockDeadline}).Acquire(context.Background())
+	lock, err := (flock.Spec{Path: s.Path + ".lock", Mode: flock.Exclusive, Deadline: fileStampLockDeadline}).Acquire(context.Background())
 	if err != nil {
 		return false, fmt.Errorf("proc: lock file stamp: %w", err)
 	}

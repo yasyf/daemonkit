@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/yasyf/daemonkit/internal/flock"
 	"github.com/yasyf/daemonkit/internal/realhome"
 	"github.com/yasyf/daemonkit/internal/runtimeauth"
 	peeridentity "github.com/yasyf/daemonkit/peer"
@@ -90,7 +91,7 @@ type Runtime struct {
 	trustWorkers         *worker.RuntimeClaim
 	server               runtimeauth.SessionServer
 	retainedListener     net.Listener
-	retainedLock         *proc.FileLockHandle
+	retainedLock         *flock.Handle
 	childFences          map[childFenceKey]*childFenceState
 	trustPolicy          trust.TrustPolicy
 	trustExecutable      string
@@ -595,7 +596,7 @@ func (r *Runtime) markServerTerminal(serveErr error) error {
 //nolint:contextcheck // Shutdown must outlive the signal or serving context that initiated it.
 func (r *Runtime) runStarted(
 	listener net.Listener,
-	lock *proc.FileLockHandle, signalCh <-chan os.Signal,
+	lock *flock.Handle, signalCh <-chan os.Signal,
 	stopSignals func(),
 	serveDone <-chan error,
 ) {
@@ -1078,14 +1079,14 @@ func (r *Runtime) requestStop(ctx context.Context) error {
 	return drainErr
 }
 
-func (r *Runtime) listen(ctx context.Context) (net.Listener, *proc.FileLockHandle, bool, error) {
+func (r *Runtime) listen(ctx context.Context) (net.Listener, *flock.Handle, bool, error) {
 	wait := r.cfg.ListenerWait
 	if wait <= 0 {
 		wait = 30 * time.Second
 	}
-	spec := proc.FileLockSpec{Path: r.cfg.Socket + ".lock", Mode: proc.FileLockExclusive, Deadline: wait}
+	spec := flock.Spec{Path: r.cfg.Socket + ".lock", Mode: flock.Exclusive, Deadline: wait}
 	lock, err := spec.TryAcquire()
-	if err != nil && !errors.Is(err, proc.ErrLockBusy) {
+	if err != nil && !errors.Is(err, flock.ErrLockBusy) {
 		return nil, nil, false, fmt.Errorf("daemon: acquire listener lock: %w", err)
 	}
 	conn, probeErr := net.DialTimeout("unix", r.cfg.Socket, 100*time.Millisecond)
@@ -1124,7 +1125,7 @@ func (r *Runtime) listen(ctx context.Context) (net.Listener, *proc.FileLockHandl
 
 func (r *Runtime) shutdown(
 	listener net.Listener,
-	lock *proc.FileLockHandle, cancelActivation context.CancelFunc,
+	lock *flock.Handle, cancelActivation context.CancelFunc,
 	cancelServe context.CancelFunc,
 	serveDone <-chan error,
 	servedEarly bool,
@@ -1208,7 +1209,7 @@ func (r *Runtime) shutdown(
 func (r *Runtime) abortBegin(
 	cause error,
 	listener net.Listener,
-	lock *proc.FileLockHandle, cancelActivation context.CancelFunc,
+	lock *flock.Handle, cancelActivation context.CancelFunc,
 	cancelServe context.CancelFunc,
 	serveDone <-chan error,
 	joined bool,
@@ -1244,7 +1245,7 @@ func (r *Runtime) abortBegin(
 	return errors.Join(cause, settleErr, closeErr)
 }
 
-func (r *Runtime) retainOwnership(listener net.Listener, lock *proc.FileLockHandle) {
+func (r *Runtime) retainOwnership(listener net.Listener, lock *flock.Handle) {
 	r.mu.Lock()
 	r.retainedListener = listener
 	r.retainedLock = lock
@@ -1252,7 +1253,7 @@ func (r *Runtime) retainOwnership(listener net.Listener, lock *proc.FileLockHand
 }
 
 //nolint:contextcheck // Drain is immediate while ctx bounds resource settlement.
-func (r *Runtime) closeAcquired(ctx context.Context, listener net.Listener, lock *proc.FileLockHandle) error {
+func (r *Runtime) closeAcquired(ctx context.Context, listener net.Listener, lock *flock.Handle) error {
 	var errs []error
 	_ = r.Drain()
 	if err := r.server.CloseRuntimeIntake(); err != nil && !errors.Is(err, net.ErrClosed) {

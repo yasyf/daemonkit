@@ -1,4 +1,6 @@
-package proc
+// Package flock is an inode-identified advisory file lock: bounded, mode-typed
+// acquisition over a lock file that is never unlinked.
+package flock
 
 import (
 	"context"
@@ -15,27 +17,27 @@ import (
 
 const flockPollInterval = 25 * time.Millisecond
 
-// FileLockMode selects shared or exclusive advisory ownership.
-type FileLockMode uint8
+// Mode selects shared or exclusive advisory ownership.
+type Mode uint8
 
 const (
-	// FileLockShared admits other shared owners and excludes exclusive owners.
-	FileLockShared FileLockMode = iota + 1
-	// FileLockExclusive excludes every other owner.
-	FileLockExclusive
+	// Shared admits other shared owners and excludes exclusive owners.
+	Shared Mode = iota + 1
+	// Exclusive excludes every other owner.
+	Exclusive
 )
 
-// FileLockSpec identifies one bounded advisory-lock acquisition.
-type FileLockSpec struct {
+// Spec identifies one bounded advisory-lock acquisition.
+type Spec struct {
 	Path string
-	Mode FileLockMode
+	Mode Mode
 	// Deadline bounds acquisition. It must be positive even for TryAcquire so a
 	// spec cannot silently become unbounded when its acquisition mode changes.
 	Deadline time.Duration
 }
 
-// FileLockHandle owns a FileLockSpec acquisition.
-type FileLockHandle struct {
+// Handle owns a Spec acquisition.
+type Handle struct {
 	mu       sync.Mutex
 	f        *os.File
 	closed   bool
@@ -45,7 +47,7 @@ type FileLockHandle struct {
 // Close idempotently drops the lock and closes the handle. The lock file is
 // deliberately retained because unlinking a held lock creates a second inode
 // that another process can own concurrently.
-func (h *FileLockHandle) Close() error {
+func (h *Handle) Close() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed {
@@ -67,7 +69,7 @@ func (h *FileLockHandle) Close() error {
 
 // Acquire waits for ownership until the earlier of ctx cancellation and the
 // spec's explicit Deadline.
-func (s FileLockSpec) Acquire(ctx context.Context) (*FileLockHandle, error) {
+func (s Spec) Acquire(ctx context.Context) (*Handle, error) {
 	if err := s.validate(); err != nil {
 		return nil, err
 	}
@@ -88,7 +90,7 @@ func (s FileLockSpec) Acquire(ctx context.Context) (*FileLockHandle, error) {
 
 // AcquireExisting waits for ownership of an already-created exact lock file.
 // It never creates directories or files and never repairs permissions.
-func (s FileLockSpec) AcquireExisting(ctx context.Context) (*FileLockHandle, error) {
+func (s Spec) AcquireExisting(ctx context.Context) (*Handle, error) {
 	if err := s.validate(); err != nil {
 		return nil, err
 	}
@@ -113,7 +115,7 @@ func (s FileLockSpec) AcquireExisting(ctx context.Context) (*FileLockHandle, err
 }
 
 // TryAcquire attempts ownership once and returns ErrLockBusy on contention.
-func (s FileLockSpec) TryAcquire() (*FileLockHandle, error) {
+func (s Spec) TryAcquire() (*Handle, error) {
 	if err := s.validate(); err != nil {
 		return nil, err
 	}
@@ -123,7 +125,7 @@ func (s FileLockSpec) TryAcquire() (*FileLockHandle, error) {
 	}
 	err = tryFileLock(f, s.Mode)
 	if err == nil {
-		return &FileLockHandle{f: f}, nil
+		return &Handle{f: f}, nil
 	}
 	if errors.Is(err, unix.EWOULDBLOCK) {
 		_ = f.Close()
@@ -133,14 +135,14 @@ func (s FileLockSpec) TryAcquire() (*FileLockHandle, error) {
 	return nil, fmt.Errorf("flock %s: %w", s.Path, err)
 }
 
-func (s FileLockSpec) validate() error {
+func (s Spec) validate() error {
 	if s.Path == "" {
 		return fmt.Errorf("%w: empty path", ErrInvalidFileLock)
 	}
 	if !filepath.IsAbs(s.Path) || filepath.Clean(s.Path) != s.Path || s.Path == string(filepath.Separator) {
 		return fmt.Errorf("%w: path %q must be absolute, clean, and non-root", ErrInvalidFileLock, s.Path)
 	}
-	if s.Mode != FileLockShared && s.Mode != FileLockExclusive {
+	if s.Mode != Shared && s.Mode != Exclusive {
 		return fmt.Errorf("%w: mode %d", ErrInvalidFileLock, s.Mode)
 	}
 	if s.Deadline <= 0 {
@@ -149,7 +151,7 @@ func (s FileLockSpec) validate() error {
 	return nil
 }
 
-func fileLockPoll(ctx context.Context, f *os.File, path string, mode FileLockMode) (*FileLockHandle, error) {
+func fileLockPoll(ctx context.Context, f *os.File, path string, mode Mode) (*Handle, error) {
 	for {
 		if err := ctx.Err(); err != nil {
 			_ = f.Close()
@@ -157,7 +159,7 @@ func fileLockPoll(ctx context.Context, f *os.File, path string, mode FileLockMod
 		}
 		err := tryFileLock(f, mode)
 		if err == nil {
-			return &FileLockHandle{f: f}, nil
+			return &Handle{f: f}, nil
 		}
 		if !errors.Is(err, unix.EWOULDBLOCK) {
 			_ = f.Close()
@@ -172,9 +174,9 @@ func fileLockPoll(ctx context.Context, f *os.File, path string, mode FileLockMod
 	}
 }
 
-func tryFileLock(f *os.File, mode FileLockMode) error {
+func tryFileLock(f *os.File, mode Mode) error {
 	operation := unix.LOCK_SH
-	if mode == FileLockExclusive {
+	if mode == Exclusive {
 		operation = unix.LOCK_EX
 	}
 	return unix.Flock(int(f.Fd()), operation|unix.LOCK_NB)

@@ -1,4 +1,4 @@
-package proc
+package flock
 
 import (
 	"bytes"
@@ -17,9 +17,9 @@ import (
 
 func bumpUnderLock(t *testing.T, lockPath, counterPath string) {
 	t.Helper()
-	h, err := (FileLockSpec{
+	h, err := (Spec{
 		Path:     lockPath,
-		Mode:     FileLockExclusive,
+		Mode:     Exclusive,
 		Deadline: 5 * time.Second,
 	}).Acquire(context.Background())
 	if err != nil {
@@ -73,9 +73,9 @@ func TestFileLockSerializesCriticalSection(t *testing.T) {
 
 func TestFileLockRespectsContext(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ctx.lock")
-	held, err := (FileLockSpec{
+	held, err := (Spec{
 		Path:     path,
-		Mode:     FileLockExclusive,
+		Mode:     Exclusive,
 		Deadline: time.Second,
 	}).Acquire(context.Background())
 	if err != nil {
@@ -86,9 +86,9 @@ func TestFileLockRespectsContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, err = (FileLockSpec{
+	_, err = (Spec{
 		Path:     path,
-		Mode:     FileLockExclusive,
+		Mode:     Exclusive,
 		Deadline: time.Second,
 	}).Acquire(ctx)
 	if err == nil {
@@ -104,7 +104,7 @@ func TestFileLockRespectsContext(t *testing.T) {
 
 func TestFileLockAcquireExistingNeverCreatesOrRepairs(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing", "status.lock")
-	_, err := (FileLockSpec{Path: path, Mode: FileLockShared, Deadline: time.Second}).AcquireExisting(t.Context())
+	_, err := (Spec{Path: path, Mode: Shared, Deadline: time.Second}).AcquireExisting(t.Context())
 	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("AcquireExisting error = %v, want os.ErrNotExist", err)
 	}
@@ -116,7 +116,7 @@ func TestFileLockAcquireExistingNeverCreatesOrRepairs(t *testing.T) {
 	if err := os.WriteFile(path, nil, 0o640); err != nil {
 		t.Fatal(err)
 	}
-	_, err = (FileLockSpec{Path: path, Mode: FileLockShared, Deadline: time.Second}).AcquireExisting(t.Context())
+	_, err = (Spec{Path: path, Mode: Shared, Deadline: time.Second}).AcquireExisting(t.Context())
 	if !errors.Is(err, ErrUnsafeLockFile) {
 		t.Fatalf("AcquireExisting unsafe error = %v", err)
 	}
@@ -128,20 +128,20 @@ func TestFileLockAcquireExistingNeverCreatesOrRepairs(t *testing.T) {
 
 func TestFileLockAcquireExistingSharesExistingInode(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "status.lock")
-	exclusive, err := (FileLockSpec{Path: path, Mode: FileLockExclusive, Deadline: time.Second}).Acquire(t.Context())
+	exclusive, err := (Spec{Path: path, Mode: Exclusive, Deadline: time.Second}).Acquire(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
-	_, err = (FileLockSpec{Path: path, Mode: FileLockShared, Deadline: time.Second}).AcquireExisting(ctx)
+	_, err = (Spec{Path: path, Mode: Shared, Deadline: time.Second}).AcquireExisting(ctx)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("AcquireExisting during exclusive lock = %v", err)
 	}
 	if err := exclusive.Close(); err != nil {
 		t.Fatal(err)
 	}
-	shared, err := (FileLockSpec{Path: path, Mode: FileLockShared, Deadline: time.Second}).AcquireExisting(t.Context())
+	shared, err := (Spec{Path: path, Mode: Shared, Deadline: time.Second}).AcquireExisting(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,9 +164,9 @@ func TestFileLockExclusiveChildHolds(t *testing.T) {
 	if lockPath == "" || readyPath == "" {
 		t.Skip("child-only helper; driven by TestFileLockExclusiveCrossProcess")
 	}
-	h, err := (FileLockSpec{
+	h, err := (Spec{
 		Path:     lockPath,
-		Mode:     FileLockExclusive,
+		Mode:     Exclusive,
 		Deadline: time.Second,
 	}).Acquire(context.Background())
 	if err != nil {
@@ -216,9 +216,9 @@ func TestFileLockExclusiveCrossProcess(t *testing.T) {
 	}
 
 	start := time.Now()
-	h, err := (FileLockSpec{
+	h, err := (Spec{
 		Path:     lockPath,
-		Mode:     FileLockExclusive,
+		Mode:     Exclusive,
 		Deadline: 5 * time.Second,
 	}).Acquire(context.Background())
 	if err != nil {
@@ -237,9 +237,9 @@ func TestFileLockChildHoldsShared(t *testing.T) {
 	if lockPath == "" || readyPath == "" {
 		t.Skip("child-only helper; driven by TestFileLockSharedExclusiveCrossProcess")
 	}
-	h, err := (FileLockSpec{
+	h, err := (Spec{
 		Path:     lockPath,
-		Mode:     FileLockShared,
+		Mode:     Shared,
 		Deadline: time.Second,
 	}).Acquire(context.Background())
 	if err != nil {
@@ -286,9 +286,9 @@ func TestFileLockSharedExclusiveCrossProcess(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	shared, err := (FileLockSpec{
+	shared, err := (Spec{
 		Path:     lockPath,
-		Mode:     FileLockShared,
+		Mode:     Shared,
 		Deadline: time.Second,
 	}).TryAcquire()
 	if err != nil {
@@ -296,9 +296,9 @@ func TestFileLockSharedExclusiveCrossProcess(t *testing.T) {
 	}
 	defer shared.Close()
 
-	if _, err := (FileLockSpec{
+	if _, err := (Spec{
 		Path:     lockPath,
-		Mode:     FileLockExclusive,
+		Mode:     Exclusive,
 		Deadline: time.Second,
 	}).TryAcquire(); !errors.Is(err, ErrLockBusy) {
 		t.Fatalf("exclusive TryAcquire err = %v, want ErrLockBusy", err)
@@ -306,9 +306,9 @@ func TestFileLockSharedExclusiveCrossProcess(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	_, err = (FileLockSpec{
+	_, err = (Spec{
 		Path:     lockPath,
-		Mode:     FileLockExclusive,
+		Mode:     Exclusive,
 		Deadline: 50 * time.Millisecond,
 	}).Acquire(ctx)
 	if !errors.Is(err, context.DeadlineExceeded) {
@@ -318,15 +318,15 @@ func TestFileLockSharedExclusiveCrossProcess(t *testing.T) {
 
 func TestFileLockSpecValidation(t *testing.T) {
 	abs := filepath.Join(t.TempDir(), "valid.lock")
-	tests := map[string]FileLockSpec{
-		"empty path":        {Mode: FileLockShared, Deadline: time.Second},
-		"relative path":     {Path: "relative.lock", Mode: FileLockShared, Deadline: time.Second},
-		"unclean path":      {Path: abs + "/../" + filepath.Base(abs), Mode: FileLockShared, Deadline: time.Second},
-		"root path":         {Path: string(filepath.Separator), Mode: FileLockShared, Deadline: time.Second},
+	tests := map[string]Spec{
+		"empty path":        {Mode: Shared, Deadline: time.Second},
+		"relative path":     {Path: "relative.lock", Mode: Shared, Deadline: time.Second},
+		"unclean path":      {Path: abs + "/../" + filepath.Base(abs), Mode: Shared, Deadline: time.Second},
+		"root path":         {Path: string(filepath.Separator), Mode: Shared, Deadline: time.Second},
 		"missing mode":      {Path: abs, Deadline: time.Second},
-		"unknown mode":      {Path: abs, Mode: FileLockMode(99), Deadline: time.Second},
-		"missing deadline":  {Path: abs, Mode: FileLockShared},
-		"negative deadline": {Path: abs, Mode: FileLockShared, Deadline: -time.Second},
+		"unknown mode":      {Path: abs, Mode: Mode(99), Deadline: time.Second},
+		"missing deadline":  {Path: abs, Mode: Shared},
+		"negative deadline": {Path: abs, Mode: Shared, Deadline: -time.Second},
 	}
 	for name, spec := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -341,9 +341,9 @@ func TestFileLockAcquireHonorsPreCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	path := filepath.Join(t.TempDir(), "canceled.lock")
-	_, err := (FileLockSpec{
+	_, err := (Spec{
 		Path:     path,
-		Mode:     FileLockExclusive,
+		Mode:     Exclusive,
 		Deadline: time.Second,
 	}).Acquire(ctx)
 	if !errors.Is(err, context.Canceled) {
@@ -399,7 +399,7 @@ func TestFileLockRejectsUnsafeExistingPaths(t *testing.T) {
 	for name, setup := range tests {
 		t.Run(name, func(t *testing.T) {
 			path := setup(t)
-			_, err := (FileLockSpec{Path: path, Mode: FileLockExclusive, Deadline: time.Second}).TryAcquire()
+			_, err := (Spec{Path: path, Mode: Exclusive, Deadline: time.Second}).TryAcquire()
 			if !errors.Is(err, ErrUnsafeLockFile) {
 				t.Fatalf("TryAcquire err = %v, want ErrUnsafeLockFile", err)
 			}
@@ -412,7 +412,7 @@ func TestFileLockNormalizesSafeExistingModeAndRetainsFile(t *testing.T) {
 	if err := os.WriteFile(path, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	h, err := (FileLockSpec{Path: path, Mode: FileLockExclusive, Deadline: time.Second}).TryAcquire()
+	h, err := (Spec{Path: path, Mode: Exclusive, Deadline: time.Second}).TryAcquire()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -433,7 +433,7 @@ func TestFileLockNormalizesSafeExistingModeAndRetainsFile(t *testing.T) {
 
 func TestFileLockTryAcquireBusyThenFree(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "try.lock")
-	spec := FileLockSpec{Path: path, Mode: FileLockExclusive, Deadline: time.Second}
+	spec := Spec{Path: path, Mode: Exclusive, Deadline: time.Second}
 
 	h1, err := spec.TryAcquire()
 	if err != nil {
@@ -452,9 +452,9 @@ func TestFileLockTryAcquireBusyThenFree(t *testing.T) {
 }
 
 func TestFileLockCloseIsIdempotent(t *testing.T) {
-	h, err := (FileLockSpec{
+	h, err := (Spec{
 		Path:     filepath.Join(t.TempDir(), "idempotent.lock"),
-		Mode:     FileLockExclusive,
+		Mode:     Exclusive,
 		Deadline: time.Second,
 	}).Acquire(context.Background())
 	if err != nil {

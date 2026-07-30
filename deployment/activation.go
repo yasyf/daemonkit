@@ -15,6 +15,7 @@ import (
 
 	"github.com/yasyf/daemonkit/codeidentity"
 	"github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/internal/flock"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/service"
 )
@@ -267,7 +268,7 @@ func (c *Controller) ActivateInstalled(ctx context.Context, config ActivateInsta
 	if err := ensureMetadataDir(paths); err != nil {
 		return ActivationReceipt{}, err
 	}
-	lock, err := (proc.FileLockSpec{Path: paths.lock, Mode: proc.FileLockExclusive, Deadline: activationLockDeadline}).Acquire(ctx)
+	lock, err := (flock.Spec{Path: paths.lock, Mode: flock.Exclusive, Deadline: activationLockDeadline}).Acquire(ctx)
 	if err != nil {
 		return ActivationReceipt{}, fmt.Errorf("deployment: acquire activation lock: %w", err)
 	}
@@ -533,7 +534,7 @@ func (c *Controller) DeactivateCurrentInstalled(ctx context.Context, config Deac
 	if err := requireRealDirectory(paths.metadataDir); err != nil {
 		return DeactivationReceipt{}, fmt.Errorf("%w: activation receipt is required", ErrInstallConflict)
 	}
-	lock, err := (proc.FileLockSpec{Path: paths.lock, Mode: proc.FileLockExclusive, Deadline: activationLockDeadline}).Acquire(ctx)
+	lock, err := (flock.Spec{Path: paths.lock, Mode: flock.Exclusive, Deadline: activationLockDeadline}).Acquire(ctx)
 	if err != nil {
 		return DeactivationReceipt{}, err
 	}

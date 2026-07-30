@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/daemonkit/internal/flock"
 	"github.com/yasyf/daemonkit/proc"
 )
 
@@ -116,8 +117,8 @@ func TestExactStateFileRejectsInvalidCodecPayload(t *testing.T) {
 
 func TestExactStateFileUpdateLockBusy(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
-	held, err := (proc.FileLockSpec{
-		Path: path + ".lock", Mode: proc.FileLockExclusive, Deadline: time.Second,
+	held, err := (flock.Spec{
+		Path: path + ".lock", Mode: flock.Exclusive, Deadline: time.Second,
 	}).TryAcquire()
 	if err != nil {
 		t.Fatalf("pre-hold lock: %v", err)
@@ -134,8 +135,8 @@ func TestExactStateFileUpdateLockBusy(t *testing.T) {
 
 func TestExactStateFileUpdateUnlocked(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
-	held, err := (proc.FileLockSpec{
-		Path: path + ".lock", Mode: proc.FileLockExclusive, Deadline: time.Second,
+	held, err := (flock.Spec{
+		Path: path + ".lock", Mode: flock.Exclusive, Deadline: time.Second,
 	}).TryAcquire()
 	if err != nil {
 		t.Fatal(err)

@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a mismatch means one consumer's long-lived daemon has outlived a client upgrade.
   The client then could not complete a handshake to tell that stale daemon to
   drain and exit, which is the one action that repairs it.
+- **Breaking.** The advisory file lock moved out of `proc` into module-private
+  `internal/flock`, dropping twelve exported symbols: `proc.FileLockSpec` (and its
+  `Path`/`Mode`/`Deadline`/`Acquire`/`AcquireExisting`/`TryAcquire` members),
+  `proc.FileLockHandle` (`Close`), `proc.FileLockMode`, `proc.FileLockShared`, and
+  `proc.FileLockExclusive`. The lock is not part of `proc`'s process-ownership
+  surface, and no fleet consumer needs it as public API. The three contention
+  sentinels stay exported from `proc` as aliases of their `internal/flock`
+  definitions, so `errors.Is(err, proc.ErrLockBusy)` keeps matching.
 - `Controller.verify` issues no launchctl mutation. It previously ran
   `launchctl enable` as a side effect of a read, which also wrote a permanent
   root-owned override-database entry per label that uninstall never removes. A

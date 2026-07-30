@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yasyf/daemonkit/internal/flock"
 	bolt "go.etcd.io/bbolt"
 	bolterrors "go.etcd.io/bbolt/errors"
 )
@@ -198,7 +199,7 @@ func (s *FileStore) openLocked(ctx context.Context, budget time.Duration) (*bolt
 // schema inside the lock and proceeds onto that fresh store. mismatch is the
 // original schema error, reported if the archival rename itself fails.
 func (s *FileStore) archiveUnderLock(ctx context.Context, timeout time.Duration, mismatch error) (*bolt.DB, error) {
-	lock, err := (FileLockSpec{Path: s.Path + ".archive.lock", Mode: FileLockExclusive, Deadline: timeout}).Acquire(ctx)
+	lock, err := (flock.Spec{Path: s.Path + ".archive.lock", Mode: flock.Exclusive, Deadline: timeout}).Acquire(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("proc: lock keyed store for archive: %w", err)
 	}

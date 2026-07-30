@@ -18,6 +18,7 @@ import (
 	"time"
 
 	dkdaemon "github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/internal/flock"
 	"github.com/yasyf/daemonkit/proc"
 	bolt "go.etcd.io/bbolt"
 )
@@ -143,8 +144,8 @@ func openControllerStore(ctx context.Context, path string) (*boltControllerStore
 func archiveControllerStore(
 	ctx context.Context, path string, timeout time.Duration, mismatch error,
 ) (*bolt.DB, error) {
-	lock, err := (proc.FileLockSpec{
-		Path: path + ".archive.lock", Mode: proc.FileLockExclusive, Deadline: timeout,
+	lock, err := (flock.Spec{
+		Path: path + ".archive.lock", Mode: flock.Exclusive, Deadline: timeout,
 	}).Acquire(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("service: lock controller state for archive: %w", err)

@@ -31,13 +31,13 @@ reverted rather than trusted.
 | `artifact` | resolves a version-exact executable from a declarative descriptor, for the cc-family's one central "give me the binary that matches my version" primitive. | 16 | 2230 |
 | `bundle` | reads a macOS .app's Info.plist and resolves the stable bundle paths a daemon installs to. | 5 | 200 |
 | `codeidentity` | defines daemon-safe signed-code identity and opaque policy proofs. | 7 | 617 |
-| `daemon` | is the consumer-agnostic process runtime for a detached daemon: exclusive listener ownership, readiness, ordered shutdown, skew observation, idle exit, and embedded-process coordination. | 19 | 4691 |
-| `deployment` | owns sealed installation, activation, upgrade, and removal of one fixed signed application. | 18 | 4170 |
+| `daemon` | is the consumer-agnostic process runtime for a detached daemon: exclusive listener ownership, readiness, ordered shutdown, skew observation, idle exit, and embedded-process coordination. | 19 | 4693 |
+| `deployment` | owns sealed installation, activation, upgrade, and removal of one fixed signed application. | 18 | 4172 |
 | `ghrelease` | queries GitHub for a repository's latest published release. | 2 | 170 |
 | `paths` | owns the canonical state-directory layout under the user's home directory, resolved through the passwd database — never the caller's HOME or CLAUDE_CONFIG_DIR — so a sandboxed environment cannot relocate state. | 4 | 209 |
 | `peer` | defines the OS-authenticated identity shared by transport and trust. | 4 | 175 |
-| `proc` | holds exact durable process identity, ownership, and reaping. | 64 | 12716 |
-| `service` | converges an exact durable set of macOS user LaunchAgents. | 28 | 10991 |
+| `proc` | holds exact durable process identity, ownership, and reaping. | 63 | 11944 |
+| `service` | converges an exact durable set of macOS user LaunchAgents. | 28 | 10992 |
 | `templates` | — | 2 | 218 |
 | `trust` | verifies the code-signing identity of a connected unix-socket peer: a same-UID floor on every platform plus, on signed darwin builds, a designated requirement checked against the peer's audit token. | 12 | 2356 |
 | `version` | classifies and compares release and development builds for launcher-owned runtime settlement and release ordering. | 2 | 302 |

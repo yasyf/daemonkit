@@ -92,11 +92,11 @@ workarounds, or disabled code — never to restate the signature.
 ```go
 // Good — exported, starts with the name, says what's not obvious from the signature
 // TryAcquire attempts ownership once and returns ErrLockBusy on contention.
-func (s FileLockSpec) TryAcquire() (*FileLockHandle, error) { ... }
+func (s Spec) TryAcquire() (*Handle, error) { ... }
 
 // Bad — restates the signature
 // TryAcquire tries to acquire the file lock.
-func (s FileLockSpec) TryAcquire() (*FileLockHandle, error) { ... }
+func (s Spec) TryAcquire() (*Handle, error) { ... }
 ```
 
 ## Testing

@@ -9,6 +9,7 @@ import (
 
 	"github.com/yasyf/daemonkit/codeidentity"
 	"github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/internal/flock"
 	"github.com/yasyf/daemonkit/proc"
 )
 
@@ -55,7 +56,7 @@ func (c *Controller) UninstallCurrentInstalled(
 	if err := requireRealDirectory(paths.metadataDir); err != nil {
 		return UninstallReceipt{}, fmt.Errorf("%w: sealed deployment state is required", ErrInstallConflict)
 	}
-	lock, err := (proc.FileLockSpec{Path: paths.lock, Mode: proc.FileLockExclusive, Deadline: activationLockDeadline}).Acquire(ctx)
+	lock, err := (flock.Spec{Path: paths.lock, Mode: flock.Exclusive, Deadline: activationLockDeadline}).Acquire(ctx)
 	if err != nil {
 		return UninstallReceipt{}, err
 	}

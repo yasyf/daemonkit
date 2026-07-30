@@ -1,15 +1,15 @@
 // Package proc holds exact durable process identity, ownership, and reaping.
 package proc
 
-import "errors"
+import "github.com/yasyf/daemonkit/internal/flock"
 
-// ErrLockBusy means FileLockSpec.TryAcquire found the lock held by another owner;
+// ErrLockBusy means flock.Spec.TryAcquire found the lock held by another owner;
 // consumers alias it and match with errors.Is.
-var ErrLockBusy = errors.New("proc: lock held by another owner")
+var ErrLockBusy = flock.ErrLockBusy
 
 // ErrInvalidFileLock means a file-lock specification is incomplete or unsafe.
-var ErrInvalidFileLock = errors.New("proc: invalid file lock")
+var ErrInvalidFileLock = flock.ErrInvalidFileLock
 
 // ErrUnsafeLockFile means an existing lock path cannot safely identify one
 // advisory-lock inode.
-var ErrUnsafeLockFile = errors.New("proc: unsafe lock file")
+var ErrUnsafeLockFile = flock.ErrUnsafeLockFile
