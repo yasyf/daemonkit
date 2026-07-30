@@ -1,9 +1,12 @@
-// Command peer is daemonkit's mixed-era conformance peer: one source compiled
-// twice — once against the previous released tag, once against the working
-// tree — so daemons and clients from different eras can be driven at each other.
+// Command precut is daemonkit's pre-cut mixed-era conformance peer: compiled
+// only against the release the harness pins as the boundary, so the cut's
+// daemons and clients can be driven at a real released binary rather than at a
+// model of one. Every verdict it reports about a failure is produced by the
+// released module's own errors.Is / errors.As classification.
 //
-//	peer serve -socket PATH -build BUILD -state DIR
-//	peer dial  -socket PATH -build BUILD
+//	precut serve       -socket PATH -build BUILD -state DIR
+//	precut dial        -socket PATH -build BUILD
+//	precut conformance
 package main
 
 import (
@@ -13,8 +16,10 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/yasyf/daemonkit/daemon"
@@ -28,6 +33,14 @@ const (
 	healthOp = wire.Op("mixedera.health")
 	stopOp   = wire.Op("mixedera.stop")
 	tenant   = "mixedera"
+	era      = "precut"
+
+	// exitTrustProbe and probeToken are the one start failure the harness
+	// retries; every other failure leaves by the usual exit 1. The harness
+	// requires both, because an exit status on its own is what any unrelated
+	// wrapper dying at 69 would also present.
+	exitTrustProbe = 69
+	probeToken     = "mixedera-precut: trust-verifier-probe-deadline"
 )
 
 type healthReport struct {
@@ -36,12 +49,23 @@ type healthReport struct {
 	PID       int    `json:"pid"`
 }
 
-type dialReport struct {
-	SelfBuild string       `json:"self_build"`
-	PeerBuild string       `json:"peer_build"`
-	Protocol  uint16       `json:"protocol"`
-	Health    healthReport `json:"health"`
-	StopAcked bool         `json:"stop_acked"`
+type report struct {
+	Era          string       `json:"era"`
+	Protocol     uint16       `json:"protocol"`
+	PeerProtocol uint16       `json:"peer_protocol,omitempty"`
+	Session      bool         `json:"session,omitempty"`
+	Failure      string       `json:"failure,omitempty"`
+	Detail       string       `json:"detail,omitempty"`
+	SelfBuild    string       `json:"self_build,omitempty"`
+	PeerBuild    string       `json:"peer_build,omitempty"`
+	Health       healthReport `json:"health,omitzero"`
+	StopAcked    bool         `json:"stop_acked,omitempty"`
+}
+
+type conformance struct {
+	Era        string            `json:"era"`
+	Protocol   uint16            `json:"protocol"`
+	Mechanisms map[string]string `json:"mechanisms"`
 }
 
 func main() {
@@ -55,16 +79,32 @@ func main() {
 		return
 	}
 	if len(os.Args) < 2 {
-		fail(errors.New("usage: peer serve|dial -socket PATH -build BUILD"))
+		fail(errors.New("usage: precut serve|dial|conformance"))
 	}
 	switch mode, args := os.Args[1], os.Args[2:]; mode {
 	case "serve":
 		fail(serve(args))
 	case "dial":
 		fail(dial(args))
+	case "conformance":
+		fail(declare())
 	default:
 		fail(fmt.Errorf("unknown mode %q", mode))
 	}
+}
+
+func declare() error {
+	return json.NewEncoder(os.Stdout).Encode(conformance{
+		Era: era, Protocol: wire.ProtocolVersion,
+		Mechanisms: map[string]string{
+			"frame-v1":                  "",
+			"protocol-gate":             "",
+			"session":                   "",
+			"drain-sigterm":             "",
+			"drain-preamble":            "predates the cut: a pre-cut server reads its first bytes as a frame length, so SIGTERM is the only repair channel that reaches a pre-cut incumbent",
+			"drain-preamble-trust-gate": "predates the cut: there is no preamble to gate",
+		},
+	})
 }
 
 func fail(err error) {
@@ -72,6 +112,10 @@ func fail(err error) {
 		return
 	}
 	fmt.Fprintln(os.Stderr, err)
+	if errors.Is(err, daemon.ErrTrustVerifierProbe) {
+		fmt.Fprintln(os.Stderr, probeToken)
+		os.Exit(exitTrustProbe)
+	}
 	os.Exit(1)
 }
 
@@ -127,6 +171,13 @@ func serve(args []string) error {
 
 	stop := make(chan struct{})
 	var stopOnce sync.Once
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		<-signals
+		stopOnce.Do(func() { close(stop) })
+	}()
+
 	server := &wire.Server{WireBuild: *build, Ladder: deadlines, WriteTimeout: 15 * time.Second}
 	server.Register(wire.HandlerSpec{
 		Op: healthOp,
@@ -199,33 +250,56 @@ func dial(args []string) error {
 		HandshakeTimeout: 30 * time.Second, WriteTimeout: 15 * time.Second,
 	})
 	if err != nil {
-		return fmt.Errorf("dial: handshake: %w", err)
+		return emit(classify(*build, err))
 	}
 	defer client.Close()
 
-	report := dialReport{SelfBuild: *build}
 	identity := client.PeerWireIdentity()
-	report.PeerBuild, report.Protocol = identity.WireBuild, identity.Protocol
+	result := report{
+		Era: era, Protocol: wire.ProtocolVersion, PeerProtocol: identity.Protocol,
+		SelfBuild: *build, PeerBuild: identity.WireBuild,
+	}
 
 	health, err := call(ctx, client, healthOp)
 	if err != nil {
-		return fmt.Errorf("dial: health: %w", err)
+		return emit(classify(*build, err))
 	}
-	if err := json.Unmarshal(health, &report.Health); err != nil {
+	if err := json.Unmarshal(health, &result.Health); err != nil {
 		return fmt.Errorf("dial: decode health: %w", err)
 	}
 
 	stopped, err := call(ctx, client, stopOp)
 	if err != nil {
-		return fmt.Errorf("dial: stop: %w", err)
+		return emit(classify(*build, err))
 	}
 	var acknowledgement string
 	if err := json.Unmarshal(stopped, &acknowledgement); err != nil {
 		return fmt.Errorf("dial: decode stop: %w", err)
 	}
-	report.StopAcked = acknowledgement == "stopping"
+	result.StopAcked = acknowledgement == "stopping"
+	result.Session = true
 
-	return json.NewEncoder(os.Stdout).Encode(report)
+	return emit(result)
+}
+
+func classify(build string, err error) report {
+	failed := report{Era: era, Protocol: wire.ProtocolVersion, SelfBuild: build, Detail: err.Error()}
+	var rejection *wire.HandshakeRejectionError
+	switch {
+	case errors.Is(err, wire.ErrProtocolVersion):
+		failed.Failure = "protocol-mismatch"
+	case errors.Is(err, wire.ErrBuildMismatch), errors.As(err, &rejection):
+		failed.Failure = "refused"
+	case errors.Is(err, wire.ErrHandshake):
+		failed.Failure = "malformed"
+	default:
+		failed.Failure = "transport"
+	}
+	return failed
+}
+
+func emit(r report) error {
+	return json.NewEncoder(os.Stdout).Encode(r)
 }
 
 func call(ctx context.Context, client *wire.Client, op wire.Op) ([]byte, error) {

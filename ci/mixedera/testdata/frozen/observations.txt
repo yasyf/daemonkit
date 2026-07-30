@@ -1,0 +1,58 @@
+# Every observation the mixed-era matrix owes, one per line, sorted.
+#
+# This file is the gate's expected set, and it is deliberately outside the run:
+# deleting a case, building one out behind a tag, or renaming a test leaves the
+# line here demanding an observation nothing produced, so the run goes red
+# instead of quietly narrowing. Nothing regenerates it — a run that owes a line
+# it does not find prints the exact text to add here.
+#
+#   case  <test>
+#   case  <test> asserts <what it asserts>
+#   claim <test> <era> <mechanism> evidenced
+#   claim <test> <era> <mechanism> entailed-by <era> <mechanism>
+#
+# An evidenced claim is redeemed only against an artifact the case cannot
+# fabricate: a process exit the OS reaped, bytes the relay copied, or the peer
+# process's own verdict. An entailed claim carries no observation of its own and
+# the manifest reports it ENTAILED, never PROVEN.
+#
+# Every case owes a claim or carries the "asserts" clause saying why it owes
+# none. Other cases reprove most mechanisms, so deleting a case's claims leaves
+# the coverage table whole and its body free to be emptied unnoticed; the clause
+# makes that deletion an edit here, in front of a reviewer.
+
+case TestFrozenFramePrefixes asserts the two eras carry well-formed frame prefixes that differ, which is what lets either answer the other with a typed mismatch
+case TestFrozenPreambleCannotOpenAFrame asserts the frozen drain preamble opens a body larger than every frame cap in the fleet, so no era can mistake it for a frame
+case TestMixedEra asserts nothing of its own: it builds the two era peers, freezes the coverage manifest, and runs the matrix below
+case TestMixedEra/classify/cut asserts the cut peer's own unit tests pass, which is where that peer's failure classification is checked
+case TestMixedEra/drain/preamble
+case TestMixedEra/drain/preamble-absent-precut
+case TestMixedEra/drain/preamble-emitted
+case TestMixedEra/drain/sigterm-cut
+case TestMixedEra/drain/sigterm-precut
+case TestMixedEra/refuse/cut-client-precut-daemon
+case TestMixedEra/refuse/precut-client-cut-daemon
+case TestMixedEra/session/cut
+case TestMixedEra/session/precut
+case TestMixedEra/skew/build asserts the boundary release still gates a session on the exact build string, so a same-era client presenting a different build is refused — the one case that goes red if the pre-cut peer is really this tree
+case TestMixedEra/wedge/18999
+case TestPrecutBoundaryPredatesTheCut asserts the pinned boundary release is older than the release that demoted the build gate, so the pre-cut peer cannot be compiled against the rewrite
+case TestProbeDeadlineNeedsBothTheStatusAndTheToken asserts the pre-cut start retries on the released peer's full probe signature and on nothing else
+case TestRelayCapturesEveryConnectionSeparately asserts the relay keeps each connection's bytes separate, which every claim redeemed against the wire depends on
+claim TestMixedEra/drain/preamble cut drain-preamble evidenced
+claim TestMixedEra/drain/preamble-absent-precut precut drain-preamble evidenced
+claim TestMixedEra/drain/preamble-absent-precut precut drain-preamble-trust-gate entailed-by precut drain-preamble
+claim TestMixedEra/drain/preamble-emitted cut drain-preamble evidenced
+claim TestMixedEra/drain/sigterm-cut cut drain-sigterm evidenced
+claim TestMixedEra/drain/sigterm-precut precut drain-sigterm evidenced
+claim TestMixedEra/refuse/cut-client-precut-daemon cut protocol-gate evidenced
+claim TestMixedEra/refuse/cut-client-precut-daemon precut protocol-gate evidenced
+claim TestMixedEra/refuse/precut-client-cut-daemon cut protocol-gate evidenced
+claim TestMixedEra/refuse/precut-client-cut-daemon precut protocol-gate evidenced
+claim TestMixedEra/session/cut cut frame-v1 evidenced
+claim TestMixedEra/session/cut cut session evidenced
+claim TestMixedEra/session/precut precut frame-v1 evidenced
+claim TestMixedEra/session/precut precut session evidenced
+claim TestMixedEra/wedge/18999 cut drain-preamble evidenced
+claim TestMixedEra/wedge/18999 cut protocol-gate evidenced
+claim TestMixedEra/wedge/18999 precut protocol-gate evidenced

@@ -50,6 +50,10 @@ jobs:
           require_workflow Guides
 
   release:
+    # TODO(phase 2): add the mixed-era workflow back to this list once the cut
+    # peer stops being a stub. Until then GITHUB_REF_TYPE=tag refuses every run
+    # — correctly, the cut era's real transport is not under test — so gating a
+    # tag on it blocks releases for a reason no release can fix.
     needs: [verify-tag-on-main, verify-main-gates]
     runs-on: ubuntu-latest
     steps:

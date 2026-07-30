@@ -1,323 +1,449 @@
 //go:build mixedera
 
-// Package mixedera proves a daemon and client of different daemonkit releases
-// share a session when only their build strings differ (RC3, ccn 0771ea54).
+// Package mixedera is daemonkit's release gate for the boundary between the
+// pre-cut release line and the cut: it drives a daemon and a client of
+// different eras at each other over a real unix socket and proves the repair
+// channel outlives the compatibility gate.
+//
+// It exists because the swarm era gated the transport on an application
+// identity: a launchd daemon holding one schema met an upgraded client holding
+// another, the handshake failed, and the client could no longer reach the wire
+// to tell the daemon to drain — the one action that repairs the condition.
+// 18,999 handshake failures over five days, behind green CI in every repo.
+// DESIGN §8.4 makes this gate non-waivable on every release.
+//
+// Every observation the matrix owes is frozen in testdata/frozen/observations.txt
+// rather than derived from this file, and each claim is redeemed against an
+// artifact its case cannot fabricate, so a case that goes missing or stops doing
+// work takes the run red instead of quietly shrinking the matrix.
 package mixedera
 
 import (
-	"bufio"
-	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
+	"slices"
 	"strings"
-	"sync"
 	"testing"
 	"time"
+
+	"github.com/yasyf/daemonkit/version"
 )
 
 const (
-	readyLine   = "READY"
-	readyWait   = 60 * time.Second
-	dialWait    = 90 * time.Second
-	settleWait  = 60 * time.Second
-	buildWait   = 5 * time.Minute
-	tagOverride = "MIXED_ERA_TAG"
+	precutBuildA = "mixedera.precut.a"
+	precutBuildB = "mixedera.precut.b"
+
+	precutBoundary    = "v0.20.10"
+	buildSkewDemotion = "v0.21.0"
+
+	refuseBound             = 10 * time.Second
+	maxHandshakeConnections = 4
 )
 
-var releaseTag = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+$`)
-
-type healthReport struct {
-	WireBuild string `json:"wire_build"`
-	Protocol  int    `json:"protocol"`
-	PID       int    `json:"pid"`
+type peers struct {
+	precut  peer
+	cut     peer
+	covered *manifest
 }
 
-type dialReport struct {
-	SelfBuild string       `json:"self_build"`
-	PeerBuild string       `json:"peer_build"`
-	Protocol  uint16       `json:"protocol"`
-	Health    healthReport `json:"health"`
-	StopAcked bool         `json:"stop_acked"`
+type gateCase struct {
+	name string
+	run  func(t *testing.T, p *peers)
 }
 
-type syncBuffer struct {
-	mu    sync.Mutex
-	bytes []byte
+var gateCases = []gateCase{
+	{
+		name: "session/precut",
+		run: func(t *testing.T, p *peers) {
+			daemon := startPrecut(t, p.precut, precutBuildA)
+			front := newRelay(t, daemon.socket)
+			result, _ := runPeer(t, p.precut, peerWait,
+				"dial", "-socket", front.path, "-build", precutBuildA)
+			if !result.Session {
+				t.Fatalf("same-era session failed: %+v", result)
+			}
+			if result.PeerBuild != precutBuildA || result.PeerProtocol != precutProtocol {
+				t.Errorf("peer identity = build %q protocol %d, want %q and %d",
+					result.PeerBuild, result.PeerProtocol, precutBuildA, precutProtocol)
+			}
+			if result.Health.WireBuild != precutBuildA || result.Health.Protocol != precutProtocol {
+				t.Errorf("health = %+v, want build %q protocol %d",
+					result.Health, precutBuildA, precutProtocol)
+			}
+			if !result.StopAcked {
+				t.Error("the pre-cut daemon did not acknowledge stop")
+			}
+			assertBothSidesFramed(t, front.quiesce(t), precutEra, precutEra)
+			if err := daemon.exitWithin(t, drainWait); err != nil {
+				t.Errorf("pre-cut daemon exited %v\nstderr:\n%s", err, daemon.log.String())
+			}
+			p.covered.redeem(t, precutEra, mechanismSession, mechanismFrame)
+		},
+	},
+	{
+		name: "session/cut",
+		run: func(t *testing.T, p *peers) {
+			daemon := startCut(t, p.cut)
+			front := newRelay(t, daemon.socket)
+			result, _ := runPeer(t, p.cut, peerWait, "dial", "-socket", front.path)
+			if !result.Session {
+				t.Fatalf("same-era session failed: %+v", result)
+			}
+			if result.Protocol != cutProtocol || result.PeerProtocol != cutProtocol {
+				t.Errorf("session protocol = self %d peer %d, want %d on both",
+					result.Protocol, result.PeerProtocol, cutProtocol)
+			}
+			assertBothSidesFramed(t, front.quiesce(t), cutEra, cutEra)
+			writePreamble(t, daemon)
+			if err := daemon.exitWithin(t, drainWait); err != nil {
+				t.Errorf("cut daemon exited %v\nstderr:\n%s", err, daemon.log.String())
+			}
+			p.covered.redeem(t, cutEra, mechanismSession, mechanismFrame)
+		},
+	},
+	{
+		name: "skew/build",
+		run: func(t *testing.T, p *peers) {
+			accepts := !version.Newer(buildSkewDemotion, precutBoundary)
+			t.Logf("boundary %s against the demotion release %s: build skew is expected to %s",
+				precutBoundary, buildSkewDemotion, refusedOrAccepted(accepts))
+
+			daemon := startPrecut(t, p.precut, precutBuildA)
+			result, _ := runPeer(t, p.precut, peerWait,
+				"dial", "-socket", daemon.socket, "-build", precutBuildB)
+			switch {
+			case accepts && !result.Session:
+				t.Errorf("%s accepts build skew and this session failed: %+v", precutBoundary, result)
+			case !accepts && result.Failure != "refused":
+				t.Errorf("%s gates on the exact build, so a skewed client is refused; got %+v",
+					precutBoundary, result)
+			}
+			if !result.Session {
+				daemon.terminate(t)
+			}
+			_ = daemon.exitWithin(t, drainWait)
+		},
+	},
+	{
+		name: "refuse/precut-client-cut-daemon",
+		run: func(t *testing.T, p *peers) {
+			daemon := startCut(t, p.cut)
+			front := newRelay(t, daemon.socket)
+			result, elapsed := runPeer(t, p.precut, peerWait,
+				"dial", "-socket", front.path, "-build", precutBuildA)
+			assertCrispRefusal(t, result, elapsed, front, precutEra, cutEra)
+			daemon.aliveAfter(t, aliveSettle)
+			p.covered.redeem(t, precutEra, mechanismGate)
+			p.covered.redeem(t, cutEra, mechanismGate)
+		},
+	},
+	{
+		name: "refuse/cut-client-precut-daemon",
+		run: func(t *testing.T, p *peers) {
+			daemon := startPrecut(t, p.precut, precutBuildA)
+			front := newRelay(t, daemon.socket)
+			result, elapsed := runPeer(t, p.cut, peerWait, "dial", "-socket", front.path)
+			assertCrispRefusal(t, result, elapsed, front, cutEra, precutEra)
+			if result.PeerProtocol != precutProtocol {
+				t.Errorf("the cut client refused carrying peer protocol %d, want the pre-cut %d: a mismatch without the peer's version is not a typed one",
+					result.PeerProtocol, precutProtocol)
+			}
+			daemon.aliveAfter(t, aliveSettle)
+			p.covered.redeem(t, cutEra, mechanismGate)
+			p.covered.redeem(t, precutEra, mechanismGate)
+			daemon.terminate(t)
+			_ = daemon.exitWithin(t, drainWait)
+		},
+	},
+	{
+		name: "classify/cut",
+		run: func(t *testing.T, p *peers) {
+			t.Log(goRun(t, p.cut.module, "test", "-count=1", "./..."))
+		},
+	},
+	{
+		name: "drain/sigterm-precut",
+		run: func(t *testing.T, p *peers) {
+			daemon := startPrecut(t, p.precut, precutBuildA)
+			daemon.terminate(t)
+			if err := daemon.exitWithin(t, drainWait); err != nil {
+				t.Errorf("SIGTERM ends the pre-cut daemon cleanly; got %v\nstderr:\n%s",
+					err, daemon.log.String())
+			}
+			p.covered.redeem(t, precutEra, mechanismSigterm)
+		},
+	},
+	{
+		name: "drain/sigterm-cut",
+		run: func(t *testing.T, p *peers) {
+			daemon := startCut(t, p.cut)
+			daemon.terminate(t)
+			if err := daemon.exitWithin(t, drainWait); err != nil {
+				t.Errorf("the cut daemon arms signals first and drains, so SIGTERM ends it cleanly; got %v\nstderr:\n%s",
+					err, daemon.log.String())
+			}
+			p.covered.redeem(t, cutEra, mechanismSigterm)
+		},
+	},
+	{
+		name: "drain/preamble",
+		run: func(t *testing.T, p *peers) {
+			daemon := startCut(t, p.cut)
+			writePreamble(t, daemon)
+			if err := daemon.exitWithin(t, drainWait); err != nil {
+				t.Errorf("the frozen preamble drained the cut daemon into %v\nstderr:\n%s",
+					err, daemon.log.String())
+			}
+			p.covered.redeem(t, cutEra, mechanismPreamble)
+		},
+	},
+	{
+		name: "drain/preamble-emitted",
+		run: func(t *testing.T, p *peers) {
+			daemon := startCut(t, p.cut)
+			front := newRelay(t, daemon.socket)
+			result, _ := runPeer(t, p.cut, peerWait, "drain", "-socket", front.path)
+			if result.Failure != "" {
+				t.Fatalf("the cut client's drain failed: %+v", result)
+			}
+			assertPreambleCrossed(t, daemon, front.quiesce(t))
+			if err := daemon.exitWithin(t, drainWait); err != nil {
+				t.Errorf("cut daemon exited %v\nstderr:\n%s", err, daemon.log.String())
+			}
+			p.covered.redeem(t, cutEra, mechanismPreamble)
+		},
+	},
+	{
+		name: "drain/preamble-absent-precut",
+		run: func(t *testing.T, p *peers) {
+			daemon := startPrecut(t, p.precut, precutBuildA)
+			conn := writePreamble(t, daemon)
+			daemon.aliveAfter(t, preambleSettle)
+			awaitPeerClose(t, conn, aliveSettle)
+			p.covered.redeem(t, precutEra, mechanismPreamble, mechanismTrustGate)
+			daemon.terminate(t)
+			_ = daemon.exitWithin(t, drainWait)
+		},
+	},
+	{
+		name: "wedge/18999",
+		run: func(t *testing.T, p *peers) {
+			daemon := startCut(t, p.cut)
+			front := newRelay(t, daemon.socket)
+
+			wedged, elapsed := runPeer(t, p.precut, peerWait,
+				"dial", "-socket", front.path, "-build", precutBuildA)
+			assertCrispRefusal(t, wedged, elapsed, front, precutEra, cutEra)
+			daemon.aliveAfter(t, aliveSettle)
+
+			writePreamble(t, daemon)
+			if err := daemon.exitWithin(t, drainWait); err != nil {
+				t.Errorf("the incumbent that refused the handshake did not drain: %v\nstderr:\n%s",
+					err, daemon.log.String())
+			}
+			p.covered.redeem(t, cutEra, mechanismPreamble, mechanismGate)
+			p.covered.redeem(t, precutEra, mechanismGate)
+		},
+	},
 }
 
-func (b *syncBuffer) Write(payload []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.bytes = append(b.bytes, payload...)
-	return len(payload), nil
-}
-
-func (b *syncBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return string(b.bytes)
-}
-
-func TestMixedEraSessionSurvivesBuildSkew(t *testing.T) {
-	root := repoRoot(t)
-	tag := previousRelease(t, root)
-	t.Logf("mixed-era boundary: working tree vs %s", tag)
-
-	oldPeer := buildPeer(t, "old", "require github.com/yasyf/daemonkit "+tag)
-	newPeer := buildPeer(t, "new", fmt.Sprintf(
-		"require github.com/yasyf/daemonkit v0.0.0\n\nreplace github.com/yasyf/daemonkit => %s", root,
-	))
-
-	oldBuild := "mixedera.consumer." + tag
-	newBuild := "mixedera.consumer.tree"
-
+func TestProbeDeadlineNeedsBothTheStatusAndTheToken(t *testing.T) {
 	tests := []struct {
-		name        string
-		daemon      string
-		daemonBuild string
-		client      string
-		clientBuild string
+		name    string
+		failure error
+		retry   bool
+		saw     string
 	}{
-		{"control/old-daemon-new-client", oldPeer, oldBuild, newPeer, oldBuild},
-		{"control/new-daemon-old-client", newPeer, newBuild, oldPeer, newBuild},
-		{"skew/new-daemon-old-client", newPeer, newBuild, oldPeer, oldBuild},
-		{"skew/old-daemon-new-client", oldPeer, oldBuild, newPeer, newBuild},
+		{
+			"the released peer's own signature",
+			probeFailure(t, precutProbeExit, "serve: begin: trust verifier probe\n"+precutProbeToken+"\n"),
+			true, "exited 69 with that line",
+		},
+		{
+			"an unrelated wrapper leaving by the same status",
+			probeFailure(t, precutProbeExit, "wrapper: upstream unavailable\n"),
+			false, "exited 69 without that line",
+		},
+		{
+			"the token without the status",
+			probeFailure(t, 1, precutProbeToken+"\n"),
+			false, "exited 1 with that line",
+		},
+		{
+			"the token embedded in a longer line",
+			probeFailure(t, precutProbeExit, "note: "+precutProbeToken+" was expected\n"),
+			false, "exited 69 without that line",
+		},
+		{"a start that never reached the peer", errors.New("fork/exec: permission denied"), false, "never reached the peer's own exit"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			report := exchange(t, tt.daemon, tt.daemonBuild, tt.client, tt.clientBuild)
-			if report.PeerBuild != tt.daemonBuild {
-				t.Errorf("handshake peer build = %q, want %q", report.PeerBuild, tt.daemonBuild)
+			retry, saw := probeDeadline(tt.failure)
+			if retry != tt.retry {
+				t.Errorf("retry = %t, want %t", retry, tt.retry)
 			}
-			if report.SelfBuild != tt.clientBuild {
-				t.Errorf("handshake self build = %q, want %q", report.SelfBuild, tt.clientBuild)
-			}
-			if report.Protocol != 1 {
-				t.Errorf("handshake protocol = %d, want 1", report.Protocol)
-			}
-			if report.Health.WireBuild != tt.daemonBuild {
-				t.Errorf("health build = %q, want %q", report.Health.WireBuild, tt.daemonBuild)
-			}
-			if report.Health.Protocol != 1 {
-				t.Errorf("health protocol = %d, want 1", report.Health.Protocol)
-			}
-			if !report.StopAcked {
-				t.Error("stop was not acknowledged")
+			if saw != tt.saw {
+				t.Errorf("saw = %q, want %q", saw, tt.saw)
 			}
 		})
 	}
+	observe(t)
 }
 
-func exchange(t *testing.T, daemonBin, daemonBuild, clientBin, clientBuild string) dialReport {
+func probeFailure(t *testing.T, code int, stderr string) error {
 	t.Helper()
-	dir := socketDir(t)
-	socket := filepath.Join(dir, "d.sock")
-
-	daemon := exec.CommandContext(t.Context(), daemonBin,
-		"serve", "-socket", socket, "-build", daemonBuild, "-state", dir)
-	daemon.WaitDelay = 5 * time.Second
-	stdout, err := daemon.StdoutPipe()
-	if err != nil {
-		t.Fatal(err)
+	exit := exec.CommandContext(t.Context(), "sh", "-c", fmt.Sprintf("exit %d", code)).Run()
+	if exit == nil {
+		t.Fatalf("sh -c 'exit %d' left no exit error", code)
 	}
-	var daemonLog syncBuffer
-	daemon.Stderr = &daemonLog
-	if err := daemon.Start(); err != nil {
-		t.Fatal(err)
-	}
-	exited := make(chan error, 1)
-	joined := false
-	t.Cleanup(func() {
-		if joined {
-			return
-		}
-		_ = daemon.Process.Kill()
-		<-exited
-	})
-	awaitReady(t, stdout, exited, daemon, &daemonLog)
-
-	client := exec.CommandContext(t.Context(), clientBin,
-		"dial", "-socket", socket, "-build", clientBuild)
-	client.WaitDelay = 5 * time.Second
-	clientOut, clientErr := run(t, client, dialWait)
-	if clientErr != nil {
-		t.Fatalf("client %s dialing daemon %s: %v\ndaemon stderr:\n%s",
-			clientBuild, daemonBuild, clientErr, daemonLog.String())
-	}
-
-	var report dialReport
-	if err := json.Unmarshal([]byte(clientOut), &report); err != nil {
-		t.Fatalf("decode client report %q: %v", clientOut, err)
-	}
-
-	select {
-	case err := <-exited:
-		joined = true
-		if err != nil {
-			t.Fatalf("daemon %s exited %v\nstderr:\n%s", daemonBuild, err, daemonLog.String())
-		}
-	case <-time.After(settleWait):
-		t.Fatalf("daemon %s did not settle after stop\nstderr:\n%s", daemonBuild, daemonLog.String())
-	}
-	return report
+	return &startFailure{era: precutEra, reason: "exited before " + readyLine, stderr: stderr, err: exit}
 }
 
-func awaitReady(t *testing.T, stdout io.Reader, exited chan error, daemon *exec.Cmd, log *syncBuffer) {
-	t.Helper()
-	ready := make(chan struct{})
-	go func() {
-		scanner := bufio.NewScanner(stdout)
-		for scanner.Scan() {
-			if strings.TrimSpace(scanner.Text()) == readyLine {
-				close(ready)
-				break
-			}
-		}
-		_, _ = io.Copy(io.Discard, stdout)
-		exited <- daemon.Wait()
-	}()
-	select {
-	case <-ready:
-	case err := <-exited:
-		exited <- err
-		t.Fatalf("daemon exited before %s: %v\nstderr:\n%s", readyLine, err, log.String())
-	case <-time.After(readyWait):
-		t.Fatalf("daemon did not report %s within %s\nstderr:\n%s", readyLine, readyWait, log.String())
+func TestPrecutBoundaryPredatesTheCut(t *testing.T) {
+	if !version.Newer(buildSkewDemotion, precutBoundary) {
+		t.Fatalf("boundary %s is not older than the cut's first release %s: the pre-cut peer would compile against the rewrite",
+			precutBoundary, buildSkewDemotion)
 	}
+	observe(t)
 }
 
-func run(t *testing.T, cmd *exec.Cmd, wait time.Duration) (string, error) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), wait)
-	defer cancel()
-	var stdout, stderr syncBuffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Start(); err != nil {
-		return "", err
+func TestMixedEra(t *testing.T) {
+	t.Logf("mixed-era boundary: the working tree against %s", precutBoundary)
+
+	p := &peers{
+		precut: buildPeer(t, precutEra),
+		cut:    buildPeer(t, cutEra),
 	}
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	select {
-	case err := <-done:
-		if err != nil {
-			return stdout.String(), fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()))
-		}
-		return stdout.String(), nil
-	case <-ctx.Done():
-		_ = cmd.Process.Kill()
-		<-done
-		return stdout.String(), fmt.Errorf("timed out after %s: %s", wait, strings.TrimSpace(stderr.String()))
+	p.covered = newManifest(t, precutBoundary, p.precut, p.cut)
+	t.Cleanup(func() { p.covered.finish(t) })
+
+	for _, gate := range gateCases {
+		t.Run(gate.name, func(t *testing.T) {
+			gate.run(t, p)
+			observe(t)
+		})
 	}
+	observe(t)
 }
 
-func buildPeer(t *testing.T, era, directive string) string {
+// assertCrispRefusal redeems the daemon era's gate off the wire: the relay saw
+// the daemon answer with its own frozen frame identity, and a separate process
+// read a typed protocol mismatch out of that answer.
+func assertCrispRefusal(
+	t *testing.T,
+	result report,
+	elapsed time.Duration,
+	front *relay,
+	clientEra, daemonEra string,
+) {
 	t.Helper()
-	dir := t.TempDir()
-	source, err := os.ReadFile(filepath.Join("testdata", "peer", "main.go"))
-	if err != nil {
-		t.Fatal(err)
+	if result.Failure != failureProtocolMismatch {
+		t.Errorf("failure = %q (%s), want %s", result.Failure, result.Detail, failureProtocolMismatch)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "main.go"), source, 0o644); err != nil {
-		t.Fatal(err)
+	if elapsed > refuseBound {
+		t.Errorf("the refusal took %s, want under %s", elapsed, refuseBound)
 	}
-	manifest := fmt.Sprintf("module mixedera/peer/%s\n\ngo %s\n\n%s\n", era, goDirective(t), directive)
-	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(manifest), 0o644); err != nil {
-		t.Fatal(err)
+	crossings := front.quiesce(t)
+	if len(crossings) > maxHandshakeConnections {
+		t.Errorf("the refused client opened %d connections, want at most %d",
+			len(crossings), maxHandshakeConnections)
 	}
-	binary := filepath.Join(dir, "peer")
-	for _, args := range [][]string{{"mod", "tidy"}, {"build", "-o", binary, "."}} {
-		cmd := exec.CommandContext(t.Context(), "go", args...)
-		cmd.Dir = dir
-		cmd.Env = append(os.Environ(), "GOFLAGS=-mod=mod", "GOWORK=off")
-		if out, err := run(t, cmd, buildWait); err != nil {
-			t.Fatalf("%s era: go %s: %v\n%s", era, strings.Join(args, " "), err, out)
-		}
+	answered := assertBothSidesFramed(t, crossings, clientEra, daemonEra)
+	if !answered || result.Failure != failureProtocolMismatch {
+		return
 	}
-	return binary
+	observedPresent(t, daemonEra, mechanismGate, fromWire, fmt.Sprintf(
+		"the %s daemon answered each of the %d connections the refused %s client opened with its own frozen frame prefix, and that client read a typed %s out of the answer",
+		daemonEra, len(crossings), clientEra, failureProtocolMismatch,
+	))
 }
 
-func previousRelease(t *testing.T, root string) string {
+func assertBothSidesFramed(t *testing.T, crossings []exchange, clientEra, daemonEra string) bool {
 	t.Helper()
-	if tag := os.Getenv(tagOverride); tag != "" {
-		return tag
+	if len(crossings) == 0 {
+		t.Error("the relay copied no connection at all")
+		return false
 	}
-	head := git(t, root, "rev-parse", "HEAD^{commit}")
-	for _, tag := range strings.Split(git(t, root, "tag", "--sort=-creatordate"), "\n") {
-		if !releaseTag.MatchString(tag) {
-			continue
-		}
-		if gitRun(t, root, "merge-base", "--is-ancestor", tag, "HEAD") != nil {
-			continue
-		}
-		if git(t, root, "rev-list", "-n", "1", tag) == head {
-			continue
-		}
-		return tag
+	framed := true
+	for i, crossing := range crossings {
+		where := fmt.Sprintf("%d of %d", i+1, len(crossings))
+		framed = assertFramePrefix(t, "client connection "+where, crossing.opened, clientEra) && framed
+		framed = assertFramePrefix(t, "daemon connection "+where, crossing.answered, daemonEra) && framed
 	}
-	t.Fatalf("no released tag precedes HEAD; set %s to name one", tagOverride)
-	return ""
+	return framed
 }
 
-func repoRoot(t *testing.T) string {
+func assertFramePrefix(t *testing.T, side string, observed []byte, era string) bool {
 	t.Helper()
-	root, err := filepath.Abs("../..")
-	if err != nil {
-		t.Fatal(err)
+	want := frozen(t, frameFixture(era))
+	if !carriesFramePrefix(observed, want) {
+		t.Errorf("the %s wrote %#x, which does not carry the frozen %s prefix %#x at offset %d",
+			side, observed, era, want, framePrefixOffset)
+		return false
 	}
-	return root
+	return true
 }
 
-func goDirective(t *testing.T) string {
-	t.Helper()
-	manifest, err := os.ReadFile(filepath.Join(repoRoot(t), "go.mod"))
-	if err != nil {
-		t.Fatal(err)
+func refusedOrAccepted(accepts bool) string {
+	if accepts {
+		return "be accepted"
 	}
-	for line := range strings.Lines(string(manifest)) {
-		if directive, ok := strings.CutPrefix(strings.TrimSpace(line), "go "); ok {
-			return strings.TrimSpace(directive)
+	return "be refused"
+}
+
+// startPrecut retries the released binary's start on one adjudicated flake and
+// nothing else: the pre-cut runtime bounds its trust-verifier self-probe at
+// 10s, which fork/exec latency on a loaded runner loses, and no change to this
+// tree can reach an already-released binary to widen it.
+func startPrecut(t *testing.T, p peer, build string) *daemonProc {
+	t.Helper()
+	var probes []string
+	for attempt := 1; attempt <= precutStartAttempts; attempt++ {
+		dir := socketDir(t)
+		socket := filepath.Join(dir, "d.sock")
+		daemon, err := tryStartDaemon(t, p, socket,
+			"serve", "-socket", socket, "-build", build, "-state", dir)
+		if err == nil {
+			return daemon
 		}
-	}
-	t.Fatal("go.mod declares no go directive")
-	return ""
-}
-
-// socketDir mirrors wiretest.SocketDir: macOS caps sun_path at 104 bytes,
-// which t.TempDir routinely exceeds.
-func socketDir(t *testing.T) string {
-	t.Helper()
-	dir, err := os.MkdirTemp("/tmp", fmt.Sprintf("dk-mixedera-%d-", os.Getpid()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	return dir
-}
-
-func git(t *testing.T, root string, args ...string) string {
-	t.Helper()
-	cmd := exec.CommandContext(t.Context(), "git", args...)
-	cmd.Dir = root
-	out, err := cmd.Output()
-	if err != nil {
-		var exit *exec.ExitError
-		if errors.As(err, &exit) {
-			t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, exit.Stderr)
+		probe, saw := probeDeadline(err)
+		if !probe {
+			t.Fatalf("the pre-cut daemon failed to start, and the only failure this gate retries is its trust-verifier self-probe, which prints %q on stderr and then exits %d. This start %s:\n%v",
+				precutProbeToken, precutProbeExit, saw, err)
 		}
-		t.Fatalf("git %s: %v", strings.Join(args, " "), err)
+		probes = append(probes, fmt.Sprintf("attempt %d of %d: %s\n%v", attempt, precutStartAttempts, saw, err))
+		t.Logf("the pre-cut trust-verifier self-probe missed its deadline, %s", probes[len(probes)-1])
 	}
-	return strings.TrimSpace(string(out))
+	t.Fatalf("the pre-cut daemon never cleared its trust-verifier self-probe in %d attempts. This is the known environmental flake, not a regression in this tree: the released runtime bounds its self-probe at 10s, and fork/exec latency for the same trivial spawn has been measured anywhere from 0.00s to 13.66s on a loaded machine (cc-notes note a40a3a1). Nothing in this tree can reach an already-released binary to widen that bound.\n%s",
+		precutStartAttempts, strings.Join(probes, "\n"))
+	return nil
 }
 
-func gitRun(t *testing.T, root string, args ...string) error {
+// probeDeadline reports whether a failed pre-cut start carries the released
+// peer's full trust-probe signature — the token it prints immediately before
+// leaving AND the exit status — and describes what it saw either way.
+func probeDeadline(err error) (bool, string) {
+	var failure *startFailure
+	if !errors.As(err, &failure) {
+		return false, "never reached the peer's own exit"
+	}
+	tokened := slices.Contains(strings.Split(failure.stderr, "\n"), precutProbeToken)
+	saw := "without that line"
+	if tokened {
+		saw = "with that line"
+	}
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) {
+		return false, fmt.Sprintf("left without an exit status, %s", saw)
+	}
+	return exit.ExitCode() == precutProbeExit && tokened,
+		fmt.Sprintf("exited %d %s", exit.ExitCode(), saw)
+}
+
+func startCut(t *testing.T, p peer) *daemonProc {
 	t.Helper()
-	cmd := exec.CommandContext(t.Context(), "git", args...)
-	cmd.Dir = root
-	return cmd.Run()
+	socket := filepath.Join(socketDir(t), "d.sock")
+	return startDaemon(t, p, socket, "serve", "-socket", socket)
 }

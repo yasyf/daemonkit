@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
 
 concurrency:
   group: mixed-era-${{ github.ref }}
@@ -12,72 +13,21 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  # Whether `skew/*` is expected to pass. This tree gates on ProtocolVersion
-  # alone and treats WireBuild as a diagnostic, so it accepts build skew — that
-  # contract is proven in-process by wire.TestSessionSurvivesBuildSkew, which is
-  # where a re-tightening would show up first.
-  #
-  # It stays `fail` anyway, because a session needs BOTH ends to accept and the
-  # boundary release this job builds still enforces the old exact-match gate. No
-  # change to this tree can make an already-released client accept skew.
-  #
-  # Flip to `pass` on the first run whose newest release ancestor is itself
-  # post-demotion (>= v0.21.0). The job reports "the expectation is stale" and
-  # goes red at exactly that moment, so this does not need watching for.
-  SKEW_EXPECT: fail
-
 jobs:
   mixed-era:
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      # Full history and tags: the test resolves the mixed-era boundary by
-      # walking `git tag` for the newest release that is an ancestor of HEAD.
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          fetch-tags: true
 
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
 
-      # Build-tagged out of ./..., so ci.yml never inherits this gate.
-      - name: Same-era control
-        run: ./scripts/test.sh -race -count=1 -tags mixedera -v -run 'TestMixedEraSessionSurvivesBuildSkew/control' ./ci/mixedera/...
-
-      - name: Cross-era skew matches SKEW_EXPECT
-        run: |
-          set +e
-          ./scripts/test.sh -race -count=1 -tags mixedera -v -run 'TestMixedEraSessionSurvivesBuildSkew/skew' ./ci/mixedera/...
-          code=$?
-          set -e
-          actual=pass
-          [ "$code" -eq 0 ] || actual=fail
-          echo "skew: expected=$SKEW_EXPECT actual=$actual (go test exit $code)"
-          if [ "$actual" = "$SKEW_EXPECT" ]; then
-            exit 0
-          fi
-          if [ "$actual" = pass ]; then
-            {
-              echo "### Mixed-era skew now passes — the expectation is stale"
-              echo
-              echo "A daemon and client whose build strings differ now share a session."
-              echo "That is the v0.21.0 contract, so set \`SKEW_EXPECT: pass\` in this"
-              echo "workflow as part of the change that demoted \`WireBuild\`."
-            } >>"$GITHUB_STEP_SUMMARY"
-          else
-            {
-              echo "### Mixed-era skew regressed"
-              echo
-              echo "\`SKEW_EXPECT\` says cross-era sessions should work, and they do not."
-              echo "Something re-tightened the handshake into an exact-match gate."
-            } >>"$GITHUB_STEP_SUMMARY"
-          fi
-          exit 1
+      - name: Mixed-era gate
+        run: ./scripts/mixed-era.sh
