@@ -26,13 +26,15 @@ var ErrUnbound = errors.New("state: unbound file")
 type Schema uint32
 
 // Core is the frozen identity of one recorded process. Its encoding never
-// changes, so any later era extracts it from a file whose payload it cannot
-// decode.
+// changes — Session, omitted for anything but a dedicated-session leader, is
+// the frozen form's one additive field — so any later era extracts it from a
+// file whose payload it cannot decode, group authority included.
 type Core struct {
 	PID        int    `json:"pid"`
 	Start      uint64 `json:"start"`
 	Boot       uint64 `json:"boot"`
 	Generation uint64 `json:"generation"`
+	Session    int    `json:"session,omitempty"`
 }
 
 // Cored is a payload that names the identities it records. Cores are read off

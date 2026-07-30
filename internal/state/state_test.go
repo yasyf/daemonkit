@@ -139,6 +139,32 @@ func TestFrameLayoutIsFrozen(t *testing.T) {
 	}
 }
 
+func TestSessionCoreIsFrozenInTheEnvelope(t *testing.T) {
+	const wantEnvelope = `{"cores":[{"pid":1,"start":2,"boot":3,"generation":4,"session":1}]}`
+	path := filepath.Join(t.TempDir(), "records.json")
+	file := New[records](path, era)
+	if err := file.Store(records{Live: []Core{{PID: 1, Start: 2, Boot: 3, Generation: 4, Session: 1}}}); err != nil {
+		t.Fatalf("Store() error = %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(raw[28 : 28+len(wantEnvelope)]); got != wantEnvelope {
+		t.Errorf("envelope = %s, want %s", got, wantEnvelope)
+	}
+
+	_, future := seed(t, handFrame(uint32(era)+1, wantEnvelope, "not this era's payload"))
+	got, err := future.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	want := []Core{{PID: 1, Start: 2, Boot: 3, Generation: 4, Session: 1}}
+	if !reflect.DeepEqual(got.Cores, want) {
+		t.Errorf("Cores = %#v, want %#v", got.Cores, want)
+	}
+}
+
 func TestLoadArchivesAsideAndYieldsCores(t *testing.T) {
 	const (
 		envelope = `{"cores":[{"pid":11,"start":22,"boot":33,"generation":44}],"era":"unknown to this build"}`

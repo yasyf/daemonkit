@@ -26,7 +26,7 @@ table() {
   module="$(go list -m)"
   echo "| Package | Owns | Files | Lines |"
   echo "|---|---|---|---|"
-  go list -f '{{.ImportPath}}	{{.Name}}	{{.Dir}}	{{.Doc}}' ./... |
+  go list -e -f '{{.ImportPath}}	{{.Name}}	{{.Dir}}	{{.Doc}}' ./... |
     while IFS=$'\t' read -r path name dir doc; do
       rel="${path#"$module"}"
       rel="${rel#/}"
