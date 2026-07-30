@@ -8,6 +8,7 @@ import "fmt"
 // Dynamic code-signing status bits, verified against xnu's cs_blobs.h and
 // Apple's CSCommon.h.
 const (
+	Valid        = 0x00000001 // CS_VALID: the kernel has not invalidated this process's signature
 	GetTaskAllow = 0x00000004 // CS_GET_TASK_ALLOW: get-task-allow entitlement
 	ForcedLV     = 0x00000010 // CS_FORCED_LV: library validation forced by system policy
 	Hard         = 0x00000100 // CS_HARD (kSecCodeStatusHard): executable page protection
@@ -17,40 +18,26 @@ const (
 	Debugged     = 0x10000000 // CS_DEBUGGED: ran with invalid pages under a debugger
 )
 
-// LibraryValidation selects which oracle proves that a peer enforces library
-// validation.
-type LibraryValidation int
-
-const (
-	// RequireLibraryValidation denies a status word carrying neither
-	// CS_REQUIRE_LV nor CS_FORCED_LV. A verifier that reads only the status
-	// word passes this: the LV clause is the sole clause that can deny a
-	// binary signed --options runtime with library validation disabled
-	// (measured status 0x22011301, whose CS_RUNTIME, CS_HARD and
-	// CS_ENFORCEMENT are all set).
-	RequireLibraryValidation LibraryValidation = iota
-	// LibraryValidationByEntitlement leaves the clause to a verifier that
-	// reads the peer's entitlement dictionary and denies the
-	// library-validation-disabling entitlement there, exempting it exactly
-	// when LibraryValidationEnforced already proves the peer enforces
-	// library validation.
-	LibraryValidationByEntitlement
-)
-
 // Check reports why a peer's dynamic code-signing status word fails
 // daemonkit's posture floor, or nil when it passes. The reason carries no
-// sentinel; each verifier wraps it in its own untrusted-peer error.
+// sentinel; the verifier wraps it in its own untrusted-peer error.
 //
-// Check proves exactly what the kernel's status word states: the Hardened
-// Runtime is on, executable page protection and signature enforcement are
-// intact, no debugger is attached or entitled, and — under
-// RequireLibraryValidation — library validation is enforced. It cannot prove
-// the absence of allow-jit or allow-dyld-environment-variables: both leave
-// the status word bit-identical to a clean hardened-runtime binary (measured
-// 0x22011311 on Slack, Cursor, 1Password and Claude.app), so no status-word
-// clause can ever close them. Only the peer's entitlement dictionary rules
-// them out, and that oracle lives in package trust.
-func Check(status int64, lv LibraryValidation) error {
+// Check proves exactly what the kernel's status word states: the signature is
+// valid, the Hardened Runtime is on, executable page protection and signature
+// enforcement are intact, no debugger is attached or entitled, and library
+// validation is enforced. CS_VALID and the CS_DEBUGGED clause are two halves
+// of one kernel disjunction — xnu serves the identity ops for
+// CS_VALID | CS_DEBUGGED, so a successful identity read implies neither on its
+// own. Check cannot prove the absence of allow-jit or
+// allow-dyld-environment-variables: both leave the status word bit-identical
+// to a clean hardened-runtime binary (measured 0x22011311 on Slack, Cursor,
+// 1Password and Claude.app), so no status-word clause can ever close them.
+// Only the peer's entitlement dictionary rules them out, and that oracle lives
+// in package trust.
+func Check(status int64) error {
+	if status&Valid == 0 {
+		return fmt.Errorf("peer signature is invalid (CS_VALID clear, status 0x%x)", status)
+	}
 	if status&Runtime == 0 {
 		return fmt.Errorf("peer lacks the Hardened Runtime (status 0x%x)", status)
 	}
@@ -66,14 +53,8 @@ func Check(status int64, lv LibraryValidation) error {
 	if status&Debugged != 0 {
 		return fmt.Errorf("peer ran under a debugger (CS_DEBUGGED, status 0x%x)", status)
 	}
-	if lv == RequireLibraryValidation && !LibraryValidationEnforced(status) {
+	if status&(RequireLV|ForcedLV) == 0 {
 		return fmt.Errorf("peer does not enforce library validation (status 0x%x)", status)
 	}
 	return nil
-}
-
-// LibraryValidationEnforced reports whether the status word itself proves the
-// peer enforces library validation.
-func LibraryValidationEnforced(status int64) bool {
-	return status&(RequireLV|ForcedLV) != 0
 }

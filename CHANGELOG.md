@@ -8,6 +8,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking.** Peer code-identity verification is kernel-only and in-process.
+  The packages `trust`, `peer`, and `codeidentity` are deleted whole and replaced
+  by module-private `internal/trust`; with them go `trust.RunVerifierChild` and
+  the disposable verifier child every consumer had to dispatch at the top of
+  `main`, both purego Security.framework bindings, the role and authority
+  registry (`trust.PeerRole`, `TrustPolicy`, `NewTrustPolicy`, and every
+  `Allows*` accessor), and `codeidentity`'s three sentinels. Verification is now
+  seven `csops_audittoken` reads against the accepted socket's audit token: no
+  file is opened, no daemon is contacted, no CoreFoundation object is built, and
+  the path cannot block, so it needs no worker lane, no timeout, and no
+  `context.Context`.
+
+  Two clauses are new denials rather than relocations. `CS_VALID` is now
+  required explicitly: xnu serves the identity ops for `CS_VALID | CS_DEBUGGED`,
+  so a successful read never implied a valid signature, and a process whose
+  signature the kernel invalidated at runtime was admitted before. And the six
+  injection entitlements are rejected unconditionally — the old verifier skipped
+  `disable-library-validation` whenever the status word proved library
+  validation, which every peer reaching that clause did, so the clause was dead
+  code. `Requirement.AllowJIT` is the one relaxation, and it is documented as
+  the marker of a peer this mechanism cannot authenticate rather than as a
+  bounded exception.
+
+  A peer's signing leaf is now resolved through the CMS SignerInfo and asserted
+  to carry the CodeDirectory's team as its Organizational Unit. Apple's own
+  `SecStaticCode::verifySignature()` silently skips that comparison when the
+  leaf has no Organizational Unit, and the old designated-requirement string
+  failed closed on such a leaf where a kernel-only check would not.
+- The daemon-facing binary-absence invariant is narrowed. A daemon-facing binary
+  still carries no consumer-supplied policy value — no app group, no required
+  entitlement key or value — but the six injection entitlement identifiers and
+  `com.apple.security.application-groups` are unconditional constants in the one
+  verifier now, so every daemonkit binary contains them. The information given
+  up is a list of Apple-published entitlement names in an open-source library.
 - **Breaking.** The wire handshake gates on `ProtocolVersion` alone. `WireBuild`
   is still required and still exchanged, but it is now a diagnostic rather than a
   gate, and the four post-handshake re-checks and the readiness-path build gate

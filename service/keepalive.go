@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/yasyf/daemonkit/codeidentity"
+	"github.com/yasyf/daemonkit/internal/trust"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/daemonkit/worker"
@@ -60,9 +60,9 @@ type appOwnedProcessRecovery interface {
 type AppStopSpec struct {
 	Dial           wire.Dialer
 	ExecutableName string
-	CodeIdentity   codeidentity.CodeIdentity
+	Requirement    trust.Requirement
 	// PolicyDigest is the opaque digest bound by the prior signed-side session.
-	PolicyDigest codeidentity.PolicyDigest
+	PolicyDigest trust.PolicyDigest
 	Reaper       *proc.Reaper
 	// RecoveryID names the barrier required before a retired app receipt is
 	// acknowledged.
@@ -71,9 +71,9 @@ type AppStopSpec struct {
 	reaper     appProcessReaper
 	dependents appOwnedProcessRecovery
 
-	peerFromConn func(net.Conn) (wire.Peer, error)
+	peerFromConn func(net.Conn) (trust.Peer, error)
 	processes    func(string) ([]proc.Identity, error)
-	checkPeer    func(wire.Peer, codeidentity.CodeIdentity) error
+	checkPeer    func(trust.Peer, trust.Requirement) error
 	now          func() time.Time
 	pause        func(context.Context, time.Duration) error
 	deadline     time.Duration
@@ -89,8 +89,8 @@ type AuthenticatedAppPeer struct {
 	Boot             string
 	Executable       string
 	AuditTokenDigest [32]byte
-	CodeIdentity     codeidentity.CodeIdentity
-	PolicyDigest     codeidentity.PolicyDigest
+	Requirement      trust.Requirement
+	PolicyDigest     trust.PolicyDigest
 }
 
 func (k AppKeepAlive) launchctl(ctx context.Context, args ...string) launchctlResult {
@@ -223,7 +223,8 @@ func (k AppKeepAlive) Stop(
 	if err := expected.validate(executable); err != nil {
 		return err
 	}
-	if expected.CodeIdentity != spec.CodeIdentity {
+	if expected.Requirement.SigningIdentifier != spec.Requirement.SigningIdentifier ||
+		expected.Requirement.TeamID != spec.Requirement.TeamID {
 		return errors.New("keepalive agent: authenticated app peer code identity changed")
 	}
 	if expected.PolicyDigest != spec.PolicyDigest {
@@ -319,11 +320,10 @@ func (k AppKeepAlive) Stop(
 
 func (p AuthenticatedAppPeer) validate(executable string) error {
 	if p.PID <= 1 || p.UID < 0 || p.StartTime == "" || p.Boot == "" || p.Executable != executable ||
-		p.AuditTokenDigest == ([32]byte{}) || p.CodeIdentity == (codeidentity.CodeIdentity{}) ||
-		p.PolicyDigest == (codeidentity.PolicyDigest{}) {
+		p.AuditTokenDigest == ([32]byte{}) || p.PolicyDigest == (trust.PolicyDigest{}) {
 		return errors.New("keepalive agent: authenticated app peer proof is incomplete")
 	}
-	if _, err := p.CodeIdentity.DRString(); err != nil {
+	if err := p.Requirement.Validate(); err != nil {
 		return fmt.Errorf("keepalive agent: authenticated app peer code identity: %w", err)
 	}
 	return nil
@@ -345,7 +345,7 @@ func (k AppKeepAlive) validateStop(spec AppStopSpec) (string, error) {
 	if spec.Dial == nil || (spec.Reaper == nil && spec.reaper == nil) || (spec.Dependents == nil && spec.dependents == nil) {
 		return "", errors.New("keepalive agent: app stop requires a dialer, durable reaper, and dependent recovery")
 	}
-	if spec.PolicyDigest == (codeidentity.PolicyDigest{}) {
+	if spec.PolicyDigest == (trust.PolicyDigest{}) {
 		return "", errors.New("keepalive agent: app stop policy digest is required")
 	}
 	if err := spec.RecoveryID.Validate(); err != nil {
@@ -354,10 +354,10 @@ func (k AppKeepAlive) validateStop(spec AppStopSpec) (string, error) {
 	if filepath.Base(spec.ExecutableName) != spec.ExecutableName || spec.ExecutableName == "." || spec.ExecutableName == "" {
 		return "", errors.New("keepalive agent: app stop executable name is invalid")
 	}
-	if k.BundleID == "" || spec.CodeIdentity.SigningIdentifier != k.BundleID {
+	if k.BundleID == "" || spec.Requirement.SigningIdentifier != k.BundleID {
 		return "", errors.New("keepalive agent: app stop signing identifier must equal BundleID")
 	}
-	if _, err := spec.CodeIdentity.DRString(); err != nil {
+	if err := spec.Requirement.Validate(); err != nil {
 		return "", fmt.Errorf("keepalive agent: app stop code identity: %w", err)
 	}
 	executable := filepath.Join(k.AppPath, "Contents", "MacOS", spec.ExecutableName)
@@ -397,15 +397,15 @@ func validateDirectAppPath(appPath, executable string) error {
 	return nil
 }
 
-func (s AppStopSpec) peer(conn net.Conn) (wire.Peer, error) {
+func (s AppStopSpec) peer(conn net.Conn) (trust.Peer, error) {
 	if s.peerFromConn != nil {
 		return s.peerFromConn(conn)
 	}
 	unix, ok := conn.(*net.UnixConn)
 	if !ok {
-		return wire.Peer{}, errors.New("fixed app dial did not return a Unix connection")
+		return trust.Peer{}, errors.New("fixed app dial did not return a Unix connection")
 	}
-	return wire.PeerFromConn(unix)
+	return trust.PeerCredentials(unix)
 }
 
 func (s AppStopSpec) executableProcesses(executable string) ([]proc.Identity, error) {
@@ -415,11 +415,16 @@ func (s AppStopSpec) executableProcesses(executable string) ([]proc.Identity, er
 	return proc.ExecutableIdentities(executable)
 }
 
-func (s AppStopSpec) check(peer wire.Peer) error {
+// The fixed app is the server here and daemonkit the client, so this proves
+// the thing about to be stopped is the app that was installed rather than an
+// impostor squatting its socket. It is the one verifier, entered at the one
+// entry point: a second, weaker check for this direction is exactly the
+// two-verifier divergence the rebuild deleted.
+func (s AppStopSpec) check(peer trust.Peer) error {
 	if s.checkPeer != nil {
-		return s.checkPeer(peer, s.CodeIdentity)
+		return s.checkPeer(peer, s.Requirement)
 	}
-	return (codeidentity.CodePolicy{Identity: s.CodeIdentity}).Check(peer)
+	return trust.Verify(peer, &s.Requirement)
 }
 
 func (k AppKeepAlive) bootout(ctx context.Context) error {

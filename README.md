@@ -76,17 +76,14 @@ disappears cannot leave a stale row behind.
 |---|---|---|---|
 | `artifact` | resolves a version-exact executable from a declarative descriptor, for the cc-family's one central "give me the binary that matches my version" primitive. | 16 | 2230 |
 | `bundle` | reads a macOS .app's Info.plist and resolves the stable bundle paths a daemon installs to. | 5 | 200 |
-| `codeidentity` | defines daemon-safe signed-code identity and opaque policy proofs. | 7 | 617 |
-| `daemon` | is the consumer-agnostic process runtime for a detached daemon: exclusive listener ownership, readiness, ordered shutdown, skew observation, idle exit, and embedded-process coordination. | 19 | 4693 |
+| `daemon` | is the consumer-agnostic process runtime for a detached daemon: exclusive listener ownership, readiness, ordered shutdown, skew observation, idle exit, and embedded-process coordination. | 18 | 4670 |
 | `deployment` | owns sealed installation, activation, upgrade, and removal of one fixed signed application. | 18 | 4172 |
 | `ghrelease` | queries GitHub for a repository's latest published release. | 2 | 170 |
 | `paths` | owns the canonical state-directory layout under the user's home directory, resolved through the passwd database — never the caller's HOME or CLAUDE_CONFIG_DIR — so a sandboxed environment cannot relocate state. | 4 | 209 |
-| `peer` | defines the OS-authenticated identity shared by transport and trust. | 4 | 175 |
-| `service` | converges an exact durable set of macOS user LaunchAgents. | 28 | 10992 |
+| `service` | converges an exact durable set of macOS user LaunchAgents. | 28 | 10997 |
 | `templates` | — | 2 | 218 |
-| `trust` | verifies the code-signing identity of a connected unix-socket peer: a same-UID floor on every platform plus, on signed darwin builds, a designated requirement checked against the peer's audit token. | 12 | 2356 |
 | `version` | classifies and compares release and development builds for launcher-owned runtime settlement and release ordering. | 2 | 302 |
-| `wire` | is daemonkit's persistent multiplexed unix-socket transport. | 40 | 10407 |
+| `wire` | is daemonkit's persistent multiplexed unix-socket transport. | 39 | 10384 |
 | `wire/wiretest` | is the in-process harness for wire's transport and peer tests: short-path socket dirs, a real client/server pair, an injectable peer, and a manually-advanced clock mirroring proc's seam. | 2 | 232 |
 | `worker` | runs bounded disposable commands under daemonkit process ownership. | 2 | 1934 |
 <!-- END GENERATED: package table -->
@@ -123,29 +120,31 @@ under `.daemonkit-deployment/<Product>`.
 
 ## The consumer trust contract
 
-Peer verification runs in a disposable child of the daemon's own executable.
-The one obligation a product keeps is dispatching that child verb at the top of
-`main`, before argument parsing or any other output:
+Peer verification is a handful of kernel reads against the accepted socket's
+audit token, in the daemon's own process. A product owes it nothing: no child
+verb to dispatch, no worker lane to size, no framework to load. Declare what a
+peer must prove and daemonkit enforces it in the acceptor:
 
 ```go
-func main() {
-	if handled, err := trust.RunVerifierChild(os.Args[1:], os.Stdout); handled {
-		if err != nil {
-			log.Fatal(err)
-		}
-		return
-	}
-	// ordinary argument parsing and startup
+daemonkit.Daemon{
+	Label: "com.example.broker",
+	Trust: daemonkit.Trust{
+		Control: &daemonkit.Requirement{
+			TeamID:            "ABCDE12345",
+			SigningIdentifier: "com.example.broker.helper",
+		},
+	},
 }
 ```
 
-daemonkit owns the other half of the exchange: the verifier worker lane is
-sized from daemonkit's constants, so a product's worker pool budgets cannot
-truncate a verdict, and `daemon.Runtime.Begin` proves one verifier exchange end
-to end against the daemon's own identity before serving. A daemon whose
-executable skips the dispatch refuses to start with
-`daemon.ErrTrustVerifierProbe` instead of silently rejecting every peer as
-untrusted.
+The same-effective-UID floor runs first, unconditionally, on every platform and
+for every peer; no `Trust` value can express its absence. A configured
+`Requirement` on a build with no verifier — any platform but darwin, or a
+`daemonkit_unsigned` build — is denied outright rather than downgraded to
+UID-only. What the check proves, and what it does not, is
+`Requirement`'s documented contract: it authenticates the peer's main Mach-O as
+a program a team signed under an identifier, not the product you installed, not
+an up-to-date build, and not a principal.
 
 Status: the module is pre-1.0 and hard-cut — no release carries a compatibility
 shim for the one before it. Protocol and durable-state epochs begin at 1 with

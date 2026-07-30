@@ -30,17 +30,14 @@ reverted rather than trusted.
 |---|---|---|---|
 | `artifact` | resolves a version-exact executable from a declarative descriptor, for the cc-family's one central "give me the binary that matches my version" primitive. | 16 | 2230 |
 | `bundle` | reads a macOS .app's Info.plist and resolves the stable bundle paths a daemon installs to. | 5 | 200 |
-| `codeidentity` | defines daemon-safe signed-code identity and opaque policy proofs. | 7 | 617 |
-| `daemon` | is the consumer-agnostic process runtime for a detached daemon: exclusive listener ownership, readiness, ordered shutdown, skew observation, idle exit, and embedded-process coordination. | 19 | 4693 |
+| `daemon` | is the consumer-agnostic process runtime for a detached daemon: exclusive listener ownership, readiness, ordered shutdown, skew observation, idle exit, and embedded-process coordination. | 18 | 4670 |
 | `deployment` | owns sealed installation, activation, upgrade, and removal of one fixed signed application. | 18 | 4172 |
 | `ghrelease` | queries GitHub for a repository's latest published release. | 2 | 170 |
 | `paths` | owns the canonical state-directory layout under the user's home directory, resolved through the passwd database — never the caller's HOME or CLAUDE_CONFIG_DIR — so a sandboxed environment cannot relocate state. | 4 | 209 |
-| `peer` | defines the OS-authenticated identity shared by transport and trust. | 4 | 175 |
-| `service` | converges an exact durable set of macOS user LaunchAgents. | 28 | 10992 |
+| `service` | converges an exact durable set of macOS user LaunchAgents. | 28 | 10997 |
 | `templates` | — | 2 | 218 |
-| `trust` | verifies the code-signing identity of a connected unix-socket peer: a same-UID floor on every platform plus, on signed darwin builds, a designated requirement checked against the peer's audit token. | 12 | 2356 |
 | `version` | classifies and compares release and development builds for launcher-owned runtime settlement and release ordering. | 2 | 302 |
-| `wire` | is daemonkit's persistent multiplexed unix-socket transport. | 40 | 10407 |
+| `wire` | is daemonkit's persistent multiplexed unix-socket transport. | 39 | 10384 |
 | `wire/wiretest` | is the in-process harness for wire's transport and peer tests: short-path socket dirs, a real client/server pair, an injectable peer, and a manually-advanced clock mirroring proc's seam. | 2 | 232 |
 | `worker` | runs bounded disposable commands under daemonkit process ownership. | 2 | 1934 |
 <!-- END GENERATED: package table -->
@@ -60,16 +57,15 @@ imports nothing from the fleet; dev wiring across repos uses an untracked
 ## Testing — always via `scripts/test.sh`
 
 Run Go tests with `scripts/test.sh ./...` (a `ulimit -u` wrapper around
-`go test`). **Never run bare `go test` on a real machine.** The trust path
-spawns a disposable child of `os.Executable()` — `daemon.Runtime` captures that
-path at construction and expects `trust.RunVerifierChild` to intercept the child
-verb at the top of `main`. A *test* binary has no such intercept: Go's flag
-parser stops at the non-flag subcommand, `testing.Main` re-runs the whole suite,
-and the suite re-enters the spawn — an exponential fork bomb that exhausts the
-process table and freezes the machine.
-The harness caps the per-UID process count so a runaway fails fast with
-`EAGAIN`. CI runs through the harness too. (See the 2026-06-24 mount-holder
-fork-storm incident, recorded in claude-pool's cc-notes: `ccn doc show ef281ea`.)
+`go test`). **Never run bare `go test` on a real machine.** Several suites spawn
+a child of `os.Executable()` and branch on an environment variable at the top of
+`TestMain`. A branch that does not fire — a dropped env var, a renamed variable,
+a helper that reaches `m.Run()` — makes the child re-run the whole suite and
+re-enter the spawn: an exponential fork bomb that exhausts the process table and
+freezes the machine. The harness caps the per-UID process count so a runaway
+fails fast with `EAGAIN`. CI runs through the harness too. (See the 2026-06-24
+mount-holder fork-storm incident, recorded in claude-pool's cc-notes:
+`ccn doc show ef281ea`.)
 
 ## Ask Before Assuming
 

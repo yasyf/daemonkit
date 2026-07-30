@@ -8,73 +8,53 @@ import (
 	"github.com/yasyf/daemonkit/internal/csposture/csposturetest"
 )
 
-func TestCheckMatchesCorpusUnderBothLibraryValidationPolicies(t *testing.T) {
-	policies := []struct {
-		name   string
-		policy csposture.LibraryValidation
-		denies func(csposturetest.Case) bool
-	}{
-		{"require", csposture.RequireLibraryValidation, func(c csposturetest.Case) bool { return c.RequireLVDenies }},
-		{"by entitlement", csposture.LibraryValidationByEntitlement, func(c csposturetest.Case) bool { return c.EntitlementLVDenies }},
-	}
-	for _, policy := range policies {
-		for _, tt := range csposturetest.Cases() {
-			t.Run(policy.name+"/"+tt.Name, func(t *testing.T) {
-				err := csposture.Check(tt.Status, policy.policy)
-				if policy.denies(tt) {
-					if err == nil {
-						t.Fatalf("Check(0x%x, %v) = nil, want a denial", tt.Status, policy.policy)
-					}
-					if !strings.Contains(err.Error(), "status 0x") {
-						t.Errorf("Check(0x%x, %v) = %q, want the status word in the reason", tt.Status, policy.policy, err)
-					}
-					return
-				}
-				if err != nil {
-					t.Fatalf("Check(0x%x, %v) = %v, want nil", tt.Status, policy.policy, err)
-				}
-			})
-		}
-	}
-}
-
-func TestLibraryValidationIsTheOnlyPolicyDifference(t *testing.T) {
+func TestCheckMatchesCorpus(t *testing.T) {
 	for _, tt := range csposturetest.Cases() {
-		if tt.EntitlementLVDenies && !tt.RequireLVDenies {
-			t.Fatalf("corpus case %q denies under the weaker policy only", tt.Name)
-		}
-		if tt.RequireLVDenies == tt.EntitlementLVDenies {
-			continue
-		}
-		if csposture.LibraryValidationEnforced(tt.Status) {
-			t.Errorf("case %q (0x%x) diverges though the status word proves library validation", tt.Name, tt.Status)
-		}
-		err := csposture.Check(tt.Status, csposture.RequireLibraryValidation)
-		if err == nil {
-			t.Errorf("case %q (0x%x) diverges yet the stricter policy allows it", tt.Name, tt.Status)
-			continue
-		}
-		if !strings.Contains(err.Error(), "library validation") {
-			t.Errorf("case %q (0x%x) diverges on a clause other than library validation: %v", tt.Name, tt.Status, err)
-		}
+		t.Run(tt.Name, func(t *testing.T) {
+			err := csposture.Check(tt.Status)
+			if tt.Denies {
+				if err == nil {
+					t.Fatalf("Check(0x%x) = nil, want a denial", tt.Status)
+				}
+				if !strings.Contains(err.Error(), "status 0x") {
+					t.Errorf("Check(0x%x) = %q, want the status word in the reason", tt.Status, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Check(0x%x) = %v, want nil", tt.Status, err)
+			}
+		})
 	}
 }
 
-func TestLibraryValidationEnforced(t *testing.T) {
+func TestCheckDeniesEachClauseIndependently(t *testing.T) {
+	const admitted = csposture.Valid | csposture.Runtime | csposture.Hard |
+		csposture.Enforcement | csposture.RequireLV
+	if err := csposture.Check(admitted); err != nil {
+		t.Fatalf("Check(0x%x) = %v, want nil", admitted, err)
+	}
 	tests := []struct {
 		name   string
 		status int64
-		want   bool
+		reason string
 	}{
-		{"neither bit", csposture.Runtime, false},
-		{"CS_REQUIRE_LV", csposture.Runtime | csposture.RequireLV, true},
-		{"CS_FORCED_LV", csposture.Runtime | csposture.ForcedLV, true},
-		{"both bits", csposture.Runtime | csposture.RequireLV | csposture.ForcedLV, true},
+		{"CS_VALID clear", admitted &^ csposture.Valid, "CS_VALID clear"},
+		{"CS_RUNTIME clear", admitted &^ csposture.Runtime, "Hardened Runtime"},
+		{"CS_HARD clear", admitted &^ csposture.Hard, "CS_HARD clear"},
+		{"CS_ENFORCEMENT clear", admitted &^ csposture.Enforcement, "CS_ENFORCEMENT clear"},
+		{"both LV bits clear", admitted &^ csposture.RequireLV, "library validation"},
+		{"CS_GET_TASK_ALLOW set", admitted | csposture.GetTaskAllow, "CS_GET_TASK_ALLOW"},
+		{"CS_DEBUGGED set", admitted | csposture.Debugged, "CS_DEBUGGED"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := csposture.LibraryValidationEnforced(tt.status); got != tt.want {
-				t.Errorf("LibraryValidationEnforced(0x%x) = %t, want %t", tt.status, got, tt.want)
+			err := csposture.Check(tt.status)
+			if err == nil {
+				t.Fatalf("Check(0x%x) = nil, want a denial", tt.status)
+			}
+			if !strings.Contains(err.Error(), tt.reason) {
+				t.Errorf("Check(0x%x) = %q, want the reason to name %q", tt.status, err, tt.reason)
 			}
 		})
 	}
