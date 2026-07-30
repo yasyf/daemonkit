@@ -603,8 +603,8 @@ func (c *Controller) loadOnce(ctx context.Context, agent Agent, path string) lau
 }
 
 func (c *Controller) launchctl(ctx context.Context, args ...string) launchctlResult {
-	out, err := runCombined(ctx, c.runtime, "/bin/launchctl", args...)
-	return launchctlOutcome(args[0], out, err)
+	out, code, err := runCombined(ctx, c.runtime.Run, "/bin/launchctl", args...)
+	return launchctlOutcome(args[0], out, code, err)
 }
 
 func desiredAgents(agents []Agent) (map[string]Agent, error) {

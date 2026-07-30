@@ -15,7 +15,6 @@ import (
 	"github.com/yasyf/daemonkit/internal/trust"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/wire"
-	"github.com/yasyf/daemonkit/worker"
 )
 
 const openPath = "/usr/bin/open"
@@ -41,8 +40,7 @@ type AppKeepAlive struct {
 	BundleID string
 	// RestartPolicy defines when launchd restarts the app waiter. Required.
 	RestartPolicy RestartPolicy
-	// Runner owns every launchctl invocation as a disposable process group.
-	Runner *worker.Pool
+	// runner owns every launchctl invocation as a disposable process group.
 	runner taskRunner
 }
 
@@ -94,12 +92,8 @@ type AuthenticatedAppPeer struct {
 }
 
 func (k AppKeepAlive) launchctl(ctx context.Context, args ...string) launchctlResult {
-	runner := taskRunner(k.Runner)
-	if k.runner != nil {
-		runner = k.runner
-	}
-	out, err := runCombined(ctx, runner, "/bin/launchctl", args...)
-	return launchctlOutcome(args[0], out, err)
+	out, code, err := runCombined(ctx, k.runner, "/bin/launchctl", args...)
+	return launchctlOutcome(args[0], out, code, err)
 }
 
 // NewAuthenticatedAppPeer binds one signed-side accepted identity to an exact
@@ -189,7 +183,7 @@ func (k AppKeepAlive) WritePlist() (string, error) {
 // and at every login. Bootout kills only the blocked open waiter, and the
 // fresh open attaches via -W instead of starting a second copy.
 func (k AppKeepAlive) Install(ctx context.Context) error {
-	if k.Runner == nil && k.runner == nil {
+	if k.runner == nil {
 		return errors.New("service: disposable task runner is required")
 	}
 	plist, err := k.WritePlist()
@@ -339,7 +333,7 @@ func (k AppKeepAlive) validateStop(spec AppStopSpec) (string, error) {
 	if err := k.validate(); err != nil {
 		return "", err
 	}
-	if k.Runner == nil && k.runner == nil {
+	if k.runner == nil {
 		return "", errors.New("service: disposable task runner is required")
 	}
 	if spec.Dial == nil || (spec.Reaper == nil && spec.reaper == nil) || (spec.Dependents == nil && spec.dependents == nil) {
@@ -512,7 +506,7 @@ func (k AppKeepAlive) Uninstall(ctx context.Context) error {
 	if err := k.validate(); err != nil {
 		return err
 	}
-	if k.Runner == nil && k.runner == nil {
+	if k.runner == nil {
 		return errors.New("service: disposable task runner is required")
 	}
 	if err := k.bootout(ctx); err != nil {

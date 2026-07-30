@@ -1,13 +1,10 @@
 package service
 
 import (
-	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
-
-	"github.com/yasyf/daemonkit/worker"
 )
 
 const (
@@ -59,9 +56,9 @@ var launchdReasonPattern = regexp.MustCompile(`(?m)^\S+ failed: (\d+): (.+)$`)
 // later succeed. Exit 5 is the aggregate batch status and is never decoded. Any
 // other status whose output carries launchd's own reason for that same status is
 // a refusal; everything else is unknown to daemonkit.
-func launchctlOutcome(verb, out string, err error) launchctlResult {
-	result := launchctlResult{verb: verb, code: launchctlExitCode(err), out: out, cause: err}
-	if err == nil {
+func launchctlOutcome(verb, out string, code int, err error) launchctlResult {
+	result := launchctlResult{verb: verb, code: code, out: out, cause: err}
+	if err == nil && code == 0 {
 		result.kind = launchctlLoaded
 		return result
 	}
@@ -80,14 +77,6 @@ func launchctlOutcome(verb, out string, err error) launchctlResult {
 		}
 	}
 	return result
-}
-
-func launchctlExitCode(err error) int {
-	var exitErr *worker.ExitError
-	if errors.As(err, &exitErr) {
-		return exitErr.ExitCode
-	}
-	return -1
 }
 
 func launchdReason(out string, code int) string {

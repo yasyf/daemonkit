@@ -72,6 +72,7 @@ type Reclaimed struct {
 type Child struct {
 	pid    int
 	demand chan time.Time
+	stdin  <-chan error // nil unless Cmd.Stdin was delivered; carries the delivery outcome
 
 	settled chan struct{}
 	exit    Exit

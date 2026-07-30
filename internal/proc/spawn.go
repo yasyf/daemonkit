@@ -3,7 +3,9 @@ package proc
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"syscall"
 	"time"
 )
@@ -35,10 +37,10 @@ func (s *Store) Spawn(c Cmd) (*Child, error) {
 }
 
 func (s *Store) spawn(c Cmd, childOut, childErr *os.File) (*Child, error) {
-	if c.Path == "" {
-		return nil, errors.New("proc: cmd path is required")
+	if err := validateExec(c.Path, c.Dir); err != nil {
+		return nil, err
 	}
-	files, parentEnd, closeChildFiles, err := s.plumb(c, childOut, childErr)
+	files, parentEnd, stdinDelivered, closeChildFiles, err := s.plumb(c, childOut, childErr)
 	if err != nil {
 		return nil, err
 	}
@@ -82,11 +84,29 @@ func (s *Store) spawn(c Cmd, childOut, childErr *os.File) (*Child, error) {
 	child := &Child{
 		pid:     pid,
 		demand:  make(chan time.Time, 1),
+		stdin:   stdinDelivered,
 		settled: make(chan struct{}),
 		handoff: parentEnd,
 	}
 	go s.drive(child, id, session)
 	return child, nil
+}
+
+// validateExec is the spawn boundary's contract on the command: an exact,
+// absolute, already-cleaned executable path, and the same for a set working
+// directory. It runs before any file action or child so an inexact path is
+// rejected without spawning.
+func validateExec(path, dir string) error {
+	if path == "" {
+		return errors.New("proc: cmd path is required")
+	}
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return fmt.Errorf("proc: cmd path %q is not absolute and clean", path)
+	}
+	if dir != "" && (!filepath.IsAbs(dir) || filepath.Clean(dir) != dir) {
+		return fmt.Errorf("proc: cmd dir %q is not absolute and clean", dir)
+	}
+	return nil
 }
 
 // SIGKILL reaches suspended processes, and the wait4 reaps the zombie so the
@@ -98,7 +118,7 @@ func (s *Store) abortSpawn(pid int, parentEnd *os.File, cause error) error {
 	return cause
 }
 
-func (s *Store) plumb(c Cmd, childOut, childErr *os.File) (spawnFiles, *os.File, func(), error) {
+func (s *Store) plumb(c Cmd, childOut, childErr *os.File) (spawnFiles, *os.File, <-chan error, func(), error) {
 	var owned []*os.File
 	closeOwned := func() {
 		for _, f := range owned {
@@ -107,7 +127,7 @@ func (s *Store) plumb(c Cmd, childOut, childErr *os.File) (spawnFiles, *os.File,
 	}
 	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 	if err != nil {
-		return spawnFiles{}, nil, nil, fmt.Errorf("proc: open %s: %w", os.DevNull, err)
+		return spawnFiles{}, nil, nil, nil, fmt.Errorf("proc: open %s: %w", os.DevNull, err)
 	}
 	owned = append(owned, devNull)
 	files := spawnFiles{stdin: devNull, stdout: devNull, stderr: devNull}
@@ -119,32 +139,42 @@ func (s *Store) plumb(c Cmd, childOut, childErr *os.File) (spawnFiles, *os.File,
 		files.stderr = childErr
 		owned = append(owned, childErr)
 	}
+	var stdinDelivered <-chan error
 	if len(c.Stdin) > 0 {
 		r, w, err := os.Pipe()
 		if err != nil {
 			closeOwned()
-			return spawnFiles{}, nil, nil, fmt.Errorf("proc: create stdin pipe: %w", err)
+			return spawnFiles{}, nil, nil, nil, fmt.Errorf("proc: create stdin pipe: %w", err)
 		}
 		owned = append(owned, r)
 		stdin := c.Stdin
+		delivered := make(chan error, 1)
 		go func() {
-			_, _ = w.Write(stdin)
+			n, err := w.Write(stdin)
 			_ = w.Close()
+			switch {
+			case errors.Is(err, syscall.EPIPE):
+				err = nil
+			case err == nil && n < len(stdin):
+				err = io.ErrShortWrite
+			}
+			delivered <- err
 		}()
 		files.stdin = r
+		stdinDelivered = delivered
 	}
 	var parentEnd *os.File
 	if c.Handoff {
 		parent, child, err := socketpairFiles()
 		if err != nil {
 			closeOwned()
-			return spawnFiles{}, nil, nil, err
+			return spawnFiles{}, nil, nil, nil, err
 		}
 		owned = append(owned, child)
 		files.handoff = child
 		parentEnd = parent
 	}
-	return files, parentEnd, closeOwned, nil
+	return files, parentEnd, stdinDelivered, closeOwned, nil
 }
 
 func closeIfOpen(f *os.File) {

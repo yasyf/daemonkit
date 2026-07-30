@@ -30,16 +30,15 @@ reverted rather than trusted.
 |---|---|---|---|
 | `artifact` | resolves a version-exact executable from a declarative descriptor, for the cc-family's one central "give me the binary that matches my version" primitive. | 16 | 2230 |
 | `bundle` | reads a macOS .app's Info.plist and resolves the stable bundle paths a daemon installs to. | 5 | 200 |
-| `daemon` | is the consumer-agnostic process runtime for a detached daemon: exclusive listener ownership, readiness, ordered shutdown, skew observation, idle exit, and embedded-process coordination. | 18 | 4670 |
+| `daemon` | is the consumer-agnostic process runtime for a detached daemon: exclusive listener ownership, readiness, ordered shutdown, skew observation, idle exit, and embedded-process coordination. | 18 | 4646 |
 | `deployment` | owns sealed installation, activation, upgrade, and removal of one fixed signed application. | 18 | 4172 |
 | `ghrelease` | queries GitHub for a repository's latest published release. | 2 | 170 |
 | `paths` | owns the canonical state-directory layout under the user's home directory, resolved through the passwd database — never the caller's HOME or CLAUDE_CONFIG_DIR — so a sandboxed environment cannot relocate state. | 4 | 209 |
-| `service` | converges an exact durable set of macOS user LaunchAgents. | 28 | 10997 |
+| `service` | converges an exact durable set of macOS user LaunchAgents. | 28 | 10954 |
 | `templates` | — | 2 | 218 |
 | `version` | classifies and compares release and development builds for launcher-owned runtime settlement and release ordering. | 2 | 302 |
 | `wire` | is daemonkit's persistent multiplexed unix-socket transport. | 39 | 10384 |
 | `wire/wiretest` | is the in-process harness for wire's transport and peer tests: short-path socket dirs, a real client/server pair, an injectable peer, and a manually-advanced clock mirroring proc's seam. | 2 | 232 |
-| `worker` | runs bounded disposable commands under daemonkit process ownership. | 2 | 1934 |
 <!-- END GENERATED: package table -->
 
 Everything under `internal/` is module-private machinery no consumer may import,

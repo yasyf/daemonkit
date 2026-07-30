@@ -7,35 +7,35 @@ import (
 	"os/exec"
 	"path/filepath"
 
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/trust"
-	"github.com/yasyf/daemonkit/worker"
+	"github.com/yasyf/daemonkit"
+	"github.com/yasyf/daemonkit/internal/proc"
 )
 
 const commandOutputLimit = 1 << 20
 
 var errCommandOutputLimit = errors.New("service: command output exceeded limit")
 
-type taskRunner interface {
-	Run(context.Context, worker.CommandRequest) (worker.CommandResult, error)
-}
+// taskRunner runs one bounded launchctl invocation under durable process
+// ownership. It is the interim seam onto the root engine; at P3 it dies with
+// service, when Ctx.Run is the one caller of the primitive.
+type taskRunner func(context.Context, proc.Cmd) (proc.Result, error)
 
 func runCombined(
 	ctx context.Context,
-	runner taskRunner,
+	run taskRunner,
 	path string,
 	args ...string,
-) (string, error) {
-	if runner == nil {
-		return "", errors.New("service: disposable task runner is required")
+) (string, int, error) {
+	if run == nil {
+		return "", -1, errors.New("service: disposable task runner is required")
 	}
 	path, err := exactCommandPath(path)
 	if err != nil {
-		return "", err
+		return "", -1, err
 	}
-	result, runErr := runner.Run(ctx, worker.CommandRequest{
+	result, runErr := run(ctx, proc.Cmd{
 		Path: path, Dir: filepath.Dir(path), Args: append([]string(nil), args...),
-		TotalTimeout: controllerCloseBound,
+		MaxStdout: commandOutputLimit, MaxStderr: commandOutputLimit,
 	})
 	output := append(append([]byte(nil), result.Stdout...), result.Stderr...)
 	var outputErr error
@@ -43,7 +43,7 @@ func runCombined(
 		output = output[:commandOutputLimit]
 		outputErr = errCommandOutputLimit
 	}
-	return string(output), errors.Join(runErr, outputErr)
+	return string(output), result.Exit.Code, errors.Join(runErr, outputErr)
 }
 
 func exactCommandPath(path string) (string, error) {
@@ -60,50 +60,24 @@ func exactCommandPath(path string) (string, error) {
 	return path, nil
 }
 
+// controllerWorkerRuntime bounds concurrent launchctl runs with a semaphore —
+// the caller's-semaphore pattern that replaces the pool's capacity — and owns
+// every run through the shared process store.
 type controllerWorkerRuntime struct {
-	pool      *worker.Pool
-	claim     *worker.RuntimeClaim
-	recovered bool
-	activated bool
+	store *proc.Store
+	slots chan struct{}
 }
 
-func newControllerWorkerRuntime(limit int, reaper *proc.Reaper) (*controllerWorkerRuntime, error) {
-	pool, err := worker.NewPool(worker.Config{
-		Capacity: limit, QueueCapacity: limit, MaxTotalRun: controllerCloseBound,
-		MaxStdinBytes: 0, MaxStdoutBytes: commandOutputLimit, MaxStderrBytes: commandOutputLimit,
-	}, reaper)
-	if err != nil {
-		return nil, err
-	}
-	claim, err := pool.ClaimRuntime(trust.VerifierWorkerBudgets())
-	if err != nil {
-		return nil, err
-	}
-	return &controllerWorkerRuntime{pool: pool, claim: claim}, nil
+func newControllerWorkerRuntime(limit int, store *proc.Store) *controllerWorkerRuntime {
+	return &controllerWorkerRuntime{store: store, slots: make(chan struct{}, limit)}
 }
 
-func (r *controllerWorkerRuntime) Start(ctx context.Context) error {
-	if err := r.claim.Recover(ctx); err != nil {
-		return err
+func (r *controllerWorkerRuntime) Run(ctx context.Context, c proc.Cmd) (proc.Result, error) {
+	select {
+	case r.slots <- struct{}{}:
+	case <-ctx.Done():
+		return proc.Result{}, ctx.Err()
 	}
-	r.recovered = true
-	if err := r.claim.Activate(); err != nil {
-		return err
-	}
-	r.activated = true
-	return nil
-}
-
-func (r *controllerWorkerRuntime) Run(ctx context.Context, request worker.CommandRequest) (worker.CommandResult, error) {
-	return r.pool.Run(ctx, request)
-}
-
-func (r *controllerWorkerRuntime) Close(ctx context.Context) error {
-	if r.activated {
-		return r.claim.Close(ctx)
-	}
-	if r.recovered {
-		return r.claim.Release(ctx)
-	}
-	return worker.ErrRuntimeOwnership
+	defer func() { <-r.slots }()
+	return daemonkit.Run(ctx, r.store, c)
 }

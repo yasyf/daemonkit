@@ -50,17 +50,28 @@ func (s *Store) Run(ctx context.Context, c Cmd) (Result, error) {
 		return Result{}, err
 	}
 
+	// A stream hitting its cap demands termination through this channel: a
+	// bounded command is disposable once its retained output is full, so the
+	// child is torn down at once rather than drained to the deadline.
+	capped := make(chan struct{}, 1)
+	onCap := func() {
+		select {
+		case capped <- struct{}{}:
+		default:
+		}
+	}
+
 	var wg sync.WaitGroup
 	var stdout, stderr streamResult
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		stdout = collectBounded(outR, runLimit(c.MaxStdout))
+		stdout = collectBounded(outR, runLimit(c.MaxStdout), onCap)
 		_ = outR.Close()
 	}()
 	go func() {
 		defer wg.Done()
-		stderr = collectBounded(errR, runLimit(c.MaxStderr))
+		stderr = collectBounded(errR, runLimit(c.MaxStderr), onCap)
 		_ = errR.Close()
 	}()
 
@@ -76,6 +87,9 @@ func (s *Store) Run(ctx context.Context, c Cmd) (Result, error) {
 	var exit Exit
 	select {
 	case exit = <-settled:
+	case <-capped:
+		child.demandBy(deadline)
+		exit = <-settled
 	case <-ctx.Done():
 		child.demandBy(deadline)
 		exit = <-settled
@@ -96,11 +110,22 @@ func (s *Store) Run(ctx context.Context, c Cmd) (Result, error) {
 		stderr.sever()
 	}
 
+	var stdinErr error
+	if child.stdin != nil {
+		select {
+		case stdinErr = <-child.stdin:
+		case <-clk.After(deadline.Sub(clk.Now())):
+		}
+	}
+
 	result := Result{
 		Exit:      exit,
 		Stdout:    stdout.data,
 		Stderr:    stderr.data,
 		Truncated: stdout.limited || stderr.limited,
+	}
+	if stdinErr != nil {
+		return result, fmt.Errorf("proc: deliver stdin: %w", stdinErr)
 	}
 	if err := errors.Join(stdout.err, stderr.err); err != nil {
 		return result, fmt.Errorf("proc: collect run output: %w", err)
@@ -128,7 +153,7 @@ func (r *streamResult) sever() {
 	}
 }
 
-func collectBounded(reader io.Reader, limit int) streamResult {
+func collectBounded(reader io.Reader, limit int, onCap func()) streamResult {
 	data := make([]byte, 0, limit)
 	buffer := make([]byte, 32*1024)
 	limited := false
@@ -139,8 +164,9 @@ func collectBounded(reader io.Reader, limit int) streamResult {
 			if remaining > 0 {
 				data = append(data, buffer[:remaining]...)
 			}
-			if n > remaining {
+			if n > remaining && !limited {
 				limited = true
+				onCap()
 			}
 		}
 		if err != nil {

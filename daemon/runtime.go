@@ -479,32 +479,8 @@ func (r *Runtime) Begin(ctx context.Context) (activation Activation, err error) 
 	r.lifecycle.mu.Unlock()
 	r.mu.Unlock()
 	activation = Activation{runtime: r, generation: generation, ctx: activationCtx}
-	go watchWorkerTerminal(serveCtx, claim, serverExit, cancelServe)
 	go r.runStarted(listener, lock, signalCh, stopSignals, serveDone)
 	return activation, nil
-}
-
-// watchWorkerTerminal turns a settlement-failed worker claim into runtime
-// termination: a wedged claim fails every future verifier exchange, so the
-// daemon must exit and restart rather than keep serving. Ordered shutdown
-// terminalizes with worker.ErrClosed and is not a failure.
-func watchWorkerTerminal(
-	ctx context.Context,
-	claim *worker.RuntimeClaim,
-	serverExit runtimeauth.ServerExit,
-	cancelServe context.CancelFunc,
-) {
-	select {
-	case <-ctx.Done():
-		return
-	case <-claim.Terminalized():
-	}
-	terminal := claim.Terminal()
-	if errors.Is(terminal, worker.ErrClosed) {
-		return
-	}
-	_ = serverExit(fmt.Errorf("daemon: runtime workers terminal: %w", terminal))
-	cancelServe()
 }
 
 // probeTrustVerifier proves one verifier child exchange end to end before the
