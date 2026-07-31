@@ -25,6 +25,18 @@ jobs:
       - name: Verify source-only release contract
         run: ./scripts/release-check.sh --tree
 
+  codegen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Frame codec drift gate
+        run: ./scripts/check-codegen.sh
+
   test:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10

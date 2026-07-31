@@ -66,7 +66,7 @@ extension SocketTransportTests {
                 processGeneration: OwnerGeneration("0123456789abcdef0123456789abcdef")
             )
             let payload = try BrokerHandoffCodec.encode(nonce: nonce, identity: identity)
-            let golden = #"{"nonce":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=","protocol":1,"# +
+            let golden = #"{"nonce":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=","protocol":2,"# +
                 #""runtime_identity":{"process_generation":"0123456789abcdef0123456789abcdef","runtime_build":"daemonkit-v0.11.0"}}"#
             #expect(payload == Data(golden.utf8))
             let decoded = try BrokerHandoffCodec.decode(payload)
@@ -81,10 +81,10 @@ extension SocketTransportTests {
             let canonicalIdentity =
                 #""runtime_identity":{"process_generation":"00000000000000000000000000000001","runtime_build":"app.v1"}"#
             let malformed = [
-                Data((#"{"nonce":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=","protocol":1,"protocol":1,"# + canonicalIdentity + "}").utf8),
-                Data((#" {"nonce":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=","protocol":1,"# + canonicalIdentity + "}").utf8),
-                Data((#"{"nonce":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8","protocol":1,"# + canonicalIdentity + "}").utf8),
-                Data((#"{"extra":true,"nonce":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=","protocol":1,"# + canonicalIdentity + "}").utf8),
+                Data((#"{"nonce":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=","protocol":2,"protocol":2,"# + canonicalIdentity + "}").utf8),
+                Data((#" {"nonce":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=","protocol":2,"# + canonicalIdentity + "}").utf8),
+                Data((#"{"nonce":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8","protocol":2,"# + canonicalIdentity + "}").utf8),
+                Data((#"{"extra":true,"nonce":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=","protocol":2,"# + canonicalIdentity + "}").utf8),
             ]
             for candidate in malformed {
                 #expect(throws: BrokerHandoffError.invalidPayload) {

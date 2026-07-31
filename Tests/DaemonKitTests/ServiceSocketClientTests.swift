@@ -4,14 +4,14 @@ import Foundation
 import Testing
 
 let readinessSubscribeOperation = "test.runtime.readiness.subscribe"
-let readinessSubscribeAck = Data(#"{"protocol":1}"#.utf8)
+let readinessSubscribeAck = Data(#"{"protocol":2}"#.utf8)
 
 func lifecyclePayload(
     _ state: RuntimeReadinessState,
     sequence: UInt64,
     generation: OwnerGeneration = testOwnerGeneration()
 ) -> Data {
-    let progress = #"{"progress":{"detail":"","sequence":\#(sequence),"state":"\#(state.rawValue)"},"protocol":1,"#
+    let progress = #"{"progress":{"detail":"","sequence":\#(sequence),"state":"\#(state.rawValue)"},"protocol":2,"#
     let runtime = #""runtime_identity":{"process_generation":"\#(generation.value)","runtime_build":"app.v1"},"#
     let json = progress + runtime + #""wire_build":"service.v1"}"#
     return Data(json.utf8)

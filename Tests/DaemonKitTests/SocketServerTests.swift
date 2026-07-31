@@ -76,26 +76,31 @@ extension SocketTransportTests {
     struct SocketServerTests {
         @Test func helloSchemaRequiresAndPreservesExactRole() throws {
             let encoded = Data(
-                #"{"protocol":1,"wire_build":"suite.v1","role":"readiness-controller.v1"}"#.utf8
+                #"{"protocol":2,"wire_build":"suite.v1","role":"readiness-controller.v1"}"#.utf8
             )
             let identity = try SessionHandshakeCodec.decodeHello(encoded)
             #expect(identity.role == "readiness-controller.v1")
-            let missing = Data(#"{"protocol":1,"wire_build":"suite.v1"}"#.utf8)
+            let missing = Data(#"{"protocol":2,"wire_build":"suite.v1"}"#.utf8)
             #expect(throws: SessionTransportError.self) {
                 _ = try SessionHandshakeCodec.decodeHello(missing)
             }
         }
 
-        @Test func frameV1MatchesSharedGoGolden() throws {
-            let repository = URL(fileURLWithPath: #filePath)
+        private static func repositoryRoot() -> URL {
+            URL(fileURLWithPath: #filePath)
                 .deletingLastPathComponent()
                 .deletingLastPathComponent()
                 .deletingLastPathComponent()
-            let fixture = try JSONSerialization.jsonObject(
-                with: Data(contentsOf: repository.appendingPathComponent("wire/testdata/frame-v1.json"))
+        }
+
+        private static func goldenHex(_ fixture: String) throws -> String {
+            let object = try JSONSerialization.jsonObject(
+                with: Data(contentsOf: repositoryRoot().appendingPathComponent(fixture))
             ) as? [String: String]
-            let hex = try #require(fixture?["hex"])
-            var encoded = Data()
+            return try #require(object?["hex"])
+        }
+
+        private static func goldenPacket() throws -> Data {
             let body = try SessionFrameCodec.encode(SessionFrame(
                 kind: .request,
                 flags: .end,
@@ -106,10 +111,35 @@ extension SocketTransportTests {
                 tenant: "acct-18",
                 payload: Data(#"{"value":1}"#.utf8)
             ))
+            var encoded = Data()
             var length = UInt32(body.count).bigEndian
             withUnsafeBytes(of: &length) { encoded.append(contentsOf: $0) }
             encoded.append(body)
+            return encoded
+        }
+
+        @Test func frameV2MatchesSharedGoGolden() throws {
+            let encoded = try Self.goldenPacket()
+            let hex = try Self.goldenHex("internal/wire/testdata/frame-v2.json")
             #expect(encoded.map { String(format: "%02x", $0) }.joined() == hex)
+        }
+
+        @Test func frameV1ShapeSurvivesTheVersionBump() throws {
+            var encoded = try Self.goldenPacket()
+            encoded[8] = 0
+            encoded[9] = 1
+            let hex = try Self.goldenHex("wire/testdata/frame-v1.json")
+            #expect(encoded.map { String(format: "%02x", $0) }.joined() == hex)
+        }
+
+        @Test func encodedBodyOpensWithTheFrozenCutPrefix() throws {
+            let frozen = try String(
+                contentsOf: Self.repositoryRoot()
+                    .appendingPathComponent("ci/mixedera/testdata/frozen/frame-prefix-cut.hex"),
+                encoding: .utf8
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+            let body = try Self.goldenPacket().dropFirst(4)
+            #expect(body.prefix(6).map { String(format: "%02x", $0) }.joined() == frozen)
         }
 
         @Test func concurrentClosedPeerWritesReturnEPIPEWithoutSIGPIPE() async throws {
@@ -454,7 +484,7 @@ extension SocketTransportTests.SocketServerTests {
         ))
         var foreign = body
         foreign[4] = 0
-        foreign[5] = 2
+        foreign[5] = 1
         #expect(throws: SessionTransportError.self) { _ = try SessionFrameCodec.decode(foreign) }
         #expect(throws: SessionTransportError.self) { _ = try SessionFrameCodec.decode(Data("short".utf8)) }
     }

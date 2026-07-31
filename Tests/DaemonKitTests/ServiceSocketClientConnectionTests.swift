@@ -220,7 +220,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
         try server.write(SessionFrame(
             kind: .helloAck,
             flags: .end,
-            payload: Data(#"{"protocol":1}"#.utf8)
+            payload: Data(#"{"protocol":2}"#.utf8)
         ))
         Darwin.close(descriptors[1])
         descriptors[1] = -1
@@ -278,8 +278,8 @@ extension SocketTransportTests.ServiceSocketClientTests {
     }
 
     @Test func handshakeCodecRejectsUnknownAndMalformedRejections() throws {
-        let unknownJSON = #"{"protocol":1,"wire_build":"service.v1","rejected":true,"code":"later","reason":"no"}"#
-        let malformedJSON = #"{"protocol":1,"wire_build":"service.v1","rejected":true,"code":"peer_untrusted"}"#
+        let unknownJSON = #"{"protocol":2,"wire_build":"service.v1","rejected":true,"code":"later","reason":"no"}"#
+        let malformedJSON = #"{"protocol":2,"wire_build":"service.v1","rejected":true,"code":"peer_untrusted"}"#
         let unknown = Data(unknownJSON.utf8)
         let malformed = Data(malformedJSON.utf8)
 

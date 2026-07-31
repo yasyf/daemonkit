@@ -16,6 +16,16 @@ tasks:
     cmds:
       - swift test
 
+  generate:
+    desc: Regenerate the frame codec (Go internal/wire + Swift SessionFrameCodec) from internal/wiregen/schema.json
+    cmds:
+      - go generate ./internal/wire
+
+  generate-check:
+    desc: Fail when the generated frame codec drifts from its schema
+    cmds:
+      - ./scripts/check-codegen.sh
+
   vet:
     desc: Vet the module
     # -unsafeptr=false: dlsym data-symbol FFI in trust/ (ccn 239201e); lockstep
@@ -36,6 +46,7 @@ tasks:
   ci:
     desc: Everything CI runs
     cmds:
+      - task: generate-check
       - task: vet
       - task: lint
       - task: test

@@ -1,0 +1,39 @@
+{
+  "magic": "DKS1",
+  "version": 2,
+  "defaultMaxFrameBytes": 4194304,
+  "lengthPrefixBytes": 4,
+  "header": [
+    { "name": "magic", "kind": "magic", "size": 4 },
+    { "name": "version", "kind": "version", "size": 2 },
+    { "name": "kind", "kind": "frameKind", "size": 1 },
+    { "name": "flags", "kind": "frameFlags", "size": 1 },
+    { "name": "id", "kind": "uint", "size": 8, "goField": "ID", "swiftField": "id" },
+    { "name": "sequence", "kind": "uint", "size": 4, "goField": "Sequence", "swiftField": "sequence" },
+    { "name": "deadlineUnixMilli", "kind": "deadline", "size": 8, "goField": "DeadlineUnixMilli", "swiftField": "deadlineUnixMilliseconds" },
+    { "name": "opLength", "kind": "length", "size": 2, "of": "op" },
+    { "name": "tenantLength", "kind": "length", "size": 2, "of": "tenant" }
+  ],
+  "kinds": [
+    { "go": "FrameHello", "swift": "hello", "value": 1, "goDoc": "begins the session handshake" },
+    { "go": "FrameHelloAck", "swift": "helloAck", "value": 2, "goDoc": "accepts the session handshake" },
+    { "go": "FrameRequest", "swift": "request", "value": 3, "goDoc": "starts one request" },
+    { "go": "FrameResponse", "swift": "response", "value": 4, "goDoc": "completes one request" },
+    { "go": "FrameCancel", "swift": "cancel", "value": 5, "goDoc": "cancels one request" },
+    { "go": "FrameEvent", "swift": "event", "value": 6, "goDoc": "pushes one session event" },
+    { "go": "FrameStream", "swift": "stream", "value": 7, "goDoc": "carries one ordered stream chunk" },
+    { "go": "FrameGoAway", "swift": "goAway", "value": 8, "goDoc": "requests or acknowledges settled session closure" },
+    { "go": "FrameWindow", "swift": "window", "value": 9, "goDoc": "grants one stream additional bounded-delivery credits" },
+    { "go": "FrameAck", "swift": "acknowledgment", "value": 10, "goDoc": "confirms that a terminal response reached the client" },
+    { "go": "FrameLifecycle", "swift": "lifecycle", "value": 11, "goDoc": "carries one daemon-owned lifecycle snapshot" }
+  ],
+  "flags": [
+    {
+      "go": "FlagEnd",
+      "swift": "end",
+      "value": 1,
+      "goDoc": "marks the final payload in a request or response stream",
+      "swiftDoc": "Marks the final request or response stream payload."
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+{
+  "comment": "Shared Go and Swift version-exact frame golden at protocol 2, including the 4-byte body-length prefix. Differs from wire/testdata/frame-v1.json only at body bytes 4:6.",
+  "hex": "00000038444b533100020301000000000000002a000000000000018bcfe5687b000600076d7574617465616363742d31387b2276616c7565223a317d"
+}

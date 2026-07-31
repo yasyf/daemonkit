@@ -80,7 +80,7 @@ struct SocketBoundedChannelTests {
     }
 
     private func lifecyclePayload(state: RuntimeReadinessState) -> Data {
-        let json = #"{"progress":{"detail":"","sequence":1,"state":"\#(state.rawValue)"},"protocol":1,"# +
+        let json = #"{"progress":{"detail":"","sequence":1,"state":"\#(state.rawValue)"},"protocol":2,"# +
             #""runtime_identity":{"process_generation":"00000000000000000000000000000001","runtime_build":"app.v1"},"wire_build":"service.v1"}"#
         return Data(json.utf8)
     }

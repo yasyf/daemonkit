@@ -141,7 +141,7 @@ extension SocketTransportTests.ServiceSocketClientTests {
                 try codec.write(SessionFrame(kind: .helloAck, flags: .end, payload: acknowledgment))
 
                 let readiness = try nextRequest(codec)
-                let subscribeEnvelope = Data(#"{"ack":true,"payload":{"protocol":1}}"#.utf8)
+                let subscribeEnvelope = Data(#"{"ack":true,"payload":{"protocol":2}}"#.utf8)
                 try codec.write(SessionFrame(
                     kind: .response,
                     flags: .end,

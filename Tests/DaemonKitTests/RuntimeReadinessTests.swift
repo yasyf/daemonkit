@@ -22,10 +22,10 @@ extension SocketTransportTests {
     struct RuntimeReadinessTests {
         @Test func wireSchemaUsesExactSubscriptionAndNestedLifecycleSnapshot() throws {
             let request = try RuntimeReadinessCodec.encodeSubscribe()
-            #expect(String(data: request, encoding: .utf8) == #"{"protocol":1}"#)
+            #expect(String(data: request, encoding: .utf8) == #"{"protocol":2}"#)
             try RuntimeReadinessCodec.decodeSubscribeAck(request)
 
-            let valid = #"{"protocol":1,"wire_build":"suite.v1","# +
+            let valid = #"{"protocol":2,"wire_build":"suite.v1","# +
                 #""runtime_identity":{"runtime_build":"app.v1","process_generation":"00000000000000000000000000000001"},"# +
                 #""progress":{"sequence":1,"state":"runtime_starting","detail":""}}"#
             let event = try RuntimeReadinessCodec.decodeEvent(Data(valid.utf8))
@@ -36,7 +36,7 @@ extension SocketTransportTests {
             #expect(event.progress == ReadinessProgress(sequence: 1, state: .starting, detail: Data()))
 
             #expect(throws: RuntimeReadinessValidationError.self) {
-                let legacy = #"{"protocol":1,"wire_build":"suite.v1","# +
+                let legacy = #"{"protocol":2,"wire_build":"suite.v1","# +
                     #""runtime_identity":{"runtime_build":"app.v1","process_generation":"00000000000000000000000000000001"},"# +
                     #""progress":{"sequence":1,"state":"runtime_starting","detail":""},"legacy":true}"#
                 _ = try RuntimeReadinessCodec.decodeEvent(Data(legacy.utf8))
