@@ -2,7 +2,11 @@ package daemonkit
 
 import (
 	"fmt"
+	"path/filepath"
 	"time"
+
+	"github.com/yasyf/daemonkit/internal/wire"
+	"github.com/yasyf/daemonkit/paths"
 )
 
 // Daemon is one daemon's whole identity. The process that serves it and the
@@ -26,6 +30,27 @@ type Daemon struct {
 // Label names one daemon; every path, lock, record file, and launchd job
 // derives from it.
 type Label string
+
+func (d Daemon) statePaths() paths.Paths { return paths.Paths{App: string(d.Label)} }
+
+func (d Daemon) recordPath() string {
+	return filepath.Join(d.statePaths().StateDir(), "daemon.records")
+}
+
+func (d Daemon) shutdownGrace() Grace {
+	if d.Shutdown == 0 {
+		return Grace(30 * time.Second)
+	}
+	return d.Shutdown
+}
+
+func (d Daemon) wireSchemas() wire.Schemas {
+	schemas := make(wire.Schemas, len(d.Schemas))
+	for i, schema := range d.Schemas {
+		schemas[i] = string(schema)
+	}
+	return schemas
+}
 
 // Schema names one application-protocol era a build speaks or still accepts.
 type Schema string
@@ -60,11 +85,26 @@ func (d Daemon) ValidateForServe() error {
 }
 
 // Trust names what each lane must additionally prove. The same-EUID floor
-// runs unconditionally in the acceptor before Trust is consulted; no Trust
-// value can express its absence.
+// runs unconditionally on both ends before Trust is consulted; no Trust value
+// can express its absence.
 type Trust struct {
 	Control  *Requirement // nil: floor alone. Gates Control and the wire Drain verb.
 	Business *Requirement // nil: floor alone.
+	// Serving is what the process answering on the socket must prove to a
+	// client attaching to it — the identity the consumer deployed. It is the
+	// client's half of the control lane's authorization and the daemon never
+	// reads it. nil: floor alone, which admits any same-UID process that binds
+	// the socket first.
+	//
+	// A floor-only Serving leaves the absence proof forgeable, not merely
+	// weak: a same-UID process that unlinks the socket and re-binds it clears
+	// the floor, self-attests its own honest PID through the attach
+	// handshake, and its own exit is then a true Stopped{ReapAbsent} for a
+	// daemon still running behind it. A caller gating an irreversible action
+	// on that proof must pin Serving to a code-signing requirement and
+	// corroborate with an executable-scoped inventory of the real process
+	// table.
+	Serving *Requirement
 }
 
 // Restart is launchd's relaunch policy for the daemon's job.

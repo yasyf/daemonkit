@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/yasyf/daemonkit/internal/trust"
@@ -46,6 +47,8 @@ type Config struct {
 	HandshakeRead time.Duration
 	// Write bounds each frame write; 10s when zero.
 	Write time.Duration
+	// Serving is the process identity the daemon.health verb reports.
+	Serving Serving
 	// Log receives accept and session diagnostics.
 	Log *slog.Logger
 }
@@ -62,6 +65,8 @@ type Server struct {
 	controlSlot   chan struct{}
 	businessSlots chan struct{}
 	handleSem     chan struct{}
+
+	admitted atomic.Int64
 
 	mu           sync.Mutex
 	serveCtx     context.Context

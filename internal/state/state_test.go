@@ -165,6 +165,68 @@ func TestSessionCoreIsFrozenInTheEnvelope(t *testing.T) {
 	}
 }
 
+func TestPeekNeverMutates(t *testing.T) {
+	const (
+		envelope = `{"cores":[{"pid":11,"start":22,"boot":33,"generation":44}]}`
+		payload  = `{"live":[{"pid":11,"start":22,"boot":33,"generation":44}],"note":"x"}`
+	)
+	recorded := []Core{{PID: 11, Start: 22, Boot: 33, Generation: 44}}
+	tests := []struct {
+		name  string
+		raw   []byte
+		ok    bool
+		cores []Core
+	}{
+		{"readable file", handFrame(uint32(era), envelope, payload), true, recorded},
+		{"foreign schema", handFrame(uint32(era)+1, envelope, payload), false, recorded},
+		{"garbage payload", handFrame(uint32(era), envelope, "not json at all"), false, recorded},
+		{"not a state file", []byte("nothing to see here"), false, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path, file := seed(t, tt.raw)
+			got, ok, err := file.Peek()
+			if err != nil {
+				t.Fatalf("Peek() error = %v", err)
+			}
+			if ok != tt.ok {
+				t.Fatalf("Peek() ok = %t, want %t", ok, tt.ok)
+			}
+			if !reflect.DeepEqual(got.Cores, tt.cores) {
+				t.Errorf("Cores = %#v, want %#v", got.Cores, tt.cores)
+			}
+			if tt.ok && got.Value.Note != "x" {
+				t.Errorf("Value = %#v, want the decoded payload", got.Value)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("the peeked file moved: %v", err)
+			}
+			if !bytes.Equal(after, tt.raw) {
+				t.Errorf("Peek() rewrote the file")
+			}
+			entries, err := os.ReadDir(filepath.Dir(path))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 1 {
+				t.Errorf("Peek() left %d entries beside the file, want the file alone", len(entries))
+			}
+		})
+	}
+}
+
+func TestPeekMissingFile(t *testing.T) {
+	file := New[records](filepath.Join(t.TempDir(), "absent.json"), era)
+	got, ok, err := file.Peek()
+	if err != nil || ok {
+		t.Fatalf("Peek() = ok=%t err=%v, want a quiet miss", ok, err)
+	}
+	if got.Cores != nil || got.Archived != "" {
+		t.Fatalf("Peek() = %#v, want zero", got)
+	}
+}
+
 func TestLoadArchivesAsideAndYieldsCores(t *testing.T) {
 	const (
 		envelope = `{"cores":[{"pid":11,"start":22,"boot":33,"generation":44}],"era":"unknown to this build"}`

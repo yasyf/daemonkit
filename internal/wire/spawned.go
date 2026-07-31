@@ -207,8 +207,8 @@ func (c *SpawnedClient) Events() <-chan Event { return c.client.Events() }
 // WireBuild returns this session's exact static schema identity.
 func (c *SpawnedClient) WireBuild() string { return c.client.WireBuild() }
 
-// Close sends GoAway and joins all client session loops.
-func (c *SpawnedClient) Close() error { return c.client.Close() }
+// Close sends GoAway and joins all client session loops, bounded by ctx.
+func (c *SpawnedClient) Close(ctx context.Context) error { return c.client.Close(ctx) }
 
 // Abort tears down the session and joins all client session loops.
 func (c *SpawnedClient) Abort(cause error) error { return c.client.Abort(cause) }

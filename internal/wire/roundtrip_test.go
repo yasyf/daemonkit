@@ -85,7 +85,7 @@ func TestBusinessRoundTrip(t *testing.T) {
 	if string(result.Response.Payload) != `{"n":42}` {
 		t.Fatalf("Payload = %s, want the echoed body", result.Response.Payload)
 	}
-	if err := client.Close(); err != nil {
+	if err := client.Close(context.Background()); err != nil {
 		t.Fatalf("Close() = %v", err)
 	}
 }

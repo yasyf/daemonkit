@@ -22,7 +22,8 @@ type record struct {
 func (r record) id() identity { return identity{pid: r.PID, start: r.Start, boot: r.Boot} }
 
 type records struct {
-	Live []record `json:"live"`
+	Live  []record `json:"live"`
+	Owner *Owner   `json:"owner,omitempty"`
 }
 
 // Cores names every live record's frozen identity core, so an era that cannot
@@ -54,7 +55,7 @@ func retained(value records, id identity) records {
 		}
 		live = append(live, rec)
 	}
-	return records{Live: live}
+	return records{Live: live, Owner: value.Owner}
 }
 
 func holds(value records, id identity) bool {

@@ -567,8 +567,11 @@ func (c *Client) deliverEvents() {
 	}
 }
 
-// Close gracefully terminates the session after a GoAway acknowledgement.
-func (c *Client) Close() error { return c.close(context.Background()) }
+// Close gracefully terminates the session after a GoAway acknowledgement,
+// bounded by ctx: every wait it makes — for pending calls to settle, for the
+// go-away write, for the peer's answer — ends when ctx does, and the session
+// is torn down instead. A ctx without a deadline waits indefinitely.
+func (c *Client) Close(ctx context.Context) error { return c.close(ctx) }
 
 // Abort tears down the local session without a GoAway exchange. Pending calls
 // fail with ErrClientAbort and the supplied cause.
@@ -592,7 +595,13 @@ func (c *Client) close(parent context.Context) error {
 		c.closing.Store(true)
 		pendingDone := c.pendingDone
 		c.mu.Unlock()
-		<-pendingDone
+		select {
+		case <-pendingDone:
+		case <-parent.Done():
+			c.closeErr = fmt.Errorf("wire: await pending calls: %w", parent.Err())
+			c.fail(c.closeErr)
+			return
+		}
 		c.writerMu.Lock()
 		c.goAwayStarted.Store(true)
 		c.writerMu.Unlock()

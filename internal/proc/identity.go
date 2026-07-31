@@ -23,6 +23,12 @@ type identity struct {
 // matches is the module's only identity comparison.
 func (i identity) matches(o identity) bool { return i == o }
 
+// instance is the exported pin's comparable core, so every comparison of two
+// Identity values still runs through matches.
+func instance(id Identity) identity {
+	return identity{pid: id.PID, start: id.Start, boot: id.Boot}
+}
+
 func (i identity) crossBoot(boot uint64) bool { return i.boot != boot }
 
 func (i identity) unsafe() bool { return i.pid <= 1 || i.pid == os.Getpid() }

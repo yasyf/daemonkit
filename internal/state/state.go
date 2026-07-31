@@ -99,6 +99,32 @@ func (f *File[T]) Load() (Loaded[T], error) {
 	return Loaded[T]{Cores: cores, Archived: archived}, nil
 }
 
+// Peek reads the file without owning it: no archive, no repair, no write —
+// the shared reader's discipline, safe beside a live writer holding the
+// flock. ok is false for a missing, foreign-schema, or undecodable file; the
+// extracted cores are still returned either way.
+func (f *File[T]) Peek() (Loaded[T], bool, error) {
+	at, err := f.at()
+	if err != nil {
+		return Loaded[T]{}, false, err
+	}
+	raw, err := at.read()
+	if errors.Is(err, fs.ErrNotExist) {
+		return Loaded[T]{}, false, nil
+	}
+	if err != nil {
+		return Loaded[T]{}, false, err
+	}
+	schema, cores, payload := scan(raw)
+	if schema == f.schema {
+		var value T
+		if err := json.Unmarshal(payload, &value); err == nil {
+			return Loaded[T]{Value: value, Cores: cores}, true, nil
+		}
+	}
+	return Loaded[T]{Cores: cores}, false, nil
+}
+
 // Store replaces the file with v: write a temp, fsync it, rename it into
 // place, fsync the directory. A crash leaves the previous contents or v.
 func (f *File[T]) Store(v T) error {

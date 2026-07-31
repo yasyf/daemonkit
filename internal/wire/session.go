@@ -375,6 +375,7 @@ func (s *session) receiveRequest(ctx context.Context, frame Frame, sidecar frame
 		state.inputEnded = true
 		state.inbound.close()
 	}
+	s.server.admitted.Add(1)
 	s.active[frame.ID] = state
 	s.mu.Unlock()
 
@@ -396,6 +397,7 @@ func (s *session) execute(sessCtx, requestCtx context.Context, frame Frame, stat
 		state.close()
 		s.removeRequest(frame.ID)
 		state.settledOnce.Do(func() { close(state.settled) })
+		s.server.admitted.Add(-1)
 		s.requestWG.Done()
 	}()
 	value, err := s.dispatch(requestCtx, frame, state)
@@ -424,6 +426,8 @@ func (s *session) execute(sessCtx, requestCtx context.Context, frame Frame, stat
 // dispatch, so Runtime.Handle never sees a daemon.-prefixed op.
 func (s *session) dispatch(requestCtx context.Context, frame Frame, state *requestState) (any, error) {
 	switch {
+	case frame.Op == healthOp:
+		return s.server.executeHealth()
 	case frame.Op == brokerHandoffOp:
 		if s.lane != LaneControl {
 			return nil, ErrPermissionDenied

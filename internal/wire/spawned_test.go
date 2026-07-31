@@ -129,7 +129,7 @@ func TestSpawnedSessionRoundTripOverCmdHandoff(t *testing.T) {
 	if result.Outcome != wire.Delivered || string(result.Response.Payload) != `{"hello":"child"}` {
 		t.Fatalf("result = %v %s", result.Outcome, result.Response.Payload)
 	}
-	if err := client.Close(); err != nil {
+	if err := client.Close(context.Background()); err != nil {
 		t.Fatalf("Close() = %v", err)
 	}
 	if exit := awaitExit(t, child); exit.Code != 0 {
