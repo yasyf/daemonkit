@@ -101,6 +101,12 @@ func (r launchctlResult) settled() bool {
 // refusal carries launchd's own reason; an unknown status carries the two ways
 // to decode it offline, since launchctl's own log subsystem redacts the reason
 // to <private> and only launchd[1] logs it in the clear.
+//
+// Only a positive status is one launchctl exited with, and only such a status
+// has a decoding to prescribe. A zero or negative code reaches here from a
+// [Runner] that could not run launchctl at all, or from one the kernel killed
+// by signal — neither produced a status, and telling their caller to decode one
+// is the misdiagnosis this reports without.
 func (r launchctlResult) fail() error {
 	out := strings.TrimSpace(r.out)
 	switch r.kind {
@@ -109,7 +115,7 @@ func (r launchctlResult) fail() error {
 	case launchctlRefused:
 		return r.errorf("%s (launchd refused: %s)", out, r.reason)
 	case launchctlUnknown:
-		if r.code < 0 {
+		if r.code <= 0 {
 			return r.errorf("%s", out)
 		}
 		return r.errorf(

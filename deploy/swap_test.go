@@ -34,10 +34,40 @@ func TestRecoverSettlesTheRenamePairFromEveryCrashPoint(t *testing.T) {
 			want:  "two",
 		},
 		{
+			name:  "supersede: neither rename landed, a plain file at the prior slot",
+			prior: "one",
+			place: func(t *testing.T, f *fixture) {
+				if err := os.WriteFile(f.deploy.layout.prior, []byte("not a bundle"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "two",
+		},
+		{
+			name:  "supersede: neither rename landed, a stale tree at the prior slot",
+			prior: "one",
+			place: func(t *testing.T, f *fixture) {
+				if err := os.MkdirAll(filepath.Join(f.deploy.layout.prior, "Contents"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "two",
+		},
+		{
 			name:  "supersede: only the prior moved aside",
 			prior: "one",
 			place: func(t *testing.T, f *fixture) {
 				rename(t, f.deploy.layout.canonical, f.deploy.layout.prior)
+			},
+			want: "two",
+		},
+		{
+			name:  "supersede: the prior moved aside and was then reclaimed by hand",
+			prior: "one",
+			place: func(t *testing.T, f *fixture) {
+				if err := os.RemoveAll(f.deploy.layout.canonical); err != nil {
+					t.Fatal(err)
+				}
 			},
 			want: "two",
 		},

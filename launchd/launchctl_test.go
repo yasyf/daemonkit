@@ -190,8 +190,14 @@ func TestLaunchctlOutcomeFailNamesTheOfflineDecodings(t *testing.T) {
 		t.Errorf("unknown-status error = %q, must prescribe nothing about session types", got)
 	}
 
-	unreached := launchctlOutcome("print", "", -1, errors.New("runner gone"))
-	if got := unreached.fail().Error(); strings.Contains(got, "launchctl error") {
-		t.Errorf("non-launchd failure error = %q, must not prescribe decoding a status", got)
+	for _, code := range []int{-1, 0} {
+		unreached := launchctlOutcome("print", "", code, errors.New("runner gone"))
+		got := unreached.fail().Error()
+		if strings.Contains(got, "launchctl error") {
+			t.Errorf("runner-reported code %d = %q, must not prescribe decoding a status", code, got)
+		}
+		if !strings.Contains(got, "runner gone") {
+			t.Errorf("runner-reported code %d = %q, want it to name the cause", code, got)
+		}
 	}
 }

@@ -34,6 +34,17 @@ const (
 // a candidate identical to the prior it replaces answers "these are the
 // candidate's bytes" before either rename has run, and taking that for a
 // landed pair strands the staged tree in its slot forever.
+//
+// The canonical path is what answers for the first rename too, and only it
+// can: the recorded prior cannot be in two places, so a canonical path still
+// holding it is that rename pending and a canonical path that does not is that
+// rename done, however occupied or empty the destination looks. Asking the
+// destination instead read an occupied one as a landed rename, which left the
+// candidate no empty slot to land in and refused — and refused identically on
+// every resume after, a permanent wedge no verb could clear. What occupied it
+// is nothing any record names, since the generation the record does name is at
+// the canonical path, and nothing the gate above this call left live; the
+// rename therefore clears its own destination rather than refusing it.
 func (d *Deployment) settleSwap(ctx context.Context, record swapRecord) error {
 	if fileExists(d.layout.canonical) {
 		occupant, err := d.inspect(ctx, d.layout.canonical)
@@ -46,9 +57,10 @@ func (d *Deployment) settleSwap(ctx context.Context, record swapRecord) error {
 		if record.Prior == nil || !occupant.sameBytes(*record.Prior) {
 			return fmt.Errorf("%w: the canonical app is neither the recorded prior nor the candidate", ErrConflict)
 		}
-	}
-	if record.Prior != nil && !fileExists(d.layout.prior) {
 		if err := d.attest(ctx, *record.Prior); err != nil {
+			return err
+		}
+		if err := removeTreeDurable(d.layout.prior); err != nil {
 			return err
 		}
 		if err := renameDurable(d.layout.canonical, d.layout.prior); err != nil {

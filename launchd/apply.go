@@ -38,6 +38,11 @@ var ErrNotOwned = errors.New("launchd: agent plist carries no " + OwnerEnvKey + 
 // stderr, its exit code, and any error that prevented it from running. Apply and
 // Remove drive /bin/launchctl through a Runner so the process boundary stays
 // mockable and the caller owns durable process supervision.
+//
+// The code is launchctl's own exit status and nothing else: a command that
+// never ran produced none, so a Runner reporting the error leaves the code at
+// its zero value rather than inventing a status. Only a positive code is read
+// as one launchctl exited with.
 type Runner func(ctx context.Context, path string, args ...string) (output string, code int, err error)
 
 // Apply installs or repairs exactly the one named agent and always kickstarts

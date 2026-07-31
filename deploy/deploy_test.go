@@ -930,6 +930,108 @@ func TestResetClearsASlotThatCannotHoldABundle(t *testing.T) {
 	}
 }
 
+// occupiedPriorSlots are the ways the destination of a supersede's first
+// rename is already taken. Reading either as a landed rename left the
+// candidate no empty slot to land in: the swap record stayed outstanding, and
+// every verb after it — Reset, the one way out of a state no other verb
+// accepts, included — resumed into the same refusal forever.
+var occupiedPriorSlots = []struct {
+	name   string
+	occupy func(*testing.T, string)
+}{
+	{"plain file", func(t *testing.T, slot string) {
+		if err := os.WriteFile(slot, []byte("not a bundle"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}},
+	{"stale directory", func(t *testing.T, slot string) {
+		if err := os.MkdirAll(filepath.Join(slot, "Contents"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}},
+}
+
+func TestSupersedeClearsAnOccupiedPriorSlot(t *testing.T) {
+	for _, tt := range occupiedPriorSlots {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFixture(t)
+			if _, err := f.deploy.Install(f.ctx(), f.candidate("First", "1.0", "one")); err != nil {
+				t.Fatalf("Install: %v", err)
+			}
+			tt.occupy(t, f.deploy.layout.prior)
+			landed, err := f.deploy.Supersede(f.ctx(), f.candidate("Second", "2.0", "two"))
+			if err != nil {
+				t.Fatalf("Supersede: %v", err)
+			}
+			if landed.Version != "2.0" {
+				t.Fatalf("Supersede = %+v, want the 2.0 generation", landed)
+			}
+			for name, path := range map[string]string{
+				"swap":      f.deploy.layout.swap,
+				"prior":     f.deploy.layout.prior,
+				"candidate": f.deploy.layout.candidate,
+			} {
+				if fileExists(path) {
+					t.Errorf("Supersede left %s behind at %q", name, path)
+				}
+			}
+			if err := f.deploy.Reset(f.ctx()); err != nil {
+				t.Fatalf("Reset: %v", err)
+			}
+			installed, err := f.deploy.inspect(f.ctx(), f.app)
+			if err != nil || installed.Version != "2.0" {
+				t.Fatalf("installed = %+v, %v; want the superseding 2.0 generation", installed, err)
+			}
+		})
+	}
+}
+
+// TestResetClearsAnOutstandingSwapWhosePriorSlotIsOccupied holds Reset to what
+// its godoc promises: it is the escape hatch of last resort, so it clears a
+// deployment whatever wrote the outstanding swap record and whatever occupies
+// the slot that record's first rename has to move into.
+func TestResetClearsAnOutstandingSwapWhosePriorSlotIsOccupied(t *testing.T) {
+	for _, tt := range occupiedPriorSlots {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.crash("one", "two", func(t *testing.T, f *fixture) {
+				tt.occupy(t, f.deploy.layout.prior)
+			})
+			if err := f.deploy.Reset(f.ctx()); err != nil {
+				t.Fatalf("Reset: %v", err)
+			}
+			f.wantCanonical("two")
+			for name, path := range map[string]string{
+				"swap":      f.deploy.layout.swap,
+				"prior":     f.deploy.layout.prior,
+				"candidate": f.deploy.layout.candidate,
+			} {
+				if fileExists(path) {
+					t.Errorf("Reset left %s behind at %q", name, path)
+				}
+			}
+		})
+	}
+}
+
+// TestResetRefusesAnOccupiedPriorSlotWhileTheDaemonIsLive is the other half:
+// clearing that slot destroys bytes a process can be running, so it is gated
+// exactly as every other generation slot's destruction is.
+func TestResetRefusesAnOccupiedPriorSlotWhileTheDaemonIsLive(t *testing.T) {
+	f := newFixture(t)
+	f.crash("one", "two", func(t *testing.T, f *fixture) {
+		writeMachO(t, filepath.Join(f.deploy.layout.prior, "Contents", "MacOS", "stale"), 0o755)
+	})
+	f.live = []LiveProcess{{PID: 909, Executable: f.agent.Program}}
+	if err := f.deploy.Reset(f.ctx()); !errors.Is(err, ErrLive) {
+		t.Fatalf("Reset err = %v, want ErrLive", err)
+	}
+	if !fileExists(filepath.Join(f.deploy.layout.prior, "Contents", "MacOS", "stale")) {
+		t.Fatal("Reset cleared the prior slot with no absence proof behind it")
+	}
+	f.wantCanonical("one")
+}
+
 func TestResetRefusesWhileTheDaemonIsLive(t *testing.T) {
 	f := newFixture(t)
 	if _, err := f.deploy.Install(f.ctx(), f.candidate("Source", "1.0", "one")); err != nil {
