@@ -188,7 +188,6 @@ final class ClientRequestState: @unchecked Sendable {
 }
 
 actor ClientRequestSender {
-    private let window = SocketCreditWindow()
     private let admissionHook: (@Sendable () async -> Void)?
     private let sendHook: (@Sendable () async -> Void)?
     private let drainWaitHook: (@Sendable () -> Void)?
@@ -220,7 +219,6 @@ actor ClientRequestSender {
         await admissionHook?()
         guard await acquireTurn() else { throw CancellationError() }
         defer { releaseTurn() }
-        guard await window.acquire() else { throw CancellationError() }
         guard !ended else { throw CancellationError() }
         let current = try sequence.take()
         await sendHook?()
@@ -237,13 +235,8 @@ actor ClientRequestSender {
         }
     }
 
-    func grant(_ count: UInt32) async {
-        await window.grant(count)
-    }
-
     func close() async {
         ended = true
-        await window.close()
         guard inFlight > 0 else { return }
         await withCheckedContinuation { continuation in
             drainWaiters.append(continuation)

@@ -486,8 +486,6 @@ extension SocketClientCore {
             try await receiveEvent(frame)
         case .lifecycle:
             try await receiveLifecycle(frame)
-        case .window:
-            try await receiveWindow(frame)
         case .goAway:
             let closing = lock.withLock {
                 if case .closing = closeState {
@@ -595,14 +593,6 @@ extension SocketClientCore {
                 group.cancelAll()
             }
         }
-    }
-
-    private func receiveWindow(_ frame: SessionFrame) async throws {
-        guard frame.id != 0, frame.flags.isEmpty, frame.sequence > 0,
-              frame.operation.isEmpty, frame.tenant.isEmpty, frame.payload.isEmpty
-        else { throw SessionTransportError.invalidFrame("request stream window") }
-        guard let state = pendingState(frame.id) else { return }
-        await state.sender.grant(frame.sequence)
     }
 
     func remove(_ id: UInt64) -> ClientRequestState? {

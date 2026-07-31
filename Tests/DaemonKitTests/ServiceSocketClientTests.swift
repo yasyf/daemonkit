@@ -116,6 +116,64 @@ struct ServiceSocketClientTests {
         #expect(try jsonObject(terminal.payload)["v"] as? Int == 9)
     }
 
+    @Test func requestStreamChunksSettleWithoutWindowGrants() async throws {
+        let server = try GoWireServer()
+        defer { server.shutdown() }
+        let client = try await SocketClient(
+            path: server.socketPath,
+            schema: GoWireServer.schema,
+            lane: .business
+        )
+        defer { client.abort() }
+        try await client.waitReady(deadline: deadline())
+
+        let call = try await client.open(
+            operation: "test.sleep.v1",
+            payload: Data(#"{"ms":300}"#.utf8),
+            endInput: false,
+            deadline: deadline()
+        )
+        try await call.sendChunk(Data("a".utf8))
+        try await call.sendChunk(Data("b".utf8))
+        try await call.closeSend()
+
+        let terminal = try await call.response()
+        #expect(terminal.error == nil)
+        #expect(!terminal.rejected)
+        #expect(try jsonObject(terminal.payload)["ms"] as? Int == 300)
+        await #expect(throws: SessionTransportError.invalidFrame("request stream already ended")) {
+            try await call.sendChunk(Data("c".utf8))
+        }
+    }
+
+    @Test func outOfOrderRequestChunkFailsTheRequest() async throws {
+        let server = try GoWireServer()
+        defer { server.shutdown() }
+        let client = try await SocketClient(
+            path: server.socketPath,
+            schema: GoWireServer.schema,
+            lane: .business
+        )
+        defer { client.abort() }
+        try await client.waitReady(deadline: deadline())
+
+        let call = try await client.open(
+            operation: "test.sleep.v1",
+            payload: Data(#"{"ms":300}"#.utf8),
+            endInput: false,
+            deadline: deadline()
+        )
+        try await client.core.writeCommitted(SessionFrame(
+            kind: .stream,
+            id: call.id,
+            sequence: 4,
+            payload: Data("skipped".utf8)
+        ))
+
+        let terminal = try await call.response()
+        #expect(terminal.error == "wire: stream sequence violation")
+    }
+
     @Test func serverEventReachesClient() async throws {
         let server = try GoWireServer()
         defer { server.shutdown() }
