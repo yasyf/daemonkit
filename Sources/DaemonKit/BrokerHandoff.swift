@@ -13,40 +13,27 @@ public enum BrokerHandoffError: Error, Equatable, Sendable {
     case invalidPayload
     case nonceGeneration(OSStatus)
     case responseRejected(SocketResponseCode?, String?)
-    case responseMismatch
     case deliveryUnknown
 }
 
 private struct BrokerHandoffEnvelope: Codable, Equatable, Sendable {
-    let protocolVersion: UInt16
     let nonce: String
-    let runtimeIdentity: RuntimeIdentity
-
-    enum CodingKeys: String, CodingKey {
-        case protocolVersion = "protocol"
-        case nonce
-        case runtimeIdentity = "runtime_identity"
-    }
 }
 
 enum BrokerHandoffCodec {
-    static func makeRequest(identity: RuntimeIdentity) throws -> (payload: Data, nonce: Data) {
+    static func makeRequest() throws -> (payload: Data, nonce: Data) {
         var nonce = Data(count: brokerHandoffNonceBytes)
         let status = nonce.withUnsafeMutableBytes { bytes in
             SecRandomCopyBytes(kSecRandomDefault, brokerHandoffNonceBytes, bytes.baseAddress!)
         }
         guard status == errSecSuccess else { throw BrokerHandoffError.nonceGeneration(status) }
-        return try (encode(nonce: nonce, identity: identity), nonce)
+        return try (encode(nonce: nonce), nonce)
     }
 
-    static func encode(nonce: Data, identity: RuntimeIdentity) throws -> Data {
-        guard nonce.count == brokerHandoffNonceBytes,
-              !identity.runtimeBuild.isEmpty
-        else { throw BrokerHandoffError.invalidPayload }
+    static func encode(nonce: Data) throws -> Data {
+        guard nonce.count == brokerHandoffNonceBytes else { throw BrokerHandoffError.invalidPayload }
         let payload = try canonicalEncoder().encode(BrokerHandoffEnvelope(
-            protocolVersion: daemonKitSessionProtocolVersion,
-            nonce: nonce.base64EncodedString(),
-            runtimeIdentity: identity
+            nonce: nonce.base64EncodedString()
         ))
         guard payload.count <= brokerHandoffMaximumPayloadBytes else {
             throw SessionTransportError.frameTooLarge(
@@ -57,7 +44,7 @@ enum BrokerHandoffCodec {
         return payload
     }
 
-    static func decode(_ payload: Data) throws -> (nonce: Data, identity: RuntimeIdentity) {
+    static func decode(_ payload: Data) throws -> Data {
         guard payload.count <= brokerHandoffMaximumPayloadBytes,
               try hasExactFields(payload)
         else { throw BrokerHandoffError.invalidPayload }
@@ -67,16 +54,11 @@ enum BrokerHandoffCodec {
         } catch {
             throw BrokerHandoffError.invalidPayload
         }
-        guard envelope.protocolVersion == daemonKitSessionProtocolVersion,
-              let nonce = Data(base64Encoded: envelope.nonce),
+        guard let nonce = Data(base64Encoded: envelope.nonce),
               nonce.count == brokerHandoffNonceBytes,
-              nonce.base64EncodedString() == envelope.nonce,
-              !envelope.runtimeIdentity.runtimeBuild.isEmpty
+              nonce.base64EncodedString() == envelope.nonce
         else { throw BrokerHandoffError.invalidPayload }
-        guard try encode(nonce: nonce, identity: envelope.runtimeIdentity) == payload else {
-            throw BrokerHandoffError.invalidPayload
-        }
-        return (nonce, envelope.runtimeIdentity)
+        return nonce
     }
 
     private static func canonicalEncoder() -> JSONEncoder {
@@ -87,9 +69,7 @@ enum BrokerHandoffCodec {
 
     private static func hasExactFields(_ payload: Data) throws -> Bool {
         guard let root = try JSONSerialization.jsonObject(with: payload) as? [String: Any],
-              Set(root.keys) == ["protocol", "nonce", "runtime_identity"],
-              let identity = root["runtime_identity"] as? [String: Any],
-              Set(identity.keys) == ["runtime_build", "process_generation"]
+              Set(root.keys) == ["nonce"]
         else { return false }
         return true
     }
@@ -120,8 +100,6 @@ actor BrokerHandoffClient {
     }
 
     private let path: String
-    private let wireBuild: String
-    private let role: String
     private let configuration: SocketClient.Configuration
     private let stateSignal = ServiceStateSignal()
     private var generation: Generation?
@@ -131,21 +109,14 @@ actor BrokerHandoffClient {
 
     init(
         path: String,
-        wireBuild: String,
-        role: String,
         configuration: SocketClient.Configuration
-    ) throws {
-        guard !wireBuild.isEmpty else { throw SessionTransportError.handshake("empty wireBuild") }
-        guard !role.isEmpty else { throw SessionTransportError.handshake("empty role") }
+    ) {
         self.path = path
-        self.wireBuild = wireBuild
-        self.role = role
         self.configuration = configuration
     }
 
     func handoff(
         descriptor: Int32,
-        runtimeIdentity: RuntimeIdentity,
         parentDeadline: Date
     ) async throws {
         var ownsDescriptor = true
@@ -170,7 +141,7 @@ actor BrokerHandoffClient {
             currentUsage.inFlight += 1
             usage[current.generation.id] = currentUsage
             do {
-                let request = try BrokerHandoffCodec.makeRequest(identity: runtimeIdentity)
+                let request = try BrokerHandoffCodec.makeRequest()
                 ownsDescriptor = false
                 let terminal = try await current.client.core.handoff(
                     owner: current.client,
@@ -181,12 +152,8 @@ actor BrokerHandoffClient {
                 guard !terminal.rejected else {
                     throw BrokerHandoffError.responseRejected(terminal.code, terminal.reason)
                 }
-                guard terminal.error == nil, let payload = terminal.payload else {
+                guard terminal.error == nil else {
                     throw BrokerHandoffError.invalidPayload
-                }
-                let response = try BrokerHandoffCodec.decode(payload)
-                guard response.nonce == request.nonce, response.identity == runtimeIdentity else {
-                    throw BrokerHandoffError.responseMismatch
                 }
                 finish(generation: current.generation.id, accepted: true)
                 if usage[current.generation.id]?.accepted == 256 {
@@ -195,7 +162,7 @@ actor BrokerHandoffClient {
                 return
             } catch {
                 finish(generation: current.generation.id, accepted: false)
-                if !ownsDescriptor, !Self.keepsSession(after: error) {
+                if !ownsDescriptor {
                     await retire(current.generation)
                 }
                 throw error
@@ -210,11 +177,6 @@ actor BrokerHandoffClient {
         if let generation {
             await retire(generation)
         }
-    }
-
-    static func keepsSession(after error: any Error) -> Bool {
-        guard case let BrokerHandoffError.responseRejected(code, _) = error else { return false }
-        return code == .handoffPendingCapacity
     }
 
     private func session(deadline: Date) async throws -> (generation: Generation, client: SocketClient) {
@@ -232,15 +194,13 @@ actor BrokerHandoffClient {
             let id = nextGeneration
             nextGeneration += 1
             let path = path
-            let wireBuild = wireBuild
-            let role = role
             current = Generation(
                 id: id,
                 client: Task {
                     try await SocketClient(
                         path: path,
-                        wireBuild: wireBuild,
-                        role: role,
+                        schema: "",
+                        lane: .control,
                         configuration: attemptConfiguration
                     )
                 }
@@ -312,7 +272,6 @@ public final class BrokerSocketBridge: @unchecked Sendable {
     }
 
     private let path: String
-    private let expectedRuntimeBuild: String
     private let lifecycleClient: ServiceSocketClient
     private let handoffClient: BrokerHandoffClient
     private let acceptQueue = DispatchQueue(label: "com.yasyf.daemonkit.BrokerSocketBridge.accept")
@@ -326,42 +285,28 @@ public final class BrokerSocketBridge: @unchecked Sendable {
     public convenience init(
         container: AppGroupContainer,
         socket: AppGroupContainer.SocketLeaf,
-        lifecycle: RuntimeClientConfiguration,
-        handoffRole: String,
-        expectedRuntimeBuild: String
+        lifecycle: RuntimeClientConfiguration
     ) throws {
         try self.init(
             path: container.socketPath(leaf: socket),
-            lifecycle: lifecycle,
-            handoffRole: handoffRole,
-            expectedRuntimeBuild: expectedRuntimeBuild
+            lifecycle: lifecycle
         )
     }
 
     init(
         path: String,
-        lifecycle: RuntimeClientConfiguration,
-        handoffRole: String,
-        expectedRuntimeBuild: String
+        lifecycle: RuntimeClientConfiguration
     ) throws {
-        guard !expectedRuntimeBuild.isEmpty else { throw BrokerHandoffError.invalidPayload }
-        guard !handoffRole.isEmpty, handoffRole != lifecycle.role else {
-            throw BrokerHandoffError.invalidPayload
-        }
         self.path = path
-        self.expectedRuntimeBuild = expectedRuntimeBuild
         lifecycleClient = try ServiceSocketClient(
             path: lifecycle.path,
-            wireBuild: lifecycle.wireBuild,
-            role: lifecycle.role,
-            noProgressTimeout: lifecycle.noProgressTimeout,
+            schema: lifecycle.schema,
+            lane: lifecycle.lane,
             configuration: lifecycle.socket,
             onProgress: lifecycle.onProgress
         )
-        handoffClient = try BrokerHandoffClient(
+        handoffClient = BrokerHandoffClient(
             path: lifecycle.path,
-            wireBuild: lifecycle.wireBuild,
-            role: handoffRole,
             configuration: lifecycle.socket
         )
     }
@@ -395,7 +340,7 @@ public final class BrokerSocketBridge: @unchecked Sendable {
                         }
                         let accepted = try await acceptConnection(bound.descriptor)
                         pending += 1
-                        group.addTask { [lifecycleClient, handoffClient, expectedRuntimeBuild] in
+                        group.addTask { [lifecycleClient, handoffClient] in
                             var ownsDescriptor = true
                             defer {
                                 if ownsDescriptor {
@@ -404,14 +349,10 @@ public final class BrokerSocketBridge: @unchecked Sendable {
                             }
                             do {
                                 let deadline = Date().addingTimeInterval(brokerHandoffMaximumDuration)
-                                let receipt = try await lifecycleClient.acquireReadyRuntime(
-                                    expectedRuntimeBuild: expectedRuntimeBuild,
-                                    deadline: deadline
-                                )
+                                try await lifecycleClient.waitReady(deadline: deadline)
                                 ownsDescriptor = false
                                 try await handoffClient.handoff(
                                     descriptor: accepted,
-                                    runtimeIdentity: receipt.runtimeIdentity,
                                     parentDeadline: deadline
                                 )
                             } catch {

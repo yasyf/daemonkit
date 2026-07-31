@@ -93,6 +93,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
       - name: Install lint tools missing from the image
         # macos-26 ships swiftformat but not swiftlint; guard both against image churn.
         run: |
@@ -105,8 +109,10 @@ jobs:
       - name: Build
         run: swift build
       - name: Test
-        run: swift test
+        # scripts/swift-test.sh builds the Go wire test server the client suites
+        # dial and exports its path as DAEMONKIT_WIRE_TEST_SERVER.
+        run: ./scripts/swift-test.sh
       - name: Strict cooperative executor transport
         env:
           LIBDISPATCH_COOPERATIVE_POOL_STRICT: "1"
-        run: swift test --filter strictExecutorRunsProductionClientAndServerTogether
+        run: ./scripts/swift-test.sh --filter ServiceSocketClientTests

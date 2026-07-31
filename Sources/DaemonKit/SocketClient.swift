@@ -23,9 +23,7 @@ public final class SocketCall: @unchecked Sendable {
         self.state = state
         chunks = SocketChunkStream(channel: state.chunkChannel) { [client, state] in
             Task { await Self.cancel(client: client, id: id, state: state) }
-        } consumptionOperation: { [client] _ in
-            try await client.writeSettlement(SessionFrame(kind: .window, id: id, sequence: 1))
-        }
+        } consumptionOperation: { _ in }
     }
 
     /// Appends an ordered request-stream chunk.
@@ -101,20 +99,114 @@ public final class SocketClient: @unchecked Sendable {
 
     public init(
         path: String,
-        wireBuild: String,
-        role: String,
-        configuration: Configuration = .init()
+        schema: String,
+        lane: SessionLane,
+        configuration: Configuration = .init(),
+        onPhase: (@Sendable (PhaseSnapshot) -> Void)? = nil
     ) async throws {
         core = try await SocketClientCore(
             path: path,
-            wireBuild: wireBuild,
-            role: role,
-            configuration: configuration
+            schema: schema,
+            lane: lane,
+            configuration: configuration,
+            onPhase: onPhase
         )
+    }
+
+    /// Blocks until the server's phase stream reports ``SessionPhase/ready``.
+    /// Throws ``RuntimeFailedError`` on failed and ``SessionDrainingError`` on
+    /// draining, mirroring internal/wire.Client.WaitReady bounded by deadline.
+    public func waitReady(deadline: Date) async throws {
+        try await core.waitReady(deadline: deadline)
+    }
+
+    /// The most recent lifecycle snapshot the server published.
+    public var phase: PhaseSnapshot {
+        core.currentPhase
     }
 
     deinit {
         core.abort()
+    }
+}
+
+/// One atomic capture of a ``PhaseGate``: snapshot, its revision, and closure.
+struct PhaseGateState {
+    let snapshot: PhaseSnapshot
+    let revision: UInt64
+    let closed: Bool
+    let error: Error?
+}
+
+/// A race-free phase gate mirroring Go's phaseMu/phaseChanged: the snapshot and
+/// its revision live under one lock, so a reader captures both atomically.
+final class PhaseGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var snapshot: PhaseSnapshot
+    private var revision: UInt64 = 0
+    private var closed = false
+    private var closeError: Error?
+    private var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+
+    init(_ initial: PhaseSnapshot) {
+        snapshot = initial
+    }
+
+    var current: PhaseSnapshot {
+        lock.withLock { snapshot }
+    }
+
+    func read() -> PhaseGateState {
+        lock.withLock {
+            PhaseGateState(snapshot: snapshot, revision: revision, closed: closed, error: closeError)
+        }
+    }
+
+    func update(_ next: PhaseSnapshot) {
+        let woken = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            snapshot = next
+            revision &+= 1
+            let woken = Array(waiters.values)
+            waiters.removeAll()
+            return woken
+        }
+        for continuation in woken {
+            continuation.resume()
+        }
+    }
+
+    func close(_ error: Error) {
+        let woken = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            guard !closed else { return [] }
+            closed = true
+            closeError = error
+            revision &+= 1
+            let woken = Array(waiters.values)
+            waiters.removeAll()
+            return woken
+        }
+        for continuation in woken {
+            continuation.resume()
+        }
+    }
+
+    func waitChange(after expected: UInt64) async {
+        let id = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let resume = lock.withLock {
+                    guard revision == expected, !closed else { return true }
+                    waiters[id] = continuation
+                    return false
+                }
+                if resume {
+                    continuation.resume()
+                }
+            }
+        } onCancel: {
+            let waiter = lock.withLock { waiters.removeValue(forKey: id) }
+            waiter?.resume()
+        }
     }
 }
 
@@ -130,22 +222,20 @@ final class SocketClientCore: @unchecked Sendable {
         let codec: SessionFrameCodec
         let writer: SessionWriter
         let readQueue: DispatchQueue
-        let peerWireBuild: String
+        let peerSchema: String
         let sessionGeneration: Data
+        let phase: SessionPhase
     }
 
     /// Events pushed by the server, bounded by ``Configuration/eventQueueDepth``.
     var events: SocketEventStream {
         SocketEventStream(channel: eventChannel) { [weak self] in
             Task { await self?.close() }
-        } consumptionOperation: { [weak self] _ in
-            guard let self else { throw SessionTransportError.disconnected }
-            try await writeSettlement(SessionFrame(kind: .window, sequence: 1))
-        }
+        } consumptionOperation: { _ in }
     }
 
-    /// Server wireBuild identity established by the mandatory handshake.
-    let peerWireBuild: String
+    /// Server schema identity established by the mandatory handshake.
+    let peerSchema: String
     private let sessionGeneration: Data
 
     private let descriptor: Int32
@@ -160,8 +250,8 @@ final class SocketClientCore: @unchecked Sendable {
     var nextID: UInt64 = 1
     var closeState = CloseState.open
     private let eventChannel: SocketBoundedChannel<SocketEvent>
-    private let lifecycleChannel: SocketBoundedChannel<Data>
-    private let lifecycleSequence = RuntimeLifecycleSequenceValidator()
+    private let phaseGate: PhaseGate
+    private let onPhase: (@Sendable (PhaseSnapshot) -> Void)?
     var openCommitHook: (@Sendable () async -> Void)?
     var requestWriteStartHook: (@Sendable () -> Void)?
     var requestSettlementHook: (@Sendable () async -> Void)?
@@ -175,12 +265,17 @@ final class SocketClientCore: @unchecked Sendable {
 
     init(
         path: String,
-        wireBuild: String,
-        role: String,
-        configuration: SocketClient.Configuration
+        schema: String,
+        lane: SessionLane,
+        configuration: SocketClient.Configuration,
+        onPhase: (@Sendable (PhaseSnapshot) -> Void)?
     ) async throws {
-        guard !wireBuild.isEmpty else { throw SessionTransportError.handshake("empty wireBuild") }
-        guard !role.isEmpty else { throw SessionTransportError.handshake("empty role") }
+        switch lane {
+        case .business:
+            guard !schema.isEmpty else { throw SessionTransportError.handshake("empty schema") }
+        case .control:
+            guard schema.isEmpty else { throw SessionTransportError.handshake("control lane carries no schema") }
+        }
         guard configuration.maximumFrameBytes > 0,
               (1 ... Int(UInt32.max)).contains(configuration.streamQueueDepth),
               (1 ... Int(UInt32.max)).contains(configuration.eventQueueDepth),
@@ -193,18 +288,19 @@ final class SocketClientCore: @unchecked Sendable {
         else { throw SessionTransportError.invalidFrame("timeout") }
         let bootstrap = try await Self.bootstrap(
             path: path,
-            wireBuild: wireBuild,
-            role: role,
+            schema: schema,
+            lane: lane,
             configuration: configuration
         )
         self.configuration = configuration
+        self.onPhase = onPhase
         readQueue = bootstrap.readQueue
         descriptor = bootstrap.descriptor
         codec = bootstrap.codec
         writer = bootstrap.writer
         eventChannel = SocketBoundedChannel(capacity: configuration.eventQueueDepth)
-        lifecycleChannel = SocketBoundedChannel(capacity: 1)
-        peerWireBuild = bootstrap.peerWireBuild
+        phaseGate = PhaseGate(PhaseSnapshot(sequence: 0, phase: bootstrap.phase))
+        peerSchema = bootstrap.peerSchema
         sessionGeneration = bootstrap.sessionGeneration
         let codec = bootstrap.codec
         let readQueue = bootstrap.readQueue
@@ -354,7 +450,8 @@ final class SocketClientCore: @unchecked Sendable {
     private func finishClose(requests: [ClientRequestState], error: Error) {
         shutdown(descriptor, SHUT_RDWR)
         writer.abort()
-        writer.afterDrained { [closeLatch, descriptor, eventChannel, lifecycleChannel, readQueue] in
+        phaseGate.close(error)
+        writer.afterDrained { [closeLatch, descriptor, eventChannel, readQueue] in
             Task {
                 await withCheckedContinuation { continuation in
                     readQueue.async {
@@ -364,10 +461,6 @@ final class SocketClientCore: @unchecked Sendable {
                 }
                 await Self.settle(requests, throwing: error)
                 await eventChannel.finish(throwing: error)
-                await lifecycleChannel.finishRetaining(
-                    where: Self.retainLifecycleAcrossClose,
-                    throwing: error
-                )
                 closeLatch.finish()
             }
         }
@@ -379,13 +472,6 @@ final class SocketClientCore: @unchecked Sendable {
                 group.addTask { _ = await request.finish(throwing: error) }
             }
         }
-    }
-
-    static func retainLifecycleAcrossClose(_ payload: Data) -> Bool {
-        guard let event = try? RuntimeReadinessCodec.decodeEvent(payload) else {
-            return true
-        }
-        return event.progress.state == .failed || event.progress.state == .draining
     }
 }
 
@@ -470,14 +556,44 @@ extension SocketClientCore {
     }
 
     private func receiveLifecycle(_ frame: SessionFrame) async throws {
-        guard try lifecycleSequence.accept(frame.payload) else { return }
-        let accepted = await lifecycleChannel.offerLatest(Data(frame.payload))
-        guard accepted else { throw SessionTransportError.disconnected }
+        let snapshot = try SessionHandshakeCodec.decodeLifecycle(frame.payload)
+        phaseGate.update(snapshot)
+        onPhase?(snapshot)
     }
 
-    func nextLifecycleSnapshot() async throws -> Data? {
-        try await lifecycleChannel.next { [weak self] in
-            self?.fail(CancellationError())
+    var currentPhase: PhaseSnapshot {
+        phaseGate.current
+    }
+
+    func waitReady(deadline: Date) async throws {
+        while true {
+            let state = phaseGate.read()
+            switch state.snapshot.phase {
+            case .ready:
+                return
+            case .failed:
+                throw RuntimeFailedError(snapshot: state.snapshot)
+            case .draining:
+                throw SessionDrainingError()
+            case .starting:
+                break
+            }
+            if state.closed {
+                throw state.error ?? SessionTransportError.disconnected
+            }
+            try Task.checkCancellation()
+            guard deadline > Date() else { throw SocketCallDeadlineExceededError() }
+            let nanoseconds = deadlineSleepNanoseconds(until: deadline)
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                group.addTask { await self.phaseGate.waitChange(after: state.revision) }
+                group.addTask {
+                    if nanoseconds > 0 {
+                        try await Task.sleep(nanoseconds: nanoseconds)
+                    }
+                }
+                _ = try await group.next()
+                group.cancelAll()
+            }
         }
     }
 
@@ -505,14 +621,14 @@ extension SocketClientCore {
 
     static func handshake(
         codec: SessionFrameCodec,
-        wireBuild: String,
-        role: String,
+        schema: String,
+        lane: SessionLane,
         timeout: TimeInterval
     ) throws -> SessionWireIdentity {
         let payload = try JSONEncoder().encode(SessionHelloIdentity(
             protocolVersion: daemonKitSessionProtocolVersion,
-            wireBuild: wireBuild,
-            role: role
+            lane: lane,
+            schema: schema.isEmpty ? nil : schema
         ))
         let writeFailure: Error?
         do {
@@ -520,6 +636,15 @@ extension SocketClientCore {
             writeFailure = nil
         } catch let error as SessionTransportError where error.isPeerEndWriteFailure {
             writeFailure = error
+        }
+        let drain: Bool
+        do {
+            drain = try codec.peekPreamble(timeout: timeout)
+        } catch {
+            throw writeFailure ?? error
+        }
+        if drain {
+            throw SessionDrainingError()
         }
         let response: SessionFrame
         do {
@@ -532,45 +657,13 @@ extension SocketClientCore {
         else {
             throw writeFailure ?? SessionTransportError.handshake("invalid acknowledgment")
         }
-        let acknowledgment: SessionHandshakeAck
         do {
-            acknowledgment = try SessionHandshakeCodec.decodeAck(response.payload)
+            return try SessionHandshakeCodec.decodeAck(response.payload)
+        } catch let rejection as SocketHandshakeRejectionError {
+            throw rejection
         } catch {
             throw writeFailure ?? error
         }
-        guard acknowledgment.protocolVersion == daemonKitSessionProtocolVersion else {
-            throw writeFailure ?? SessionTransportError.unsupportedProtocolVersion(acknowledgment.protocolVersion)
-        }
-        guard !acknowledgment.wireBuild.isEmpty else {
-            throw writeFailure ?? SessionTransportError.handshake("empty server wireBuild")
-        }
-        guard acknowledgment.wireBuild == wireBuild else {
-            throw SocketWireBuildMismatchError(server: acknowledgment.wireBuild, client: wireBuild)
-        }
-        if acknowledgment.rejected == true {
-            guard let rawCode = acknowledgment.code, !rawCode.isEmpty,
-                  let reason = acknowledgment.reason, !reason.isEmpty
-            else {
-                throw writeFailure ?? SessionTransportError.handshake("invalid rejection")
-            }
-            let code = SocketResponseCode(rawValue: rawCode)
-            switch code {
-            case .sessionCapacity, .peerUntrusted, .permissionDenied, .buildMismatch:
-                throw SocketHandshakeRejectionError(code: code, reason: reason)
-            default:
-                throw writeFailure ?? SessionTransportError.handshake(
-                    "invalid rejection code \(rawCode.debugDescription)"
-                )
-            }
-        }
-        guard let session = acknowledgment.session else {
-            throw writeFailure ?? SessionTransportError.handshake("missing session generation")
-        }
-        return SessionWireIdentity(
-            protocolVersion: acknowledgment.protocolVersion,
-            wireBuild: acknowledgment.wireBuild,
-            session: session
-        )
     }
 
     private struct DecodedResponse {
@@ -626,8 +719,8 @@ extension SocketClientCore {
 private extension SocketClientCore {
     private static func bootstrap(
         path: String,
-        wireBuild: String,
-        role: String,
+        schema: String,
+        lane: SessionLane,
         configuration: SocketClient.Configuration
     ) async throws -> Bootstrap {
         let owner = OwnedDescriptor()
@@ -655,18 +748,11 @@ private extension SocketClientCore {
                 let identity = try await readQueue.performIO {
                     try handshake(
                         codec: codec,
-                        wireBuild: wireBuild,
-                        role: role,
+                        schema: schema,
+                        lane: lane,
                         timeout: configuration.handshakeTimeout
                     )
                 }
-                guard let session = identity.session, session.count == 16 else {
-                    throw SessionTransportError.handshake("invalid session generation")
-                }
-                try await sessionWriter.write(SessionFrame(
-                    kind: .window,
-                    sequence: UInt32(configuration.eventQueueDepth)
-                ))
                 try Task.checkCancellation()
                 try owner.releaseIfNotCanceled()
                 return Bootstrap(
@@ -674,8 +760,9 @@ private extension SocketClientCore {
                     codec: codec,
                     writer: sessionWriter,
                     readQueue: readQueue,
-                    peerWireBuild: identity.wireBuild,
-                    sessionGeneration: session
+                    peerSchema: identity.schema,
+                    sessionGeneration: identity.session,
+                    phase: identity.phase
                 )
             } catch {
                 let canceled = Task.isCancelled || owner.isCanceled

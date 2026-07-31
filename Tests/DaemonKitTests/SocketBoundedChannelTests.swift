@@ -40,31 +40,6 @@ struct SocketBoundedChannelTests {
         await channel.discard()
     }
 
-    @Test func transportCloseDiscardsStaleReadyButRetainsTerminalLifecycle() async throws {
-        let ready = lifecyclePayload(state: .ready)
-        let stale = SocketBoundedChannel<Data>(capacity: 1)
-        #expect(await stale.offerLatest(ready))
-        await stale.finishRetaining(
-            where: SocketClientCore.retainLifecycleAcrossClose,
-            throwing: SessionTransportError.disconnected
-        )
-        await #expect(throws: SessionTransportError.disconnected) {
-            try await stale.next(onCancel: {})
-        }
-
-        let failedPayload = lifecyclePayload(state: .failed)
-        let terminal = SocketBoundedChannel<Data>(capacity: 1)
-        #expect(await terminal.offerLatest(failedPayload))
-        await terminal.finishRetaining(
-            where: SocketClientCore.retainLifecycleAcrossClose,
-            throwing: SessionTransportError.disconnected
-        )
-        #expect(try await terminal.next(onCancel: {}) == failedPayload)
-        await #expect(throws: SessionTransportError.disconnected) {
-            try await terminal.next(onCancel: {})
-        }
-    }
-
     private func expectCanceledFullSendSettles<Element: Sendable>(
         _ channel: SocketBoundedChannel<Element>,
         value: Element
@@ -77,11 +52,5 @@ struct SocketBoundedChannelTests {
 
     private func chunk(_ sequence: UInt32) -> SocketRequestChunk {
         SocketRequestChunk(sequence: sequence, payload: Data([UInt8(sequence)]), end: false)
-    }
-
-    private func lifecyclePayload(state: RuntimeReadinessState) -> Data {
-        let json = #"{"progress":{"detail":"","sequence":1,"state":"\#(state.rawValue)"},"protocol":2,"# +
-            #""runtime_identity":{"process_generation":"00000000000000000000000000000001","runtime_build":"app.v1"},"wire_build":"service.v1"}"#
-        return Data(json.utf8)
     }
 }

@@ -75,37 +75,9 @@ extension SocketClient {
         core.events
     }
 
-    /// Server wireBuild identity established by the mandatory handshake.
-    public var peerWireBuild: String {
-        core.peerWireBuild
-    }
-
-    /// Acquires the authenticated exact runtime identity before lifecycle waiting.
-    public func acquireRuntimeReceipt(
-        expectedRuntimeBuild: String,
-        deadline: Date
-    ) async throws -> RuntimeProcessReceipt {
-        guard deadline > Date() else { throw ServiceSocketClientError.deadlineExceeded }
-        guard !expectedRuntimeBuild.isEmpty else {
-            throw RuntimeReadinessValidationError.invalidResponse("expected runtime build is required")
-        }
-        let terminal = try await call(
-            operation: runtimeReceiptOperation,
-            payload: RuntimeReceiptCodec.encodeRequest(),
-            deadline: deadline
-        )
-        guard terminal.error == nil, !terminal.rejected, let payload = terminal.payload else {
-            throw RuntimeReceiptUnavailableError()
-        }
-        let receipt = try RuntimeReceiptCodec.decodeResponse(payload)
-        guard receipt.runtimeIdentity.runtimeBuild == expectedRuntimeBuild else {
-            throw RuntimeReadinessValidationError.invalidResponse("runtime receipt build mismatch")
-        }
-        return receipt
-    }
-
-    func nextLifecycleSnapshot() async throws -> Data? {
-        try await core.nextLifecycleSnapshot()
+    /// Server schema identity established by the mandatory handshake.
+    public var peerSchema: String {
+        core.peerSchema
     }
 
     func waitUntilClosed() async {

@@ -1,25 +1,21 @@
 import Foundation
 
+/// Connects the configured socket and returns once a ready session is
+/// established, mirroring internal/wire.Client.WaitReady over reconnects.
 public func acquireReadyRuntime(
     configuration: RuntimeClientConfiguration,
-    expectedRuntimeBuild: String,
     deadline: Date
-) async throws -> RuntimeProcessReceipt {
+) async throws {
     let client = try ServiceSocketClient(
         path: configuration.path,
-        wireBuild: configuration.wireBuild,
-        role: configuration.role,
-        noProgressTimeout: configuration.noProgressTimeout,
+        schema: configuration.schema,
+        lane: configuration.lane,
         configuration: configuration.socket,
         onProgress: configuration.onProgress
     )
     do {
-        let receipt = try await client.acquireReadyRuntime(
-            expectedRuntimeBuild: expectedRuntimeBuild,
-            deadline: deadline
-        )
+        try await client.waitReady(deadline: deadline)
         await client.close()
-        return receipt
     } catch {
         await client.close()
         throw error

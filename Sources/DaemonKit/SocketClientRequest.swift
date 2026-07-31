@@ -77,12 +77,6 @@ extension SocketClientCore {
             committed = true
             await openCommitHook?()
             try Task.checkCancellation()
-            try await write(SessionFrame(
-                kind: .window,
-                id: id,
-                sequence: UInt32(configuration.streamQueueDepth)
-            ))
-            try Task.checkCancellation()
         } catch is CancellationError {
             try await settleCanceledOpen(id: id, state: state, committed: committed)
         } catch {

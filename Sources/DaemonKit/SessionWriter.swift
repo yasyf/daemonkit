@@ -179,17 +179,6 @@ final class SessionWriter: @unchecked Sendable {
         }
     }
 
-    func writeLifecycle(_ frame: SessionFrame) async throws {
-        try await enqueueLifecycle(frame).wait()
-    }
-
-    func enqueueLifecycle(_ frame: SessionFrame) -> LifecycleWriteReceipt {
-        let receipt = LifecycleWriteReceipt()
-        let entry = Entry(frame: frame) { receipt.finish($0) }
-        submit(entry, cancellation: nil, priority: .lifecycle)
-        return receipt
-    }
-
     func close(with frame: SessionFrame) async throws {
         try Task.checkCancellation()
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in

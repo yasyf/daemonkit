@@ -13,33 +13,24 @@ public enum ServiceSocketReplayPolicy: Equatable, Sendable {
     case idempotent
 }
 
-/// ServiceRuntimeTarget selects exact installer fencing or explicit generic successor following.
-public enum ServiceRuntimeTarget: Equatable, Sendable {
-    case exact(RuntimeIdentity)
-    case anyAuthenticatedSuccessor
-}
-
-/// RuntimeClientConfiguration configures one private acquire-through-ready operation.
+/// RuntimeClientConfiguration configures one private connect-through-ready operation.
 public struct RuntimeClientConfiguration: Sendable {
     public let path: String
-    public let wireBuild: String
-    public let role: String
-    public let noProgressTimeout: TimeInterval
+    public let schema: String
+    public let lane: SessionLane
     public let socket: SocketClient.Configuration
-    public let onProgress: (@Sendable (ReadinessProgress) -> Void)?
+    public let onProgress: (@Sendable (PhaseSnapshot) -> Void)?
 
     public init(
         path: String,
-        wireBuild: String,
-        role: String,
-        noProgressTimeout: TimeInterval,
+        schema: String,
+        lane: SessionLane = .business,
         socket: SocketClient.Configuration = .init(),
-        onProgress: (@Sendable (ReadinessProgress) -> Void)? = nil
+        onProgress: (@Sendable (PhaseSnapshot) -> Void)? = nil
     ) {
         self.path = path
-        self.wireBuild = wireBuild
-        self.role = role
-        self.noProgressTimeout = noProgressTimeout
+        self.schema = schema
+        self.lane = lane
         self.socket = socket
         self.onProgress = onProgress
     }

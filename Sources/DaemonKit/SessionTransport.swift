@@ -112,10 +112,52 @@ extension SessionFrameCodec {
 
 // wiregen:end
 
-/// Roles reserved by daemonkit's session protocol.
-public enum SessionPeerRole {
-    /// A same-UID session with no protected or lifecycle authority.
-    public static let unprotected = "daemonkit.unprotected.v1"
+/// The two session kinds protocol 2 admits: the trust-gated control lane and
+/// the schema-gated business lane.
+public enum SessionLane: String, Codable, Sendable {
+    /// The repair channel: drain and broker handoff, gated by control trust.
+    case control
+    /// The product channel: schema set-membership at attach.
+    case business
+}
+
+/// The runtime lifecycle state the server publishes to every session.
+public enum SessionPhase: String, Codable, Sendable {
+    /// Pre-readiness; business dispatch is typed-rejected.
+    case starting = "runtime_starting"
+    /// Business dispatch is admitted.
+    case ready = "runtime_ready"
+    /// Intake is closing; reconnect elsewhere.
+    case draining = "runtime_draining"
+    /// The runtime's terminal failure.
+    case failed = "runtime_failed"
+}
+
+/// One monotonic runtime lifecycle publication.
+public struct PhaseSnapshot: Equatable, Sendable {
+    public let sequence: UInt64
+    public let phase: SessionPhase
+    public let detail: Data?
+
+    public init(sequence: UInt64, phase: SessionPhase, detail: Data? = nil) {
+        self.sequence = sequence
+        self.phase = phase
+        self.detail = detail
+    }
+}
+
+/// The server answered the handshake with the drain preamble instead of an ack.
+public struct SessionDrainingError: Error, Equatable, Sendable {
+    public init() {}
+}
+
+/// RuntimeFailedError reports the runtime's terminal failed phase.
+public struct RuntimeFailedError: Error, Equatable, Sendable {
+    public let snapshot: PhaseSnapshot
+
+    public init(snapshot: PhaseSnapshot) {
+        self.snapshot = snapshot
+    }
 }
 
 /// One version-exact length-prefixed session frame.
@@ -150,6 +192,24 @@ public struct SessionFrame: Sendable {
     }
 }
 
+/// One ordered request-stream chunk.
+public struct SocketRequestChunk: Sendable {
+    public let sequence: UInt32
+    public let payload: Data
+    public let end: Bool
+}
+
+/// Errors raised while resolving or binding a unix-socket address.
+enum SocketServerError: Error, Sendable {
+    case pathTooLong(path: String, limit: Int)
+    case addressInUse(path: String)
+    case socketFailed(errno: Int32)
+    case bindFailed(path: String, errno: Int32)
+    case chmodFailed(path: String, errno: Int32)
+    case listenFailed(errno: Int32)
+    case alreadyRunning
+}
+
 /// Fail-closed codec errors.
 public enum SessionTransportError: Error, Equatable, Sendable {
     case truncatedFrame
@@ -178,124 +238,119 @@ extension SessionTransportError {
     }
 }
 
-struct SessionWireIdentity: Codable, Sendable {
+/// The server identity established by the mandatory protocol-2 handshake.
+struct SessionWireIdentity: Sendable {
     let protocolVersion: UInt16
-    let wireBuild: String
-    let session: Data?
-
-    init(protocolVersion: UInt16, wireBuild: String, session: Data? = nil) {
-        self.protocolVersion = protocolVersion
-        self.wireBuild = wireBuild
-        self.session = session
-    }
-
-    enum CodingKeys: String, CodingKey {
-        case protocolVersion = "protocol"
-        case wireBuild = "wire_build"
-        case session
-    }
+    let schema: String
+    let session: Data
+    let phase: SessionPhase
 }
 
-struct SessionHelloIdentity: Codable, Sendable {
+struct SessionHelloIdentity: Encodable, Sendable {
     let protocolVersion: UInt16
-    let wireBuild: String
-    let role: String
+    let lane: SessionLane
+    let schema: String?
+    let nonce: Data?
 
-    enum CodingKeys: String, CodingKey {
-        case protocolVersion = "protocol"
-        case wireBuild = "wire_build"
-        case role
-    }
-}
-
-struct SessionHandshakeAck: Codable, Sendable {
-    let protocolVersion: UInt16
-    let wireBuild: String
-    let session: Data?
-    let rejected: Bool?
-    let code: String?
-    let reason: String?
-
-    init(
-        protocolVersion: UInt16,
-        wireBuild: String,
-        session: Data? = nil,
-        rejected: Bool? = nil,
-        code: String? = nil,
-        reason: String? = nil
-    ) {
+    init(protocolVersion: UInt16, lane: SessionLane, schema: String? = nil, nonce: Data? = nil) {
         self.protocolVersion = protocolVersion
-        self.wireBuild = wireBuild
-        self.session = session
-        self.rejected = rejected
-        self.code = code
-        self.reason = reason
+        self.lane = lane
+        self.schema = schema
+        self.nonce = nonce
     }
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol"
-        case wireBuild = "wire_build"
-        case session
-        case rejected
-        case code
-        case reason
+        case lane
+        case schema
+        case nonce
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(protocolVersion, forKey: .protocolVersion)
+        try container.encode(lane, forKey: .lane)
+        if let schema, !schema.isEmpty {
+            try container.encode(schema, forKey: .schema)
+        }
+        if let nonce, !nonce.isEmpty {
+            try container.encode(nonce.base64EncodedString(), forKey: .nonce)
+        }
     }
 }
 
 enum SessionHandshakeCodec {
-    static func decodeHello(_ data: Data) throws -> SessionHelloIdentity {
-        try requireKeys(data, exact: ["protocol", "wire_build", "role"])
-        return try JSONDecoder().decode(SessionHelloIdentity.self, from: data)
-    }
-
-    static func decodeAck(_ data: Data) throws -> SessionHandshakeAck {
-        let object = try jsonObject(data)
-        let rejected = object["rejected"] as? Bool ?? false
-        let expected: Set<String> = rejected
-            ? ["protocol", "wire_build", "rejected", "code", "reason"]
-            : ["protocol", "wire_build", "session"]
-        guard Set(object.keys) == expected else {
-            throw SessionTransportError.handshake("invalid acknowledgment fields")
-        }
-        return try JSONDecoder().decode(SessionHandshakeAck.self, from: data)
-    }
-
-    static func encodeSuccess(wireBuild: String, session: Data) throws -> Data {
-        try JSONEncoder().encode(SessionHandshakeAck(
-            protocolVersion: daemonKitSessionProtocolVersion,
-            wireBuild: wireBuild,
-            session: session
-        ))
-    }
-
-    static func encodeRejection(
-        wireBuild: String,
-        code: SocketResponseCode,
-        reason: String
-    ) throws -> Data {
-        try JSONEncoder().encode(SessionHandshakeAck(
-            protocolVersion: daemonKitSessionProtocolVersion,
-            wireBuild: wireBuild,
-            rejected: true,
-            code: code.rawValue,
-            reason: reason
-        ))
-    }
-
-    private static func requireKeys(_ data: Data, exact: Set<String>) throws {
-        let object = try jsonObject(data)
-        guard Set(object.keys) == exact else {
-            throw SessionTransportError.handshake("invalid identity fields")
-        }
-    }
-
-    private static func jsonObject(_ data: Data) throws -> [String: Any] {
+    static func decodeAck(_ data: Data) throws -> SessionWireIdentity {
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw SessionTransportError.handshake("invalid identity JSON")
+            throw SessionTransportError.handshake("invalid acknowledgment JSON")
         }
-        return object
+        guard let protocolNumber = object["protocol"] as? NSNumber else {
+            throw SessionTransportError.handshake("acknowledgment protocol")
+        }
+        let protocolVersion = protocolNumber.uint16Value
+        guard protocolVersion == daemonKitSessionProtocolVersion else {
+            throw SessionTransportError.unsupportedProtocolVersion(protocolVersion)
+        }
+        guard let schema = object["schema"] as? String, !schema.isEmpty else {
+            throw SessionTransportError.handshake("empty server schema")
+        }
+        guard let phaseRaw = object["phase"] as? String, let phase = SessionPhase(rawValue: phaseRaw) else {
+            throw SessionTransportError.handshake("acknowledgment phase")
+        }
+        let rejected = (object["rejected"] as? NSNumber)?.boolValue ?? false
+        if rejected {
+            guard object["session"] == nil,
+                  Set(object.keys).isSubset(of: ["protocol", "schema", "phase", "rejected", "code", "reason"]),
+                  let rawCode = object["code"] as? String, !rawCode.isEmpty,
+                  let reason = object["reason"] as? String, !reason.isEmpty
+            else {
+                throw SessionTransportError.handshake("invalid rejection")
+            }
+            let code = SocketResponseCode(rawValue: rawCode)
+            switch code {
+            case .sessionCapacity, .peerUntrusted, .buildMismatch:
+                throw SocketHandshakeRejectionError(code: code, reason: reason)
+            default:
+                throw SessionTransportError.handshake("invalid rejection code \(rawCode.debugDescription)")
+            }
+        }
+        guard object["code"] == nil, object["reason"] == nil else {
+            throw SessionTransportError.handshake("success carried rejection")
+        }
+        guard Set(object.keys).isSubset(of: ["protocol", "schema", "session", "phase"]),
+              let sessionRaw = object["session"] as? String,
+              let session = Data(base64Encoded: sessionRaw),
+              session.count == sessionGenerationBytes
+        else {
+            throw SessionTransportError.handshake("invalid session generation")
+        }
+        return SessionWireIdentity(
+            protocolVersion: protocolVersion,
+            schema: schema,
+            session: session,
+            phase: phase
+        )
+    }
+
+    static func decodeLifecycle(_ data: Data) throws -> PhaseSnapshot {
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              Set(object.keys).isSubset(of: ["sequence", "phase", "detail"]),
+              let sequence = object["sequence"] as? NSNumber,
+              let phaseRaw = object["phase"] as? String,
+              let phase = SessionPhase(rawValue: phaseRaw)
+        else {
+            throw SessionTransportError.invalidFrame("lifecycle snapshot")
+        }
+        let detail: Data? = if let value = object["detail"] {
+            try JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed])
+        } else {
+            nil
+        }
+        return PhaseSnapshot(sequence: sequence.uint64Value, phase: phase, detail: detail)
     }
 }
+
+let sessionGenerationBytes = 16
 
 struct SessionSequence: Sendable {
     private var next: UInt32
@@ -321,11 +376,14 @@ struct SessionSequence: Sendable {
 
 final class SessionFrameCodec: @unchecked Sendable {
     static let defaultMaximumFrameBytes = daemonKitDefaultMaximumFrameBytes
+    /// The two bytes 0x4452 ("DR") a draining server emits instead of an ack.
+    static let drainPreamble = Data([0x44, 0x52])
 
     private let descriptor: Int32
     private let maximumFrameBytes: Int
     private let writeTimeout: TimeInterval
     private let writeLock = NSLock()
+    private var peeked: Data?
 
     init(
         descriptor: Int32,
@@ -335,6 +393,18 @@ final class SessionFrameCodec: @unchecked Sendable {
         self.descriptor = descriptor
         self.maximumFrameBytes = maximumFrameBytes
         self.writeTimeout = writeTimeout
+    }
+
+    /// Reads the next two bytes and reports whether they are the drain preamble.
+    /// Bytes that are not the preamble are stashed as the head of the next frame
+    /// read, mirroring internal/wire.Codec.PeekPreamble.
+    func peekPreamble(timeout: TimeInterval = 0) throws -> Bool {
+        let head = try readExactly(2, deadline: Self.deadline(after: timeout))
+        if head == Self.drainPreamble {
+            return true
+        }
+        peeked = head
+        return false
     }
 
     func read(timeout: TimeInterval = 0) throws -> SessionFrame {
@@ -474,6 +544,19 @@ extension SessionFrameCodec {
     private func readExactly(_ count: Int, deadline: UInt64?) throws -> Data {
         var data = Data(count: count)
         var offset = 0
+        if let stashed = peeked {
+            peeked = nil
+            if stashed.count >= count {
+                let head = Data(stashed.prefix(count))
+                let rest = stashed.dropFirst(count)
+                if !rest.isEmpty {
+                    peeked = Data(rest)
+                }
+                return head
+            }
+            data.replaceSubrange(0 ..< stashed.count, with: stashed)
+            offset = stashed.count
+        }
         while offset < count {
             let readCount = data.withUnsafeMutableBytes { buffer in
                 Darwin.read(descriptor, buffer.baseAddress?.advanced(by: offset), count - offset)
