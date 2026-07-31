@@ -83,8 +83,6 @@ disappears cannot leave a stale row behind.
 | `service` | converges an exact durable set of macOS user LaunchAgents. | 28 | 10954 |
 | `templates` | — | 2 | 218 |
 | `version` | classifies and compares release and development builds for launcher-owned runtime settlement and release ordering. | 2 | 302 |
-| `wire` | is daemonkit's persistent multiplexed unix-socket transport. | 39 | 10384 |
-| `wire/wiretest` | is the in-process harness for wire's transport and peer tests: short-path socket dirs, a real client/server pair, an injectable peer, and a manually-advanced clock mirroring proc's seam. | 2 | 232 |
 <!-- END GENERATED: package table -->
 
 Packages under `internal/` are module-private machinery and carry no compatibility

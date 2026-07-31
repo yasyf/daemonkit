@@ -76,7 +76,7 @@ func TestGoldenV2Packet(t *testing.T) {
 }
 
 func TestGoldenV1ShapeSurvivesTheVersionBump(t *testing.T) {
-	v1 := goldenPacket(t, filepath.Join("..", "..", "wire", "testdata", "frame-v1.json"))
+	v1 := goldenPacket(t, filepath.Join("testdata", "frame-v1.json"))
 	v2 := goldenPacket(t, filepath.Join("testdata", "frame-v2.json"))
 	if len(v1) != len(v2) {
 		t.Fatalf("golden lengths %d and %d differ", len(v1), len(v2))
@@ -111,7 +111,7 @@ func TestFrozenEraPrefixes(t *testing.T) {
 	if cut := frozenPrefix(t, "frame-prefix-cut.hex"); !bytes.Equal(body[:len(cut)], cut) {
 		t.Fatalf("v2 body opens %x, want the frozen cut prefix %x", body[:len(cut)], cut)
 	}
-	v1 := goldenPacket(t, filepath.Join("..", "..", "wire", "testdata", "frame-v1.json"))
+	v1 := goldenPacket(t, filepath.Join("testdata", "frame-v1.json"))
 	precut := frozenPrefix(t, "frame-prefix-precut.hex")
 	if !bytes.Equal(v1[framePrefixSize:framePrefixSize+len(precut)], precut) {
 		t.Fatalf("v1 golden body opens %x, want the frozen pre-cut prefix %x",

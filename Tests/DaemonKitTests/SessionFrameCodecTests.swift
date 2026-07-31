@@ -47,7 +47,7 @@ struct SessionFrameCodecTests {
         var encoded = try Self.goldenPacket()
         encoded[8] = 0
         encoded[9] = 1
-        let hex = try Self.goldenHex("wire/testdata/frame-v1.json")
+        let hex = try Self.goldenHex("internal/wire/testdata/frame-v1.json")
         #expect(encoded.map { String(format: "%02x", $0) }.joined() == hex)
     }
 
