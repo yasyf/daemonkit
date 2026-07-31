@@ -329,28 +329,28 @@ type eraModule struct {
 
 func moduleOf(t *testing.T, era string) eraModule {
 	t.Helper()
-	switch era {
-	case precutEra:
+	if era == precutEra {
 		return eraModule{
 			directive: fmt.Sprintf("require %s %s", daemonkitModule, precutBoundary),
 			release:   precutBoundary,
 		}
-	case cutEra:
-		return eraModule{directive: fmt.Sprintf("require %s v0.0.0\n\nreplace %s => %s",
-			daemonkitModule, daemonkitModule, repoRoot(t))}
 	}
-	t.Fatalf("no module defines the %q era", era)
+	t.Fatalf("no foreign module defines the %q era", era)
 	return eraModule{}
 }
 
-// buildPeer compiles the era's conformance peer against the module that defines
-// the era, so the era's name and the module it was built from cannot be chosen
-// separately, and then proves a released era's binary linked that release. A
-// requirement repointed at this tree — the edit that makes a build error go
-// away — leaves the binary carrying a replaced daemonkit and fails here instead
-// of running as the boundary under the boundary's label.
+// buildPeer compiles the era's conformance peer. The cut era's peer is in-tree,
+// built against this working tree's internal/wire directly; a released era's
+// peer is built in its own module against the pinned release and proven linked
+// to it. The era's name and the module it was built from cannot be chosen
+// separately: a released requirement repointed at this tree — the edit that
+// makes a build error go away — leaves the binary carrying a replaced daemonkit
+// and fails here instead of running as the boundary under the boundary's label.
 func buildPeer(t *testing.T, era string) peer {
 	t.Helper()
+	if era == cutEra {
+		return buildInTreePeer(t)
+	}
 	defines := moduleOf(t, era)
 	dir := t.TempDir()
 	sources, err := filepath.Glob(filepath.Join("testdata", era, "*.go"))
@@ -378,6 +378,18 @@ func buildPeer(t *testing.T, era string) peer {
 		assertLinksRelease(t, built, defines.release)
 	}
 	return built
+}
+
+// buildInTreePeer compiles the cut peer from ci/mixedera/cutpeer against this
+// module, so it links this working tree's internal/wire — which Go's
+// internal-package rule bars the foreign per-era module from importing. There is
+// no release to link-check: the cut era is this tree.
+func buildInTreePeer(t *testing.T) peer {
+	t.Helper()
+	root := repoRoot(t)
+	binary := filepath.Join(t.TempDir(), cutEra)
+	goRun(t, root, "build", "-tags", "mixedera", "-o", binary, "./ci/mixedera/cutpeer")
+	return peer{era: cutEra, binary: binary, module: filepath.Join(root, "ci", "mixedera", "cutpeer")}
 }
 
 // assertLinksRelease reads the module versions the linker embedded in the built

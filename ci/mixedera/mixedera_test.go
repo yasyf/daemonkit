@@ -160,7 +160,7 @@ var gateCases = []gateCase{
 	{
 		name: "classify/cut",
 		run: func(t *testing.T, p *peers) {
-			t.Log(goRun(t, p.cut.module, "test", "-count=1", "./..."))
+			t.Log(goRun(t, p.cut.module, "test", "-count=1", "-tags", "mixedera", "./..."))
 		},
 	},
 	{
