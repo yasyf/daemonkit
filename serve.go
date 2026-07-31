@@ -138,7 +138,7 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 	if err != nil {
 		return Drained{}, err
 	}
-	store, err := proc.OpenStore(d.recordPath())
+	store, err := proc.OpenStore(d.RecordPath())
 	if err != nil {
 		_ = lock.Close()
 		return Drained{}, fmt.Errorf("daemonkit: open record store: %w", err)

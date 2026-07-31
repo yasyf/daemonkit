@@ -21,6 +21,16 @@ type Identity struct {
 	Executable string
 }
 
+// String names one process instance for a refusal to report. A process
+// nothing could name still names its pin: "a process remains" tells an
+// operator nothing, and the pin is what they can act on.
+func (i Identity) String() string {
+	if i.Executable == "" {
+		return fmt.Sprintf("pid %d (unnameable, start %d, boot %d)", i.PID, i.Start, i.Boot)
+	}
+	return fmt.Sprintf("pid %d %s", i.PID, i.Executable)
+}
+
 // Peer is a connected socket's kernel-authenticated peer credentials, read
 // from one getsockopt so the process id and the user id it is judged under
 // cannot disagree.

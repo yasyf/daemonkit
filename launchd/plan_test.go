@@ -3,6 +3,7 @@ package launchd
 import (
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func residentAgent(t *testing.T, label string) Agent {
@@ -88,6 +89,55 @@ func TestRestorePlanReconstructsWithoutProgramResidency(t *testing.T) {
 	}
 	if restored.Digest() != want.Digest() {
 		t.Fatalf("restored digest %s != expected %s", restored.Digest(), want.Digest())
+	}
+}
+
+// TestPlanDigestSeparatesExitTimeOut holds ExitTimeOut inside the digested
+// identity: two agents that drain on different deadlines are different agents,
+// unlike the ownership marker, which is a render-time constant every plist
+// carries and so distinguishes nothing.
+func TestPlanDigestSeparatesExitTimeOut(t *testing.T) {
+	agent := residentAgent(t, "com.example.a")
+	patient := agent
+	patient.ExitTimeOut = 90 * time.Second
+
+	plain, err := NewPlan([]Agent{agent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	timed, err := NewPlan([]Agent{patient})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plain.Digest() == timed.Digest() {
+		t.Fatalf("digest %s ignores ExitTimeOut", plain.Digest())
+	}
+	restored, err := RestorePlan(timed.Agents(), timed.Digest())
+	if err != nil {
+		t.Fatalf("RestorePlan of an agent with an exit timeout: %v", err)
+	}
+	if got := restored.Agents()[0].ExitTimeOut; got != patient.ExitTimeOut {
+		t.Fatalf("restored ExitTimeOut = %s, want %s", got, patient.ExitTimeOut)
+	}
+}
+
+// TestPlanDigestIsFrozenWithoutAnExitTimeOut pins the durable wire format: an
+// agent that sets no exit timeout digests to exactly what it digested before
+// the field existed, so a plan a consumer stored still restores.
+func TestPlanDigestIsFrozenWithoutAnExitTimeOut(t *testing.T) {
+	const frozen = "d4afa0cd2002257967cd4dce3e0c6b84d5a109c9eea76b42a159ecf2f83e70b5"
+	plan, err := NewPlan([]Agent{{
+		Label:         "com.example.frozen",
+		Program:       "/usr/bin/true",
+		LogPath:       "/tmp/daemonkit-frozen.log",
+		Env:           map[string]string{"PATH": "/usr/bin"},
+		RestartPolicy: RestartAlways,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := plan.Digest().String(); got != frozen {
+		t.Fatalf("plan digest = %s, want the frozen %s", got, frozen)
 	}
 }
 

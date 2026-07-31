@@ -33,7 +33,12 @@ type Label string
 
 func (d Daemon) statePaths() paths.Paths { return paths.Paths{App: string(d.Label)} }
 
-func (d Daemon) recordPath() string {
+// RecordPath is where Serve persists this daemon's durable owner record: the
+// {pid, start, boot, generation, build} core it writes behind the flock before
+// it binds. An inventory gate outside this package reads it to correlate a
+// live process nothing could name against the identity this daemon recorded —
+// the only thing that says whose husk it is.
+func (d Daemon) RecordPath() string {
 	return filepath.Join(d.statePaths().StateDir(), "daemon.records")
 }
 

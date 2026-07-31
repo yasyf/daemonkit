@@ -1,0 +1,298 @@
+package deploy
+
+import (
+	"debug/macho"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+
+	"github.com/yasyf/daemonkit/internal/proc"
+)
+
+// ErrLive means the executable-scoped inventory gate found live processes on
+// a deployment's own programs. It is the refusal that stands between a
+// half-quiesced daemon and an irreversible step.
+var ErrLive = errors.New("deploy: live processes remain on the deployment's executables")
+
+// machOMagics are the thin and fat Mach-O headers, the 64-bit fat variant
+// included: debug/macho names every one of them but that last.
+var machOMagics = [...]uint32{macho.Magic32, macho.Magic64, macho.MagicFat, 0xcafebabf}
+
+// LiveProcess is one inventory survivor, pinned so a refusal can say exactly
+// what remains. Executable is empty for a survivor nothing could name, whose
+// pin is then the whole of what is known about it.
+type LiveProcess struct {
+	PID        int
+	Start      uint64
+	Boot       uint64
+	Executable string
+}
+
+// String names the survivor a refusal reports: the pid and its executable, or
+// the instance pin alone when nothing could name it.
+func (p LiveProcess) String() string { return p.identity().String() }
+
+func (p LiveProcess) identity() proc.Identity {
+	return proc.Identity{PID: p.PID, Start: p.Start, Boot: p.Boot, Executable: p.Executable}
+}
+
+// Survivors is what one inventory found, in the two sets that carry different
+// authority. Live is attributed to the query: each process runs one of the
+// executables asked about. Unnameable is attributed to nothing — a live
+// same-user process whose executable neither the kernel nor its recorded
+// execve path could resolve, which is what a daemon whose binary was unlinked
+// under it looks like — so nothing about the process says whose it is. Only a
+// caller that recognizes the pin as one it recorded may hold it against
+// itself.
+type Survivors struct {
+	Live       []LiveProcess
+	Unnameable []LiveProcess
+}
+
+// attributed returns the unnameable survivors whose instance pin is one of
+// known. A pid alone is never the answer: the kernel hands it to a stranger
+// the moment the process leaves, so the whole pin is compared.
+func (s Survivors) attributed(known ...proc.Identity) []LiveProcess {
+	attributed := make([]LiveProcess, 0)
+	for _, survivor := range s.Unnameable {
+		if slices.ContainsFunc(known, func(id proc.Identity) bool {
+			return proc.SameInstance(survivor.identity(), id)
+		}) {
+			attributed = append(attributed, survivor)
+		}
+	}
+	return attributed
+}
+
+// Inventory reports every live same-user process the kernel names as running
+// one of paths — compared both in the symlink-free form the kernel reports and
+// in the literal form the caller wrote — and every live same-user process
+// nothing could name at all. It consults no names, no argv, and no shell
+// process discovery, and it revalidates each matched PID's executable and
+// instance around the identity snapshot, so a PID reused mid-inventory is
+// dropped rather than reported at its dead predecessor's pin.
+//
+// Another user's process is never one of this deployment's: the trust floor is
+// the same effective uid, and a root daemon that happens to run a queried path
+// would otherwise refuse every irreversible step forever.
+//
+// An empty Inventory over a daemon's host and app executables is the absence
+// proof quiesce and uninstall gate on, and it is the only one of daemonkit's
+// absence proofs that reads the kernel's own process table directly. Stopped
+// proves that one pinned identity left and says nothing about an orphaned
+// child, a second instance, or the app half; Settle's identity comes out of a
+// same-UID-writable owner record that a hostile writer can point at a corpse.
+// Neither can be substituted for this. Gate every irreversible step on both.
+//
+// Unnameable comes back beside the answer rather than folded into it. A
+// process nothing can name is evidence the scan may not drop — it may be the
+// daemon whose bytes were unlinked — but it is evidence about no particular
+// executable, and counting it against every query hands one long-lived husk
+// anywhere on the machine a veto over every gate. Correlate it against an
+// identity you recorded; ignore it when you recorded none.
+//
+// Each path scans the one process table, so a survivor both an unnameable set
+// and a second query would report twice is reported once.
+func Inventory(paths ...string) (Survivors, error) {
+	found := Survivors{Live: make([]LiveProcess, 0), Unnameable: make([]LiveProcess, 0)}
+	for _, path := range paths {
+		report, err := proc.ExecutableIdentities(path)
+		if err != nil {
+			return Survivors{}, fmt.Errorf("deploy: inventory %q: %w", path, err)
+		}
+		for _, identity := range report.Matched {
+			found.Live = append(found.Live, liveProcess(identity))
+		}
+		for _, identity := range report.Unnameable {
+			found.Unnameable = append(found.Unnameable, liveProcess(identity))
+		}
+	}
+	byPID := func(a, b LiveProcess) int { return a.PID - b.PID }
+	slices.SortFunc(found.Live, byPID)
+	slices.SortFunc(found.Unnameable, byPID)
+	found.Live = slices.Compact(found.Live)
+	found.Unnameable = slices.Compact(found.Unnameable)
+	return found, nil
+}
+
+func liveProcess(identity proc.Identity) LiveProcess {
+	return LiveProcess{
+		PID:        identity.PID,
+		Start:      identity.Start,
+		Boot:       identity.Boot,
+		Executable: identity.Executable,
+	}
+}
+
+// resolveExecutables holds every declared host binary to the exact form the
+// kernel reports for a running process: absolute, cleaned, and free of
+// symlinks. The inventory compares a query against that form and against the
+// literal one, and against nothing else, so a path in any other form matches
+// nothing — and a gate that matches nothing is a gate that always passes,
+// which is the one failure mode an absence proof may not have.
+func resolveExecutables(declared []string) ([]string, error) {
+	resolved := make([]string, 0, len(declared))
+	for _, path := range declared {
+		if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+			return nil, fmt.Errorf("%w: executable %q must be an exact absolute path", ErrConfig, path)
+		}
+		actual, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return nil, fmt.Errorf("%w: resolve executable %q: %w", ErrConfig, path, err)
+		}
+		resolved = append(resolved, actual)
+	}
+	return resolved, nil
+}
+
+// executables is every program this deployment runs: each agent's Program, the
+// host binaries the consumer declared outside the bundle, and every Mach-O
+// executable the bundle carries at each of the three paths a bundle of this
+// deployment sits at. The bundle half is what covers the helper that is
+// neither an agent nor declared — nothing else would notice it, and it is the
+// bundle under it that the next step deletes.
+//
+// The prior, candidate, and removal slots are in the set because the canonical
+// path is not where a bundle lives when the gate matters most: supersede
+// renames the incumbent aside to prior and the staged candidate into place, and
+// uninstall renames the whole generation into the removal slot, so a scan of the
+// canonical path alone is blind to a process still running the generation that
+// just moved — the exact bytes the next step destroys. A slot holding no bundle
+// carries no executables and is not an error.
+func (d *Deployment) executables() ([]string, error) {
+	paths := make([]string, 0, len(d.config.Agents)+len(d.config.Executables))
+	for _, agent := range d.config.Agents {
+		paths = append(paths, agent.Program)
+	}
+	paths = append(paths, d.config.Executables...)
+	for _, bundle := range []string{d.layout.canonical, d.layout.prior, d.layout.candidate, d.layout.removed} {
+		carried, err := bundleExecutables(bundle)
+		if err != nil {
+			return nil, err
+		}
+		paths = append(paths, carried...)
+	}
+	slices.Sort(paths)
+	return slices.Compact(paths), nil
+}
+
+// bundleExecutables reports every Mach-O file in the installed bundle that
+// carries an execute bit, walked under an os.Root scope so no entry names
+// anything outside the tree. Symlinks are skipped: the kernel reports the file
+// it execed, never a link to it. A bundle that is not installed carries
+// nothing, which is a state the ladder branches on rather than an error.
+func bundleExecutables(appPath string) ([]string, error) {
+	handle, err := os.OpenRoot(appPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("deploy: open bundle root: %w", err)
+	}
+	defer handle.Close()
+	var carried []string
+	walkErr := fs.WalkDir(handle.FS(), ".", func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+			return nil
+		}
+		executable, err := isMachO(handle, path)
+		if err != nil {
+			return err
+		}
+		if executable {
+			carried = append(carried, filepath.Join(appPath, filepath.FromSlash(path)))
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return nil, fmt.Errorf("deploy: scan bundle executables: %w", walkErr)
+	}
+	return carried, nil
+}
+
+func isMachO(handle *os.Root, path string) (bool, error) {
+	file, err := handle.Open(path)
+	if err != nil {
+		return false, err
+	}
+	var header [4]byte
+	_, readErr := io.ReadFull(file, header[:])
+	closeErr := file.Close()
+	if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
+		return false, closeErr
+	}
+	if err := errors.Join(readErr, closeErr); err != nil {
+		return false, err
+	}
+	native, swapped := binary.LittleEndian.Uint32(header[:]), binary.BigEndian.Uint32(header[:])
+	for _, magic := range machOMagics {
+		if native == magic || swapped == magic {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// requireEmpty is the inventory gate every quiesce arm ends at. A live process
+// on one of this deployment's own executables refuses outright. A live process
+// nothing could name refuses when its pin is the one this deployment's daemon
+// recorded, and only then: its own husk is in the owner record Serve writes
+// before it binds, while the long-lived stranger every machine carries — a
+// process under some other product's deleted binary — is not this deployment's
+// to answer for, and counting it would leave the gate unpassable forever.
+//
+// The residual is exact and worth stating: a husk that never recorded itself
+// is attributable to nothing, and no scan of the process table can attribute
+// it. Quiesce's other half is what covers a recorded identity whose executable
+// is gone — Stopped's reap observes that identity out of the table directly.
+func (d *Deployment) requireEmpty() error {
+	paths, err := d.executables()
+	if err != nil {
+		return err
+	}
+	found, err := d.inventory(paths...)
+	if err != nil {
+		return err
+	}
+	recorded, err := d.recordedIdentities()
+	if err != nil {
+		return err
+	}
+	remaining := append(slices.Clone(found.Live), found.attributed(recorded...)...)
+	if len(remaining) == 0 {
+		return nil
+	}
+	names := make([]string, len(remaining))
+	for i, process := range remaining {
+		names[i] = process.String()
+	}
+	return fmt.Errorf("%w: %s", ErrLive, strings.Join(names, ", "))
+}
+
+// recordedIdentities is every process instance this deployment wrote down as
+// its own: the durable owner record its daemon persists before it binds. It is
+// the only thing that says which unnameable process is this deployment's, and
+// nothing recorded means nothing to attribute.
+func (d *Deployment) recordedIdentities() ([]proc.Identity, error) {
+	owner, recorded, err := proc.ReadOwner(d.config.Daemon.RecordPath())
+	if err != nil {
+		return nil, fmt.Errorf("deploy: read owner record: %w", err)
+	}
+	if !recorded {
+		return nil, nil
+	}
+	return []proc.Identity{owner.Identity()}, nil
+}

@@ -32,8 +32,7 @@ func Staged() (Program, error) {
 	if err != nil {
 		return Program{}, fmt.Errorf("daemonkit: stage %q: %w", exe, err)
 	}
-	sum := sha256.Sum256(data)
-	dir := filepath.Join(home, ".daemonkit", "staged", hex.EncodeToString(sum[:]))
+	dir := filepath.Join(home, ".daemonkit", "staged", digest(data))
 	target := filepath.Join(dir, filepath.Base(exe))
 	if err := stage(dir, target, data); err != nil {
 		return Program{}, fmt.Errorf("daemonkit: stage %q: %w", exe, err)
@@ -76,6 +75,38 @@ func InBundle(app, rel string) (Program, error) {
 		return Program{}, fmt.Errorf("daemonkit: %q does not stay inside %q", rel, app)
 	}
 	return Program{path: path}, nil
+}
+
+// build is the Health.Build the daemon this program becomes will publish:
+// Serve digests its own executable, so the build a launcher wants is the
+// digest of the file launchd is told to exec.
+func (p Program) build() (string, error) {
+	data, err := os.ReadFile(p.path)
+	if err != nil {
+		return "", fmt.Errorf("daemonkit: read program %q: %w", p.path, err)
+	}
+	return digest(data), nil
+}
+
+// resolved is the program path in the form the kernel reports an executable:
+// absolute and symlink-free. A path that resolves to nothing is an error, never
+// an empty answer — a caller comparing against the kernel's own paths would
+// otherwise match nothing and read that as proof.
+func (p Program) resolved() (string, error) {
+	absolute, err := filepath.Abs(p.path)
+	if err != nil {
+		return "", fmt.Errorf("daemonkit: resolve program %q: %w", p.path, err)
+	}
+	resolved, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return "", fmt.Errorf("daemonkit: resolve program %q: %w", p.path, err)
+	}
+	return resolved, nil
+}
+
+func digest(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
 func stage(dir, target string, data []byte) error {

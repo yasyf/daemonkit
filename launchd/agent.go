@@ -41,7 +41,9 @@ const plistTemplateText = `<?xml version="1.0" encoding="UTF-8"?>
 {{end}}
     <key>ThrottleInterval</key>
     <integer>10</integer>
-{{if .ProcessType}}
+{{if .ExitTimeOut}}    <key>ExitTimeOut</key>
+    <integer>{{.ExitTimeOut}}</integer>
+{{end}}{{if .ProcessType}}
     <key>ProcessType</key>
     <string>{{.ProcessType}}</string>
 {{end}}
@@ -65,8 +67,9 @@ const plistTemplateText = `<?xml version="1.0" encoding="UTF-8"?>
 var plistTemplate = template.Must(template.New("plist").Parse(plistTemplateText))
 
 // OwnerEnvKey is the EnvironmentVariables key every daemonkit-rendered plist
-// carries so convergence recognizes a plist as daemonkit-owned without an
-// external store. It is reserved: an Agent.Env that sets it is rejected.
+// carries so [Apply] and [Remove] can tell whether the plist at the one label
+// they touch is daemonkit's, without an external store. It is reserved: an
+// Agent.Env that sets it is rejected.
 const OwnerEnvKey = "DAEMONKIT_AGENT_OWNER"
 
 const ownerEnvValue = "daemonkit"
@@ -87,6 +90,7 @@ type plistData struct {
 	Env                         []plistKV
 	Restart                     string
 	StartInterval               int64
+	ExitTimeOut                 int64
 	WatchPaths                  []string
 	StartCalendarInterval       []string
 	ProcessType                 string
@@ -117,6 +121,13 @@ type Agent struct {
 	// StartInterval schedules the job at a whole-second interval. Zero omits
 	// the launchd key.
 	StartInterval time.Duration
+	// ExitTimeOut is the grace launchd allows between the SIGTERM it sends a
+	// job it is booting out and the SIGKILL that backstops a drain that wedges.
+	// It is whole seconds; zero omits the launchd key and leaves launchd's own
+	// 20-second default. Two agents whose exit timeouts differ are different
+	// agents, so it is part of the digested identity — encoded only when set,
+	// so a plan digested before the field existed still restores.
+	ExitTimeOut time.Duration `json:",omitzero"`
 	// WatchPaths starts the job whenever any listed path is modified. Entries
 	// must be exact absolute paths. Empty omits the launchd key.
 	WatchPaths []string
@@ -166,7 +177,11 @@ func (a Agent) Plist() ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("render restart policy: %w", err)
 	}
-	startInterval, err := startIntervalSeconds(a.StartInterval)
+	startInterval, err := wholeSeconds("start interval", a.StartInterval)
+	if err != nil {
+		return nil, err
+	}
+	exitTimeOut, err := wholeSeconds("exit timeout", a.ExitTimeOut)
 	if err != nil {
 		return nil, err
 	}
@@ -210,6 +225,7 @@ func (a Agent) Plist() ([]byte, error) {
 		Env:                         env,
 		Restart:                     restart,
 		StartInterval:               startInterval,
+		ExitTimeOut:                 exitTimeOut,
 		WatchPaths:                  watchPaths,
 		StartCalendarInterval:       calendar,
 		ProcessType:                 processType,

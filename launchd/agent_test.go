@@ -45,6 +45,8 @@ const goldenPlist = `<?xml version="1.0" encoding="UTF-8"?>
 
     <key>ThrottleInterval</key>
     <integer>10</integer>
+    <key>ExitTimeOut</key>
+    <integer>45</integer>
 
     <key>ProcessType</key>
     <string>Background</string>
@@ -82,6 +84,7 @@ func TestAgentPlistGoldenCarriesOwnerMarker(t *testing.T) {
 		RestartPolicy:               RestartOnFailure,
 		ProcessType:                 ProcessTypeBackground,
 		StartInterval:               15 * time.Minute,
+		ExitTimeOut:                 45 * time.Second,
 	}
 	body, err := agent.Plist()
 	if err != nil {
@@ -122,6 +125,33 @@ func TestAgentPlistIsPureAndEscaped(t *testing.T) {
 	}
 }
 
+// TestAgentPlistOmitsExitTimeOutWhenUnset holds the launchd default: an agent
+// that names no drain grace renders no ExitTimeOut key, so launchd's own
+// 20-second SIGKILL backstop applies and the plist bytes of every agent written
+// before the field existed are unchanged.
+func TestAgentPlistOmitsExitTimeOutWhenUnset(t *testing.T) {
+	agent := testAgent(t)
+	body, err := agent.Plist()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "<key>ExitTimeOut</key>") {
+		t.Fatalf("plist names ExitTimeOut without one set\n%s", body)
+	}
+}
+
+func TestAgentPlistRendersExitTimeOutAsWholeSeconds(t *testing.T) {
+	agent := testAgent(t)
+	agent.ExitTimeOut = 90 * time.Second
+	body, err := agent.Plist()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "<key>ExitTimeOut</key>\n    <integer>90</integer>"; !strings.Contains(string(body), want) {
+		t.Fatalf("plist missing %q\n%s", want, body)
+	}
+}
+
 func TestAgentPlistRejectsReservedOwnerEnvKey(t *testing.T) {
 	agent := testAgent(t)
 	agent.Env = map[string]string{OwnerEnvKey: "someone-else"}
@@ -141,6 +171,16 @@ func TestAgentPlistRequiresCanonicalIdentityAndPaths(t *testing.T) {
 		{name: "program", edit: func(agent *Agent) { agent.Program = "usr/bin/true" }, want: "program path"},
 		{name: "log", edit: func(agent *Agent) { agent.LogPath = "worker.log" }, want: "log path"},
 		{name: "restart", edit: func(agent *Agent) { agent.RestartPolicy = 0 }, want: "restart policy is required"},
+		{
+			name: "sub-second exit timeout",
+			edit: func(agent *Agent) { agent.ExitTimeOut = 500 * time.Millisecond },
+			want: "exit timeout must be a positive whole number of seconds",
+		},
+		{
+			name: "fractional exit timeout",
+			edit: func(agent *Agent) { agent.ExitTimeOut = 1500 * time.Millisecond },
+			want: "exit timeout must be a positive whole number of seconds",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

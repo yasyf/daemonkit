@@ -129,12 +129,12 @@ func acceptIgnoredSessionType(agent *Agent) {
 	agent.LimitLoadToSessionType = sessionTypeUnset
 }
 
-func startIntervalSeconds(interval time.Duration) (int64, error) {
-	if interval == 0 {
+func wholeSeconds(name string, value time.Duration) (int64, error) {
+	if value == 0 {
 		return 0, nil
 	}
-	if interval < time.Second || interval%time.Second != 0 {
-		return 0, fmt.Errorf("launchd: start interval must be a positive whole number of seconds")
+	if value < time.Second || value%time.Second != 0 {
+		return 0, fmt.Errorf("launchd: %s must be a positive whole number of seconds", name)
 	}
-	return int64(interval / time.Second), nil
+	return int64(value / time.Second), nil
 }

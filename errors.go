@@ -36,6 +36,12 @@ var (
 	// its own Shutdown budget; re-observe with Settle.
 	ErrUnsettled = errors.New("daemonkit: daemon did not provably exit")
 
+	// errPinMoved means the process answering on a pinned session is no longer
+	// the one the attach pinned: the incumbent was replaced between two reads.
+	// It is unexported because it is nobody's error to handle — Ensure absorbs
+	// it by observing again, exactly as it absorbs ErrWrongIncumbent.
+	errPinMoved = errors.New("daemonkit: pinned incumbent moved")
+
 	// ErrUnrecorded means Settle found no owner record naming an incumbent:
 	// nothing of this daemon ever recorded itself here. Absence is then an
 	// inventory question — deploy.Inventory over the daemon's executables.

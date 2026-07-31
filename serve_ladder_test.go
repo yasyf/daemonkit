@@ -78,15 +78,22 @@ func TestServeDrainReleasesBlockedStart(t *testing.T) {
 	}
 }
 
+// TestServeSettlesLargeReplyBeforeExit proves the ladder settles a terminal
+// already in flight: the product initiates the drain from inside Handle, so the
+// reply is written while the shutdown ladder is already running.
+//
+// The body is sized past the socket's own send buffer — 8 KiB on darwin — so
+// the write cannot complete into it and has to be flushed against a reading
+// peer, which is what a torn settlement would fail. A multi-MiB body proves
+// nothing further and races the requests share's deadline for it.
 func TestServeSettlesLargeReplyBeforeExit(t *testing.T) {
 	shortHome(t)
 	d := Daemon{
 		Label:    "dkbig",
 		Schemas:  []Schema{"test.v1"},
 		Shutdown: Grace(5 * time.Second),
-		MaxFrame: Bytes(16 << 20),
 	}
-	body := make([]byte, 3<<20)
+	body := make([]byte, 64<<10)
 	if _, err := rand.Read(body); err != nil {
 		t.Fatalf("rand: %v", err)
 	}

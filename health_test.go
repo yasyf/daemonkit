@@ -53,9 +53,19 @@ func TestMaxDetail(t *testing.T) {
 // TestServeRefusesOversizedReport proves an oversized Report cannot kill the
 // health session: the report never reaches the wire, and the verb keeps
 // answering on the same session with the last detail that fit.
+//
+// The frame bound is declared small on purpose. MaxDetail derives the boundary
+// from it, so the refusal is the same one at any frame size, while the default
+// 4 MiB frame turns every health round trip into a full-frame transfer and the
+// whole test into a race between three of them and a wall clock.
 func TestServeRefusesOversizedReport(t *testing.T) {
 	shortHome(t)
-	d := Daemon{Label: "dkdetail", Schemas: []Schema{"test.v1"}, Shutdown: Grace(5 * time.Second)}
+	d := Daemon{
+		Label:    "dkdetail",
+		Schemas:  []Schema{"test.v1"},
+		Shutdown: Grace(5 * time.Second),
+		MaxFrame: Bytes(16 << 10),
+	}
 	small := bytes.Repeat([]byte("d"), 1024)
 	limit := int(MaxDetail(d.MaxFrame))
 	reported := make(chan func([]byte), 1)
@@ -84,7 +94,7 @@ func TestServeRefusesOversizedReport(t *testing.T) {
 		{"the starting report", 0, len(small)},
 		{"exactly the bound", limit, limit},
 		{"one byte past the bound", limit + 1, limit},
-		{"a report no frame could carry", limit + (1 << 20), limit},
+		{"a report no frame could carry", limit + int(d.MaxFrame), limit},
 	}
 	for _, tt := range reports {
 		if tt.publish > 0 {

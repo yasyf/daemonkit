@@ -3,30 +3,45 @@ package daemonkit
 import (
 	"context"
 	"errors"
+	"syscall"
 	"time"
 
 	"github.com/yasyf/daemonkit/internal/proc"
+	"github.com/yasyf/daemonkit/internal/wire"
+	"github.com/yasyf/daemonkit/launchd"
 )
 
 // Open prepares a client for d's daemon and performs no I/O. Every verb
 // refuses a context without a deadline: all stall bounds derive from it.
 func Open(d Daemon) *Client {
-	return &Client{
+	c := &Client{
 		daemon:     d,
-		recordPath: d.recordPath(),
+		recordPath: d.RecordPath(),
 		probe:      proc.ProbeIdentity,
 		observe:    proc.Observe,
+		identities: proc.ExecutableIdentities,
 		readOwner:  proc.ReadOwner,
+		kill:       syscall.Kill,
+		launchctl:  launchctl,
 	}
+	c.serving = c.servedHealth
+	return c
 }
 
-// Client reaches one daemon named by its Daemon identity.
+// Client reaches one daemon named by its Daemon identity. Every field past the
+// identity is a boundary this package talks to — the process table, the record
+// file, the socket, launchctl — bound once at Open so the repair ladder has no
+// boundary it reaches around.
 type Client struct {
 	daemon     Daemon
 	recordPath string
 	probe      func(int) (proc.Identity, error)
 	observe    func(proc.Identity) (proc.Reap, bool, error)
+	identities func(string) (proc.Report, error)
 	readOwner  func(string) (proc.Owner, bool, error)
+	kill       func(int, syscall.Signal) error
+	serving    func(context.Context) (wire.HealthReport, error)
+	launchctl  launchd.Runner
 }
 
 // Settle proves the recorded incumbent gone without a live session. It reads

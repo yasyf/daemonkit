@@ -234,8 +234,8 @@ func (c *Control) Health(ctx context.Context) (Health, error) {
 func (c *Control) pinnedBy(report wire.HealthReport) error {
 	if report.PID != c.pinned.PID || report.Generation != c.generation {
 		return fmt.Errorf(
-			"daemonkit: pinned incumbent moved: health names pid %d generation %d, pinned pid %d generation %d",
-			report.PID, report.Generation, c.pinned.PID, c.generation,
+			"%w: health names pid %d generation %d, pinned pid %d generation %d",
+			errPinMoved, report.PID, report.Generation, c.pinned.PID, c.generation,
 		)
 	}
 	return nil
