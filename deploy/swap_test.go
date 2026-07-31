@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/yasyf/daemonkit"
@@ -274,7 +275,11 @@ func TestRetireSwapKeepsTheRecordUntilThePriorTreeIsGone(t *testing.T) {
 		rename(t, f.deploy.layout.candidate, f.deploy.layout.canonical)
 	})
 	sealTree(t, f.deploy.layout.prior)
-	if err := f.deploy.retireSwap(); err == nil {
+	var record swapRecord
+	if err := readRecord(f.deploy.layout.swap, &record); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.deploy.retireSwap(record); err == nil {
 		t.Fatal("retireSwap = nil, want the undeletable prior tree's failure")
 	}
 	if !fileExists(f.deploy.layout.prior) {
@@ -282,6 +287,41 @@ func TestRetireSwapKeepsTheRecordUntilThePriorTreeIsGone(t *testing.T) {
 	}
 	if !fileExists(f.deploy.layout.swap) {
 		t.Fatal("retireSwap discarded the record that brings the next resume back to the surviving prior tree")
+	}
+}
+
+// TestRetireSwapDestroysNoPriorItsRecordDoesNotName holds the retirement to the
+// one generation this pass's gate scanned and settle itself renamed aside. An
+// install proves nothing absent — it lands into an empty canonical path — so a
+// tree some earlier crash stranded in the prior slot is bytes no gate of this
+// pass ever asked about, and destroying it is exactly the harm the gate exists
+// to refuse. A gated verb is what reclaims it.
+func TestRetireSwapDestroysNoPriorItsRecordDoesNotName(t *testing.T) {
+	f := newFixture(t)
+	if err := f.deploy.layout.ensureMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	stranded := filepath.Join(f.deploy.layout.prior, "Contents", "MacOS", "example")
+	writeMachO(t, stranded, 0o755)
+	if _, err := f.deploy.Install(f.ctx(), f.candidate("Source", "1.0", "one")); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if !fileExists(stranded) {
+		t.Fatal("Install destroyed a generation no gate of its own ever scanned")
+	}
+	var queried []string
+	f.deploy.inventory = func(paths ...string) (Survivors, error) {
+		queried = append(queried, paths...)
+		return Survivors{}, nil
+	}
+	if err := f.deploy.Reset(f.ctx()); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	if fileExists(f.deploy.layout.prior) {
+		t.Fatal("Reset left the stranded prior tree behind")
+	}
+	if !slices.Contains(queried, stranded) {
+		t.Fatalf("Reset destroyed the stranded prior tree without scanning %q: %q", stranded, queried)
 	}
 }
 

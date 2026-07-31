@@ -232,21 +232,23 @@ func (c *Client) observeWorld(ctx context.Context, agent launchd.Agent) (converg
 // servedHealth attaches the control lane, reads the pinned incumbent's report,
 // and lets the session go. The attach is what judges the serving process
 // against Trust.Serving and pins the kernel process the report describes, so
-// this observation names one instance rather than whatever answered.
-func (c *Client) servedHealth(ctx context.Context) (wire.HealthReport, error) {
+// this observation names one instance rather than whatever answered — and that
+// pin outlives the session it was taken on, because it is what a later proof
+// correlates an unnameable process against.
+func (c *Client) servedHealth(ctx context.Context) (wire.HealthReport, proc.Identity, error) {
 	control, err := c.Control(ctx)
 	if err != nil {
-		return wire.HealthReport{}, err
+		return wire.HealthReport{}, proc.Identity{}, err
 	}
 	defer func() { _ = control.Close(ctx) }()
 	report, err := control.session.Health(ctx)
 	if err != nil {
-		return wire.HealthReport{}, err
+		return wire.HealthReport{}, proc.Identity{}, err
 	}
 	if err := control.pinnedBy(report); err != nil {
-		return wire.HealthReport{}, err
+		return wire.HealthReport{}, proc.Identity{}, err
 	}
-	return report, nil
+	return report, control.pinned, nil
 }
 
 // evict removes the observed incumbent and proves it left the process table.
@@ -511,7 +513,9 @@ func (r Restart) launchd() (launchd.RestartPolicy, error) {
 
 // launchctl runs one /bin/launchctl invocation to completion. An exit code is
 // an answer, not a failure: only a launchctl that could not be run at all is
-// an error, which is the boundary launchd's single outcome classifier reads.
+// an error, which is the boundary launchd's single outcome classifier reads. A
+// launchctl that never ran carries no status either: reporting one as zero had
+// the classifier prescribe decoding a status launchd never returned.
 func launchctl(ctx context.Context, path string, args ...string) (string, int, error) {
 	out, err := exec.CommandContext(ctx, path, args...).CombinedOutput()
 	var exit *exec.ExitError
@@ -519,7 +523,7 @@ func launchctl(ctx context.Context, path string, args ...string) (string, int, e
 		return string(out), exit.ExitCode(), nil
 	}
 	if err != nil {
-		return string(out), 0, err
+		return string(out), -1, err
 	}
 	return string(out), 0, nil
 }

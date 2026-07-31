@@ -507,8 +507,12 @@ func TestLaunchctlReportsExitCodesAsAnswers(t *testing.T) {
 	if out != "spoke\n" {
 		t.Fatalf("launchctl() out = %q, want %q", out, "spoke\n")
 	}
-	if _, _, err := launchctl(ctx, filepath.Join(t.TempDir(), "absent")); err == nil {
+	_, code, err = launchctl(ctx, filepath.Join(t.TempDir(), "absent"))
+	if err == nil {
 		t.Fatal("launchctl() of a missing binary reported no error")
+	}
+	if code >= 0 {
+		t.Fatalf("launchctl() that never ran reported status %d, want no status at all", code)
 	}
 }
 
@@ -601,16 +605,17 @@ func servedReport(phase wire.Phase, build string, generation uint64) wire.Health
 
 type observation struct {
 	report wire.HealthReport
+	pinned proc.Identity
 	err    error
 }
 
 // servingScript answers each observation from the script in turn and repeats
 // its last entry, so a test states only the transitions it cares about.
-func servingScript(script []observation, seen *int) func(context.Context) (wire.HealthReport, error) {
-	return func(context.Context) (wire.HealthReport, error) {
+func servingScript(script []observation, seen *int) func(context.Context) (wire.HealthReport, proc.Identity, error) {
+	return func(context.Context) (wire.HealthReport, proc.Identity, error) {
 		step := script[min(*seen, len(script)-1)]
 		*seen++
-		return step.report, step.err
+		return step.report, step.pinned, step.err
 	}
 }
 
@@ -1137,6 +1142,63 @@ func TestEvictHoldsTheHuskItObservedWithoutASession(t *testing.T) {
 	}
 }
 
+// TestEnsureOnceHandsTheObservationsPinToTheEviction is that same correlation
+// one step earlier, on the pass that genuinely observed a live peer. The attach
+// that read Health pinned the process answering for it, while the owner record
+// beside it names nobody — which is what an upgrade that unlinked the daemon's
+// bytes and cleared its record looks like — so the pin is the whole of what says
+// whose the husk left behind is. Handing the record's zero identity down instead
+// left the one path that observed a live peer with nothing to correlate.
+func TestEnsureOnceHandsTheObservationsPinToTheEviction(t *testing.T) {
+	pinned := proc.Identity{PID: 4242, Start: 1, Boot: 1}
+	tests := []struct {
+		name    string
+		husk    proc.Identity
+		wantErr error
+	}{
+		{
+			name:    "the husk this pass pinned",
+			husk:    pinned,
+			wantErr: ErrUnsettled,
+		},
+		{
+			name: "a husk this pass never pinned",
+			husk: proc.Identity{PID: pinned.PID + 1, Start: pinned.Start, Boot: pinned.Boot},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newEnsureOnceHarness(
+				t,
+				[]observation{{report: servedReport(wire.PhaseReady, "stale", 7), pinned: pinned}},
+				func(string) (proc.Owner, bool, error) { return proc.Owner{}, false, nil },
+			)
+			h.client.identities = func(string) (proc.Report, error) {
+				return proc.Report{Unnameable: []proc.Identity{tt.husk}}, nil
+			}
+			h.launchd.refuse = "bootstrap"
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_, err := h.client.ensureOnce(ctx, "wanted", h.agent)
+			if tt.wantErr == nil {
+				if err == nil || errors.Is(err, ErrUnsettled) {
+					t.Fatalf("ensureOnce() = %v, want a cleared gate and the apply refusal past it", err)
+				}
+				return
+			}
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("ensureOnce() = %v, want %v", err, tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), "unnameable") {
+				t.Fatalf("ensureOnce() = %v, want the pinned husk named", err)
+			}
+			if len(h.signals) != 0 {
+				t.Fatalf("signalled %v, want no signal at a record that names nobody", h.signals)
+			}
+		})
+	}
+}
+
 // TestEvictHandsTheSessionsPinToTheProof is the eviction's other arm, the one
 // that held a session. The drain lands but its exit is never observed, so the
 // proof runs — and it runs with nothing observed on the way in, which leaves the
@@ -1425,10 +1487,10 @@ func TestEnsureRefusesAPassItCannotFinish(t *testing.T) {
 	seen := 0
 	var last time.Duration
 	client := Open(Daemon{Label: Label(agent.Label), Program: Program{path: agent.Program}})
-	client.serving = func(ctx context.Context) (wire.HealthReport, error) {
+	client.serving = func(ctx context.Context) (wire.HealthReport, proc.Identity, error) {
 		seen++
 		last = left(ctx)
-		return servedReport(wire.PhaseReady, "stale", 7), nil
+		return servedReport(wire.PhaseReady, "stale", 7), proc.Identity{}, nil
 	}
 	client.readOwner = func(string) (proc.Owner, bool, error) { return recordedOwner("a stranger", 99), true, nil }
 	client.observe = func(proc.Identity) (proc.Reap, bool, error) { return proc.ReapAbsent, true, nil }

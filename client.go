@@ -40,7 +40,7 @@ type Client struct {
 	identities func(string) (proc.Report, error)
 	readOwner  func(string) (proc.Owner, bool, error)
 	kill       func(int, syscall.Signal) error
-	serving    func(context.Context) (wire.HealthReport, error)
+	serving    func(context.Context) (wire.HealthReport, proc.Identity, error)
 	launchctl  launchd.Runner
 }
 

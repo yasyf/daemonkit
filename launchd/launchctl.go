@@ -1,6 +1,7 @@
 package launchd
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -106,17 +107,29 @@ func (r launchctlResult) fail() error {
 	case launchctlLoaded:
 		return nil
 	case launchctlRefused:
-		return fmt.Errorf("launchctl %s: %w: %s (launchd refused: %s)", r.verb, r.cause, out, r.reason)
+		return r.errorf("%s (launchd refused: %s)", out, r.reason)
 	case launchctlUnknown:
 		if r.code < 0 {
-			return fmt.Errorf("launchctl %s: %w: %s", r.verb, r.cause, out)
+			return r.errorf("%s", out)
 		}
-		return fmt.Errorf(
-			"launchctl %s: %w: %s (unclassified launchctl status %d; decode it with `launchctl error %d`"+
+		return r.errorf(
+			"%s (unclassified launchctl status %d; decode it with `launchctl error %d`"+
 				` and read launchd's own "failed (<code>: <reason>)" from`+
 				" `log show --predicate 'subsystem == \"com.apple.xpc.launchd\" AND processID == 1' --last 5m`)",
-			r.verb, r.cause, out, r.code, r.code,
+			out, r.code, r.code,
 		)
 	}
-	return fmt.Errorf("launchctl %s: %w: %s", r.verb, r.cause, out)
+	return r.errorf("%s", out)
+}
+
+// errorf renders one classified failure, wrapping the cause only when there is
+// one. Every runner in the fleet answers an exit status with a nil error —
+// launchd refusing is an answer, not a failure to run launchctl — so formatting
+// the cause unconditionally printed %!w(<nil>) where the diagnosis belonged.
+func (r launchctlResult) errorf(format string, args ...any) error {
+	failure := fmt.Sprintf("launchctl %s: %s", r.verb, fmt.Sprintf(format, args...))
+	if r.cause == nil {
+		return errors.New(failure)
+	}
+	return fmt.Errorf("%s: %w", failure, r.cause)
 }

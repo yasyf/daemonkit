@@ -628,6 +628,49 @@ func TestUninstallRegatesAReplayAfterTheAppIsGone(t *testing.T) {
 	}
 }
 
+// TestUninstallDiscardsEveryGenerationItScanned pins what "removes the
+// installed application" has to mean. A leaked staging tree and a superseded
+// prior are whole copies of the same signed application, so an uninstall that
+// took away only the canonical path left the app it removed sitting on disk.
+// Their targets come out of the enumeration the gate just scanned, exactly as
+// Reset's do.
+func TestUninstallDiscardsEveryGenerationItScanned(t *testing.T) {
+	f := newFixture(t)
+	if _, err := f.deploy.Install(f.ctx(), f.candidate("Source", "1.0", "one")); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	leaked, err := os.MkdirTemp(f.deploy.layout.metadata, stagePrefix+"*"+stageSuffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slots := map[string]string{"prior": f.deploy.layout.prior, "stage": leaked}
+	carried := make(map[string]string, len(slots))
+	for name, slot := range slots {
+		helper := filepath.Join(slot, "Contents", "MacOS", name)
+		writeMachO(t, helper, 0o755)
+		carried[name] = helper
+	}
+	var queried []string
+	f.deploy.inventory = func(paths ...string) (Survivors, error) {
+		queried = append(queried, paths...)
+		return Survivors{}, nil
+	}
+	if _, err := f.deploy.Uninstall(f.ctx()); err != nil {
+		t.Fatalf("Uninstall: %v", err)
+	}
+	for name, slot := range slots {
+		if fileExists(slot) {
+			t.Errorf("Uninstall left a whole signed generation at the %s slot %q", name, slot)
+		}
+		if !slices.Contains(queried, carried[name]) {
+			t.Errorf("Uninstall destroyed the %s slot at %q, which the gate never scanned: %q", name, slot, queried)
+		}
+	}
+	if fileExists(f.app) || fileExists(f.deploy.layout.removed) {
+		t.Fatal("Uninstall left the app or the removal slot behind")
+	}
+}
+
 // TestInstallRetiresTheTombstone pins the record land must clear: a completed
 // uninstall's proof names the departed generation, so a surviving tombstone
 // wedges the next uninstall against bytes it was never minted for.
@@ -831,6 +874,62 @@ func TestResetDestroysNothingTheGateDidNotScan(t *testing.T) {
 	}
 }
 
+// TestResetRegatesBeforeItDiscards pins the window Reset left open while its
+// siblings closed it. Between the gate and the generations it destroys, Reset
+// converges launchd empty — a bootout exec per label, plist removals, directory
+// syncs — and that is exactly long enough for a process to come back onto the
+// bytes the discard is about to take.
+func TestResetRegatesBeforeItDiscards(t *testing.T) {
+	f := newFixture(t)
+	if _, err := f.deploy.Install(f.ctx(), f.candidate("Source", "1.0", "one")); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	writeMachO(t, filepath.Join(f.deploy.layout.prior, "Contents", "MacOS", "example"), 0o755)
+	scans := 0
+	f.deploy.inventory = func(...string) (Survivors, error) {
+		scans++
+		if scans == 1 {
+			return Survivors{}, nil
+		}
+		return Survivors{Live: []LiveProcess{{PID: 5150, Start: 77, Boot: 9, Executable: f.agent.Program}}}, nil
+	}
+	if err := f.deploy.Reset(f.ctx()); !errors.Is(err, ErrLive) {
+		t.Fatalf("Reset err = %v, want ErrLive", err)
+	}
+	if scans < 2 {
+		t.Fatalf("inventory ran %d times, want a second scan before the discard", scans)
+	}
+	if !fileExists(f.deploy.layout.prior) {
+		t.Fatal("Reset destroyed a generation a process had come back onto")
+	}
+}
+
+// TestResetClearsASlotThatCannotHoldABundle is the wedge's regression, and the
+// reason it mattered: a plain file at a generation slot — a botched install, a
+// same-uid plant — failed the inventory the gate every verb runs, and Reset is
+// the way out of a state no other verb accepts, so there was no way out at all.
+func TestResetClearsASlotThatCannotHoldABundle(t *testing.T) {
+	f := newFixture(t)
+	if _, err := f.deploy.Install(f.ctx(), f.candidate("Source", "1.0", "one")); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if err := os.WriteFile(f.deploy.layout.prior, []byte("not a bundle"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.deploy.requireEmpty(); err != nil {
+		t.Fatalf("requireEmpty = %v, want a gate a non-directory slot cannot wedge", err)
+	}
+	if err := f.deploy.Reset(f.ctx()); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	if fileExists(f.deploy.layout.prior) {
+		t.Fatal("Reset left the slot that cannot hold a bundle behind")
+	}
+	if !fileExists(f.app) {
+		t.Fatal("Reset destroyed the installed bytes")
+	}
+}
+
 func TestResetRefusesWhileTheDaemonIsLive(t *testing.T) {
 	f := newFixture(t)
 	if _, err := f.deploy.Install(f.ctx(), f.candidate("Source", "1.0", "one")); err != nil {
@@ -967,6 +1066,9 @@ func TestOpenRejectsInvalidConfig(t *testing.T) {
 		{"program outside app", mutate(func(c *Config) { c.Agents[0].Program = "/usr/bin/true" })},
 		{"relative program", mutate(func(c *Config) { c.Agents[0].Program = "Contents/MacOS/x" })},
 		{"unclean program", mutate(func(c *Config) { c.Agents[0].Program = "/opt/Example.app/./Contents/MacOS/x" })},
+		{"serving requirement that admits nobody", mutate(func(c *Config) {
+			c.Daemon.Trust.Serving = &daemonkit.Requirement{TeamID: testTeamID}
+		})},
 		{"relative executable", mutate(func(c *Config) { c.Executables = []string{"hookd"} })},
 		{"unclean executable", mutate(func(c *Config) { c.Executables = []string{"/usr/bin/../bin/true"} })},
 		{"absent executable", mutate(func(c *Config) { c.Executables = []string{"/usr/bin/daemonkit-absent"} })},
@@ -980,6 +1082,12 @@ func TestOpenRejectsInvalidConfig(t *testing.T) {
 	}
 	if _, err := Open(valid); err != nil {
 		t.Fatalf("Open(valid): %v", err)
+	}
+	pinned := mutate(func(c *Config) {
+		c.Daemon.Trust.Serving = &daemonkit.Requirement{TeamID: testTeamID, SigningIdentifier: testSigning}
+	})
+	if _, err := Open(pinned); err != nil {
+		t.Fatalf("Open with a pinned serving requirement: %v", err)
 	}
 }
 

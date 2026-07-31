@@ -12,9 +12,9 @@ tasks:
       - ./scripts/test.sh -race -count=1 ./...
 
   test-swift:
-    desc: Run the Swift package tests
+    desc: Run the Swift package tests against the Go wire test server they dial
     cmds:
-      - swift test
+      - ./scripts/swift-test.sh
 
   generate:
     desc: Regenerate the frame codec (Go internal/wire + Swift SessionFrameCodec) from internal/wiregen/schema.json

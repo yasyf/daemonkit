@@ -71,6 +71,15 @@ type Config struct {
 	// and readiness can be observed. Trust.Serving pins what the process
 	// answering on the socket must prove — without it an absence proof is
 	// forgeable by any same-UID process that binds the socket first.
+	//
+	// Leaving it nil is the caller's risk to take, and deploy takes it rather
+	// than refusing: no irreversible step here rests on that proof alone. Each
+	// one also requires the executable-scoped inventory, which reads the
+	// kernel's own process table and no same-UID process can forge, so a forged
+	// socket proof buys a swap or a removal nothing — it still has to be true
+	// that no process of this deployment is running. A Serving that is set is
+	// held to the same terms as Requirement: Open renders it once, so a policy
+	// that could admit nobody fails there rather than at the first attach.
 	Daemon daemonkit.Daemon
 
 	// Agents is the exact LaunchAgent set activation converges launchd to.
@@ -110,6 +119,11 @@ func Open(config Config) (*Deployment, error) {
 	}
 	if config.Daemon.Label == "" {
 		return nil, fmt.Errorf("%w: Daemon.Label is required", ErrConfig)
+	}
+	if serving := config.Daemon.Trust.Serving; serving != nil {
+		if _, err := designatedRequirement(*serving); err != nil {
+			return nil, fmt.Errorf("%w: Daemon.Trust.Serving: %w", ErrConfig, err)
+		}
 	}
 	if len(config.Agents) == 0 {
 		return nil, fmt.Errorf("%w: at least one agent is required", ErrConfig)
@@ -260,7 +274,7 @@ func (d *Deployment) land(ctx context.Context, candidate Candidate, supersede bo
 	if err := d.settleSwap(ctx, record); err != nil {
 		return Generation{}, err
 	}
-	if err := d.retireSwap(); err != nil {
+	if err := d.retireSwap(record); err != nil {
 		return Generation{}, err
 	}
 	return d.inspect(ctx, d.layout.canonical)
@@ -336,6 +350,12 @@ func (d *Deployment) Activate(ctx context.Context) (Activation, error) {
 // before the removal, since sealing the tombstone stands between it and the
 // rename. The removal is staged through a private slot, so the canonical path
 // goes from whole to absent in one rename and is never left half-deleted.
+//
+// What it removes is every generation slot but the canonical path, out of the
+// same enumeration Reset draws from and the gate just scanned: a leaked staging
+// tree and a superseded prior are whole copies of the same signed application,
+// and an uninstall that left them behind left the application it removed on
+// disk.
 func (d *Deployment) Uninstall(ctx context.Context) (Removal, error) {
 	release, err := d.hold(ctx)
 	if err != nil {
@@ -367,10 +387,7 @@ func (d *Deployment) Uninstall(ctx context.Context) (Removal, error) {
 			return Removal{}, err
 		}
 	}
-	if err := errors.Join(
-		removeTreeDurable(d.layout.removed),
-		removeTreeDurable(d.layout.candidate),
-	); err != nil {
+	if err := d.discardGenerations(); err != nil {
 		return Removal{}, err
 	}
 	if fileExists(d.layout.canonical) {
@@ -415,10 +432,16 @@ func (d *Deployment) tombstone(ctx context.Context, runtime RuntimeProof) (remov
 // deploy owns is discarded, and so is every generation slot the gate just
 // scanned.
 //
+// The inventory half runs once more immediately before the discard, exactly as
+// it does on Uninstall's arm: converging launchd empty is a bootout exec per
+// label plus plist removals and directory syncs, and that is long enough for a
+// process to come back onto the bytes the discard is about to take.
+//
 // It is the way out of a state no other verb accepts — a sealed activation
 // whose daemon has since restarted, a removal proof for an app that was put
-// back by hand — and it never destroys installed bytes: the canonical path
-// keeps whatever generation the settled swap left there.
+// back by hand, a plain file planted at a generation slot — and it never
+// destroys installed bytes: the canonical path keeps whatever generation the
+// settled swap left there.
 func (d *Deployment) Reset(ctx context.Context) error {
 	release, err := d.hold(ctx)
 	if err != nil {
@@ -429,6 +452,9 @@ func (d *Deployment) Reset(ctx context.Context) error {
 		return err
 	}
 	if _, err := d.quiesceAndConverge(ctx, nil); err != nil {
+		return err
+	}
+	if err := d.requireEmpty(); err != nil {
 		return err
 	}
 	return errors.Join(

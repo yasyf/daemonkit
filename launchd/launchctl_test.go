@@ -95,6 +95,80 @@ func TestLaunchctlOutcomeClassifies(t *testing.T) {
 	}
 }
 
+// TestLaunchctlOutcomeFailReadsWithoutACause runs the classifier the way every
+// production runner drives it: an exit code is an answer, so the runner swallows
+// launchctl's ExitError and hands back a nil cause. Formatting that nil as a
+// wrapped error printed %!w(<nil>) where launchd's own reason belonged, which is
+// all a consumer diagnosing a refusal ever saw.
+func TestLaunchctlOutcomeFailReadsWithoutACause(t *testing.T) {
+	tests := []struct {
+		name string
+		out  string
+		code int
+		want []string
+	}{
+		{
+			name: "a refusal",
+			out:  "Boot-out failed: 1: Operation not permitted",
+			code: 1,
+			want: []string{
+				"launchctl bootout",
+				"Boot-out failed: 1: Operation not permitted",
+				"launchd refused: Operation not permitted",
+			},
+		},
+		{
+			name: "an unclassified status",
+			out:  "Bootstrap failed: 5: Input/output error",
+			code: launchctlAggregateExit,
+			want: []string{"launchctl bootout", "unclassified launchctl status 5", "launchctl error 5"},
+		},
+		{
+			name: "a status launchd never explained",
+			out:  "denied",
+			code: 77,
+			want: []string{"launchctl bootout", "denied"},
+		},
+		{
+			name: "an in-flux status",
+			out:  "Boot-out failed: 36: Operation now in progress",
+			code: launchctlInProgressExit,
+			want: []string{"launchctl bootout", "Boot-out failed: 36: Operation now in progress"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := launchctlOutcome("bootout", test.out, test.code, nil).fail()
+			if err == nil {
+				t.Fatal("fail() = nil, want the classified failure")
+			}
+			got := err.Error()
+			if strings.Contains(got, "%!w") || strings.Contains(got, "<nil>") {
+				t.Fatalf("fail() = %q, want a message that never formats an absent cause", got)
+			}
+			for _, want := range test.want {
+				if !strings.Contains(got, want) {
+					t.Errorf("fail() = %q, want it to name %q", got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestLaunchctlOutcomeFailWrapsACauseWhenThereIsOne pins the other half: a
+// runner that could not run launchctl at all hands back a real error, and it
+// stays matchable through the classified failure.
+func TestLaunchctlOutcomeFailWrapsACauseWhenThereIsOne(t *testing.T) {
+	unreachable := errors.New("launchctl is not on this machine")
+	err := launchctlOutcome("print", "", -1, unreachable).fail()
+	if !errors.Is(err, unreachable) {
+		t.Fatalf("fail() = %v, want it to wrap %v", err, unreachable)
+	}
+	if !strings.Contains(err.Error(), unreachable.Error()) {
+		t.Fatalf("fail() = %q, want it to name the cause", err)
+	}
+}
+
 func TestLaunchctlOutcomeFailNamesTheOfflineDecodings(t *testing.T) {
 	refused := launchctlOutcome("bootout", "Boot-out failed: 1: Operation not permitted", 1, launchctlErr(1))
 	if got := refused.fail().Error(); !strings.Contains(got, "launchd refused: Operation not permitted") {

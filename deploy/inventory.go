@@ -179,16 +179,33 @@ func (d *Deployment) executables() ([]string, error) {
 	return slices.Compact(paths), nil
 }
 
-// bundleExecutables reports every Mach-O file in the installed bundle that
-// carries an execute bit, walked under an os.Root scope so no entry names
-// anything outside the tree. Symlinks are skipped: the kernel reports the file
-// it execed, never a link to it. A bundle that is not installed carries
-// nothing, which is a state the ladder branches on rather than an error.
-func bundleExecutables(appPath string) ([]string, error) {
-	handle, err := os.OpenRoot(appPath)
+// bundleExecutables reports every Mach-O file carrying an execute bit the
+// generation slot holds: each one in its tree when the slot holds a bundle,
+// walked under an os.Root scope so no entry names anything outside it, and the
+// slot itself when it holds a plain file. A slot nothing occupies holds nothing,
+// which is a state the ladder branches on rather than an error.
+//
+// Symlinks are skipped, the slot's own included: the kernel reports the file it
+// execed, never a link to it, and a step that discards a slot unlinks the link
+// rather than what it points at.
+//
+// A slot that exists and is not a directory holds no bundle, and the bytes it
+// does hold are the whole of what the gate can honestly say about it. Failing
+// the inventory for it instead refused every gated verb for as long as it stayed
+// occupied — Reset included, which is the way out of a state no other verb
+// accepts, so a plain file planted at a slot left no way out at all.
+func bundleExecutables(slot string) ([]string, error) {
+	info, err := os.Lstat(slot)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
+	if err != nil {
+		return nil, fmt.Errorf("deploy: inspect generation slot: %w", err)
+	}
+	if !info.IsDir() {
+		return slotFileExecutable(slot, info)
+	}
+	handle, err := os.OpenRoot(slot)
 	if err != nil {
 		return nil, fmt.Errorf("deploy: open bundle root: %w", err)
 	}
@@ -210,7 +227,7 @@ func bundleExecutables(appPath string) ([]string, error) {
 			return err
 		}
 		if executable {
-			carried = append(carried, filepath.Join(appPath, filepath.FromSlash(path)))
+			carried = append(carried, filepath.Join(slot, filepath.FromSlash(path)))
 		}
 		return nil
 	})
@@ -218,6 +235,29 @@ func bundleExecutables(appPath string) ([]string, error) {
 		return nil, fmt.Errorf("deploy: scan bundle executables: %w", walkErr)
 	}
 	return carried, nil
+}
+
+// slotFileExecutable answers for a generation slot holding a plain file: the
+// file itself when it is a Mach-O the kernel could have execed, and nothing
+// otherwise. It is read through a root scoped to the directory the slot sits in,
+// exactly as a bundle's own entries are.
+func slotFileExecutable(slot string, info os.FileInfo) ([]string, error) {
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		return nil, nil
+	}
+	handle, err := os.OpenRoot(filepath.Dir(slot))
+	if err != nil {
+		return nil, fmt.Errorf("deploy: open generation slot root: %w", err)
+	}
+	defer handle.Close()
+	executable, err := isMachO(handle, filepath.Base(slot))
+	if err != nil {
+		return nil, fmt.Errorf("deploy: scan generation slot: %w", err)
+	}
+	if !executable {
+		return nil, nil
+	}
+	return []string{slot}, nil
 }
 
 func isMachO(handle *os.Root, path string) (bool, error) {

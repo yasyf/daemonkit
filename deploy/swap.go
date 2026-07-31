@@ -116,7 +116,7 @@ func (d *Deployment) recover(ctx context.Context) error {
 	if err := d.settleSwap(ctx, record); err != nil {
 		return err
 	}
-	return d.retireSwap()
+	return d.retireSwap(record)
 }
 
 // resumeDestroys reports whether driving record to its end still moves or
@@ -138,23 +138,34 @@ func (d *Deployment) resumeDestroys(ctx context.Context, record swapRecord) (boo
 	return !occupant.sameTree(record.Candidate), nil
 }
 
-// retireSwap discards everything a landed swap invalidates: the superseded
-// tree, the sealed activation its readiness no longer describes, and the
-// tombstone minted for a generation that is no longer installed.
+// retireSwap discards everything the landed swap in record invalidates: the
+// superseded tree, the sealed activation its readiness no longer describes, and
+// the tombstone minted for a generation that is no longer installed.
+//
+// The prior tree is destroyed only when the record names one, and that is what
+// keeps this a gated destruction: a record naming a prior is one whose pass
+// proved the deployment empty and whose settle renamed that very generation
+// aside, so the bytes destroyed here are the bytes the gate just scanned. A
+// record naming none — a first install, whose canonical path was empty and
+// which therefore proves nothing absent — leaves a tree some earlier crash
+// stranded in the slot alone; reclaiming it is Reset's, under the whole gate.
 //
 // The swap record goes last, and that order is the crash window's only cover:
 // while it is on disk the next verb's resume comes back through here, so a
 // crash mid-retirement cannot strand a stale record that no resume revisits.
 // A failure is the same window as a crash and gets the same cover, which is
-// why the removals are two calls and not four arguments to one: errors.Join
-// evaluates every argument it is handed, so a prior tree that could not be
-// destroyed would still have had its record retired out from under it.
-func (d *Deployment) retireSwap() error {
-	if err := errors.Join(
-		removeTreeDurable(d.layout.prior),
+// why the record's removal is a call of its own: errors.Join evaluates every
+// argument it is handed, so a prior tree that could not be destroyed would
+// still have had its record retired out from under it.
+func (d *Deployment) retireSwap(record swapRecord) error {
+	retired := []error{
 		removeFileDurable(d.layout.activation),
 		removeFileDurable(d.layout.removal),
-	); err != nil {
+	}
+	if record.Prior != nil {
+		retired = append(retired, removeTreeDurable(d.layout.prior))
+	}
+	if err := errors.Join(retired...); err != nil {
 		return err
 	}
 	return removeFileDurable(d.layout.swap)

@@ -236,6 +236,55 @@ func TestExecutablesCoversALeakedStagingTree(t *testing.T) {
 	}
 }
 
+// TestBundleExecutablesClassifiesWhatASlotHolds pins the gate against the shape
+// that wedged it: a generation slot that exists and is not a directory. Failing
+// the whole inventory for it left every gated verb refusing — Reset included,
+// which is the documented way out of a state no other verb accepts — so a plain
+// file planted at a slot bricked the deployment for good. Such a slot carries no
+// bundle, but it can still be an executable itself, and the next destroying step
+// destroys it, so it answers for exactly its own bytes.
+func TestBundleExecutablesClassifiesWhatASlotHolds(t *testing.T) {
+	root := t.TempDir()
+	slot := func(name string) string { return filepath.Join(root, name+".app") }
+	bundled := slot("bundle")
+	writeMachO(t, filepath.Join(bundled, "Contents", "MacOS", "example"), 0o755)
+	plain := slot("plain")
+	writeMachO(t, plain, 0o755)
+	unreadable := slot("unreadable")
+	writeMachO(t, unreadable, 0o644)
+	script := slot("script")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linked := slot("linked")
+	if err := os.Symlink(bundled, linked); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name string
+		slot string
+		want []string
+	}{
+		{"a slot nothing occupies", slot("absent"), nil},
+		{"a bundle", bundled, []string{filepath.Join(bundled, "Contents", "MacOS", "example")}},
+		{"a plain Mach-O executable", plain, []string{plain}},
+		{"a Mach-O carrying no execute bit", unreadable, nil},
+		{"an executable that is not Mach-O", script, nil},
+		{"a symlink to a bundle", linked, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := bundleExecutables(tt.slot)
+			if err != nil {
+				t.Fatalf("bundleExecutables(%q): %v", tt.slot, err)
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Fatalf("bundleExecutables(%q) = %q, want %q", tt.slot, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestGenerationSlotsNamesEveryBundleTheLayoutDerives guards the enumeration
 // itself. Every layout path naming a bundle is a place a whole generation sits,
 // so a slot added without reaching generationSlots is one the gate never scans
