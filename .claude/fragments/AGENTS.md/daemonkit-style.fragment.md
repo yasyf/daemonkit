@@ -2,6 +2,8 @@
 
 Target Go 1.26+. Run `task build` (`CGO_ENABLED=0` — proves the module stays pure), `task test` (`scripts/test.sh -race`), and `task lint`.
 
+**macOS only, and structurally so.** Every package reaches straight for the darwin seam it needs — `kern.proc` sysctls, `csops_audittoken`, `LOCAL_PEERCRED`, `posix_spawn`, launchd — and the module does not compile off darwin. There are no `_other.go` stubs, no `!darwin` build tags, and no runtime "unsupported platform" sentinels: a missing verifier is a build failure, which is a stronger guarantee than an error value a caller can ignore. Where a libc call has no `x/sys/unix` binding, bind it with `purego.Dlsym` + `purego.SyscallN` and read errno from that same trampoline — never through a second `__error()` call, which a goroutine reschedule can point at another thread's errno (see `internal/proc/executable.go`, `internal/trust/csops.go`). CGO stays off.
+
 **Comments are terse and used sparingly — the code documents itself** through names, types, and organization. The one exception is documentation-generation comments: godoc on exported types, funcs, and the package, each starting with the identifier's name (`// NewRootCmd builds …`); unexported helpers get none. Beyond godoc, comment only for TODOs, non-obvious workarounds, or disabled code — never to restate the signature.
 
 **Errors wrap with `%w`.** Return failures up the stack with `fmt.Errorf("…: %w", err)` and inspect them with `errors.Is` / `errors.As`, never string matching. See STYLEGUIDE.md § Error Handling.

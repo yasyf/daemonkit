@@ -1,7 +1,7 @@
 // Package trust decides whether a connected unix-socket peer is the signed
 // application a daemon expects, using only kernel-held code-signing state: a
-// same-EUID floor on every platform, plus six csops_audittoken reads against
-// the peer's audit token on signed darwin builds. It opens no file, contacts
+// same-EUID floor, plus six csops_audittoken reads against the peer's audit
+// token on signed builds. It opens no file, contacts
 // no daemon, builds no CoreFoundation object, and cannot block. A configured
 // Requirement with no verifier fails closed, never downgrading to UID-only; a
 // nil Requirement is explicit UID-only trust. The daemonkit_unsigned build tag
@@ -56,8 +56,8 @@ func PeerCredentials(conn *net.UnixConn) (Peer, error) {
 	return peer, nil
 }
 
-// Floor enforces the unconditional same-effective-UID requirement that runs on
-// every platform, for every peer, before any Requirement is consulted.
+// Floor enforces the unconditional same-effective-UID requirement that runs
+// for every peer, before any Requirement is consulted.
 func Floor(uid int) error {
 	if uid != os.Geteuid() {
 		return fmt.Errorf("%w: uid %d != %d", ErrUntrustedPeer, uid, os.Geteuid())

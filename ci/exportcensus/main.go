@@ -2,14 +2,15 @@
 // against a checked-in allowlist, so no export appears or disappears unreviewed.
 //
 // The census walks every non-internal, non-main package of the module under each
-// supported GOOS, so a symbol that exists only behind //go:build darwin is still
-// recorded — and recorded as darwin-only. Output is one sorted line per symbol:
+// supported GOOS/GOARCH pair. daemonkit is macOS-only, so darwin is the whole
+// list and every recorded symbol is available on it. Output is one sorted line
+// per symbol:
 //
 //	<package>\t<kind>\t<symbol>\t<platform>
 //
 // kind is const, var, func, type, method, or field; symbol is Name for a
 // package-level identifier and Type.Name for a method or struct field; platform
-// is all, darwin, or linux.
+// is all when a symbol is present under every pair.
 package main
 
 import (
@@ -36,7 +37,6 @@ type platform struct {
 
 var platforms = []platform{
 	{goos: "darwin", goarch: "arm64"},
-	{goos: "linux", goarch: "amd64"},
 }
 
 type symbol struct {

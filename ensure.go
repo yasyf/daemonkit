@@ -151,7 +151,7 @@ func (c *Client) ensureOnce(ctx context.Context, want string, agent launchd.Agen
 		if action == ActionNothing {
 			action = ActionRestarted
 		}
-		if err := c.evict(ctx, before); err != nil {
+		if err := c.evict(ctx, before, world.Observed()); err != nil {
 			return Ensured{}, err
 		}
 	} else if err := c.proveRecorded(ctx, world); err != nil {
@@ -260,11 +260,13 @@ func (c *Client) servedHealth(ctx context.Context) (wire.HealthReport, error) {
 // falls to the record on what the whole eviction has left rather than being
 // reported as something the incumbent did.
 //
-// An attach that did pin its peer carries that identity into the proof. It is
-// the one thing that says whose an unnameable process is when the record turns
-// out to name nobody — and a session this ladder held is exactly the evidence
-// no record file can forge.
-func (c *Client) evict(ctx context.Context, before Health) error {
+// Whichever arm it takes, the eviction carries a pinned identity into the
+// proof: the peer this attach pinned when there was a session, and otherwise
+// observed — what the pass that reached here already named. It is the one thing
+// that says whose an unnameable process is when the record turns out to name
+// nobody, and a session this ladder held is exactly the evidence no record file
+// can forge.
+func (c *Client) evict(ctx context.Context, before Health, observed proc.Identity) error {
 	target, err := pin(before.Build, before.Generation)
 	if err != nil {
 		return err
@@ -287,7 +289,7 @@ func (c *Client) evict(ctx context.Context, before Health) error {
 	default:
 		return err
 	}
-	return c.prove(ctx, target)
+	return c.prove(ctx, target, observed)
 }
 
 // incumbent is one completely named runtime: the build stamp and the instance
@@ -323,13 +325,13 @@ func (i incumbent) expect() Expect { return Expect{Build: i.build, Generation: i
 // this Ensure never saw and holds no authority over.
 func (c *Client) proveRecorded(ctx context.Context, world converge.World) error {
 	if !world.Recorded {
-		return c.inventoryClear()
+		return c.inventoryClear(world.Observed())
 	}
 	target, err := pin(world.Owner.Build, world.Owner.Generation)
 	if err != nil {
 		return err
 	}
-	return c.prove(ctx, target, world.Owner.Identity())
+	return c.prove(ctx, target, world.Observed())
 }
 
 // prove settles target out of the process table without a session. A record
@@ -343,8 +345,10 @@ func (c *Client) proveRecorded(ctx context.Context, world converge.World) error 
 // observed is what the ladder pinned on its way here — the session's peer, or
 // the identity the observation read out of the record — and it is the only
 // thing that can attribute an unnameable process to this daemon once the record
-// names nobody. A caller that observed nothing passes nothing.
-func (c *Client) prove(ctx context.Context, target incumbent, observed ...proc.Identity) error {
+// names nobody. It is required rather than optional because a call site that
+// forgets it forgets the whole correlation silently; a pass that genuinely
+// pinned nothing names the zero identity, which no live process matches.
+func (c *Client) prove(ctx context.Context, target incumbent, observed proc.Identity) error {
 	proving := Grace(left(ctx)).mint("prove")
 	settleCtx, cancel := proving.Share("settle", proveSettleShare).Context(ctx)
 	defer cancel()
@@ -353,7 +357,7 @@ func (c *Client) prove(ctx context.Context, target incumbent, observed ...proc.I
 	case err == nil:
 		return nil
 	case errors.Is(err, ErrUnrecorded):
-		return c.inventoryClear(observed...)
+		return c.inventoryClear(observed)
 	case errors.Is(err, ErrUnsettled):
 		if err := repairWedged(c.recordPath, target, c.readOwner, c.probe, c.kill); err != nil {
 			return err
@@ -425,14 +429,14 @@ func repairWedged(
 // this ladder pinned on its way here, and a stranger's husk never is. The owner
 // record is not re-read for that correlation — every path into this gate is
 // entered precisely because the record named nobody, so a re-read would
-// correlate against nothing — which is why the callers that did observe an
-// identity hand it down.
+// correlate against nothing — which is why every caller hands down what it
+// observed, and the zero identity when it observed nothing.
 //
 // The residual is exact and stated rather than papered over: a husk this ladder
 // never observed is attributable to nothing, and no scan of the process table
 // can attribute it. Settling a recorded identity out of the table is the half
 // that covers a recorded process whose executable is gone.
-func (c *Client) inventoryClear(observed ...proc.Identity) error {
+func (c *Client) inventoryClear(observed proc.Identity) error {
 	program, err := c.daemon.Program.resolved()
 	if err != nil {
 		return err
@@ -443,7 +447,7 @@ func (c *Client) inventoryClear(observed ...proc.Identity) error {
 	}
 	live := slices.Clone(found.Matched)
 	for _, husk := range found.Unnameable {
-		if slices.ContainsFunc(observed, func(id proc.Identity) bool { return proc.SameInstance(husk, id) }) {
+		if proc.SameInstance(husk, observed) {
 			live = append(live, husk)
 		}
 	}

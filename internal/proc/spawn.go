@@ -31,7 +31,7 @@ type spawnFiles struct {
 
 // Spawn starts one owned child whose record is durable before its first
 // instruction runs: spawned suspended, continued only after the fsynced write
-// is re-read (darwin; spawn_other.go names the residue).
+// is re-read.
 func (s *Store) Spawn(c Cmd) (*Child, error) {
 	return s.spawn(c, nil, nil)
 }
@@ -58,7 +58,7 @@ func (s *Store) spawn(c Cmd, childOut, childErr *os.File) (*Child, error) {
 	if err != nil {
 		return nil, s.abortSpawn(pid, parentEnd, fmt.Errorf("snapshot pid %d: %w", pid, err))
 	}
-	if spawnSuspends && !info.stopped {
+	if !info.stopped {
 		return nil, s.abortSpawn(pid, parentEnd, fmt.Errorf("proc: spawned pid %d is not suspended", pid))
 	}
 	session := 0

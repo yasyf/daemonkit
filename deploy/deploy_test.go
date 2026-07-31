@@ -787,6 +787,50 @@ func TestResetDiscardsALeakedStagingTree(t *testing.T) {
 	}
 }
 
+// TestResetDestroysNothingTheGateDidNotScan holds Reset to the enumeration the
+// inventory gate scans. Every slot it destroys can be the bytes a live process
+// is running, so each one has to carry its executables into the query set the
+// gate proved empty — a slot the gate never asked about is destruction nothing
+// authorized.
+func TestResetDestroysNothingTheGateDidNotScan(t *testing.T) {
+	f := newFixture(t)
+	if _, err := f.deploy.Install(f.ctx(), f.candidate("Source", "1.0", "one")); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	leaked, err := os.MkdirTemp(f.deploy.layout.metadata, stagePrefix+"*"+stageSuffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slots := map[string]string{
+		"prior":     f.deploy.layout.prior,
+		"candidate": f.deploy.layout.candidate,
+		"removed":   f.deploy.layout.removed,
+		"stage":     leaked,
+	}
+	carried := make(map[string]string, len(slots))
+	for name, slot := range slots {
+		helper := filepath.Join(slot, "Contents", "MacOS", name)
+		writeMachO(t, helper, 0o755)
+		carried[name] = helper
+	}
+	var queried []string
+	f.deploy.inventory = func(paths ...string) (Survivors, error) {
+		queried = append(queried, paths...)
+		return Survivors{}, nil
+	}
+	if err := f.deploy.Reset(f.ctx()); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	for name, slot := range slots {
+		if fileExists(slot) {
+			t.Fatalf("Reset left the %s slot at %q", name, slot)
+		}
+		if !slices.Contains(queried, carried[name]) {
+			t.Fatalf("Reset destroyed the %s slot at %q, which the gate never scanned: %q", name, slot, queried)
+		}
+	}
+}
+
 func TestResetRefusesWhileTheDaemonIsLive(t *testing.T) {
 	f := newFixture(t)
 	if _, err := f.deploy.Install(f.ctx(), f.candidate("Source", "1.0", "one")); err != nil {
@@ -939,11 +983,13 @@ func TestOpenRejectsInvalidConfig(t *testing.T) {
 	}
 }
 
-// TestOpenResolvesDeclaredExecutables pins the fail-open the gate cannot have:
-// the inventory compares a query against the literal form and the symlink-free
-// one, and a process reports neither when the declared path reaches its
-// executable through a symlinked directory — so an unresolved declaration would
-// survive Open and then match nothing at all.
+// TestOpenResolvesDeclaredExecutables pins when a declared host binary is held
+// to a real file. The scan-time matcher resolves the query itself, so the
+// symlink-free form a process reports is compared either way; what Open adds is
+// the moment. A declaration naming no file is ErrConfig here, rather than a
+// query that narrows to its literal form mid-gate — the narrowing
+// executableMatcher makes on purpose for an agent Program whose bundle was
+// renamed aside, and which for a host binary is a gate that matches nothing.
 func TestOpenResolvesDeclaredExecutables(t *testing.T) {
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {

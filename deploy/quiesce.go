@@ -71,10 +71,10 @@ func (p ReadinessProof) Digest() SHA256 { return p.digest }
 // (ErrUnrecorded) is the already-absent arm.
 //
 // Every arm ends at the same gate: the executable-scoped inventory over every
-// program this deployment runs — inside the installed bundle, inside the prior
-// and candidate slots a supersede moves bundles through, and at every declared
-// host binary — must be empty. That gate is not a belt-and-braces check, it is
-// what closes the hole — see [Inventory].
+// program this deployment runs — at every declared host binary, and inside a
+// bundle at every location a whole generation can occupy — must be empty. That
+// gate is not a belt-and-braces check, it is what closes the hole — see
+// [Inventory] and [Deployment.generationSlots].
 //
 // A live process nothing could name counts against that gate when the daemon's
 // owner record names its exact pin, so this deployment's own husk refuses while

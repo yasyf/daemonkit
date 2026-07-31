@@ -43,7 +43,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # macOS only: daemonkit is a macOS library and no longer compiles off
+        # darwin — the sysctl, csops, and LOCAL_PEERCRED seams have no stubs.
+        os: [macos-latest]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
@@ -58,9 +60,14 @@ jobs:
       - name: Build (pure)
         run: CGO_ENABLED=0 go build ./...
 
+  # Static analysis type-checks the tree, so it runs for darwin. GOOS/GOARCH
+  # keep it on a cheap linux runner instead of billing macOS minutes 10x.
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      GOOS: darwin
+      GOARCH: arm64
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
@@ -75,6 +82,9 @@ jobs:
   vuln:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      GOOS: darwin
+      GOARCH: arm64
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
@@ -83,7 +93,7 @@ jobs:
           cache: true
       - name: govulncheck
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          GOOS= GOARCH= go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...
 
   # One Swift job (macOS minutes bill 10x); macos-26 pinned — its image ships

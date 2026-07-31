@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -19,6 +20,7 @@ import (
 	"github.com/yasyf/daemonkit/internal/realhome"
 	"github.com/yasyf/daemonkit/internal/wire"
 	"github.com/yasyf/daemonkit/launchd"
+	"github.com/yasyf/daemonkit/paths"
 )
 
 func TestEnsureRequiresDeadline(t *testing.T) {
@@ -359,11 +361,11 @@ func TestInventoryClearProvesAbsenceOverTheProcessTable(t *testing.T) {
 	}
 	idle := Open(Daemon{Program: Program{path: unrun}})
 	idle.identities = liveAt(realPath(t, selfPath(t)))
-	if err := idle.inventoryClear(); err != nil {
+	if err := idle.inventoryClear(proc.Identity{}); err != nil {
 		t.Fatalf("inventoryClear() error = %v, want a clear inventory", err)
 	}
 	running := Open(Daemon{Program: Program{path: realPath(t, selfPath(t))}})
-	if err := running.inventoryClear(); !errors.Is(err, ErrUnsettled) {
+	if err := running.inventoryClear(proc.Identity{}); !errors.Is(err, ErrUnsettled) {
 		t.Fatalf("inventoryClear() over this very process = %v, want ErrUnsettled", err)
 	}
 }
@@ -382,31 +384,31 @@ func TestInventoryClearHoldsOnlyItsOwnUnnameableHusk(t *testing.T) {
 	husk := proc.Identity{PID: 4242, Start: 77, Boot: 9}
 	tests := []struct {
 		name     string
-		observed []proc.Identity
+		observed proc.Identity
 		wantErr  error
 	}{
 		{
 			name:     "the husk this ladder observed",
-			observed: []proc.Identity{husk},
+			observed: husk,
 			wantErr:  ErrUnsettled,
 		},
 		{
-			name: "a husk this ladder never observed",
+			name: "a pass that observed nothing",
 		},
 		{
 			name:     "an observation naming another instance at the same pid",
-			observed: []proc.Identity{{PID: husk.PID, Start: husk.Start + 1, Boot: husk.Boot}},
+			observed: proc.Identity{PID: husk.PID, Start: husk.Start + 1, Boot: husk.Boot},
 		},
 		{
 			name:     "an observation from another boot session",
-			observed: []proc.Identity{{PID: husk.PID, Start: husk.Start, Boot: husk.Boot + 1}},
+			observed: proc.Identity{PID: husk.PID, Start: husk.Start, Boot: husk.Boot + 1},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client := Open(Daemon{Program: Program{path: unrun}})
 			client.identities = huskAt(husk)
-			err := client.inventoryClear(tt.observed...)
+			err := client.inventoryClear(tt.observed)
 			if tt.wantErr == nil {
 				if err != nil {
 					t.Fatalf("inventoryClear() = %v, want a clear inventory", err)
@@ -453,7 +455,7 @@ func TestInventoryClearQueriesTheProgramPathAlone(t *testing.T) {
 		queried = append(queried, path)
 		return proc.Report{}, nil
 	}
-	if err := client.inventoryClear(); err != nil {
+	if err := client.inventoryClear(proc.Identity{}); err != nil {
 		t.Fatalf("inventoryClear() error = %v, want a clear inventory", err)
 	}
 	if want := []string{realPath(t, wanted)}; !slices.Equal(queried, want) {
@@ -485,7 +487,7 @@ func TestInventoryClearNeverPassesOnAnUnresolvedProgram(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			client := Open(Daemon{Program: Program{path: tt.program}})
 			client.identities = liveAt(realPath(t, self))
-			if err := client.inventoryClear(); !errors.Is(err, tt.wantErr) {
+			if err := client.inventoryClear(proc.Identity{}); !errors.Is(err, tt.wantErr) {
 				t.Fatalf("inventoryClear() error = %v, want %v", err, tt.wantErr)
 			}
 		})
@@ -1076,6 +1078,161 @@ func TestEnsureOnceHoldsTheHuskItObserved(t *testing.T) {
 				t.Fatalf("signalled %v, want no signal at a record that names nobody", h.signals)
 			}
 		})
+	}
+}
+
+// TestEvictHoldsTheHuskItObservedWithoutASession is the same correlation on the
+// eviction arm, where it was forgotten. A daemon served the observation, so the
+// ladder named an incumbent — but the drain attach finds no listener and the
+// record is gone by the time the proof reads it, which leaves what the
+// observation pinned as the whole of what says whose an unnameable process is.
+func TestEvictHoldsTheHuskItObservedWithoutASession(t *testing.T) {
+	owner := recordedOwner("stale", 7)
+	tests := []struct {
+		name    string
+		husk    proc.Identity
+		wantErr error
+	}{
+		{
+			name:    "the husk the observation named",
+			husk:    owner.Identity(),
+			wantErr: ErrUnsettled,
+		},
+		{
+			name: "a husk this ladder never observed",
+			husk: proc.Identity{PID: owner.PID + 1, Start: owner.Start, Boot: owner.Boot},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reads := 0
+			h := newEnsureOnceHarness(
+				t,
+				[]observation{{report: servedReport(wire.PhaseReady, owner.Build, owner.Generation)}},
+				func(string) (proc.Owner, bool, error) {
+					reads++
+					return owner, reads == 1, nil
+				},
+			)
+			h.client.identities = func(string) (proc.Report, error) {
+				return proc.Report{Unnameable: []proc.Identity{tt.husk}}, nil
+			}
+			h.launchd.refuse = "bootstrap"
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_, err := h.client.ensureOnce(ctx, "wanted", h.agent)
+			if tt.wantErr == nil {
+				if err == nil || errors.Is(err, ErrUnsettled) {
+					t.Fatalf("ensureOnce() = %v, want a cleared gate and the apply refusal past it", err)
+				}
+				return
+			}
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("ensureOnce() = %v, want %v", err, tt.wantErr)
+			}
+			if len(h.signals) != 0 {
+				t.Fatalf("signalled %v, want no signal at a record that names nobody", h.signals)
+			}
+		})
+	}
+}
+
+// TestEvictHandsTheSessionsPinToTheProof is the eviction's other arm, the one
+// that held a session. The drain lands but its exit is never observed, so the
+// proof runs — and it runs with nothing observed on the way in, which leaves the
+// peer this attach pinned as the whole of what can attribute a husk once the
+// record names nobody.
+//
+// The eviction takes the only control session this test opens. A closed
+// session's lane slot is freed when the daemon's own read loop returns, so a
+// warm-up attach closed a moment earlier would race the eviction's for it —
+// which is why the incumbent is named out of the record it wrote before binding
+// rather than read off a session.
+func TestEvictHandsTheSessionsPinToTheProof(t *testing.T) {
+	tests := []struct {
+		name    string
+		label   string
+		husk    func(proc.Identity) proc.Identity
+		wantErr error
+	}{
+		{
+			name:    "the husk this attach pinned",
+			label:   "dkevictown",
+			husk:    func(id proc.Identity) proc.Identity { return id },
+			wantErr: ErrUnsettled,
+		},
+		{
+			name:  "a husk this attach never pinned",
+			label: "dkevictother",
+			husk: func(id proc.Identity) proc.Identity {
+				return proc.Identity{PID: id.PID + 1, Start: id.Start, Boot: id.Boot}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home := shortHome(t)
+			unrun := filepath.Join(home, "never-executed")
+			if err := os.WriteFile(unrun, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+				t.Fatalf("write program: %v", err)
+			}
+			startControlChild(t, tt.label)
+			client := Open(Daemon{
+				Label:    Label(tt.label),
+				Program:  Program{path: unrun},
+				Schemas:  []Schema{"test.v1"},
+				Shutdown: Grace(5 * time.Second),
+			})
+			awaitListener(t, tt.label)
+			owner, recorded, err := proc.ReadOwner(client.recordPath)
+			if err != nil || !recorded {
+				t.Fatalf("ReadOwner() = %+v, %v, %v; want the child's own record", owner, recorded, err)
+			}
+			client.observe = func(proc.Identity) (proc.Reap, bool, error) { return 0, false, nil }
+			client.readOwner = func(string) (proc.Owner, bool, error) { return proc.Owner{}, false, nil }
+			client.identities = func(string) (proc.Report, error) {
+				return proc.Report{Unnameable: []proc.Identity{tt.husk(owner.Identity())}}, nil
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			before := Health{Build: owner.Build, Generation: owner.Generation, PID: owner.PID}
+			err = client.evict(ctx, before, proc.Identity{})
+			if tt.wantErr == nil {
+				if err != nil {
+					t.Fatalf("evict() = %v, want a cleared gate", err)
+				}
+				return
+			}
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("evict() = %v, want %v", err, tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), "unnameable") {
+				t.Fatalf("evict() = %v, want the pinned husk named", err)
+			}
+		})
+	}
+}
+
+// awaitListener waits for the child's socket to accept without taking a lane
+// slot: a connection that sends no hello never reaches the lane's capacity gate.
+// The owner record is written before the bind, so a socket that accepts has one.
+func awaitListener(t *testing.T, label string) {
+	t.Helper()
+	socket, err := paths.Socket(label)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		conn, err := net.Dial("unix", socket)
+		if err == nil {
+			_ = conn.Close()
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("dial %q = %v", socket, err)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

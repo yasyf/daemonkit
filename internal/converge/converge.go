@@ -51,6 +51,17 @@ type World struct {
 // Serving reports whether a daemon answered on the socket.
 func (w World) Serving() bool { return w.Attach == nil }
 
+// Observed is the process instance this observation named, and the zero
+// identity when the record named nobody. It is what a later proof correlates an
+// unnameable process against, so an observation that named no instance answers
+// with a pin no live process can match rather than with nothing at all.
+func (w World) Observed() proc.Identity {
+	if !w.Recorded {
+		return proc.Identity{}
+	}
+	return w.Owner.Identity()
+}
+
 // Observe re-derives a World from s. A boundary that answers with a refusal is
 // recorded as that refusal; only a boundary that could not be consulted at all
 // fails the observation.

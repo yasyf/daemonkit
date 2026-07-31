@@ -29,12 +29,11 @@ reverted rather than trusted.
 | Package | Owns | Files | Lines |
 |---|---|---|---|
 | `artifact` | resolves a version-exact executable from a declarative descriptor, for the cc-family's one central "give me the binary that matches my version" primitive. | 16 | 2230 |
-| `bundle` | reads a macOS .app's Info.plist and resolves the stable bundle paths a daemon installs to. | 5 | 200 |
-| `daemon` | is the consumer-agnostic process runtime for a detached daemon: exclusive listener ownership, readiness, ordered shutdown, skew observation, idle exit, and embedded-process coordination. | 18 | 4646 |
-| `deployment` | owns sealed installation, activation, upgrade, and removal of one fixed signed application. | 18 | 4172 |
+| `bundle` | reads a macOS .app's Info.plist and resolves the stable bundle paths a daemon installs to. | 5 | 198 |
+| `deploy` | owns sealed installation, activation, supersession, and removal of one fixed signed application. | 14 | 4330 |
 | `ghrelease` | queries GitHub for a repository's latest published release. | 2 | 170 |
+| `launchd` | is the value-type model for one exact macOS user LaunchAgent and the stateless primitives that apply it. | 12 | 2359 |
 | `paths` | owns the canonical state-directory layout under the user's home directory, resolved through the passwd database — never the caller's HOME or CLAUDE_CONFIG_DIR — so a sandboxed environment cannot relocate state. | 4 | 209 |
-| `service` | converges an exact durable set of macOS user LaunchAgents. | 28 | 10954 |
 | `templates` | — | 2 | 218 |
 | `version` | classifies and compares release and development builds for launcher-owned runtime settlement and release ordering. | 2 | 302 |
 <!-- END GENERATED: package table -->
@@ -152,6 +151,8 @@ Reach for your **LSP** when the answer must be exhaustive/structural (findRefere
 ## Go Style
 
 Target Go 1.26+. Run `task build` (`CGO_ENABLED=0` — proves the module stays pure), `task test` (`scripts/test.sh -race`), and `task lint`.
+
+**macOS only, and structurally so.** Every package reaches straight for the darwin seam it needs — `kern.proc` sysctls, `csops_audittoken`, `LOCAL_PEERCRED`, `posix_spawn`, launchd — and the module does not compile off darwin. There are no `_other.go` stubs, no `!darwin` build tags, and no runtime "unsupported platform" sentinels: a missing verifier is a build failure, which is a stronger guarantee than an error value a caller can ignore. Where a libc call has no `x/sys/unix` binding, bind it with `purego.Dlsym` + `purego.SyscallN` and read errno from that same trampoline — never through a second `__error()` call, which a goroutine reschedule can point at another thread's errno (see `internal/proc/executable.go`, `internal/trust/csops.go`). CGO stays off.
 
 **Comments are terse and used sparingly — the code documents itself** through names, types, and organization. The one exception is documentation-generation comments: godoc on exported types, funcs, and the package, each starting with the identifier's name (`// NewRootCmd builds …`); unexported helpers get none. Beyond godoc, comment only for TODOs, non-obvious workarounds, or disabled code — never to restate the signature.
 

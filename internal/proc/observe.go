@@ -40,9 +40,8 @@ type Peer struct {
 }
 
 // PeerCredentials reads conn's kernel-authenticated peer process and user id
-// (LOCAL_PEERPID plus LOCAL_PEERCRED on darwin, SO_PEERCRED on linux). It
-// answers on both ends of a connected socket, so a client reads the identity
-// of the process accepting for it.
+// (LOCAL_PEERPID plus LOCAL_PEERCRED). It answers on both ends of a connected
+// socket, so a client reads the identity of the process accepting for it.
 func PeerCredentials(conn *net.UnixConn) (Peer, error) {
 	raw, err := conn.SyscallConn()
 	if err != nil {

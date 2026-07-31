@@ -21,8 +21,8 @@ linters:
     - unused
   settings:
     govet:
-      # unsafeptr: trust/verify_darwin.go derefs dlsym'd CF data symbols — fixed
-      # dyld addresses, not Go pointers (ccn 239201e). Lockstep with the
+      # unsafeptr: internal/trust derefs dlsym'd data symbols — fixed dyld
+      # addresses, not Go pointers (ccn 239201e). Lockstep with the
       # -unsafeptr=false vet step in Taskfile.yml and ci.yml.
       disable:
         - unsafeptr

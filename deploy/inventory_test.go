@@ -6,8 +6,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/yasyf/daemonkit/internal/proc"
@@ -205,6 +207,54 @@ func TestExecutablesCoversTheBundleMovedIntoTheRemovalSlot(t *testing.T) {
 	slices.Sort(want)
 	if !slices.Equal(got, want) {
 		t.Fatalf("executables() = %q, want %q", got, want)
+	}
+}
+
+// TestExecutablesCoversALeakedStagingTree is the last of the places a whole
+// generation sits at. stage names its copy through MkdirTemp and publishes it
+// only by rename, so a crash in between strands a full bundle copy under the
+// metadata directory — bytes a process can be running and Reset destroys.
+func TestExecutablesCoversALeakedStagingTree(t *testing.T) {
+	f := newFixture(t)
+	if _, err := f.deploy.Install(f.ctx(), f.candidate("Source", "1.0", "one")); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	leaked, err := os.MkdirTemp(f.deploy.layout.metadata, stagePrefix+"*"+stageSuffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	helper := filepath.Join(leaked, "Contents", "MacOS", "example")
+	writeMachO(t, helper, 0o755)
+	got, err := f.deploy.executables()
+	if err != nil {
+		t.Fatalf("executables: %v", err)
+	}
+	want := []string{f.agent.Program, helper}
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Fatalf("executables() = %q, want %q", got, want)
+	}
+}
+
+// TestGenerationSlotsNamesEveryBundleTheLayoutDerives guards the enumeration
+// itself. Every layout path naming a bundle is a place a whole generation sits,
+// so a slot added without reaching generationSlots is one the gate never scans
+// and a destructive step still destroys — the hole the enumeration exists to
+// close, reopened in silence.
+func TestGenerationSlotsNamesEveryBundleTheLayoutDerives(t *testing.T) {
+	f := newFixture(t)
+	slots, err := f.deploy.generationSlots()
+	if err != nil {
+		t.Fatalf("generationSlots: %v", err)
+	}
+	derived := reflect.ValueOf(f.deploy.layout)
+	for i := range derived.NumField() {
+		path := derived.Field(i).String()
+		if !strings.HasSuffix(path, stageSuffix) || slices.Contains(slots, path) {
+			continue
+		}
+		t.Errorf("layout.%s = %q names a bundle generationSlots() does not: %q",
+			derived.Type().Field(i).Name, path, slots)
 	}
 }
 

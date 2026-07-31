@@ -153,26 +153,23 @@ func resolveExecutables(declared []string) ([]string, error) {
 
 // executables is every program this deployment runs: each agent's Program, the
 // host binaries the consumer declared outside the bundle, and every Mach-O
-// executable the bundle carries at each of the three paths a bundle of this
-// deployment sits at. The bundle half is what covers the helper that is
-// neither an agent nor declared — nothing else would notice it, and it is the
-// bundle under it that the next step deletes.
-//
-// The prior, candidate, and removal slots are in the set because the canonical
-// path is not where a bundle lives when the gate matters most: supersede
-// renames the incumbent aside to prior and the staged candidate into place, and
-// uninstall renames the whole generation into the removal slot, so a scan of the
-// canonical path alone is blind to a process still running the generation that
-// just moved — the exact bytes the next step destroys. A slot holding no bundle
-// carries no executables and is not an error.
+// executable a bundle carries at each of the locations a whole generation can
+// occupy — [Deployment.generationSlots], which is where those locations are
+// enumerated and why. The bundle half is what covers the helper that is neither
+// an agent nor declared — nothing else would notice it, and it is the bundle
+// under it that the next step deletes.
 func (d *Deployment) executables() ([]string, error) {
 	paths := make([]string, 0, len(d.config.Agents)+len(d.config.Executables))
 	for _, agent := range d.config.Agents {
 		paths = append(paths, agent.Program)
 	}
 	paths = append(paths, d.config.Executables...)
-	for _, bundle := range []string{d.layout.canonical, d.layout.prior, d.layout.candidate, d.layout.removed} {
-		carried, err := bundleExecutables(bundle)
+	slots, err := d.generationSlots()
+	if err != nil {
+		return nil, err
+	}
+	for _, slot := range slots {
+		carried, err := bundleExecutables(slot)
 		if err != nil {
 			return nil, err
 		}

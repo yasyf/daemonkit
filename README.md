@@ -1,6 +1,6 @@
 # ![daemonkit](docs/assets/readme-banner.webp)
 
-**Daemons that spawn detached, trust by codesign, and drain on upgrade.** daemonkit is the daemon + signed-app pattern extracted from fusekit, claude-pool, cc-interact, and synckit, shipped as one Go module and one Swift package.
+**Daemons that spawn detached, trust by codesign, and drain on upgrade.** daemonkit is the daemon + signed-app pattern extracted from fusekit, claude-pool, cc-interact, and synckit, shipped as one Go module and one Swift package. It is macOS-only. The trust, process, and service layers read kernel state directly, so the module does not compile off darwin.
 
 [![CI](https://img.shields.io/github/actions/workflow/status/yasyf/daemonkit/ci.yml?branch=main&label=ci)](https://github.com/yasyf/daemonkit/actions/workflows/ci.yml)
 [![License: PolyForm-Noncommercial-1.0.0](https://img.shields.io/badge/License-PolyForm--Noncommercial--1.0.0-blue.svg)](https://github.com/yasyf/daemonkit/blob/main/LICENSE)
@@ -53,7 +53,7 @@ and exact process identity to settle before it starts the replacement.
 
 ### Trust the process on the other end of the socket
 
-A unix socket's permission bits say which UID connected, not which binary. On macOS, daemonkit's trust check resolves the peer's audit token to its code signature and pins team + signing identifier — same-team-but-different-tool is rejected, and a configured requirement with no verifier fails closed.
+A unix socket's permission bits say which UID connected, not which binary. daemonkit's trust check resolves the peer's audit token to its code signature and pins team + signing identifier — same-team-but-different-tool is rejected, and a configured requirement with no verifier fails closed.
 
 ### Own a typed Swift service generation
 
@@ -75,12 +75,11 @@ disappears cannot leave a stale row behind.
 | Package | Owns | Files | Lines |
 |---|---|---|---|
 | `artifact` | resolves a version-exact executable from a declarative descriptor, for the cc-family's one central "give me the binary that matches my version" primitive. | 16 | 2230 |
-| `bundle` | reads a macOS .app's Info.plist and resolves the stable bundle paths a daemon installs to. | 5 | 200 |
-| `daemon` | is the consumer-agnostic process runtime for a detached daemon: exclusive listener ownership, readiness, ordered shutdown, skew observation, idle exit, and embedded-process coordination. | 18 | 4646 |
-| `deployment` | owns sealed installation, activation, upgrade, and removal of one fixed signed application. | 18 | 4172 |
+| `bundle` | reads a macOS .app's Info.plist and resolves the stable bundle paths a daemon installs to. | 5 | 198 |
+| `deploy` | owns sealed installation, activation, supersession, and removal of one fixed signed application. | 14 | 4330 |
 | `ghrelease` | queries GitHub for a repository's latest published release. | 2 | 170 |
+| `launchd` | is the value-type model for one exact macOS user LaunchAgent and the stateless primitives that apply it. | 12 | 2359 |
 | `paths` | owns the canonical state-directory layout under the user's home directory, resolved through the passwd database — never the caller's HOME or CLAUDE_CONFIG_DIR — so a sandboxed environment cannot relocate state. | 4 | 209 |
-| `service` | converges an exact durable set of macOS user LaunchAgents. | 28 | 10954 |
 | `templates` | — | 2 | 218 |
 | `version` | classifies and compares release and development builds for launcher-owned runtime settlement and release ordering. | 2 | 302 |
 <!-- END GENERATED: package table -->
@@ -134,11 +133,10 @@ daemonkit.Daemon{
 }
 ```
 
-The same-effective-UID floor runs first, unconditionally, on every platform and
-for every peer; no `Trust` value can express its absence. A configured
-`Requirement` on a build with no verifier — any platform but darwin, or a
-`daemonkit_unsigned` build — is denied outright rather than downgraded to
-UID-only. What the check proves, and what it does not, is
+The same-effective-UID floor runs first, unconditionally, for every peer; no
+`Trust` value can express its absence. A configured `Requirement` on a build
+with no verifier — a `daemonkit_unsigned` build — is denied outright rather
+than downgraded to UID-only. What the check proves, and what it does not, is
 `Requirement`'s documented contract: it authenticates the peer's main Mach-O as
 a program a team signed under an identifier, not the product you installed, not
 an up-to-date build, and not a principal.

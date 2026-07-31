@@ -34,8 +34,12 @@ jobs:
           - binrun
           - cc-present
           - cc-review
+    # daemonkit is macOS-only, so its consumers cross-compile for darwin here
+    # rather than billing macOS minutes across every leg of the fleet.
     env:
       CGO_ENABLED: "0"
+      GOOS: darwin
+      GOARCH: arm64
     steps:
       - name: Check out daemonkit
         uses: actions/checkout@v7

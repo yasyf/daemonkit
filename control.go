@@ -74,8 +74,7 @@ const (
 // to exactly one kernel process instance. The pin is assembled at attach, in
 // an order that closes the PID-reuse window without a server nonce:
 //
-//  1. the peer PID is read from the connected socket (LOCAL_PEERPID on
-//     darwin, SO_PEERCRED on linux);
+//  1. the peer PID is read from the connected socket (LOCAL_PEERPID);
 //  2. that PID is probed through the process table for {start, boot};
 //  3. the native health verb is asked on the same session and must answer
 //     PID == the socket-observed PID — a self-attestation only a peer still

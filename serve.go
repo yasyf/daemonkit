@@ -225,7 +225,7 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 		}
 	}
 
-	drained := runShutdownLadder(d.shutdownGrace(), server, product, store, cancelActivation)
+	drained := runShutdownLadder(d.shutdownGrace(), server, product, store, cancelActivation) //nolint:contextcheck // the ladder runs after the caller's ctx is cancelled by design: its own budget is the only deadline
 	drained.Archived = archived
 	cancelServe()
 	if !serveReturned {

@@ -52,9 +52,6 @@ var (
 
 	// ErrState means a durable deployment record is corrupt or inexact.
 	ErrState = errors.New("deploy: durable deployment state is invalid")
-
-	// ErrUnsupported means signed-bundle verification is unavailable here.
-	ErrUnsupported = errors.New("deploy: codesign verification is only supported on macOS")
 )
 
 const lockGrace = 30 * time.Second
@@ -134,7 +131,7 @@ func Open(config Config) (*Deployment, error) {
 		config:      config,
 		layout:      layoutFor(config.App),
 		requirement: requirement,
-		verify:      newVerifier(),
+		verify:      codesignVerifier{},
 		run:         execRunner,
 		client:      daemonkit.Open(config.Daemon),
 		inventory:   Inventory,
@@ -414,8 +411,9 @@ func (d *Deployment) tombstone(ctx context.Context, runtime RuntimeProof) (remov
 
 // Reset returns the deployment to a clean slate: whatever swap was
 // outstanding is driven to its end, the daemon is quiesced under the same
-// gate every irreversible step uses, launchd is converged empty, and every
-// record and staging tree deploy owns is discarded.
+// gate every irreversible step uses, launchd is converged empty, every record
+// deploy owns is discarded, and so is every generation slot the gate just
+// scanned.
 //
 // It is the way out of a state no other verb accepts — a sealed activation
 // whose daemon has since restarted, a removal proof for an app that was put
@@ -438,10 +436,7 @@ func (d *Deployment) Reset(ctx context.Context) error {
 		removeFileDurable(d.layout.removal),
 		removeFileDurable(d.layout.swap),
 		removeFileDurable(d.layout.services),
-		removeTreeDurable(d.layout.prior),
-		removeTreeDurable(d.layout.candidate),
-		removeTreeDurable(d.layout.removed),
-		d.discardStages(),
+		d.discardGenerations(),
 	)
 }
 

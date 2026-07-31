@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -189,20 +190,65 @@ func (d *Deployment) stage(ctx context.Context, candidate Candidate) (Generation
 	return staged, nil
 }
 
-// discardStages reclaims every staging tree under the metadata directory. A
-// stage that crashed before its rename owns a whole bundle copy the swap record
-// does not name and no path derives from, so no verb but this one revisits it.
-func (d *Deployment) discardStages() error {
-	entries, err := os.ReadDir(d.layout.metadata)
+// generationSlots is every location this deployment can move or copy a whole
+// generation into: the canonical path, the three private slots beside it, and
+// every staging tree left under the metadata directory. It is the one place
+// those locations are named — the inventory gate scans exactly this set and
+// every step that destroys a generation draws its targets from it, so a
+// location added here is covered by both and one missing from it by neither.
+//
+// The private slots belong on it because the canonical path is not where a
+// bundle lives when the gate matters most. Supersede renames the incumbent
+// aside to prior and the staged candidate into place; uninstall renames the
+// whole generation into the removal slot; a stage that crashed before its
+// rename owns a full bundle copy the swap record does not name and no path
+// derives from. Each is bytes a process may still be running and the next step
+// destroys. A slot holding no bundle is not an error.
+func (d *Deployment) generationSlots() ([]string, error) {
+	stages, err := d.stagingTrees()
 	if err != nil {
-		return fmt.Errorf("deploy: scan staging trees: %w", err)
+		return nil, err
 	}
-	discarded := make([]error, 0, len(entries))
+	fixed := []string{d.layout.canonical, d.layout.prior, d.layout.candidate, d.layout.removed}
+	return slices.Concat(fixed, stages), nil
+}
+
+// stagingTrees names every staging tree under the metadata directory. A
+// deployment that has never held its lock has no metadata directory and so no
+// trees, which is a state the ladder branches on rather than an error.
+func (d *Deployment) stagingTrees() ([]string, error) {
+	entries, err := os.ReadDir(d.layout.metadata)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("deploy: scan staging trees: %w", err)
+	}
+	trees := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		if !strings.HasPrefix(entry.Name(), stagePrefix) || !strings.HasSuffix(entry.Name(), stageSuffix) {
 			continue
 		}
-		discarded = append(discarded, removeTreeDurable(filepath.Join(d.layout.metadata, entry.Name())))
+		trees = append(trees, filepath.Join(d.layout.metadata, entry.Name()))
+	}
+	return trees, nil
+}
+
+// discardGenerations destroys every generation slot but the canonical path,
+// whose installed bytes no caller of this asked to lose. Its targets come out
+// of the same enumeration the inventory gate scans, so it destroys nothing the
+// gate did not just prove empty.
+func (d *Deployment) discardGenerations() error {
+	slots, err := d.generationSlots()
+	if err != nil {
+		return err
+	}
+	discarded := make([]error, 0, len(slots))
+	for _, slot := range slots {
+		if slot == d.layout.canonical {
+			continue
+		}
+		discarded = append(discarded, removeTreeDurable(slot))
 	}
 	return errors.Join(discarded...)
 }
