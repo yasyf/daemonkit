@@ -1,0 +1,220 @@
+// Package wiretest is the in-process harness for wire's transport and peer
+// tests: short-path socket dirs, a real client/server pair, a stub Runtime,
+// and a manually-advanced clock mirroring proc's seam.
+package wiretest
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/yasyf/daemonkit/internal/wire"
+)
+
+// SocketDir returns a fresh directory short enough for a unix socket path
+// (macOS caps sun_path at 104 bytes; t.TempDir routinely exceeds it), removed
+// on t's cleanup.
+func SocketDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", fmt.Sprintf("dk-%d-", os.Getpid()))
+	if err != nil {
+		t.Fatalf("wiretest: mkdir socket dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
+// Pair returns a connected client/server unix-socket pair. Both ends live in
+// this process, so peer credentials on either report this process's own uid.
+func Pair(t *testing.T) (client, server *net.UnixConn) {
+	t.Helper()
+	sock := filepath.Join(SocketDir(t), "s")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("wiretest: listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	type accepted struct {
+		conn net.Conn
+		err  error
+	}
+	ch := make(chan accepted, 1)
+	go func() {
+		conn, err := ln.Accept()
+		ch <- accepted{conn, err}
+	}()
+
+	dialed, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatalf("wiretest: dial: %v", err)
+	}
+	a := <-ch
+	if a.err != nil {
+		t.Fatalf("wiretest: accept: %v", a.err)
+	}
+	client = dialed.(*net.UnixConn)
+	server = a.conn.(*net.UnixConn)
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+	})
+	return client, server
+}
+
+// StubRuntime is a wire.Runtime with a settable handler and a phase variable
+// driven by SetPhase. Drain closes Drained and publishes PhaseDraining.
+type StubRuntime struct {
+	// HandleFunc serves every dispatched business request.
+	HandleFunc func(ctx context.Context, req wire.Request) (any, error)
+	// Drained closes on the first Drain call.
+	Drained chan struct{}
+
+	mu        sync.Mutex
+	snapshot  wire.PhaseSnapshot
+	changed   chan struct{}
+	drainOnce sync.Once
+}
+
+var _ wire.Runtime = (*StubRuntime)(nil)
+
+// NewStubRuntime returns a stub already publishing PhaseReady.
+func NewStubRuntime() *StubRuntime {
+	return &StubRuntime{
+		Drained:  make(chan struct{}),
+		snapshot: wire.PhaseSnapshot{Sequence: 1, Phase: wire.PhaseReady},
+		changed:  make(chan struct{}),
+	}
+}
+
+// Handle dispatches to HandleFunc.
+func (r *StubRuntime) Handle(ctx context.Context, req wire.Request) (any, error) {
+	r.mu.Lock()
+	handle := r.HandleFunc
+	r.mu.Unlock()
+	if handle == nil {
+		return nil, fmt.Errorf("wiretest: no handler for op %q", req.Op)
+	}
+	return handle(ctx, req)
+}
+
+// SetHandle installs the business handler.
+func (r *StubRuntime) SetHandle(handle func(ctx context.Context, req wire.Request) (any, error)) {
+	r.mu.Lock()
+	r.HandleFunc = handle
+	r.mu.Unlock()
+}
+
+// Phase returns the current snapshot.
+func (r *StubRuntime) Phase() wire.PhaseSnapshot {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.snapshot
+}
+
+// WaitPhase blocks until the sequence advances past after or ctx ends.
+func (r *StubRuntime) WaitPhase(ctx context.Context, after uint64) (wire.PhaseSnapshot, error) {
+	for {
+		r.mu.Lock()
+		snapshot := r.snapshot
+		changed := r.changed
+		r.mu.Unlock()
+		if snapshot.Sequence > after {
+			return snapshot, nil
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return wire.PhaseSnapshot{}, ctx.Err()
+		}
+	}
+}
+
+// SetPhase publishes phase with detail, bumping the sequence and waking every
+// WaitPhase waiter.
+func (r *StubRuntime) SetPhase(phase wire.Phase, detail []byte) {
+	r.mu.Lock()
+	r.snapshot = wire.PhaseSnapshot{Sequence: r.snapshot.Sequence + 1, Phase: phase, Detail: detail}
+	changed := r.changed
+	r.changed = make(chan struct{})
+	r.mu.Unlock()
+	close(changed)
+}
+
+// Drain closes Drained and publishes PhaseDraining.
+func (r *StubRuntime) Drain() {
+	r.drainOnce.Do(func() {
+		close(r.Drained)
+		r.SetPhase(wire.PhaseDraining, nil)
+	})
+}
+
+// Clock is the time seam mirrored from proc: real wall time in production, a
+// FakeClock in tests.
+type Clock interface {
+	Now() time.Time
+	After(d time.Duration) <-chan time.Time
+}
+
+// FakeClock is a manually-advanced Clock: Now moves only on Advance, which fires
+// every waiter whose deadline has arrived.
+type FakeClock struct {
+	mu      sync.Mutex
+	now     time.Time
+	waiters []fakeWaiter
+}
+
+type fakeWaiter struct {
+	at time.Time
+	ch chan time.Time
+}
+
+var _ Clock = (*FakeClock)(nil)
+
+// NewFakeClock returns a FakeClock reading start until the first Advance.
+func NewFakeClock(start time.Time) *FakeClock {
+	return &FakeClock{now: start}
+}
+
+// Now returns the current fake time.
+func (c *FakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+// After returns a channel that fires once the fake clock reaches now+d. A
+// non-positive d fires immediately.
+func (c *FakeClock) After(d time.Duration) <-chan time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ch := make(chan time.Time, 1)
+	at := c.now.Add(d)
+	if !at.After(c.now) {
+		ch <- c.now
+		return ch
+	}
+	c.waiters = append(c.waiters, fakeWaiter{at: at, ch: ch})
+	return ch
+}
+
+// Advance moves the clock forward by d and fires every waiter now due.
+func (c *FakeClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+	kept := c.waiters[:0]
+	for _, w := range c.waiters {
+		if w.at.After(c.now) {
+			kept = append(kept, w)
+			continue
+		}
+		w.ch <- c.now
+	}
+	c.waiters = kept
+}
