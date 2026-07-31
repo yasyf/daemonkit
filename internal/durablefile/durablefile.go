@@ -1,4 +1,6 @@
-package daemon
+// Package durablefile writes files and directories durably and manages typed
+// exact on-disk state.
+package durablefile
 
 import (
 	"bytes"
@@ -45,7 +47,7 @@ func (s ExactStateFile[T]) Read() (T, error) {
 }
 
 // Update takes the state file's flock and applies mutate, returning
-// proc.ErrLockBusy when another writer holds it.
+// flock.ErrLockBusy when another writer holds it.
 func (s ExactStateFile[T]) Update(ctx context.Context, mutate func(*T) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -138,15 +140,15 @@ func (s ExactStateFile[T]) write(state T) error {
 
 func (s ExactStateFile[T]) validate() error {
 	if !filepath.IsAbs(s.Path) || filepath.Clean(s.Path) != s.Path || s.Path == string(filepath.Separator) {
-		return errors.New("daemon: exact state path must be absolute, clean, and non-root")
+		return errors.New("durablefile: exact state path must be absolute, clean, and non-root")
 	}
 	if s.Codec.Identity == "" || s.Codec.New == nil ||
 		s.Codec.Encode == nil || s.Codec.Decode == nil {
-		return errors.New("daemon: exact state file configuration is incomplete")
+		return errors.New("durablefile: exact state file configuration is incomplete")
 	}
 	fingerprint, err := hex.DecodeString(s.Codec.Fingerprint)
 	if err != nil || len(fingerprint) != 32 || hex.EncodeToString(fingerprint) != s.Codec.Fingerprint {
-		return errors.New("daemon: exact state fingerprint must be 32 lowercase hex bytes")
+		return errors.New("durablefile: exact state fingerprint must be 32 lowercase hex bytes")
 	}
 	return nil
 }

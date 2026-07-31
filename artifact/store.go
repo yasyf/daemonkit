@@ -15,7 +15,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/internal/durablefile"
 	"github.com/yasyf/daemonkit/internal/flock"
 	"github.com/yasyf/daemonkit/internal/realhome"
 )
@@ -172,7 +172,7 @@ func writeCacheMeta(digestDir, name string, entry PlatformEntry) error {
 	if err != nil {
 		return fmt.Errorf("artifact: encode cache meta: %w", err)
 	}
-	return daemon.WriteFileDurable(filepath.Join(digestDir, "meta.json"), append(data, '\n'), 0o600)
+	return durablefile.WriteFileDurable(filepath.Join(digestDir, "meta.json"), append(data, '\n'), 0o600)
 }
 
 // syncTree fsyncs every file and directory under root, skipping symlinks, so a

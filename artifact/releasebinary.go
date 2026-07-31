@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/internal/durablefile"
 )
 
 const (
@@ -107,7 +107,7 @@ func (s Store) materializeReleaseBinary(ctx context.Context, desc *Descriptor, e
 	if err := writeCacheMeta(stage, desc.Name, entry); err != nil {
 		return err
 	}
-	if err := daemon.SyncDir(stage); err != nil {
+	if err := durablefile.SyncDir(stage); err != nil {
 		return err
 	}
 
@@ -120,7 +120,7 @@ func (s Store) materializeReleaseBinary(ctx context.Context, desc *Descriptor, e
 		return fmt.Errorf("artifact: publish cache entry: %w", err)
 	}
 	keep = true
-	return daemon.SyncDir(shardDir)
+	return durablefile.SyncDir(shardDir)
 }
 
 func placeArtifact(ctx context.Context, entry PlatformEntry, src, stageDir, dst string) error {

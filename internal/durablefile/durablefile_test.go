@@ -1,4 +1,4 @@
-package daemon
+package durablefile
 
 import (
 	"bytes"
@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/internal/flock"
-	"github.com/yasyf/daemonkit/proc"
 )
 
 const testStateFingerprint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -128,8 +127,8 @@ func TestExactStateFileUpdateLockBusy(t *testing.T) {
 		t.Fatal("mutate ran while lock was held")
 		return nil
 	})
-	if !errors.Is(err, proc.ErrLockBusy) {
-		t.Fatalf("Update err = %v, want proc.ErrLockBusy", err)
+	if !errors.Is(err, flock.ErrLockBusy) {
+		t.Fatalf("Update err = %v, want flock.ErrLockBusy", err)
 	}
 }
 
