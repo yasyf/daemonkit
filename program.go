@@ -8,7 +8,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/yasyf/daemonkit/durable"
 	"github.com/yasyf/daemonkit/internal/realhome"
@@ -181,10 +180,6 @@ func (c copied) place(el element) (bool, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return false, fmt.Errorf("daemonkit: create program dir %q: %w", dir, err)
 	}
-	prefix := "." + filepath.Base(target) + "."
-	if err := sweep(dir, prefix); err != nil {
-		return false, err
-	}
 	held, err := placedDigest(target)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return false, fmt.Errorf("daemonkit: read program %q: %w", target, err)
@@ -202,7 +197,7 @@ func (c copied) place(el element) (bool, error) {
 			c.source, placing, c.digest,
 		)
 	}
-	if err := writeExecutable(target, prefix, data); err != nil {
+	if err := durable.WriteFile(target, data, 0o700); err != nil {
 		return false, fmt.Errorf("daemonkit: place %q at %q: %w", c.source, target, err)
 	}
 	return true, nil
@@ -240,69 +235,6 @@ func (b bundled) build() (string, error) {
 func (b bundled) path(element) (string, error) { return b.file, nil }
 
 func (b bundled) place(element) (bool, error) { return false, nil }
-
-// writeExecutable renames data into place through a temp file named for target
-// alone. A shared ".durable-*" pattern names nobody, and
-// nobody, and the program root is shared by every daemonkit consumer: a stump
-// a crash leaves there has to be attributable to one target for the next
-// placement to be allowed to take it.
-func writeExecutable(target, prefix string, data []byte) error {
-	dir := filepath.Dir(target)
-	tmp, err := os.CreateTemp(dir, prefix+"*")
-	if err != nil {
-		return fmt.Errorf("create temp: %w", err)
-	}
-	name := tmp.Name()
-	defer func() { _ = os.Remove(name) }()
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("write temp: %w", err)
-	}
-	if err := tmp.Chmod(0o700); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("chmod temp: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("fsync temp: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temp: %w", err)
-	}
-	if err := os.Rename(name, target); err != nil {
-		return fmt.Errorf("rename into place: %w", err)
-	}
-	return durable.SyncDir(dir)
-}
-
-// sweep removes the temps a crashed placement left behind. It takes this
-// target's own and no others: the prefix is the one every one of its writes
-// carries, and the start lock held across it is one label's alone — a sweep by
-// pattern would take another consumer's in-flight write out from under it.
-//
-// The prefix alone does not say whose a name is, because one label is free to
-// be another's dot-extension: com.example.daemon.helper's temps all begin with
-// com.example.daemon's prefix. What disambiguates is the rest of the name —
-// CreateTemp's random suffix and nothing else, so a remainder carrying the
-// separator this file appended belongs to a longer label, whose own start lock
-// this one does not hold.
-func sweep(dir, prefix string) error {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return fmt.Errorf("daemonkit: read program dir %q: %w", dir, err)
-	}
-	for _, entry := range entries {
-		suffix, mine := strings.CutPrefix(entry.Name(), prefix)
-		if !mine || strings.Contains(suffix, ".") {
-			continue
-		}
-		stump := filepath.Join(dir, entry.Name())
-		if err := os.Remove(stump); err != nil {
-			return fmt.Errorf("daemonkit: sweep %q: %w", stump, err)
-		}
-	}
-	return nil
-}
 
 // placedDigest is the digest of the bytes path itself holds, and it does not
 // follow the final component: a program path that outlives every upgrade is a

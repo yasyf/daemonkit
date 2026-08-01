@@ -288,6 +288,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   would drop the package from the manifest and launder the broken boundary into
   an approved one in one command. A regression prints the linux build and vet
   output that explains it, and the command to reproduce it.
+- `Stable`'s program placement writes through `durable.WriteFile` rather than
+  the second durable write it carried. That copy existed because the shared
+  write named its temps `.durable-*`, which attributes a crash stump to nobody
+  on a program root every daemonkit consumer shares. `durable`'s temp now
+  derives from the target's basename, which for a program path is
+  `.<Label>.<random>` — byte for byte the name the private copy built — and its
+  sweep carries the same rule that stops one label from taking a dot-extension
+  sibling's temps. It adds a bound the copy leaned on the start lock for: a temp
+  under an hour old is spared, so a concurrent launcher's in-flight write
+  survives. The one behavior that changes is when the sweep runs — on a
+  placement that writes, not at the top of every `Ensure` — and the hour-old
+  bound that spares a live temp spares a fresh stump too. A crash stump
+  outlives every no-op convergence, and the first placement that writes an hour
+  or more after the crash collects it; a launcher that crash-loops inside that
+  hour leaves one stump per attempt where the unbounded pre-write sweep left at
+  most one.
 
 ### Fixed
 

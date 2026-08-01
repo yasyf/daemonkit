@@ -8,6 +8,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/yasyf/daemonkit/internal/realhome"
 )
@@ -120,8 +121,8 @@ func TestStablePlacesTheInvokingExecutable(t *testing.T) {
 	if !info.Mode().IsRegular() {
 		t.Fatalf("placed copy mode = %v, want a regular file", info.Mode())
 	}
-	if info.Mode().Perm()&0o100 == 0 {
-		t.Fatalf("placed copy mode = %v, want owner-executable", info.Mode())
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("placed copy mode = %v, want 0700", info.Mode())
 	}
 }
 
@@ -192,8 +193,8 @@ func TestPlaceReplacesPlantedBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm()&0o100 == 0 {
-		t.Errorf("placed copy mode = %v, want owner-executable", info.Mode())
+	if info.Mode().Perm() != 0o700 {
+		t.Errorf("placed copy mode = %v, want 0700 rather than the planted file's", info.Mode())
 	}
 }
 
@@ -256,9 +257,10 @@ func TestPlaceReplacesAPlantedSymlink(t *testing.T) {
 }
 
 // TestPlaceSweepsOnlyItsOwnStumps covers the crash between the temp file and
-// the rename. The stump is named for this target, so the next placement under
-// the same start lock reclaims it — and a neighbour's, on a root every
-// daemonkit consumer shares, is not this label's to remove.
+// the rename. The stump is named for this target, so the next placement that
+// writes reclaims it — and a neighbour's, on a root every daemonkit consumer
+// shares, is not this label's to remove, nor is a temp another launcher is
+// still writing.
 func TestPlaceSweepsOnlyItsOwnStumps(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv(realhome.EnvOverride, home)
@@ -267,11 +269,11 @@ func TestPlaceSweepsOnlyItsOwnStumps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stable() error = %v", err)
 	}
-	if _, err := program.place(placedElement(t)); err != nil {
-		t.Fatalf("place() error = %v", err)
-	}
 	target := placedAt(t, home)
 	dir := filepath.Dir(target)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	mine := filepath.Join(dir, "."+string(placedLabel)+".123456")
 	neighbours := []string{
 		filepath.Join(dir, ".com.example.other.123456"),
@@ -281,10 +283,18 @@ func TestPlaceSweepsOnlyItsOwnStumps(t *testing.T) {
 		if err := os.WriteFile(stump, []byte("half a binary"), 0o600); err != nil {
 			t.Fatal(err)
 		}
+		stale := time.Now().Add(-2 * time.Hour)
+		if err := os.Chtimes(stump, stale, stale); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inFlight := filepath.Join(dir, "."+string(placedLabel)+".789012")
+	if err := os.WriteFile(inFlight, []byte("half a binary"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 
 	if _, err := program.place(placedElement(t)); err != nil {
-		t.Fatalf("second place() error = %v", err)
+		t.Fatalf("place() error = %v", err)
 	}
 	if _, err := os.Stat(mine); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("stat own stump = %v, want it swept", err)
@@ -293,6 +303,9 @@ func TestPlaceSweepsOnlyItsOwnStumps(t *testing.T) {
 		if _, err := os.Stat(neighbour); err != nil {
 			t.Errorf("stat neighbour's stump %q = %v, want it untouched", neighbour, err)
 		}
+	}
+	if _, err := os.Stat(inFlight); err != nil {
+		t.Errorf("stat a concurrent launcher's temp %q = %v, want it untouched", inFlight, err)
 	}
 	if _, err := os.Stat(target); err != nil {
 		t.Errorf("stat the program = %v, want the sweep to have spared it", err)
