@@ -56,9 +56,3 @@ xcuserdata/
 
 # signed trust E2E fixtures (regenerate: scripts/trust-fixtures.sh)
 .trust-fixtures/
-
-# stray binaries from `go build ./internal/<pkg>/` at the repo root
-/exportcensus
-/testserver
-/trustfixture
-/wiregen
