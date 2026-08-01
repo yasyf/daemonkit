@@ -14,6 +14,10 @@ func TestDaemonValidateForServe(t *testing.T) {
 		wantErr string
 	}{
 		{"zero graces default", Daemon{Label: "x"}, ""},
+		{"no label", Daemon{}, "not canonical"},
+		{"label escaping the state root", Daemon{Label: "../../evil"}, "not canonical"},
+		{"label naming two path elements", Daemon{Label: "bin/daemon"}, "not canonical"},
+		{"hidden label", Daemon{Label: ".hidden"}, "not canonical"},
 		{"bounds inclusive", Daemon{Label: "x", Shutdown: Grace(24 * time.Hour), Handshake: Grace(time.Millisecond)}, ""},
 		{"saturated shutdown", Daemon{Label: "x", Shutdown: Grace(math.MaxInt64)}, "Shutdown"},
 		{"negative shutdown", Daemon{Label: "x", Shutdown: Grace(-time.Second)}, "Shutdown"},

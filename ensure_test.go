@@ -2,10 +2,9 @@ package daemonkit
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
@@ -16,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/daemonkit/internal/flock"
 	"github.com/yasyf/daemonkit/internal/proc"
 	"github.com/yasyf/daemonkit/internal/realhome"
 	"github.com/yasyf/daemonkit/internal/wire"
@@ -30,6 +30,19 @@ func TestEnsureRequiresDeadline(t *testing.T) {
 	}
 }
 
+// TestEnsureNamesAnUnsetProgram refuses a Daemon no constructor built a Program
+// for where the cause is still nameable. Past this point the ladder holds an
+// empty path and an empty build, and reports a missing file or an unpinned
+// incumbent instead of the field that was never set.
+func TestEnsureNamesAnUnsetProgram(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	_, err := Open(Daemon{Label: "com.example.ensure"}).Ensure(ctx)
+	if err == nil || !strings.Contains(err.Error(), "Daemon.Program is unset") {
+		t.Fatalf("Ensure() error = %v, want the unset Program named", err)
+	}
+}
+
 func TestWaitReadyRequiresDeadline(t *testing.T) {
 	client := Open(Daemon{Label: "com.example.ensure"})
 	if _, err := client.WaitReady(context.Background()); err == nil {
@@ -41,23 +54,217 @@ func TestWaitReadyRequiresDeadline(t *testing.T) {
 	}
 }
 
+// TestProgramBuildIsTheContentDigestServePublishes pins the launcher's half of
+// every upgrade comparison to the daemon's. Ensure wants the build the Program
+// carries and the daemon publishes buildDigest of its own executable, so the
+// two are the same function of the same bytes or no decision between them can
+// ever come out equal.
 func TestProgramBuildIsTheContentDigestServePublishes(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "daemon")
-	body := []byte("#!/bin/sh\nexit 0\n")
-	if err := os.WriteFile(path, body, 0o700); err != nil {
-		t.Fatalf("write program: %v", err)
+	t.Setenv(realhome.EnvOverride, t.TempDir())
+	program, err := Stable()
+	if err != nil {
+		t.Fatalf("Stable() error = %v", err)
 	}
-	got, err := Program{path: path}.build()
+	carried, err := program.build()
 	if err != nil {
 		t.Fatalf("build() error = %v", err)
 	}
-	sum := sha256.Sum256(body)
-	if want := hex.EncodeToString(sum[:]); got != want {
-		t.Fatalf("build() = %q, want %q", got, want)
+	published, err := buildDigest()
+	if err != nil {
+		t.Fatalf("buildDigest() error = %v", err)
 	}
-	if _, err := (Program{path: filepath.Join(t.TempDir(), "missing")}).build(); err == nil {
-		t.Fatal("build() of a missing program succeeded")
+	if carried != published {
+		t.Fatalf("Program.build = %q, the daemon publishes %q", carried, published)
 	}
+}
+
+// TestLabelIsRefusedUnlessLaunchdWouldAcceptIt pins the one rule to launchd's
+// own. The Label names a LaunchAgent before it names a directory, a lock, a
+// socket, or a binary copy, so the strictest reading of it is the only reading:
+// a leading dot, a trailing dot, an embedded "..", and anything outside
+// launchd's alphabet are refused here, and the rule this package runs is
+// launchd's own rather than one beside it that could disagree.
+func TestLabelIsRefusedUnlessLaunchdWouldAcceptIt(t *testing.T) {
+	refused := []Label{
+		"", ".", "..", ".hidden", "trailing.", "com.example..daemon",
+		"../daemon", "bin/daemon", "/daemon", "daemon/", "com example", "com.example.daemon\n",
+	}
+	for _, label := range refused {
+		t.Run(string(label), func(t *testing.T) {
+			el, err := label.element()
+			if err == nil {
+				t.Fatalf("element() = %q, want %q refused", el.label, label)
+			}
+			if err := launchd.ValidateLabel(string(label)); err == nil {
+				t.Fatalf("launchd.ValidateLabel(%q) accepted what daemonkit refused: the two rules disagree", label)
+			}
+		})
+	}
+	for _, label := range []Label{"com.example.daemon", "dkt", "with-dash", "a.b-c.9"} {
+		t.Run(string(label), func(t *testing.T) {
+			el, err := label.element()
+			if err != nil {
+				t.Fatalf("element() error = %v, want %q accepted", err, label)
+			}
+			if el.label != string(label) {
+				t.Fatalf("element = %q, want %q verbatim", el.label, label)
+			}
+		})
+	}
+}
+
+// TestNoPathIsJoinedFromALabelLaunchdWouldRefuse is the class the per-policy
+// check is one instance of, driven as the cross product it is: every exported
+// verb that takes a Daemon, against every shape of Label launchd refuses — a
+// leading dot, a trailing dot, an embedded "..", a traversal out of the state
+// root, a second path element, a byte outside launchd's alphabet, and no label
+// at all. The whole tree the home sits two directories inside is compared byte
+// for byte after each verb, so a state directory, a lock, a socket, a record
+// file, a binary copy, or a plist created anywhere under it — or above it, where
+// a traversal lands — fails the door that created it.
+//
+// RecordPath is the one derivation that states the layout without running the
+// rule, so it is driven here for what it must not do: it names an escaped path
+// and reads nothing at it.
+func TestNoPathIsJoinedFromALabelLaunchdWouldRefuse(t *testing.T) {
+	root := escapeRoot(t)
+	program, err := Stable()
+	if err != nil {
+		t.Fatalf("Stable() error = %v", err)
+	}
+	settled := treeOf(t, root)
+
+	for _, bad := range []Label{
+		"", ".", "..", ".hidden", "trailing.", "com.example..daemon", "../../evil",
+		"../daemon", "bin/daemon", "/daemon", "daemon/", "com example", "com.example.daemon\n",
+	} {
+		t.Run(fmt.Sprintf("%q", string(bad)), func(t *testing.T) {
+			daemon := Daemon{Label: bad, Program: program}
+			client := Open(daemon)
+			client.launchctl = (&launchctlRecorder{}).run
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
+
+			doors := []struct {
+				name    string
+				refuses bool
+				run     func() error
+			}{
+				{"Ensure", true, func() error { _, err := client.Ensure(ctx); return err }},
+				{"Control", true, func() error { _, err := client.Control(ctx); return err }},
+				{"WaitReady", true, func() error { _, err := client.WaitReady(ctx); return err }},
+				{"Settle", true, func() error {
+					_, err := client.Settle(ctx, Expect{Build: "b", Generation: 1})
+					return err
+				}},
+				{"Serve", true, func() error {
+					_, err := Serve(ctx, daemon, func(Ctx) (Product, error) { return nil, nil })
+					return err
+				}},
+				{"ValidateForServe", true, daemon.ValidateForServe},
+				{"Daemon.agent", true, func() error { _, err := daemon.agent(); return err }},
+				{"inventoryClear", true, func() error { return client.inventoryClear(proc.Identity{}) }},
+				{"RecordPath", false, func() error {
+					record := daemon.RecordPath()
+					if _, err := os.Stat(record); !errors.Is(err, fs.ErrNotExist) {
+						return fmt.Errorf("stat %q = %v", record, err)
+					}
+					return nil
+				}},
+			}
+			for _, door := range doors {
+				t.Run(door.name, func(t *testing.T) {
+					err := door.run()
+					switch {
+					case door.refuses && (err == nil || !strings.Contains(err.Error(), "is not canonical")):
+						t.Errorf("%s() error = %v, want the label refused by launchd's own rule", door.name, err)
+					case !door.refuses && err != nil:
+						t.Errorf("%s() error = %v", door.name, err)
+					}
+					if got := treeOf(t, root); !reflect.DeepEqual(got, settled) {
+						t.Errorf("%s() changed %q: %v", door.name, root, treeDelta(settled, got))
+						settled = got
+					}
+				})
+			}
+		})
+	}
+}
+
+// escapeRoot stands the passwd home up two directories inside a root the test
+// owns, so a Label that traverses out of the state root lands somewhere the
+// walk still sees rather than in a parent nobody can assert on.
+func escapeRoot(t *testing.T) string {
+	t.Helper()
+	root, err := os.MkdirTemp("/tmp", fmt.Sprintf("dk-%d-", os.Getpid()))
+	if err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	home := filepath.Join(root, "s", "h")
+	if err := os.MkdirAll(filepath.Join(home, "Library", "LaunchAgents"), 0o700); err != nil {
+		t.Fatalf("create LaunchAgents dir: %v", err)
+	}
+	t.Setenv(realhome.EnvOverride, home)
+	return root
+}
+
+func treeOf(t *testing.T, root string) map[string]string {
+	t.Helper()
+	tree := map[string]string{}
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		switch {
+		case entry.IsDir():
+			tree[rel] = info.Mode().String()
+		case info.Mode()&fs.ModeSymlink != 0:
+			target, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			tree[rel] = info.Mode().String() + " -> " + target
+		default:
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			tree[rel] = info.Mode().String() + " " + digest(data)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %q: %v", root, err)
+	}
+	return tree
+}
+
+func treeDelta(before, after map[string]string) []string {
+	var delta []string
+	for path, state := range after {
+		switch was, known := before[path]; {
+		case !known:
+			delta = append(delta, "+ "+path+" "+state)
+		case was != state:
+			delta = append(delta, "~ "+path+" "+was+" -> "+state)
+		}
+	}
+	for path := range before {
+		if _, known := after[path]; !known {
+			delta = append(delta, "- "+path)
+		}
+	}
+	slices.Sort(delta)
+	return delta
 }
 
 func TestDaemonAgent(t *testing.T) {
@@ -74,7 +281,7 @@ func TestDaemonAgent(t *testing.T) {
 			name: "every field derives from the daemon",
 			daemon: Daemon{
 				Label:   "com.example.ensure",
-				Program: Program{path: program},
+				Program: Program{policy: bundled{file: program}},
 				Args:    []string{"daemon", "--serve"},
 				Log:     filepath.Join(home, "custom.log"),
 				Restart: RestartAlways,
@@ -92,7 +299,7 @@ func TestDaemonAgent(t *testing.T) {
 			name: "the shutdown grace is the plist's exit timeout",
 			daemon: Daemon{
 				Label:    "com.example.ensure",
-				Program:  Program{path: program},
+				Program:  Program{policy: bundled{file: program}},
 				Log:      filepath.Join(home, "custom.log"),
 				Shutdown: Grace(90 * time.Second),
 			},
@@ -108,7 +315,7 @@ func TestDaemonAgent(t *testing.T) {
 			name: "a sub-second grace rounds up rather than cutting the drain short",
 			daemon: Daemon{
 				Label:    "com.example.ensure",
-				Program:  Program{path: program},
+				Program:  Program{policy: bundled{file: program}},
 				Log:      filepath.Join(home, "custom.log"),
 				Shutdown: Grace(1500 * time.Millisecond),
 			},
@@ -124,7 +331,7 @@ func TestDaemonAgent(t *testing.T) {
 			name: "an unset log sinks to the state directory",
 			daemon: Daemon{
 				Label:   "com.example.ensure",
-				Program: Program{path: program},
+				Program: Program{policy: bundled{file: program}},
 				Restart: RestartOnFailure,
 			},
 			want: launchd.Agent{
@@ -139,7 +346,7 @@ func TestDaemonAgent(t *testing.T) {
 			name: "the zero restart never relaunches",
 			daemon: Daemon{
 				Label:   "com.example.ensure",
-				Program: Program{path: program},
+				Program: Program{policy: bundled{file: program}},
 				Log:     filepath.Join(home, "custom.log"),
 			},
 			want: launchd.Agent{
@@ -154,7 +361,7 @@ func TestDaemonAgent(t *testing.T) {
 			name: "an unknown restart policy is refused",
 			daemon: Daemon{
 				Label:   "com.example.ensure",
-				Program: Program{path: program},
+				Program: Program{policy: bundled{file: program}},
 				Restart: Restart(9),
 			},
 			refused: true,
@@ -190,7 +397,8 @@ func TestDaemonAgent(t *testing.T) {
 }
 
 func TestRepairWedgedAddressesTheRecordedIdentity(t *testing.T) {
-	path, owner := settleFixture(t)
+	recorded, owner := settleFixture(t)
+	path := recorded.RecordPath()
 	noRecord := filepath.Join(t.TempDir(), "absent.records")
 	readErr := errors.New("record file is corrupt")
 	tests := []struct {
@@ -354,17 +562,19 @@ func huskAt(pin proc.Identity) func(string) (proc.Report, error) {
 	}
 }
 
+const inventoryLabel = Label("com.example.inventory")
+
 func TestInventoryClearProvesAbsenceOverTheProcessTable(t *testing.T) {
 	unrun := filepath.Join(t.TempDir(), "never-executed")
 	if err := os.WriteFile(unrun, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 		t.Fatalf("write program: %v", err)
 	}
-	idle := Open(Daemon{Program: Program{path: unrun}})
+	idle := Open(Daemon{Label: inventoryLabel, Program: Program{policy: bundled{file: unrun}}})
 	idle.identities = liveAt(realPath(t, selfPath(t)))
 	if err := idle.inventoryClear(proc.Identity{}); err != nil {
 		t.Fatalf("inventoryClear() error = %v, want a clear inventory", err)
 	}
-	running := Open(Daemon{Program: Program{path: realPath(t, selfPath(t))}})
+	running := Open(Daemon{Label: inventoryLabel, Program: Program{policy: bundled{file: realPath(t, selfPath(t))}}})
 	if err := running.inventoryClear(proc.Identity{}); !errors.Is(err, ErrUnsettled) {
 		t.Fatalf("inventoryClear() over this very process = %v, want ErrUnsettled", err)
 	}
@@ -406,7 +616,7 @@ func TestInventoryClearHoldsOnlyItsOwnUnnameableHusk(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			client := Open(Daemon{Program: Program{path: unrun}})
+			client := Open(Daemon{Label: inventoryLabel, Program: Program{policy: bundled{file: unrun}}})
 			client.identities = huskAt(husk)
 			err := client.inventoryClear(tt.observed)
 			if tt.wantErr == nil {
@@ -426,31 +636,28 @@ func TestInventoryClearHoldsOnlyItsOwnUnnameableHusk(t *testing.T) {
 }
 
 // TestInventoryClearQueriesTheProgramPathAlone pins the query set to this
-// daemon's own program. Staged keys every build by the digest of its own
-// bytes under a root every daemonkit consumer shares, so a sibling there is
-// not this daemon by construction: a gate that guessed siblings by basename
-// held another product's live daemon against this one, and still missed a
-// build staged under a different basename. What covers a live build this
-// path does not name is the recorded identity, not a guessed path.
+// daemon's own program. Every daemonkit consumer places its program under one
+// shared root, so a sibling there is another product's daemon by construction
+// and a gate that queried one would hold that product's live daemon against
+// this one. What covers a live build this path does not name is the recorded
+// identity, not a guessed path.
 func TestInventoryClearQueriesTheProgramPathAlone(t *testing.T) {
-	staging := t.TempDir()
-	body := []byte("#!/bin/sh\nexit 0\n")
-	wanted := filepath.Join(staging, digest(body), "daemon")
-	if err := os.MkdirAll(filepath.Dir(wanted), 0o700); err != nil {
-		t.Fatalf("stage the wanted build: %v", err)
+	home := t.TempDir()
+	t.Setenv(realhome.EnvOverride, home)
+	label := Label("com.example.mine")
+	program, err := Stable()
+	if err != nil {
+		t.Fatalf("Stable() error = %v", err)
 	}
-	if err := os.WriteFile(wanted, body, 0o700); err != nil {
-		t.Fatalf("stage the wanted build: %v", err)
+	if _, err := program.place(mustElement(t, label)); err != nil {
+		t.Fatalf("place() error = %v", err)
 	}
-	stranger := filepath.Join(staging, strings.Repeat("f", 64), "daemon")
-	if err := os.MkdirAll(filepath.Dir(stranger), 0o700); err != nil {
-		t.Fatalf("stage the stranger: %v", err)
-	}
+	stranger := filepath.Join(home, ".daemonkit", "bin", "com.example.other")
 	if err := os.WriteFile(stranger, []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
-		t.Fatalf("stage the stranger: %v", err)
+		t.Fatalf("place the stranger: %v", err)
 	}
 	var queried []string
-	client := Open(Daemon{Program: Program{path: wanted}})
+	client := Open(Daemon{Label: label, Program: program})
 	client.identities = func(path string) (proc.Report, error) {
 		queried = append(queried, path)
 		return proc.Report{}, nil
@@ -458,7 +665,7 @@ func TestInventoryClearQueriesTheProgramPathAlone(t *testing.T) {
 	if err := client.inventoryClear(proc.Identity{}); err != nil {
 		t.Fatalf("inventoryClear() error = %v, want a clear inventory", err)
 	}
-	if want := []string{realPath(t, wanted)}; !slices.Equal(queried, want) {
+	if want := []string{realPath(t, programPath(t, client.daemon))}; !slices.Equal(queried, want) {
 		t.Fatalf("inventoryClear queried %q, want %q", queried, want)
 	}
 }
@@ -485,7 +692,7 @@ func TestInventoryClearNeverPassesOnAnUnresolvedProgram(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			client := Open(Daemon{Program: Program{path: tt.program}})
+			client := Open(Daemon{Label: inventoryLabel, Program: Program{policy: bundled{file: tt.program}}})
 			client.identities = liveAt(realPath(t, self))
 			if err := client.inventoryClear(proc.Identity{}); !errors.Is(err, tt.wantErr) {
 				t.Fatalf("inventoryClear() error = %v, want %v", err, tt.wantErr)
@@ -755,7 +962,7 @@ func newEnsureOnceHarness(t *testing.T, serving []observation, owners func(strin
 	}
 	h := &ensureOnceHarness{launchd: &launchctlRecorder{}}
 	h.agent = ladderAgent(t, home)
-	h.client = Open(Daemon{Label: Label(h.agent.Label), Program: Program{path: unrun}})
+	h.client = Open(Daemon{Label: Label(h.agent.Label), Program: Program{policy: bundled{file: unrun}}})
 	seen := 0
 	h.client.serving = servingScript(serving, &seen)
 	h.client.readOwner = owners
@@ -831,7 +1038,7 @@ func TestEnsureOnceDoesNothingWhenTheWantedBuildIsReadyAndApplied(t *testing.T) 
 	h.installPlist(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	ensured, err := h.client.ensureOnce(ctx, "wanted", h.agent)
+	ensured, err := h.client.ensureOnce(ctx, "wanted", h.agent, false)
 	if err != nil {
 		t.Fatalf("ensureOnce() error = %v", err)
 	}
@@ -846,6 +1053,111 @@ func TestEnsureOnceDoesNothingWhenTheWantedBuildIsReadyAndApplied(t *testing.T) 
 	}
 	if len(h.signals) != 0 {
 		t.Fatalf("delivered %d signals, want none", len(h.signals))
+	}
+}
+
+// TestEnsureConvergesOnAnUpgradedBundle is the bundled policy's whole drift
+// semantics, and it is not copied's. A .app is upgraded out of band, under a
+// Client that outlives the upgrade — the shape every long-lived launcher in the
+// fleet has. Nothing daemonkit owns deployed those bytes, so the build the
+// launcher wants is whatever is at the path launchd execs, re-read; a digest
+// frozen when the Program was constructed makes want permanently unreachable,
+// and every later Ensure evicts a healthy daemon, re-applies, and fails on a
+// build that exists nowhere — forever, on every pass.
+func TestEnsureConvergesOnAnUpgradedBundle(t *testing.T) {
+	home := ladderHome(t)
+	app := filepath.Join(realPath(t, t.TempDir()), "Fake.app")
+	exe := filepath.Join(app, "Contents", "MacOS", "fake")
+	if err := os.MkdirAll(filepath.Dir(exe), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exe, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	program, err := InBundle(app, filepath.Join("Contents", "MacOS", "fake"))
+	if err != nil {
+		t.Fatalf("InBundle() error = %v", err)
+	}
+	daemon := Daemon{Label: "com.example.bundled", Program: program}
+	client := Open(daemon)
+
+	upgraded := []byte("#!/bin/sh\nexit 1\n")
+	if err := os.WriteFile(exe, upgraded, 0o700); err != nil {
+		t.Fatalf("upgrade the bundle: %v", err)
+	}
+	agent, err := daemon.agent()
+	if err != nil {
+		t.Fatalf("agent() error = %v", err)
+	}
+	plist, err := agent.Plist()
+	if err != nil {
+		t.Fatalf("Plist() error = %v", err)
+	}
+	plistPath, err := agent.PlistPath()
+	if err != nil {
+		t.Fatalf("PlistPath() error = %v", err)
+	}
+	if err := os.WriteFile(plistPath, plist, 0o600); err != nil {
+		t.Fatalf("write plist: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, "Library", "LaunchAgents")); err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := &launchctlRecorder{loaded: true}
+	client.launchctl = recorder.run
+	seen := 0
+	client.serving = servingScript(
+		[]observation{{report: servedReport(wire.PhaseReady, digest(upgraded), 7)}},
+		&seen,
+	)
+	client.readOwner = func(string) (proc.Owner, bool, error) {
+		return recordedOwner(digest(upgraded), 7), true, nil
+	}
+	client.observe = func(proc.Identity) (proc.Reap, bool, error) { return proc.ReapAbsent, true, nil }
+	client.kill = func(pid int, _ syscall.Signal) error {
+		t.Fatalf("signalled pid %d, want a healthy daemon left alone", pid)
+		return nil
+	}
+
+	for pass := 1; pass <= 2; pass++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ensured, err := client.Ensure(ctx)
+		cancel()
+		if err != nil {
+			t.Fatalf("pass %d: Ensure() error = %v, want the upgraded bundle already converged", pass, err)
+		}
+		if ensured.Did != ActionNothing {
+			t.Fatalf("pass %d: Did = %v, want %v", pass, ensured.Did, ActionNothing)
+		}
+	}
+	if !slices.Equal(recorder.verbs, []string{"print", "print"}) {
+		t.Fatalf("launchctl verbs = %q, want only the applied-state observations", recorder.verbs)
+	}
+}
+
+// TestEnsureOnceRestartsWhatItPlacedOver is the pass that replaced the program
+// bytes: the incumbent reports the wanted build and launchd runs exactly the
+// agent, and it is still evicted, because a daemon whose startup straddled the
+// replace digests the new bytes while executing the old ones and reports a
+// build no launcher can tell apart. What was placed is what gets started.
+func TestEnsureOnceRestartsWhatItPlacedOver(t *testing.T) {
+	h := newEnsureOnceHarness(
+		t,
+		[]observation{{report: servedReport(wire.PhaseReady, "wanted", 7)}},
+		func(string) (proc.Owner, bool, error) { return recordedOwner("wanted", 7), true, nil },
+	)
+	h.launchd.loaded = true
+	h.launchd.refuse = "kickstart"
+	h.installPlist(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := h.client.ensureOnce(ctx, "wanted", h.agent, true); err == nil ||
+		!strings.Contains(err.Error(), "daemonkit: apply") {
+		t.Fatalf("ensureOnce() error = %v, want the apply refusal past the eviction", err)
+	}
+	if !slices.Contains(h.launchd.verbs, "kickstart") {
+		t.Fatalf("launchctl verbs = %q, want the agent re-applied over the placed bytes", h.launchd.verbs)
 	}
 }
 
@@ -884,7 +1196,7 @@ func TestEnsureOnceReAppliesUnlessLaunchdRunsExactlyTheAgent(t *testing.T) {
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
-			_, err := h.client.ensureOnce(ctx, "wanted", h.agent)
+			_, err := h.client.ensureOnce(ctx, "wanted", h.agent, false)
 			if err == nil || !strings.Contains(err.Error(), "daemonkit: apply") {
 				t.Fatalf("ensureOnce() error = %v, want the apply refusal", err)
 			}
@@ -917,7 +1229,7 @@ func TestEnsureOnceFailsWhenLaunchdCannotBeAsked(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if _, err := h.client.ensureOnce(ctx, "wanted", h.agent); !errors.Is(err, unreachable) {
+	if _, err := h.client.ensureOnce(ctx, "wanted", h.agent, false); !errors.Is(err, unreachable) {
 		t.Fatalf("ensureOnce() error = %v, want %v", err, unreachable)
 	}
 	if len(h.signals) != 0 {
@@ -934,7 +1246,7 @@ func TestEnsureOnceTouchesNoLabelButItsOwn(t *testing.T) {
 	h.launchd.refuse = "bootstrap"
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if _, err := h.client.ensureOnce(ctx, "wanted", h.agent); err == nil {
+	if _, err := h.client.ensureOnce(ctx, "wanted", h.agent, false); err == nil {
 		t.Fatal("ensureOnce() error = nil, want the apply refusal")
 	}
 	if len(h.launchd.targets) == 0 {
@@ -969,7 +1281,7 @@ func TestEnsureOnceNeverSignalsARecordItDidNotObserve(t *testing.T) {
 	h.settling = true
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	_, err := h.client.ensureOnce(ctx, "wanted", h.agent)
+	_, err := h.client.ensureOnce(ctx, "wanted", h.agent, false)
 	if !errors.Is(err, ErrWrongIncumbent) {
 		t.Fatalf("ensureOnce() error = %v, want ErrWrongIncumbent", err)
 	}
@@ -994,7 +1306,7 @@ func TestEnsureOnceSignalsAWedgedIncumbentAtItsRecordedIdentity(t *testing.T) {
 	h.settling = true
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	if _, err := h.client.ensureOnce(ctx, "wanted", h.agent); !errors.Is(err, ErrUnsettled) {
+	if _, err := h.client.ensureOnce(ctx, "wanted", h.agent, false); !errors.Is(err, ErrUnsettled) {
 		t.Fatalf("ensureOnce() error = %v, want ErrUnsettled", err)
 	}
 	if !slices.Equal(h.signals, []int{owner.PID}) {
@@ -1018,7 +1330,7 @@ func TestProveLeavesBudgetPastAWedgedIncumbent(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	start := time.Now()
-	if _, err := h.client.ensureOnce(ctx, "wanted", h.agent); !errors.Is(err, ErrUnsettled) {
+	if _, err := h.client.ensureOnce(ctx, "wanted", h.agent, false); !errors.Is(err, ErrUnsettled) {
 		t.Fatalf("ensureOnce() error = %v, want ErrUnsettled", err)
 	}
 	if spent := time.Since(start); spent > budget*9/10 {
@@ -1069,7 +1381,7 @@ func TestEnsureOnceHoldsTheHuskItObserved(t *testing.T) {
 			h.launchd.refuse = "bootstrap"
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
-			_, err := h.client.ensureOnce(ctx, "wanted", h.agent)
+			_, err := h.client.ensureOnce(ctx, "wanted", h.agent, false)
 			if tt.wantErr == nil {
 				if err == nil || errors.Is(err, ErrUnsettled) {
 					t.Fatalf("ensureOnce() = %v, want a cleared gate and the apply refusal past it", err)
@@ -1125,7 +1437,7 @@ func TestEvictHoldsTheHuskItObservedWithoutASession(t *testing.T) {
 			h.launchd.refuse = "bootstrap"
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
-			_, err := h.client.ensureOnce(ctx, "wanted", h.agent)
+			_, err := h.client.ensureOnce(ctx, "wanted", h.agent, false)
 			if tt.wantErr == nil {
 				if err == nil || errors.Is(err, ErrUnsettled) {
 					t.Fatalf("ensureOnce() = %v, want a cleared gate and the apply refusal past it", err)
@@ -1179,7 +1491,7 @@ func TestEnsureOnceHandsTheObservationsPinToTheEviction(t *testing.T) {
 			h.launchd.refuse = "bootstrap"
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
-			_, err := h.client.ensureOnce(ctx, "wanted", h.agent)
+			_, err := h.client.ensureOnce(ctx, "wanted", h.agent, false)
 			if tt.wantErr == nil {
 				if err == nil || errors.Is(err, ErrUnsettled) {
 					t.Fatalf("ensureOnce() = %v, want a cleared gate and the apply refusal past it", err)
@@ -1241,12 +1553,12 @@ func TestEvictHandsTheSessionsPinToTheProof(t *testing.T) {
 			startControlChild(t, tt.label)
 			client := Open(Daemon{
 				Label:    Label(tt.label),
-				Program:  Program{path: unrun},
+				Program:  Program{policy: bundled{file: unrun}},
 				Schemas:  []Schema{"test.v1"},
 				Shutdown: Grace(5 * time.Second),
 			})
 			awaitListener(t, tt.label)
-			owner, recorded, err := proc.ReadOwner(client.recordPath)
+			owner, recorded, err := proc.ReadOwner(client.daemon.RecordPath())
 			if err != nil || !recorded {
 				t.Fatalf("ReadOwner() = %+v, %v, %v; want the child's own record", owner, recorded, err)
 			}
@@ -1315,13 +1627,13 @@ func TestEnsureOnceProvesAbsenceByInventoryWhenNothingIsRecorded(t *testing.T) {
 	h.launchd.refuse = "bootstrap"
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if _, err := h.client.ensureOnce(ctx, "wanted", h.agent); err == nil {
+	if _, err := h.client.ensureOnce(ctx, "wanted", h.agent, false); err == nil {
 		t.Fatal("ensureOnce() error = nil, want the apply refusal")
 	}
 	if settled != 0 {
 		t.Fatalf("observed the process table %d times, want the inventory instead", settled)
 	}
-	if want := []string{realPath(t, h.client.daemon.Program.path)}; !slices.Equal(h.inventoried, want) {
+	if want := []string{realPath(t, programPath(t, h.client.daemon))}; !slices.Equal(h.inventoried, want) {
 		t.Fatalf("inventoried %q, want %q", h.inventoried, want)
 	}
 	if len(h.signals) != 0 {
@@ -1392,7 +1704,7 @@ func TestEnsureReObservesWhenTheIncumbentMovesUnderIt(t *testing.T) {
 	home := ladderHome(t)
 	agent := ladderAgent(t, home)
 	seen := 0
-	client := Open(Daemon{Label: Label(agent.Label), Program: Program{path: agent.Program}})
+	client := Open(Daemon{Label: Label(agent.Label), Program: Program{policy: bundled{file: agent.Program}}})
 	client.serving = servingScript([]observation{{report: servedReport(wire.PhaseReady, "stale", 7)}}, &seen)
 	client.readOwner = func(string) (proc.Owner, bool, error) { return recordedOwner("a stranger", 99), true, nil }
 	client.observe = func(proc.Identity) (proc.Reap, bool, error) { return proc.ReapAbsent, true, nil }
@@ -1427,7 +1739,7 @@ func TestEnsureOnceReportsTheRaceWhenItsBudgetIsGone(t *testing.T) {
 	home := ladderHome(t)
 	agent := ladderAgent(t, home)
 	seen := 0
-	client := Open(Daemon{Label: Label(agent.Label), Program: Program{path: agent.Program}})
+	client := Open(Daemon{Label: Label(agent.Label), Program: Program{policy: bundled{file: agent.Program}}})
 	client.serving = servingScript([]observation{{report: servedReport(wire.PhaseReady, "stale", 7)}}, &seen)
 	client.readOwner = func(string) (proc.Owner, bool, error) { return recordedOwner("a stranger", 99), true, nil }
 	client.observe = func(proc.Identity) (proc.Reap, bool, error) { return proc.ReapAbsent, true, nil }
@@ -1438,7 +1750,7 @@ func TestEnsureOnceReportsTheRaceWhenItsBudgetIsGone(t *testing.T) {
 	client.launchctl = (&launchctlRecorder{}).run
 	ctx, cancel := context.WithTimeout(context.Background(), -time.Second)
 	defer cancel()
-	_, err := client.ensureOnce(ctx, "wanted", agent)
+	_, err := client.ensureOnce(ctx, "wanted", agent, false)
 	if !errors.Is(err, ErrWrongIncumbent) || !moved(err) {
 		t.Fatalf("ensureOnce() error = %v, want the race the pass lost", err)
 	}
@@ -1486,7 +1798,7 @@ func TestEnsureRefusesAPassItCannotFinish(t *testing.T) {
 	agent := ladderAgent(t, home)
 	seen := 0
 	var last time.Duration
-	client := Open(Daemon{Label: Label(agent.Label), Program: Program{path: agent.Program}})
+	client := Open(Daemon{Label: Label(agent.Label), Program: Program{policy: bundled{file: agent.Program}}})
 	client.serving = func(ctx context.Context) (wire.HealthReport, proc.Identity, error) {
 		seen++
 		last = left(ctx)
@@ -1506,4 +1818,66 @@ func TestEnsureRefusesAPassItCannotFinish(t *testing.T) {
 	if last < minPassSlice/4 {
 		t.Fatalf("the last pass began with %v of a %v budget left, want at least %v", last, budget, minPassSlice/4)
 	}
+}
+
+// TestEnsurePlacesTheProgramOnlyUnderTheStartLock is the second consequence of
+// a constructor that writes: the write is decoupled from the one lock that
+// serializes every transition of the live daemon, so two launchers racing the
+// same fixed path both land bytes and the loser reaches "came up as build X" —
+// an error moved() does not name, so Ensure hard-errors against a healthy
+// daemon instead of re-observing. Under the lock the loser places nothing and
+// waits its turn.
+func TestEnsurePlacesTheProgramOnlyUnderTheStartLock(t *testing.T) {
+	home := ladderHome(t)
+	label := Label("com.example.race")
+	statePaths := paths.Paths{App: string(label)}
+	if err := statePaths.EnsureLockDir(); err != nil {
+		t.Fatalf("create lock dir: %v", err)
+	}
+	held, err := flock.Spec{
+		Path:     statePaths.StartLockPath(),
+		Mode:     flock.Exclusive,
+		Deadline: 2 * time.Second,
+	}.Acquire(t.Context())
+	if err != nil {
+		t.Fatalf("hold the start lock: %v", err)
+	}
+	defer func() { _ = held.Close() }()
+
+	program, err := Stable()
+	if err != nil {
+		t.Fatalf("Stable() error = %v", err)
+	}
+	client := Open(Daemon{Label: label, Program: program})
+	client.launchctl = (&launchctlRecorder{}).run
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+	if _, err := client.Ensure(ctx); err == nil {
+		t.Fatal("Ensure() succeeded while another launcher held the start lock")
+	}
+
+	target := filepath.Join(home, ".daemonkit", "bin", string(label))
+	if _, err := os.Stat(target); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the program was placed at %q while another launcher held the start lock (stat: %v)", target, err)
+	}
+}
+
+func programPath(t *testing.T, d Daemon) string {
+	t.Helper()
+	path, err := d.Program.path(mustElement(t, d.Label))
+	if err != nil {
+		t.Fatalf("Program.path() error = %v", err)
+	}
+	return path
+}
+
+// mustElement is the Label rule run for a fixture that is meant to clear it, so
+// a test that means to exercise a path never states the path element itself.
+func mustElement(t *testing.T, label Label) element {
+	t.Helper()
+	el, err := label.element()
+	if err != nil {
+		t.Fatalf("element() error = %v", err)
+	}
+	return el
 }

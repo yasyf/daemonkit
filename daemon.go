@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/internal/wire"
+	"github.com/yasyf/daemonkit/launchd"
 	"github.com/yasyf/daemonkit/paths"
 )
 
@@ -15,7 +16,7 @@ import (
 // and launchd job all derive from Label through paths.
 type Daemon struct {
 	Label       Label
-	Program     Program // the executable launchd runs
+	Program     Program // the executable launchd runs; Ensure places it
 	Args        []string
 	Schemas     []Schema // [0] is what this build speaks; the rest are prior eras still accepted
 	Trust       Trust    // lane requirements; the same-EUID floor is not here and cannot be turned off
@@ -31,16 +32,46 @@ type Daemon struct {
 // derives from it.
 type Label string
 
-func (d Daemon) statePaths() paths.Paths { return paths.Paths{App: string(d.Label)} }
+// element is a Label the rule accepted. Every path this package joins a Label
+// into is joined from an element and never from a Label, and Label.element is
+// the only thing that makes one, so a path added later inherits the rule
+// instead of restating a weaker one beside it. The unexported field is what
+// holds that: a Label cannot be converted into an element, only accepted into
+// one.
+type element struct{ label string }
+
+// element refuses a Label that is not a launchd job label. The rule lives in
+// launchd and is read from there rather than copied: the Label names a
+// LaunchAgent before it names anything else, so the strictest reading of it is
+// the only one, and a second rule at any of the paths that derive from it is a
+// rule that disagrees.
+func (l Label) element() (element, error) {
+	if err := launchd.ValidateLabel(string(l)); err != nil {
+		return element{}, fmt.Errorf("daemonkit: %w", err)
+	}
+	return element{label: string(l)}, nil
+}
+
+func (e element) state() paths.Paths { return paths.Paths{App: e.label} }
+
+func (e element) socket() (string, error) { return paths.Socket(e.label) }
+
+func (e element) record() string { return filepath.Join(e.state().StateDir(), "daemon.records") }
 
 // RecordPath is where Serve persists this daemon's durable owner record: the
 // {pid, start, boot, generation, build} core it writes behind the flock before
 // it binds. An inventory gate outside this package reads it to correlate a
 // live process nothing could name against the identity this daemon recorded —
 // the only thing that says whose husk it is.
-func (d Daemon) RecordPath() string {
-	return filepath.Join(d.statePaths().StateDir(), "daemon.records")
-}
+//
+// It is the one derivation that states the layout without running the rule
+// itself, because it does no I/O and has no refusal to return. What carries the
+// rule instead is the boundary: every entry point that takes a Daemon — Serve,
+// deploy.Open, and each Client verb — refuses a Label launchd would, so a
+// Daemon that reached any code in this module has been accepted and the path is
+// inside its own state directory. A Daemon that crossed no boundary gets an
+// unchecked join here, and the file it names is not one to read.
+func (d Daemon) RecordPath() string { return element{label: string(d.Label)}.record() }
 
 func (d Daemon) shutdownGrace() Grace {
 	if d.Shutdown == 0 {
@@ -70,11 +101,17 @@ type Grace time.Duration
 
 const maxGrace = Grace(24 * time.Hour)
 
-// ValidateForServe is the config-boundary check Serve runs once before any
-// Budget is minted: every Grace must lie in (0, 24h], zero meaning its
-// documented default. Rejecting the range here is what keeps every deadline
-// downstream of mint within budget arithmetic's exact domain.
+// ValidateForServe is the config-boundary check every entry point taking a
+// Daemon runs before the value reaches a derivation — Serve on its argument,
+// deploy.Open on Config.Daemon — and it runs before any Budget is minted. The
+// Label must be one launchd itself would accept, since every path, lock,
+// socket, and job name is joined from it; every Grace must lie in (0, 24h],
+// zero meaning its documented default. Rejecting the range here is what keeps
+// every deadline downstream of mint within budget arithmetic's exact domain.
 func (d Daemon) ValidateForServe() error {
+	if _, err := d.Label.element(); err != nil {
+		return err
+	}
 	for _, g := range []struct {
 		field string
 		grace Grace

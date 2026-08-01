@@ -1164,6 +1164,12 @@ func TestOpenRejectsInvalidConfig(t *testing.T) {
 		{"no team", mutate(func(c *Config) { c.Requirement.TeamID = "" })},
 		{"no signing identifier", mutate(func(c *Config) { c.Requirement.SigningIdentifier = "" })},
 		{"no label", mutate(func(c *Config) { c.Daemon.Label = "" })},
+		{"label traversing out of the state root", mutate(func(c *Config) { c.Daemon.Label = "../../evil" })},
+		{"hidden label", mutate(func(c *Config) { c.Daemon.Label = ".hidden" })},
+		{"label naming two path elements", mutate(func(c *Config) { c.Daemon.Label = "bin/daemon" })},
+		{"absolute label", mutate(func(c *Config) { c.Daemon.Label = "/daemon" })},
+		{"label with an embedded dot-dot", mutate(func(c *Config) { c.Daemon.Label = "com.example..daemon" })},
+		{"label outside launchd's alphabet", mutate(func(c *Config) { c.Daemon.Label = "com example" })},
 		{"no agents", mutate(func(c *Config) { c.Agents = nil })},
 		{"program outside app", mutate(func(c *Config) { c.Agents[0].Program = "/usr/bin/true" })},
 		{"relative program", mutate(func(c *Config) { c.Agents[0].Program = "Contents/MacOS/x" })},
@@ -1190,6 +1196,64 @@ func TestOpenRejectsInvalidConfig(t *testing.T) {
 	})
 	if _, err := Open(pinned); err != nil {
 		t.Fatalf("Open with a pinned serving requirement: %v", err)
+	}
+}
+
+// TestOpenRefusesALabelWhoseRecordPathEscapesTheStateRoot is the traversal a
+// "Label is required" check lets through. Daemon.RecordPath states the layout
+// without running the Label rule, and the inventory gate every quiesce arm ends
+// at reads that path — so a Label of "../../evil" reaches Install, Supersede,
+// Uninstall, Reset, and Quiesce as a file outside the state root entirely. Open
+// is the boundary that refuses it, and the owner record planted at the escaped
+// path is what proves the refusal is the only thing standing between a consumer
+// and that read.
+func TestOpenRefusesALabelWhoseRecordPathEscapesTheStateRoot(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := filepath.Join(root, "state", "home")
+	if err := os.MkdirAll(filepath.Join(home, "Library", "LaunchAgents"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(realhome.EnvOverride, home)
+
+	const label = daemonkit.Label("../../evil")
+	escaped := daemonkit.Daemon{Label: label}.RecordPath()
+	if strings.HasPrefix(escaped, home+string(filepath.Separator)) {
+		t.Fatalf("record path %q is inside the state root %q; this label no longer escapes", escaped, home)
+	}
+	if err := os.MkdirAll(filepath.Dir(escaped), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := proc.OpenStore(escaped)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	planted, err := store.RecordOwner("planted-build")
+	if err != nil {
+		t.Fatalf("RecordOwner: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	app := filepath.Join(root, "Example.app")
+	deployment, err := Open(Config{
+		App:         app,
+		Requirement: daemonkit.Requirement{TeamID: testTeamID, SigningIdentifier: testSigning},
+		Daemon:      daemonkit.Daemon{Label: label},
+		Agents:      []launchd.Agent{{Label: "l", Program: filepath.Join(app, "Contents", "MacOS", "x")}},
+	})
+	if err == nil {
+		found, readErr := deployment.recordedIdentities()
+		t.Fatalf(
+			"Open accepted Label %q; the inventory gate read %v (err %v) out of %q, outside the state root %q — planted %v",
+			label, found, readErr, escaped, home, planted.Identity(),
+		)
+	}
+	if !errors.Is(err, ErrConfig) {
+		t.Fatalf("Open err = %v, want ErrConfig", err)
 	}
 }
 

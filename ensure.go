@@ -57,15 +57,26 @@ type Ensured struct {
 // Program, ready and serving, and reports what that took.
 //
 // The ladder is fixed and every step observes rather than assumes. The state
-// directory's start lock serializes concurrent Ensures. The world is
-// re-derived from the socket, the durable owner record, and launchd's own view
-// of the LaunchAgent — never from stored intent. A pure decision reads the
-// observed Health (decide). An incumbent that decision replaces is evicted
-// through Control.Drain, pinned to the build and generation just observed so a
-// replacement that raced in is refused rather than stopped, and proven out of
-// the process table. The daemon's own LaunchAgent is then applied, and
-// readiness is a subscription on the new daemon's phase stream rather than a
-// poll.
+// directory's start lock serializes concurrent Ensures. Placement is the first
+// step under it: a Program whose policy is a copy of the invoking executable
+// gets those bytes put at the path the plist names, idempotently, before
+// anything is observed. It happens here rather than at construction because it
+// replaces the file launchd is currently executing, which is a transition of
+// the live daemon and belongs to the convergence that owns every other one — so
+// a launcher that builds a Daemon and never converges replaces nothing, and two
+// launchers racing one path take turns instead of both landing bytes. A pass
+// that did replace those bytes never reports ActionNothing: the process running
+// is not the one the new bytes produce, so it restarts rather than answering
+// from a report the old image wrote.
+//
+// The world is re-derived from the socket, the durable owner record, and
+// launchd's own view of the LaunchAgent — never from stored intent. A pure
+// decision reads the observed Health (decide). An incumbent that decision
+// replaces is evicted through Control.Drain, pinned to the build and generation
+// just observed so a replacement that raced in is refused rather than stopped,
+// and proven out of the process table. The daemon's own LaunchAgent is then
+// applied, and readiness is a subscription on the new daemon's phase stream
+// rather than a poll.
 //
 // Applying rewrites a drifted plist and re-bootstraps the job, which boots a
 // live incumbent out — so an incumbent is always drained first, and a daemon
@@ -87,6 +98,10 @@ func (c *Client) Ensure(ctx context.Context) (Ensured, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		return Ensured{}, errors.New("daemonkit: Ensure requires a context deadline")
 	}
+	el, err := c.daemon.Label.element()
+	if err != nil {
+		return Ensured{}, err
+	}
 	want, err := c.daemon.Program.build()
 	if err != nil {
 		return Ensured{}, err
@@ -95,7 +110,7 @@ func (c *Client) Ensure(ctx context.Context) (Ensured, error) {
 	if err != nil {
 		return Ensured{}, err
 	}
-	statePaths := c.daemon.statePaths()
+	statePaths := el.state()
 	if err := statePaths.EnsureLockDir(); err != nil {
 		return Ensured{}, fmt.Errorf("daemonkit: create lock dir: %w", err)
 	}
@@ -108,10 +123,14 @@ func (c *Client) Ensure(ctx context.Context) (Ensured, error) {
 		return Ensured{}, fmt.Errorf("daemonkit: serialize ensure: %w", err)
 	}
 	defer func() { _ = lock.Close() }()
+	replaced, err := c.daemon.Program.place(el)
+	if err != nil {
+		return Ensured{}, err
+	}
 	timer := time.NewTimer(attachCadence(ctx))
 	defer timer.Stop()
 	for {
-		ensured, err := c.ensureOnce(ctx, want, agent)
+		ensured, err := c.ensureOnce(ctx, want, agent, replaced)
 		if !moved(err) {
 			return ensured, err
 		}
@@ -138,13 +157,13 @@ func moved(err error) bool {
 	return errors.Is(err, ErrWrongIncumbent) || errors.Is(err, errPinMoved)
 }
 
-func (c *Client) ensureOnce(ctx context.Context, want string, agent launchd.Agent) (Ensured, error) {
+func (c *Client) ensureOnce(ctx context.Context, want string, agent launchd.Agent, replaced bool) (Ensured, error) {
 	world, action, err := c.settle(ctx, want, agent)
 	if err != nil {
 		return Ensured{}, err
 	}
 	before := healthFromReport(world.Health)
-	if action == ActionNothing && world.Applied {
+	if action == ActionNothing && world.Applied && !replaced {
 		return Ensured{Before: before, Did: ActionNothing, After: before}, nil
 	}
 	if world.Serving() {
@@ -220,10 +239,14 @@ func (c *Client) settle(ctx context.Context, want string, agent launchd.Agent) (
 }
 
 func (c *Client) observeWorld(ctx context.Context, agent launchd.Agent) (converge.World, error) {
+	record, err := c.record()
+	if err != nil {
+		return converge.World{}, err
+	}
 	return converge.Observe(ctx, converge.Sources{
 		Serving:    c.serving,
 		Recorded:   c.readOwner,
-		RecordPath: c.recordPath,
+		RecordPath: record,
 		Agent:      agent,
 		Launchctl:  c.launchctl,
 	})
@@ -361,7 +384,11 @@ func (c *Client) prove(ctx context.Context, target incumbent, observed proc.Iden
 	case errors.Is(err, ErrUnrecorded):
 		return c.inventoryClear(observed)
 	case errors.Is(err, ErrUnsettled):
-		if err := repairWedged(c.recordPath, target, c.readOwner, c.probe, c.kill); err != nil {
+		record, recordErr := c.record()
+		if recordErr != nil {
+			return recordErr
+		}
+		if err := repairWedged(record, target, c.readOwner, c.probe, c.kill); err != nil {
 			return err
 		}
 		reproofCtx, cancelReproof := proving.Share("reproof", proveReproofShare).Context(ctx)
@@ -423,23 +450,26 @@ func repairWedged(
 // answer.
 //
 // The query is this daemon's own program and nothing else. A path guessed by
-// name — a sibling under the staging root every daemonkit consumer shares — is
-// wrong in both directions: it misses a build staged under another basename,
-// and it holds another product's daemon against this gate. What covers a live
-// process this daemon's program path does not name is observed: a process
-// nothing could name at all counts against the gate exactly when its pin is one
-// this ladder pinned on its way here, and a stranger's husk never is. The owner
-// record is not re-read for that correlation — every path into this gate is
-// entered precisely because the record named nobody, so a re-read would
-// correlate against nothing — which is why every caller hands down what it
-// observed, and the zero identity when it observed nothing.
+// name — a sibling under the program root every daemonkit consumer shares — is
+// another product's daemon, held against a gate that is none of its business.
+// What covers a live process this daemon's program path does not name is
+// observed: a process nothing could name at all counts against the gate exactly
+// when its pin is one this ladder pinned on its way here, and a stranger's husk
+// never is. The owner record is not re-read for that correlation — every path
+// into this gate is entered precisely because the record named nobody, so a
+// re-read would correlate against nothing — which is why every caller hands
+// down what it observed, and the zero identity when it observed nothing.
 //
 // The residual is exact and stated rather than papered over: a husk this ladder
 // never observed is attributable to nothing, and no scan of the process table
 // can attribute it. Settling a recorded identity out of the table is the half
 // that covers a recorded process whose executable is gone.
 func (c *Client) inventoryClear(observed proc.Identity) error {
-	program, err := c.daemon.Program.resolved()
+	el, err := c.daemon.Label.element()
+	if err != nil {
+		return err
+	}
+	program, err := c.daemon.Program.resolved(el)
 	if err != nil {
 		return err
 	}
@@ -467,17 +497,25 @@ func (c *Client) inventoryClear(observed proc.Identity) error {
 // the Daemon, so nothing about the job is declared twice; an unset Log sinks
 // to the state directory's daemon.log.
 func (d Daemon) agent() (launchd.Agent, error) {
+	el, err := d.Label.element()
+	if err != nil {
+		return launchd.Agent{}, err
+	}
+	program, err := d.Program.path(el)
+	if err != nil {
+		return launchd.Agent{}, err
+	}
 	restart, err := d.Restart.launchd()
 	if err != nil {
 		return launchd.Agent{}, err
 	}
 	log := d.Log
 	if log == "" {
-		log = d.statePaths().LogPath()
+		log = el.state().LogPath()
 	}
 	return launchd.Agent{
-		Label:         string(d.Label),
-		Program:       d.Program.path,
+		Label:         el.label,
+		Program:       program,
 		Args:          d.Args,
 		LogPath:       log,
 		RestartPolicy: restart,

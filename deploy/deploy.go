@@ -117,8 +117,8 @@ func Open(config Config) (*Deployment, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrConfig, err)
 	}
-	if config.Daemon.Label == "" {
-		return nil, fmt.Errorf("%w: Daemon.Label is required", ErrConfig)
+	if err := config.Daemon.ValidateForServe(); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrConfig, err)
 	}
 	if serving := config.Daemon.Trust.Serving; serving != nil {
 		if _, err := designatedRequirement(*serving); err != nil {

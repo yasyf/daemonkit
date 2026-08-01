@@ -18,7 +18,6 @@ import (
 	"github.com/yasyf/daemonkit/internal/proc"
 	"github.com/yasyf/daemonkit/internal/trust"
 	"github.com/yasyf/daemonkit/internal/wire"
-	"github.com/yasyf/daemonkit/paths"
 )
 
 // Start builds the product once ownership is proven. Its return IS readiness.
@@ -123,11 +122,15 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 	signal.Notify(signals, drainSignals...)
 	defer signal.Stop(signals)
 
-	socket, err := paths.Socket(string(d.Label))
+	el, err := d.Label.element()
+	if err != nil {
+		return Drained{}, err
+	}
+	socket, err := el.socket()
 	if err != nil {
 		return Drained{}, fmt.Errorf("daemonkit: derive socket path: %w", err)
 	}
-	if err := d.statePaths().EnsureStateDir(); err != nil {
+	if err := el.state().EnsureStateDir(); err != nil {
 		return Drained{}, fmt.Errorf("daemonkit: create state dir: %w", err)
 	}
 	build, err := buildDigest()
@@ -138,7 +141,7 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 	if err != nil {
 		return Drained{}, err
 	}
-	store, err := proc.OpenStore(d.RecordPath())
+	store, err := proc.OpenStore(el.record())
 	if err != nil {
 		_ = lock.Close()
 		return Drained{}, fmt.Errorf("daemonkit: open record store: %w", err)
@@ -382,6 +385,18 @@ func ownListener(ctx context.Context, socket string, wait time.Duration) (*flock
 	return lock, nil
 }
 
+// TODO: digest the image this process is executing — the cdhash csops already
+// reads in internal/trust — instead of re-reading the path it was executed
+// from. A replace landing between execve and this read has the daemon publish
+// and record the replacement's build while running the old code, and no
+// launcher can tell. Ensure's placement is serialized by the start lock and the
+// pass that made it evicts whatever is serving before it starts anything, so
+// what is left is a launcher that died between its own placement and that
+// eviction, and an out-of-band replace by a package manager. Against a bundled
+// Program the divergence is not merely undetected but silent forever:
+// bundled.build re-reads that same replaced path, agrees with the record, and
+// every later Ensure decides ActionNothing. Only digesting the running image
+// closes it — nothing reachable from the path can.
 func buildDigest() (string, error) {
 	exe, err := os.Executable()
 	if err != nil {

@@ -16,7 +16,6 @@ import (
 func Open(d Daemon) *Client {
 	c := &Client{
 		daemon:     d,
-		recordPath: d.RecordPath(),
 		probe:      proc.ProbeIdentity,
 		observe:    proc.Observe,
 		identities: proc.ExecutableIdentities,
@@ -34,7 +33,6 @@ func Open(d Daemon) *Client {
 // boundary it reaches around.
 type Client struct {
 	daemon     Daemon
-	recordPath string
 	probe      func(int) (proc.Identity, error)
 	observe    func(proc.Identity) (proc.Reap, bool, error)
 	identities func(string) (proc.Report, error)
@@ -42,6 +40,18 @@ type Client struct {
 	kill       func(int, syscall.Signal) error
 	serving    func(context.Context) (wire.HealthReport, proc.Identity, error)
 	launchctl  launchd.Runner
+}
+
+// record is the durable owner record's path, derived past the Label rule
+// wherever a verb is about to read it. Open derives nothing: a Label no path
+// may be joined from has to be refused where a refusal can be returned, which
+// is the verb and never the constructor.
+func (c *Client) record() (string, error) {
+	el, err := c.daemon.Label.element()
+	if err != nil {
+		return "", err
+	}
+	return el.record(), nil
 }
 
 // Settle proves the recorded incumbent gone without a live session. It reads
@@ -71,7 +81,11 @@ func (c *Client) Settle(ctx context.Context, expect Expect) (Stopped, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		return Stopped{}, errors.New("daemonkit: Settle requires a context deadline")
 	}
-	owner, ok, err := c.readOwner(c.recordPath)
+	record, err := c.record()
+	if err != nil {
+		return Stopped{}, err
+	}
+	owner, ok, err := c.readOwner(record)
 	if err != nil {
 		return Stopped{}, err
 	}

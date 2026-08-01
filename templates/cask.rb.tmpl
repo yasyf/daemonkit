@@ -23,9 +23,10 @@ cask "__CASK_TOKEN__" do
   depends_on macos: :__MACOS_MIN__ # parsed with a ">=" comparator
 
   # A full .app bundle, never a bare `binary`: only a bundle staples its
-  # notarization ticket and keeps a stable, bundle-keyed TCC/Keychain identity
-  # across upgrades (a bare Mach-O can't staple and gets path-keyed TCC). The
-  # installed app is LSUIElement (no Dock icon) and registers its
+  # notarization ticket, and a bundle installed at a fixed path keeps its TCC
+  # and Keychain grants across upgrades. TCC keys a bare Mach-O on its absolute
+  # path, so one installed into a versioned directory re-prompts on every
+  # upgrade. The installed app is LSUIElement (no Dock icon) and registers its
   # SMAppService/LaunchAgent supervisor on launch.
   app "__APP_NAME__.app"
 

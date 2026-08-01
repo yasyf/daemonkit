@@ -156,7 +156,7 @@ type Agent struct {
 // the home resolved through the passwd database so a sandboxed caller HOME
 // cannot redirect the bootstrap.
 func (a Agent) PlistPath() (string, error) {
-	if err := validateLabel(a.Label); err != nil {
+	if err := ValidateLabel(a.Label); err != nil {
 		return "", err
 	}
 	return plistPath(a.Label)
@@ -172,7 +172,7 @@ func plistPath(label string) (string, error) {
 
 // Plist renders the exact LaunchAgent plist without mutating the filesystem.
 func (a Agent) Plist() ([]byte, error) {
-	if err := validateLabel(a.Label); err != nil {
+	if err := ValidateLabel(a.Label); err != nil {
 		return nil, err
 	}
 	restart, err := a.RestartPolicy.plist()
@@ -299,7 +299,11 @@ func validBundleIdentifier(value string) bool {
 	return true
 }
 
-func validateLabel(label string) error {
+// ValidateLabel is the one rule a launchd job label must pass, and the one
+// every path daemonkit joins a Label into is joined past: exactly one path
+// component, no leading or trailing dot, no "..", and nothing outside
+// [A-Za-z0-9.-].
+func ValidateLabel(label string) error {
 	if label == "" || filepath.Base(label) != label || label == "." || label == ".." ||
 		strings.HasPrefix(label, ".") || strings.HasSuffix(label, ".") || strings.Contains(label, "..") {
 		return fmt.Errorf("launchd: launch agent label %q is not canonical", label)

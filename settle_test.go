@@ -4,17 +4,27 @@ import (
 	"context"
 	"errors"
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/yasyf/daemonkit/internal/proc"
 )
 
-func settleFixture(t *testing.T) (string, proc.Owner) {
+// settleFixture stands the owner record up where a Daemon's own Label puts it:
+// Settle derives the record path past the Label rule, so a fixture that named
+// its own file would exercise a path no verb takes.
+func settleFixture(t *testing.T) (Daemon, proc.Owner) {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "daemon.records")
-	store, err := proc.OpenStore(path)
+	shortHome(t)
+	d := Daemon{Label: "com.example.settle"}
+	el, err := d.Label.element()
+	if err != nil {
+		t.Fatalf("element() error = %v", err)
+	}
+	if err := el.state().EnsureStateDir(); err != nil {
+		t.Fatalf("EnsureStateDir: %v", err)
+	}
+	store, err := proc.OpenStore(el.record())
 	if err != nil {
 		t.Fatalf("OpenStore: %v", err)
 	}
@@ -25,7 +35,7 @@ func settleFixture(t *testing.T) (string, proc.Owner) {
 	if err := store.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	return path, owner
+	return d, owner
 }
 
 func TestClientSettle(t *testing.T) {
@@ -49,16 +59,16 @@ func TestClientSettle(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			path, owner := settleFixture(t)
+			d, owner := settleFixture(t)
 			if tt.missing {
-				path = filepath.Join(t.TempDir(), "absent.records")
+				d.Label = "com.example.settle.unrecorded"
 			}
 			expect := tt.expect
 			if expect == (Expect{}) && !tt.missing && tt.wantErr == nil {
 				expect = Expect{Build: owner.Build, Generation: owner.Generation}
 			}
 			client := &Client{
-				recordPath: path,
+				daemon: d,
 				observe: func(id proc.Identity) (proc.Reap, bool, error) {
 					if !tt.missing && id != owner.Identity() {
 						t.Fatalf("observed %+v, want the recorded owner core %+v", id, owner.Identity())

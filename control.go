@@ -11,7 +11,6 @@ import (
 	"github.com/yasyf/daemonkit/internal/proc"
 	"github.com/yasyf/daemonkit/internal/trust"
 	"github.com/yasyf/daemonkit/internal/wire"
-	"github.com/yasyf/daemonkit/paths"
 )
 
 // Expect pins which incumbent Drain may stop or Settle may settle. Zero
@@ -109,7 +108,11 @@ func (c *Client) Control(ctx context.Context) (*Control, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		return nil, errors.New("daemonkit: Control requires a context deadline")
 	}
-	socket, err := paths.Socket(string(c.daemon.Label))
+	el, err := c.daemon.Label.element()
+	if err != nil {
+		return nil, err
+	}
+	socket, err := el.socket()
 	if err != nil {
 		return nil, fmt.Errorf("daemonkit: derive socket path: %w", err)
 	}

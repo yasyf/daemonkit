@@ -99,7 +99,7 @@ func Remove(ctx context.Context, run Runner, label string) error {
 	if run == nil {
 		return errors.New("launchd: remove runner is required")
 	}
-	if err := validateLabel(label); err != nil {
+	if err := ValidateLabel(label); err != nil {
 		return err
 	}
 	c := applier{run: run, wait: waitRetry}

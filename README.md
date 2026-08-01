@@ -76,9 +76,9 @@ disappears cannot leave a stale row behind.
 |---|---|---|---|
 | `artifact` | resolves a version-exact executable from a declarative descriptor, for the cc-family's one central "give me the binary that matches my version" primitive. | 16 | 2230 |
 | `bundle` | reads a macOS .app's Info.plist and resolves the stable bundle paths a daemon installs to. | 5 | 198 |
-| `deploy` | owns sealed installation, activation, supersession, and removal of one fixed signed application. | 15 | 5033 |
+| `deploy` | owns sealed installation, activation, supersession, and removal of one fixed signed application. | 15 | 5097 |
 | `ghrelease` | queries GitHub for a repository's latest published release. | 2 | 170 |
-| `launchd` | is the value-type model for one exact macOS user LaunchAgent and the stateless primitives that apply it. | 12 | 2487 |
+| `launchd` | is the value-type model for one exact macOS user LaunchAgent and the stateless primitives that apply it. | 12 | 2491 |
 | `paths` | owns the canonical state-directory layout under the user's home directory, resolved through the passwd database — never the caller's HOME or CLAUDE_CONFIG_DIR — so a sandboxed environment cannot relocate state. | 4 | 209 |
 | `templates` | — | 2 | 218 |
 | `version` | classifies and compares release and development builds for launcher-owned runtime settlement and release ordering. | 2 | 302 |
