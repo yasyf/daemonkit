@@ -16,6 +16,8 @@ daemonkit/
 ├── scripts/test.sh   # the ONLY way to run Go tests — see Testing below
 ├── .github/workflows/ci.yml # Go vet/test/-race via the harness + pure build
 │                            #   + the macos-26 Swift job
+├── docs/DESIGN.md    # the lifecycle-core design; §8 is the migration contract
+├── docs/BUILD-ORDER.md      # how DESIGN.md gets built and shipped, phase by phase
 ├── AGENTS.md         # This file — shared conventions
 └── README.md         # Project overview
 ```
@@ -30,7 +32,7 @@ reverted rather than trusted.
 |---|---|---|---|
 | `artifact` | resolves a version-exact executable from a declarative descriptor, for the cc-family's one central "give me the binary that matches my version" primitive. | 16 | 2230 |
 | `bundle` | reads a macOS .app's Info.plist and resolves the stable bundle paths a daemon installs to. | 5 | 198 |
-| `deploy` | owns sealed installation, activation, supersession, and removal of one fixed signed application. | 15 | 4942 |
+| `deploy` | owns sealed installation, activation, supersession, and removal of one fixed signed application. | 15 | 5033 |
 | `ghrelease` | queries GitHub for a repository's latest published release. | 2 | 170 |
 | `launchd` | is the value-type model for one exact macOS user LaunchAgent and the stateless primitives that apply it. | 12 | 2487 |
 | `paths` | owns the canonical state-directory layout under the user's home directory, resolved through the passwd database — never the caller's HOME or CLAUDE_CONFIG_DIR — so a sandboxed environment cannot relocate state. | 4 | 209 |

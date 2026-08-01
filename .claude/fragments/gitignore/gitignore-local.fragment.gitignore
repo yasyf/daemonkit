@@ -1,2 +1,9 @@
 # signed trust E2E fixtures (regenerate: scripts/trust-fixtures.sh)
 .trust-fixtures/
+
+# stray binaries from `go build ./internal/<pkg>/` or `./ci/<pkg>/` at the root
+# (each ~4 MB, and one `git add -A` from the index)
+/exportcensus
+/testserver
+/trustfixture
+/wiregen

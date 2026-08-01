@@ -76,7 +76,7 @@ disappears cannot leave a stale row behind.
 |---|---|---|---|
 | `artifact` | resolves a version-exact executable from a declarative descriptor, for the cc-family's one central "give me the binary that matches my version" primitive. | 16 | 2230 |
 | `bundle` | reads a macOS .app's Info.plist and resolves the stable bundle paths a daemon installs to. | 5 | 198 |
-| `deploy` | owns sealed installation, activation, supersession, and removal of one fixed signed application. | 15 | 4942 |
+| `deploy` | owns sealed installation, activation, supersession, and removal of one fixed signed application. | 15 | 5033 |
 | `ghrelease` | queries GitHub for a repository's latest published release. | 2 | 170 |
 | `launchd` | is the value-type model for one exact macOS user LaunchAgent and the stateless primitives that apply it. | 12 | 2487 |
 | `paths` | owns the canonical state-directory layout under the user's home directory, resolved through the passwd database — never the caller's HOME or CLAUDE_CONFIG_DIR — so a sandboxed environment cannot relocate state. | 4 | 209 |
@@ -100,19 +100,22 @@ and readiness preflight. A separate persistent handoff session sends only
 `daemon.broker-handoff.v1`, pinned to the exact ready-runtime receipt. There is
 no single-role or compatibility initializer.
 
-`deployment.Controller` never downloads an application. Packaging supplies one
-exact local signed `.app` resource. `ApplyInstalledCandidate` copies it into a
-private controller-owned stage, verifies its bundle digest, version, signature,
-identity, and file generation, then owns first install or atomic upgrade through
-activation and rollback. Its opaque `CandidatePlan` is validated against the
-packaged app, persisted with relative program paths, and rebound and revalidated
-only after the exact candidate occupies the canonical path.
-`DeactivateCurrentInstalled` derives prior build,
-policy, plan, and generation only from sealed state. `UninstallCurrentInstalled`
-owns quiescence and crash-recoverable namespace removal. Consumers never write a
-candidate path, swap the installed app, inspect private JSON, or remove the
-canonical app. Exact v1 receipts, service state, and locks live beside the app
-under `.daemonkit-deploy/<Product>`.
+`deploy` never downloads an application. Packaging supplies one exact local
+signed `.app`: a `Candidate` names it by source path, exact version, and
+bundle-tree digest, and its bytes are copied into a private slot beside the
+canonical path, never moved from under the caller. `deploy.Open` binds a
+`Config` — the canonical `.app` path, the trusted-publisher requirement, the
+daemon, and the exact LaunchAgent set — into a `Deployment`, one application's
+sealed lifecycle. `Install` lands the first generation and refuses an occupied
+canonical path; `Supersede` proves the incumbent gone and its executables
+empty, then swaps as one recorded rename pair, so a crash anywhere in the
+middle resumes to the same end. `Activate` converges launchd to the agent set
+and seals what the started daemon proves about itself; `Uninstall` quiesces,
+converges the services away, and removes the app whole-to-absent in one rename;
+`Reset` is the way out of a state no other verb accepts. Consumers never touch
+the private stage, swap the installed app, inspect the records' JSON, or remove
+the canonical app. Exact v1 receipts, service state, and locks live beside the
+app under `.daemonkit-deploy/<Product>`.
 
 ## The consumer trust contract
 

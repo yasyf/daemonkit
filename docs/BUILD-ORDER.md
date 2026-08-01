@@ -7,10 +7,13 @@ cohere — no interphase adapters, no dual-mode params, no alias layer.
 
 Two consequences of building in place, both deliberate:
 
-- **`main` is unbuildable-for-consumers during phases 1–3.** fleet-build is a release gate, not
-  a per-commit gate, until phase 3 closes; its redness carries no information while the surface
-  is still moving. The in-repo suite, `task build`, `task lint`, and `swift build && swift test`
-  stay green **per commit** — those are the phase gates.
+- **`main` is unbuildable-for-consumers during phases 1–3.** While the surface moves,
+  fleet-build's redness carries no information, so it gates nothing per commit. The rule as
+  first written also made it the release gate — no tag until green — but phase 3's close
+  inverted that: the cut tags `v0.21.0` before any consumer migrates, so fleet-build is red by
+  construction at tag time and gates the close of the migration instead (DESIGN §8.1). The
+  in-repo suite, `task build`, `task lint`, and `swift build && swift test` stay green **per
+  commit** — those are the phase gates.
 - **The old packages are deleted as their replacements land**, not after. A phase that leaves
   both the old and new mechanism alive has built the compat layer the design refuses.
 
@@ -112,15 +115,15 @@ serve → drain → release), `Open`/`Client`/`Control`, `Ensure` with the promo
 
 **Gates:** mixed-era both directions against a real pre-cut consumer build (the 18,999
 reproduction must stay red-proof); the B1 five-axes matrix as integration tests (settlement
-unconditional, recovery-after-flock, signals armed first); **fleet-build turns from expected-red
-to required-green here** — it is the phase-3 exit criterion, and the export census emits the
-final rename ledger.
+unconditional, recovery-after-flock, signals armed first); **fleet-build's redness starts
+carrying information here** — from phase 3's close each red leg names exactly one unmigrated
+consumer (DESIGN §8.1) — and the export census emits the final rename ledger.
 
 ## Phase 4 — the flag day
 
-Every consumer PR is authored against the tagged release, adopts-and-deletes in the same diff,
-and is **green before the tag**, not after it. Ordering is dependency-only; there are no waves,
-because there is no overlap window to stage them across.
+The cut tags `v0.21.0` first; consumers migrate after it (DESIGN §8.1). Every consumer PR is
+authored against the tagged release and adopts-and-deletes in the same diff. Ordering is
+dependency-only; there are no waves, because there is no overlap window to stage them across.
 
 | Order | Repos | Constraint |
 |---|---|---|
@@ -128,11 +131,14 @@ because there is no overlap window to stage them across.
 | 2 (lockstep ×3) | cc-interact + cc-present + cc-review | cc-present/cc-review import daemonkit directly *and* consume cc-interact's launcher. Signed-app end-to-end: `Ensure` against a real signed DR |
 | 3 | cc-notes, reposync, cc-patch, claude-pool/cc-pool, cookiesync | consume order 1–2's surfaces. cc-notes rewrites its source-text contract test (`release_contract_test.go`) in the same change; cc-patch is a `launchd`-leaf bump |
 
-**Release gate:** every PR green · fleet-build green · mixed-era green both directions · export
-census reconciles against the rename ledger · full suite on CI or a quiet machine ·
-`task build`/`task lint` · `swift build && swift test` · the real-machine E2E from the plan's
-Verification section. A stalled repo is a **red release, not a slow one** — this is the flag
-day's whole cost, and paying it is the decision.
+**Tag gate** (`verify-main-gates` in `.github/workflows/release.yml`): CI · Guides · Export
+census · Docs drift · Mixed era, all green on the tagged commit — fleet-build is deliberately
+absent, since every leg is red by construction until consumers migrate (DESIGN §8.1).
+**Migration-close gate:** every consumer PR green · fleet-build green · export census
+reconciles against the rename ledger · the real-machine E2E from the plan's Verification
+section. A stalled repo is an **open migration, not a slow one** — fleet-build joins the
+release gate only when its last leg turns green, and `v0.21.1` is the fix path for an API
+mistake the migration surfaces.
 
 **After the cut:** the legacy bbolt sweep deletes at its named release. The mixed-era gate
 narrows to protocol-bump coverage and stays forever — it is the one check that reproduces the

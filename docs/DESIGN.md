@@ -693,11 +693,20 @@ synckit's `hostregistry` and reposync's `state` at build time, which is the migr
 rather than a risk to mitigate. What it costs is an 11-repo lockstep event: the exact shape that
 produced three incompatible schema epochs in two days. Hence the gates below, none waivable.
 
-1. **`main` is deliberately unbuildable-for-consumers during phases 1–3.** Phase intermediates
-   may be broken; only the final state must cohere. fleet-build is a **release gate**, not a
-   per-commit gate, until phase 3 closes — and no tag exists until it is green. The in-repo
-   suite and `task build`/`task lint` stay green per commit; fleet-build is expected red and its
-   redness carries no information until the surface stops moving.
+1. **`main` was deliberately unbuildable-for-consumers during phases 1–3.** Phase intermediates
+   may be broken; only the final state must cohere. As first written, this gate made fleet-build
+   a **release gate**, not a per-commit gate, until phase 3 closed — and no tag until it was
+   green — because its redness carried no information while the surface moved. Phase 3's close
+   inverted the release-gate half (yasyf, 2026-08-01, `d691ed8`): the cut tags `v0.21.0`
+   **before any consumer migrates**, so at tag time every fleet-build leg is red by construction
+   — consumers still pin `v0.20.*` and import packages the cut deleted — and a tag gated on
+   fleet-build is not late but unreachable. The tag's gate is `verify-main-gates`
+   (`.github/workflows/release.yml`): CI, Guides, Export census, Docs drift, and Mixed era, all
+   green on the tagged commit; fleet-build is deliberately absent from that list and gates the
+   **close of the migration** instead — its redness now carries information, one red leg per
+   unmigrated consumer, and it joins the release gate once the last leg turns green. An API
+   mistake found mid-migration is fixed forward as `v0.21.1`, never by re-cutting the tag. The
+   in-repo suite and `task build`/`task lint` stay green per commit, as they did throughout.
 2. **The legacy record sweep survives the decision** — it answers durable state crossing an
    upgrade, not a module path. For one release cycle, the recover step also reads a legacy bbolt
    file if present, reaps its recorded children, and archives it, so a machine crashing
@@ -715,8 +724,9 @@ produced three incompatible schema epochs in two days. Hence the gates below, no
    tagged release and adopts-and-deletes in the same diff; they merge in one event, ordered only
    where one repo consumes another's surface: cc-interact before cc-present/cc-review; synckit
    before reposync; cc-patch (a `launchd` leaf) and the pool/cookiesync repins last. **No repo is
-   left behind** — under a flag day a stalled repo is a red release, not a slow one, so each
-   repo's PR is authored and green *before* the tag, not after it.
+   left behind** — though under the tag-first order (gate 1) a stalled repo is no longer a red
+   release but an open migration: its fleet-build leg stays red, and fleet-build joins the
+   release gate only when every leg is green.
 6. **Bundle identity is untouched** — labels, teams, signing identifiers, install paths
    unchanged; no TCC or notification grant resets. `Staged()`'s digest-keyed program path is a
    plist change per consumer and needs one real-machine re-bootstrap test before the cut (§12).
