@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+
+	"github.com/yasyf/daemonkit/durable"
 )
 
 // A staging tree is named with these and reclaimed by them; nothing else names
@@ -60,10 +62,10 @@ func (d *Deployment) settleSwap(ctx context.Context, record swapRecord) error {
 		if err := d.attest(ctx, *record.Prior); err != nil {
 			return err
 		}
-		if err := removeTreeDurable(d.layout.prior); err != nil {
+		if err := durable.RemoveTree(d.layout.prior); err != nil {
 			return err
 		}
-		if err := renameDurable(d.layout.canonical, d.layout.prior); err != nil {
+		if err := durable.Rename(d.layout.canonical, d.layout.prior); err != nil {
 			return err
 		}
 	}
@@ -76,7 +78,7 @@ func (d *Deployment) settleSwap(ctx context.Context, record swapRecord) error {
 		if fileExists(d.layout.canonical) {
 			return fmt.Errorf("%w: canonical app is occupied during swap", ErrConflict)
 		}
-		if err := renameDurable(d.layout.candidate, d.layout.canonical); err != nil {
+		if err := durable.Rename(d.layout.candidate, d.layout.canonical); err != nil {
 			return err
 		}
 	}
@@ -171,16 +173,16 @@ func (d *Deployment) resumeDestroys(ctx context.Context, record swapRecord) (boo
 // still have had its record retired out from under it.
 func (d *Deployment) retireSwap(record swapRecord) error {
 	retired := []error{
-		removeFileDurable(d.layout.activation),
-		removeFileDurable(d.layout.removal),
+		durable.Remove(d.layout.activation),
+		durable.Remove(d.layout.removal),
 	}
 	if record.Prior != nil {
-		retired = append(retired, removeTreeDurable(d.layout.prior))
+		retired = append(retired, durable.RemoveTree(d.layout.prior))
 	}
 	if err := errors.Join(retired...); err != nil {
 		return err
 	}
-	return removeFileDurable(d.layout.swap)
+	return durable.Remove(d.layout.swap)
 }
 
 // stage copies the candidate source into the deployment's private candidate
@@ -208,7 +210,7 @@ func (d *Deployment) stage(ctx context.Context, candidate Candidate) (Generation
 	}
 	staged, stageErr := d.copyIntoStage(ctx, candidate, source, stagePath)
 	if stageErr != nil {
-		return Generation{}, errors.Join(stageErr, removeTreeDurable(stagePath))
+		return Generation{}, errors.Join(stageErr, durable.RemoveTree(stagePath))
 	}
 	return staged, nil
 }
@@ -271,7 +273,7 @@ func (d *Deployment) discardGenerations() error {
 		if slot == d.layout.canonical {
 			continue
 		}
-		discarded = append(discarded, removeTreeDurable(slot))
+		discarded = append(discarded, durable.RemoveTree(slot))
 	}
 	return errors.Join(discarded...)
 }
@@ -298,7 +300,7 @@ func (d *Deployment) copyIntoStage(
 	if !copied.sameBytes(source) {
 		return Generation{}, fmt.Errorf("%w: staged copy differs from its source", ErrConflict)
 	}
-	if err := renameDurable(stagePath, d.layout.candidate); err != nil {
+	if err := durable.Rename(stagePath, d.layout.candidate); err != nil {
 		return Generation{}, fmt.Errorf("deploy: publish private candidate: %w", err)
 	}
 	published, err := d.inspect(ctx, d.layout.candidate)

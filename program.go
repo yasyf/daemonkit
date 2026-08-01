@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/yasyf/daemonkit/internal/durablefile"
+	"github.com/yasyf/daemonkit/durable"
 	"github.com/yasyf/daemonkit/internal/realhome"
 )
 
@@ -242,7 +242,7 @@ func (b bundled) path(element) (string, error) { return b.file, nil }
 func (b bundled) place(element) (bool, error) { return false, nil }
 
 // writeExecutable renames data into place through a temp file named for target
-// alone. durablefile writes through a shared ".durable-*" pattern that names
+// alone. A shared ".durable-*" pattern names nobody, and
 // nobody, and the program root is shared by every daemonkit consumer: a stump
 // a crash leaves there has to be attributable to one target for the next
 // placement to be allowed to take it.
@@ -272,7 +272,7 @@ func writeExecutable(target, prefix string, data []byte) error {
 	if err := os.Rename(name, target); err != nil {
 		return fmt.Errorf("rename into place: %w", err)
 	}
-	return durablefile.SyncDir(dir)
+	return durable.SyncDir(dir)
 }
 
 // sweep removes the temps a crashed placement left behind. It takes this

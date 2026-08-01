@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit"
+	"github.com/yasyf/daemonkit/durable"
 	"github.com/yasyf/daemonkit/internal/flock"
 	"github.com/yasyf/daemonkit/internal/trust"
 	"github.com/yasyf/daemonkit/launchd"
@@ -325,7 +326,7 @@ func (d *Deployment) Activate(ctx context.Context) (Activation, error) {
 		return Activation{}, fmt.Errorf("%w: readiness differs from the sealed activation", ErrConflict)
 	}
 	if err := errors.Join(
-		removeFileDurable(d.layout.removal),
+		durable.Remove(d.layout.removal),
 		writeRecord(d.layout.activation, record),
 	); err != nil {
 		return Activation{}, err
@@ -383,7 +384,7 @@ func (d *Deployment) Uninstall(ctx context.Context) (Removal, error) {
 		if err := d.attest(ctx, record.Generation); err != nil {
 			return Removal{}, err
 		}
-		if err := renameDurable(d.layout.canonical, d.layout.removed); err != nil {
+		if err := durable.Rename(d.layout.canonical, d.layout.removed); err != nil {
 			return Removal{}, err
 		}
 	}
@@ -418,7 +419,7 @@ func (d *Deployment) tombstone(ctx context.Context, runtime RuntimeProof) (remov
 		Generation: generation, Runtime: runtime.stored(),
 	}
 	if err := errors.Join(
-		removeFileDurable(d.layout.activation),
+		durable.Remove(d.layout.activation),
 		writeRecord(d.layout.removal, record),
 	); err != nil {
 		return removalRecord{}, err
@@ -458,10 +459,10 @@ func (d *Deployment) Reset(ctx context.Context) error {
 		return err
 	}
 	return errors.Join(
-		removeFileDurable(d.layout.activation),
-		removeFileDurable(d.layout.removal),
-		removeFileDurable(d.layout.swap),
-		removeFileDurable(d.layout.services),
+		durable.Remove(d.layout.activation),
+		durable.Remove(d.layout.removal),
+		durable.Remove(d.layout.swap),
+		durable.Remove(d.layout.services),
 		d.discardGenerations(),
 	)
 }
@@ -572,7 +573,7 @@ func (d *Deployment) appliedServices() ([]string, error) {
 
 func (d *Deployment) recordServices(labels []string) error {
 	if len(labels) == 0 {
-		return removeFileDurable(d.layout.services)
+		return durable.Remove(d.layout.services)
 	}
 	return writeRecord(d.layout.services, serviceRecord{
 		Identity: serviceIdentity, Schema: recordSchema, Labels: labels,

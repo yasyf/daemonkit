@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/yasyf/daemonkit/internal/durablefile"
+	"github.com/yasyf/daemonkit/durable"
 )
 
 func (s Store) resolvePythonTool(ctx context.Context, desc *Descriptor, version string, o options) (string, error) {
@@ -67,7 +67,7 @@ func installPythonTool(ctx context.Context, uv, dist, version, toolDir, binDir, 
 		_ = os.RemoveAll(toolDir)
 		return fmt.Errorf("artifact: sync tool env: %w", err)
 	}
-	if err := durablefile.WriteFileDurable(marker, nil, 0o600); err != nil {
+	if err := durable.WriteFile(marker, nil, 0o600); err != nil {
 		_ = os.RemoveAll(toolDir)
 		return fmt.Errorf("artifact: mark tool env installed: %w", err)
 	}

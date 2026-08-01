@@ -6,8 +6,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `durable` — a public leaf package of durable filesystem verbs.
+  `WriteFile`, `Create`, and `Writer`
+  publish bytes and streams atomically; `SyncDir`, `Rename`, `Mkdir`, `Remove`,
+  and `RemoveTree` make a directory mutation survive a power loss; `Marshal`,
+  `Unmarshal`, and `ReadFile` strictly decode a `Validating` payload, refusing
+  unknown fields, trailing values, and duplicate object keys at any depth; and
+  `AcquireLock` bounds one exclusive `Lock` by a context deadline it requires.
+  That lock excludes goroutines as well as processes, and by one mechanism
+  rather than two — `flock(2)` binds ownership to the open file description,
+  and every acquisition opens its own, so a caller needs no in-process mutex
+  beside it — and contention is `durable.ErrLockBusy`, the one identity the
+  fleet aliases and matches with `errors.Is`.
+
+  The package has one tier, and its name is the contract: a no-fsync write
+  inside `durable` would be a lie in the import path. Every lock is
+  caller-held, so the lost-update class that grows an `UpdateUnlocked` twin
+  cannot arise here. A temp name derives from its target's basename
+  (`.<base>.<random>`), which makes a crashed writer's stump attributable in a
+  scanned directory without a caller-supplied prefix; a publication sweeps
+  stale stumps for the same target, bounded to temps at least an hour old,
+  because two writers racing one path is legal and an unbounded sweep would
+  unlink the slower one's in-flight temp.
+
+  `internal/durablefile` is deleted. Its durable write and directory fsync move
+  into `durable` unchanged in behavior; `ExactStateFile` and `ExactStateCodec`
+  go with no replacement. Nothing ever used them, and every piece — the
+  envelope, the fingerprint, the fallible `New`, the read that defaults an
+  absent file, `UpdateUnlocked` — is something daemonkit's own record ladder in
+  `deploy/record.go` declined when it was written with a free hand.
+
 ### Changed
 
+- Durable writes create no directories. `durablefile.WriteFileDurable` ran an
+  implicit `mkdir -p` at a hardcoded 0700, a mode that silently disagreed with
+  call sites owning their directory at another one; `durable.WriteFile` returns
+  the plain os error instead, and a call site that owns a directory creates it
+  with `durable.Mkdir` at its own mode. The `launchd` applier gains exactly
+  that: it writes the agent plist into `~/Library/LaunchAgents`, which a fresh
+  macOS account does not have.
 - **Breaking.** Peer code-identity verification is kernel-only and in-process.
   The packages `trust`, `peer`, and `codeidentity` are deleted whole and replaced
   by module-private `internal/trust`; with them go `trust.RunVerifierChild` and
@@ -63,7 +102,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `proc.FileLockExclusive`. The lock is not part of `proc`'s process-ownership
   surface, and no fleet consumer needs it as public API. The three contention
   sentinels stay exported from `proc` as aliases of their `internal/flock`
-  definitions, so `errors.Is(err, proc.ErrLockBusy)` keeps matching.
+  definitions, so `errors.Is(err, proc.ErrLockBusy)` keeps matching. Their
+  messages move to daemonkit's own register — `daemonkit: invalid file lock`
+  and `daemonkit: unsafe lock file` replace a `proc:` prefix that named a
+  package no consumer can import; the values themselves are untouched, so
+  every `errors.Is` match is unaffected.
 - `Controller.verify` issues no launchctl mutation. It previously ran
   `launchctl enable` as a side effect of a read, which also wrote a permanent
   root-owned override-database entry per label that uninstall never removes. A

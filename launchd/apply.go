@@ -16,7 +16,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/yasyf/daemonkit/internal/durablefile"
+	"github.com/yasyf/daemonkit/durable"
 )
 
 const (
@@ -146,11 +146,8 @@ func (c applier) remove(ctx context.Context, label string) error {
 	if bootout := c.launchctl(ctx, "bootout", serviceTarget(label)); !bootout.settled() {
 		return fmt.Errorf("launchd: remove agent %q: %w", label, bootout.fail())
 	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := durable.Remove(path); err != nil {
 		return fmt.Errorf("launchd: remove agent plist: %w", err)
-	}
-	if err := durablefile.SyncDir(filepath.Dir(path)); err != nil {
-		return fmt.Errorf("launchd: persist agent plist removal: %w", err)
 	}
 	return nil
 }
@@ -212,10 +209,13 @@ func (c applier) install(ctx context.Context, agent Agent) error {
 	if err := os.MkdirAll(filepath.Dir(agent.LogPath), 0o700); err != nil {
 		return fmt.Errorf("launchd: create log directory: %w", err)
 	}
+	if err := durable.Mkdir(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("launchd: create LaunchAgents directory: %w", err)
+	}
 	if err := archiveForeignPlist(path); err != nil {
 		return err
 	}
-	if err := durablefile.WriteFileDurable(path, plist, 0o600); err != nil {
+	if err := durable.WriteFile(path, plist, 0o600); err != nil {
 		return fmt.Errorf("launchd: write agent plist: %w", err)
 	}
 	return c.reload(ctx, agent, path)
@@ -299,11 +299,8 @@ func archiveForeignPlist(path string) error {
 		return nil
 	}
 	backup := path + ".daemonkit-archived-" + strconv.FormatInt(time.Now().UnixNano(), 10)
-	if err := os.Rename(path, backup); err != nil {
+	if err := durable.Rename(path, backup); err != nil {
 		return fmt.Errorf("launchd: archive foreign plist %q: %w", path, err)
-	}
-	if err := durablefile.SyncDir(filepath.Dir(path)); err != nil {
-		return fmt.Errorf("launchd: persist foreign plist archive: %w", err)
 	}
 	slog.Warn("launchd: archived foreign LaunchAgent plist before adopting the label", "path", path, "backup", backup)
 	return nil

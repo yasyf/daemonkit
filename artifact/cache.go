@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yasyf/daemonkit/internal/durablefile"
+	"github.com/yasyf/daemonkit/durable"
 )
 
 // CacheEntry is one materialized release-binary in the content-addressed cache,
@@ -91,11 +91,8 @@ func (s Store) RemoveCacheEntry(entry CacheEntry) error {
 		return fmt.Errorf("artifact: cache entry dir %q is not within the cache", entry.Dir)
 	}
 	return s.withLock(context.Background(), "release:"+entry.Digest, func() error {
-		if err := os.RemoveAll(entry.Dir); err != nil {
+		if err := durable.RemoveTree(entry.Dir); err != nil {
 			return fmt.Errorf("artifact: remove cache entry: %w", err)
-		}
-		if err := durablefile.SyncDir(filepath.Dir(entry.Dir)); err != nil {
-			return fmt.Errorf("artifact: persist cache entry removal: %w", err)
 		}
 		return nil
 	})

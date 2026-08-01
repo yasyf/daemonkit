@@ -11,7 +11,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/yasyf/daemonkit/internal/durablefile"
+	"github.com/yasyf/daemonkit/durable"
 )
 
 const (
@@ -149,48 +149,10 @@ func writeRecord(path string, value any) error {
 	if err != nil {
 		return fmt.Errorf("deploy: encode %s: %w", path, err)
 	}
-	if err := durablefile.WriteFileDurable(path, append(payload, '\n'), 0o600); err != nil {
+	if err := durable.WriteFile(path, append(payload, '\n'), 0o600); err != nil {
 		return fmt.Errorf("deploy: persist %s: %w", path, err)
 	}
 	return nil
-}
-
-func removeFileDurable(path string) error {
-	if err := os.Remove(path); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	return durablefile.SyncDir(filepath.Dir(path))
-}
-
-func removeTreeDurable(path string) error {
-	if !fileExists(path) {
-		return nil
-	}
-	if err := os.RemoveAll(path); err != nil {
-		return err
-	}
-	return durablefile.SyncDir(filepath.Dir(path))
-}
-
-// renameDurable syncs both sides of the rename. Every swap rename crosses
-// directories, and syncing only the destination leaves the source's removal of
-// its entry undurable: a crash could resurface the tree at both paths at once,
-// which is the one shape settle cannot tell from a torn pair.
-func renameDurable(from, to string) error {
-	if err := os.Rename(from, to); err != nil {
-		return err
-	}
-	source, target := filepath.Dir(from), filepath.Dir(to)
-	if err := durablefile.SyncDir(target); err != nil {
-		return err
-	}
-	if source == target {
-		return nil
-	}
-	return durablefile.SyncDir(source)
 }
 
 // layout is every path one deployment owns, all derived from the canonical
@@ -238,13 +200,10 @@ func (l layout) ensureMetadata() error {
 		return err
 	}
 	for _, dir := range []string{filepath.Dir(l.metadata), l.metadata} {
-		if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		if err := durable.Mkdir(dir, 0o700); err != nil {
 			return fmt.Errorf("deploy: create metadata directory %q: %w", dir, err)
 		}
 		if err := requirePrivateDirectory(dir); err != nil {
-			return err
-		}
-		if err := durablefile.SyncDir(filepath.Dir(dir)); err != nil {
 			return err
 		}
 	}
@@ -270,7 +229,7 @@ func (l layout) ensureMetadata() error {
 func (l layout) archiveLegacy() error {
 	archive := l.legacy + ".bak"
 	for n := 2; ; n++ {
-		switch err := renameDurable(l.legacy, archive); {
+		switch err := durable.Rename(l.legacy, archive); {
 		case err == nil, errors.Is(err, os.ErrNotExist):
 			return nil
 		case !errors.Is(err, os.ErrExist):

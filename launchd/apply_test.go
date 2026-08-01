@@ -572,3 +572,36 @@ func TestRemoveRequiresACanonicalLabel(t *testing.T) {
 		t.Fatalf("Remove of a traversing label = %v, want a canonical-label refusal", err)
 	}
 }
+
+// TestApplyInstallsIntoAnAbsentLaunchAgentsDirectory pins the applier's
+// ownership of the plist directory: a fresh macOS account has ~/Library but no
+// ~/Library/LaunchAgents, and durable.WriteFile creates no directories, so an
+// applier that does not create it cannot install on a new machine.
+func TestApplyInstallsIntoAnAbsentLaunchAgentsDirectory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv(realhome.EnvOverride, home)
+	if err := os.Mkdir(filepath.Join(home, "Library"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(home, "Library", "LaunchAgents")
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fixture: %q already exists (stat err = %v)", dir, err)
+	}
+	agent := applyAgent(t, "com.example.fresh")
+
+	if err := Apply(context.Background(), okRunner, agent); err != nil {
+		t.Fatalf("Apply onto a fresh account: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(dir, agent.Label+".plist"))
+	if err != nil {
+		t.Fatalf("agent plist not installed: %v", err)
+	}
+	want, err := agent.Plist()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("installed plist is not the rendered plist\n%s", got)
+	}
+}

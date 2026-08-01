@@ -1,11 +1,11 @@
 artifact
 bundle
 ci/exportcensus
+durable
 ghrelease
 internal/csposture
 internal/csposture/csposturetest
 internal/duplexconn
-internal/durablefile
 internal/flock
 internal/realhome
 internal/state
