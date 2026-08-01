@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/daemonkit/ci/mixedera/coverage"
 	"github.com/yasyf/daemonkit/internal/wire"
 	"github.com/yasyf/daemonkit/internal/wire/wiretest"
 )
@@ -99,6 +100,7 @@ func TestFrozenFixturesMatchRealWire(t *testing.T) {
 			t.Error("the mismatch consumed the whole deadline: a hang, not a typed answer")
 		}
 	})
+	coverage.Observe(t)
 }
 
 func contractServer(t *testing.T, draining bool) string {

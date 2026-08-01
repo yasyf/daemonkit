@@ -12,14 +12,16 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/yasyf/daemonkit/ci/mixedera/coverage"
 )
 
 const (
 	gateScript       = "../../scripts/mixed-era.sh"
 	coverageGate     = "unproven"
 	stubGate         = "stub"
-	redemptionSource = "manifest_test.go"
-	redemptionType   = "redemption"
+	redemptionSource = coveragePackage + "/manifest.go"
+	redemptionType   = "Redemption"
 )
 
 // TestTheGateRefusesExactlyTheUnredeemedStatuses drives the shell's own
@@ -33,16 +35,16 @@ func TestTheGateRefusesExactlyTheUnredeemedStatuses(t *testing.T) {
 	tests := []struct {
 		name     string
 		absence  string
-		redeemed redemption
+		redeemed coverage.Redemption
 	}{
-		{"claimed, evidenced", "", byEvidence},
-		{"claimed, entailed", "", byEntailment},
-		{"claimed, unredeemed", "", unredeemed},
-		{"declared absent, evidenced", "predates the cut", byEvidence},
-		{"declared absent, entailed", "predates the cut", byEntailment},
-		{"declared absent, unredeemed", "predates the cut", unredeemed},
+		{"claimed, evidenced", "", coverage.ByEvidence},
+		{"claimed, entailed", "", coverage.ByEntailment},
+		{"claimed, unredeemed", "", coverage.Unredeemed},
+		{"declared absent, evidenced", "predates the cut", coverage.ByEvidence},
+		{"declared absent, entailed", "predates the cut", coverage.ByEntailment},
+		{"declared absent, unredeemed", "predates the cut", coverage.Unredeemed},
 	}
-	exercised := map[redemption]bool{}
+	exercised := map[coverage.Redemption]bool{}
 	for _, tt := range tests {
 		exercised[tt.redeemed] = true
 	}
@@ -52,16 +54,14 @@ func TestTheGateRefusesExactlyTheUnredeemedStatuses(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			m := &manifest{covered: map[string]map[string]*coverage{
-				cutEra: {mechanismTrustGate: {absence: tt.absence, redeemed: tt.redeemed}},
-			}}
-			status := m.status(cutEra, mechanismTrustGate)
-			want := tt.redeemed == unredeemed
+			status := coverage.StatusOf(tt.absence, tt.redeemed)
+			want := tt.redeemed == coverage.Unredeemed
 			if got := gateRefuses(t, line, coverageRow(cutEra, mechanismTrustGate, status)); got != want {
 				t.Errorf("%s reports %s and %s refuses it = %v, want %v", tt.name, status, gateScript, got, want)
 			}
 		})
 	}
+	coverage.Observe(t)
 }
 
 // TestTheGateReadsOnlyTheSubjectEra pins the coverage line's era filter. The
@@ -70,13 +70,15 @@ func TestTheGateRefusesExactlyTheUnredeemedStatuses(t *testing.T) {
 // over an era that predates the boundary and can no longer be proven.
 func TestTheGateReadsOnlyTheSubjectEra(t *testing.T) {
 	line := gateLine(t, coverageGate)
-	if gateRefuses(t, line,
-		coverageRow(cutEra, mechanismTrustGate, statusProven),
-		coverageRow(precutEra, mechanismTrustGate, statusOpen),
+	if gateRefuses(
+		t, line,
+		coverageRow(cutEra, mechanismTrustGate, coverage.StatusProven),
+		coverageRow(precutEra, mechanismTrustGate, coverage.StatusOpen),
 	) {
 		t.Errorf("a %s row refuses a %s subject whose own rows are all %s, so the coverage line no longer filters on the era",
-			precutEra, cutEra, statusProven)
+			precutEra, cutEra, coverage.StatusProven)
 	}
+	coverage.Observe(t)
 }
 
 // TestTheGateRefusesAStubPeerOnlyForTheSubjectEra drives the coverage line's
@@ -90,14 +92,16 @@ func TestTheGateRefusesAStubPeerOnlyForTheSubjectEra(t *testing.T) {
 		t.Errorf("the %s peer reports a stub era and %s clears it, so a release the cut era's real transport never saw goes out unrefused",
 			cutEra, gateScript)
 	}
-	if gateRefuses(t, line,
+	if gateRefuses(
+		t, line,
 		peerRow(cutEra, cutEra),
 		peerRow(precutEra, "stub"),
-		coverageRow(cutEra, mechanismTrustGate, statusProven),
+		coverageRow(cutEra, mechanismTrustGate, coverage.StatusProven),
 	) {
 		t.Errorf("a %s peer row or a %s coverage row refuses a %s subject whose own peer reports %s, so the peer line no longer reads only the subject era's peer rows",
 			precutEra, cutEra, cutEra, cutEra)
 	}
+	coverage.Observe(t)
 }
 
 // redemptionMembers reads the enum out of the manifest's source because an int

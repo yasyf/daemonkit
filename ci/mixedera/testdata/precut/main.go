@@ -43,6 +43,22 @@ const (
 	probeToken     = "mixedera-precut: trust-verifier-probe-deadline"
 )
 
+// Each proposition below is quoted verbatim from
+// ci/mixedera/testdata/frozen/mechanisms.txt, where the claim each mechanism
+// name denotes is frozen. The manifest refuses this peer if a single byte
+// differs, so the boundary release's column cannot come to answer a different
+// question than the cut era's column does.
+const (
+	propositionFrame            = "a packet the relay copied carries that era's frozen 6-byte frame identity at the head of its body: the DKS1 magic and the era's own protocol number"
+	propositionGate             = "a handshake between the two eras is promptly refused as a typed protocol mismatch"
+	propositionSession          = "a client and a daemon at one protocol complete a request and its response over one unix socket"
+	propositionSigterm          = "SIGTERM ends the daemon at exit status 0"
+	propositionPreamble         = "a connection whose first bytes are the frozen two-byte drain preamble drains the daemon it reaches"
+	propositionPreambleEmitted  = "a daemon already draining answers a handshake it is still reading with exactly the frozen two-byte preamble and nothing else"
+	propositionTrustGate        = "the drain an inbound frozen preamble admits is still authorized by Trust.Control, the preamble sitting above the trust gate, so an untrusted peer's preamble leaves the incumbent running"
+	propositionControlTrustGate = "a drain arriving on the control lane is authorized by Trust.Control: one peer's drain of a daemon whose control lane names a requirement that peer cannot prove is refused untrusted, that daemon still completes the same peer's session at one protocol on the socket it refused the drain from, and that same peer's drain of a daemon naming no control requirement is honoured, reaping the pid of the daemon it stopped"
+)
+
 type healthReport struct {
 	WireBuild string `json:"wire_build"`
 	Protocol  int    `json:"protocol"`
@@ -62,10 +78,15 @@ type report struct {
 	StopAcked    bool         `json:"stop_acked,omitempty"`
 }
 
+type verdict struct {
+	Proposition string `json:"proposition"`
+	Absence     string `json:"absence,omitempty"`
+}
+
 type conformance struct {
-	Era        string            `json:"era"`
-	Protocol   uint16            `json:"protocol"`
-	Mechanisms map[string]string `json:"mechanisms"`
+	Era        string             `json:"era"`
+	Protocol   uint16             `json:"protocol"`
+	Mechanisms map[string]verdict `json:"mechanisms"`
 }
 
 func main() {
@@ -96,13 +117,27 @@ func main() {
 func declare() error {
 	return json.NewEncoder(os.Stdout).Encode(conformance{
 		Era: era, Protocol: wire.ProtocolVersion,
-		Mechanisms: map[string]string{
-			"frame-v1":                  "",
-			"protocol-gate":             "",
-			"session":                   "",
-			"drain-sigterm":             "",
-			"drain-preamble":            "predates the cut: a pre-cut server reads its first bytes as a frame length, so SIGTERM is the only repair channel that reaches a pre-cut incumbent",
-			"drain-preamble-trust-gate": "predates the cut: there is no preamble to gate",
+		Mechanisms: map[string]verdict{
+			"frame-v1":      {Proposition: propositionFrame},
+			"protocol-gate": {Proposition: propositionGate},
+			"session":       {Proposition: propositionSession},
+			"drain-sigterm": {Proposition: propositionSigterm},
+			"drain-preamble": {
+				Proposition: propositionPreamble,
+				Absence:     "predates the cut: a pre-cut server reads its first bytes as a frame length, so SIGTERM is the only repair channel that reaches a pre-cut incumbent",
+			},
+			"drain-preamble-emitted": {
+				Proposition: propositionPreambleEmitted,
+				Absence:     "predates the cut: the pre-cut wire carries no drain preamble in either direction, so a draining pre-cut daemon has none to emit",
+			},
+			"drain-preamble-trust-gate": {
+				Proposition: propositionTrustGate,
+				Absence:     "predates the cut: there is no preamble to gate",
+			},
+			"drain-control-trust-gate": {
+				Proposition: propositionControlTrustGate,
+				Absence:     "predates the cut: the pre-cut wire has no control lane, so no lane-scoped requirement exists for a drain to be authorized against",
+			},
 		},
 	})
 }

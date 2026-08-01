@@ -3,6 +3,7 @@
 package mixedera
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/yasyf/daemonkit/ci/mixedera/coverage"
 )
 
 const (
@@ -135,12 +138,54 @@ func (r *relay) witness(t *testing.T, crossings []exchange) {
 				if !carriesFramePrefix(side.observed, prefix) {
 					continue
 				}
-				observedPresent(t, era, mechanismFrame, fromWire, fmt.Sprintf(
+				coverage.ObservedPresent(t, era, mechanismFrame, coverage.FromWire, fmt.Sprintf(
 					"the relay at %s copied the frozen %s frame prefix %#x on the %s side of connection %d of %d",
 					r.path, era, prefix, side.name, i+1, len(crossings),
 				))
 			}
 		}
+	}
+}
+
+// carried reports whether some connection the relay copied opened with exactly
+// these bytes and wrote nothing after them, waiting out the copy. It is what
+// makes an absence redeemable: the stimulus the daemon then ignored crossed a
+// process the case does not write to.
+func (r *relay) carried(opening []byte, within time.Duration) bool {
+	deadline := time.Now().Add(within)
+	for {
+		crossings, _ := r.sample()
+		for _, crossing := range crossings {
+			if bytes.Equal(crossing.opened, opening) {
+				return true
+			}
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(intakePoll)
+	}
+}
+
+// awaitCrossed waits until the relay has carried some connection's opening
+// bytes upstream. A relay dials its upstream from the goroutine that accepted,
+// so a dial the caller has already returned from does not yet mean the daemon
+// has a connection at all: a drain begun in that window closes the listener
+// under the relay, which then closes the connection rather than parking it.
+func (r *relay) awaitCrossed(t *testing.T, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for {
+		crossings, _ := r.sample()
+		for _, crossing := range crossings {
+			if len(crossing.opened) > 0 {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the relay at %s carried nothing upstream within %s", r.path, within)
+		}
+		time.Sleep(intakePoll)
 	}
 }
 

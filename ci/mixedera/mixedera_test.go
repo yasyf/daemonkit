@@ -12,15 +12,29 @@
 // 18,999 handshake failures over five days, behind green CI in every repo.
 // DESIGN §8.4 makes this gate non-waivable on every release.
 //
-// Every observation the matrix owes is frozen in testdata/frozen/observations.txt
-// rather than derived from this file, and each claim is redeemed against an
-// artifact its case cannot fabricate, so a case that goes missing or stops doing
-// work takes the run red instead of quietly shrinking the matrix.
+// The verdict is not this package's to write. Every observation the matrix owes
+// is frozen in testdata/frozen/observations.txt and every mechanism it names in
+// testdata/frozen/mechanisms.txt, both read on every access rather than held
+// parsed; and the state those two files govern — the coverage rows, the ledger
+// of observations, the evidence journal, the seal over the frozen text — lives
+// in ci/mixedera/coverage, which exports the redemption verbs and nothing this
+// package can assign. What is left here is the harness: it builds the two era
+// peers, drives them at each other, and observes. It cannot write a row
+// redeemed, mark a claim observed, drop an era from the record, file a fact past
+// the witness mechanisms.txt reserves, or rewrite the frozen text it reads —
+// each of those is a compile error rather than a finding.
+//
+// What no package boundary reaches is this harness misreporting what it saw. A
+// witness here is free to branch on the wrong value, and
+// (*daemonProc).witnessDrain attributes a clean exit to SIGTERM on a field this
+// package sets when it signals. Those are edits to a witness body, where a
+// reviewer reads them.
 package mixedera
 
 import (
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
@@ -28,8 +42,28 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/daemonkit/ci/mixedera/coverage"
 	"github.com/yasyf/daemonkit/version"
 )
+
+const (
+	summaryEnv  = "GITHUB_STEP_SUMMARY"
+	coverageEnv = "MIXED_ERA_COVERAGE"
+)
+
+func TestMain(m *testing.M) {
+	into := coverage.Destinations{Record: os.Getenv(coverageEnv), Summary: os.Getenv(summaryEnv)}
+	if err := coverage.Bind(into); err != nil {
+		fmt.Fprintf(os.Stderr, "mixed-era: %v\n", err)
+		os.Exit(1)
+	}
+	code := m.Run()
+	if err := coverage.Settle(code == 0); err != nil {
+		fmt.Fprintf(os.Stderr, "mixed-era: %v\n", err)
+		code = 1
+	}
+	os.Exit(code)
+}
 
 const (
 	precutBuildA = "mixedera.precut.a"
@@ -40,12 +74,17 @@ const (
 
 	refuseBound             = 10 * time.Second
 	maxHandshakeConnections = 4
+
+	// cutLabel is the daemonkit.Label ci/mixedera/cutpeer serves under, which
+	// with the state root the harness hands that process is what every path the
+	// cut daemon owns derives from.
+	cutLabel = "mixedera"
 )
 
 type peers struct {
 	precut  peer
 	cut     peer
-	covered *manifest
+	covered *coverage.Manifest
 }
 
 type gateCase struct {
@@ -79,7 +118,7 @@ var gateCases = []gateCase{
 			if err := daemon.exitWithin(t, drainWait); err != nil {
 				t.Errorf("pre-cut daemon exited %v\nstderr:\n%s", err, daemon.log.String())
 			}
-			p.covered.redeem(t, precutEra, mechanismSession, mechanismFrame)
+			p.covered.Redeem(t, precutEra, mechanismSession, mechanismFrame)
 		},
 	},
 	{
@@ -96,11 +135,11 @@ var gateCases = []gateCase{
 					result.Protocol, result.PeerProtocol, cutProtocol)
 			}
 			assertBothSidesFramed(t, front.quiesce(t), cutEra, cutEra)
-			writePreamble(t, daemon)
+			daemon.terminate(t)
 			if err := daemon.exitWithin(t, drainWait); err != nil {
 				t.Errorf("cut daemon exited %v\nstderr:\n%s", err, daemon.log.String())
 			}
-			p.covered.redeem(t, cutEra, mechanismSession, mechanismFrame)
+			p.covered.Redeem(t, cutEra, mechanismSession, mechanismFrame)
 		},
 	},
 	{
@@ -135,8 +174,8 @@ var gateCases = []gateCase{
 				"dial", "-socket", front.path, "-build", precutBuildA)
 			assertCrispRefusal(t, result, elapsed, front, precutEra, cutEra)
 			daemon.aliveAfter(t, aliveSettle)
-			p.covered.redeem(t, precutEra, mechanismGate)
-			p.covered.redeem(t, cutEra, mechanismGate)
+			p.covered.Redeem(t, precutEra, mechanismGate)
+			p.covered.Redeem(t, cutEra, mechanismGate)
 		},
 	},
 	{
@@ -151,8 +190,8 @@ var gateCases = []gateCase{
 					result.PeerProtocol, precutProtocol)
 			}
 			daemon.aliveAfter(t, aliveSettle)
-			p.covered.redeem(t, cutEra, mechanismGate)
-			p.covered.redeem(t, precutEra, mechanismGate)
+			p.covered.Redeem(t, cutEra, mechanismGate)
+			p.covered.Redeem(t, precutEra, mechanismGate)
 			daemon.terminate(t)
 			_ = daemon.exitWithin(t, drainWait)
 		},
@@ -172,7 +211,7 @@ var gateCases = []gateCase{
 				t.Errorf("SIGTERM ends the pre-cut daemon cleanly; got %v\nstderr:\n%s",
 					err, daemon.log.String())
 			}
-			p.covered.redeem(t, precutEra, mechanismSigterm)
+			p.covered.Redeem(t, precutEra, mechanismSigterm)
 		},
 	},
 	{
@@ -184,19 +223,7 @@ var gateCases = []gateCase{
 				t.Errorf("the cut daemon arms signals first and drains, so SIGTERM ends it cleanly; got %v\nstderr:\n%s",
 					err, daemon.log.String())
 			}
-			p.covered.redeem(t, cutEra, mechanismSigterm)
-		},
-	},
-	{
-		name: "drain/preamble",
-		run: func(t *testing.T, p *peers) {
-			daemon := startCut(t, p.cut)
-			writePreamble(t, daemon)
-			if err := daemon.exitWithin(t, drainWait); err != nil {
-				t.Errorf("the frozen preamble drained the cut daemon into %v\nstderr:\n%s",
-					err, daemon.log.String())
-			}
-			p.covered.redeem(t, cutEra, mechanismPreamble)
+			p.covered.Redeem(t, cutEra, mechanismSigterm)
 		},
 	},
 	{
@@ -204,25 +231,45 @@ var gateCases = []gateCase{
 		run: func(t *testing.T, p *peers) {
 			daemon := startCut(t, p.cut)
 			front := newRelay(t, daemon.socket)
-			result, _ := runPeer(t, p.cut, peerWait, "drain", "-socket", front.path)
-			if result.Failure != "" {
-				t.Fatalf("the cut client's drain failed: %+v", result)
-			}
-			assertPreambleCrossed(t, daemon, front.quiesce(t))
+			held := parkHandshake(t, front)
+			daemon.terminate(t)
+			awaitIntakeClosed(t, daemon.socket, drainWait)
+			assertPreambleAnswered(t, held.answer(t), front.quiesce(t))
 			if err := daemon.exitWithin(t, drainWait); err != nil {
-				t.Errorf("cut daemon exited %v\nstderr:\n%s", err, daemon.log.String())
+				t.Errorf("the cut daemon that answered the parked handshake with the frozen preamble exited %v\nstderr:\n%s",
+					err, daemon.log.String())
 			}
-			p.covered.redeem(t, cutEra, mechanismPreamble)
+			p.covered.Redeem(t, cutEra, mechanismPreambleEmitted)
+		},
+	},
+	{
+		name: "drain/control-trust-gate",
+		run: func(t *testing.T, p *peers) {
+			strict := startCut(t, p.cut, "-strict")
+			refused, _ := runPeer(t, p.cut, peerWait, "drain", "-home", strict.home)
+			strict.aliveAfter(t, aliveSettle)
+			served, _ := runPeer(t, p.cut, peerWait, "dial", "-socket", strict.socket)
+
+			open := startCut(t, p.cut)
+			honoured, _ := runPeer(t, p.cut, peerWait, "drain", "-home", open.home)
+			if err := open.exitWithin(t, drainWait); err != nil {
+				t.Errorf("the drained cut daemon exited %v\nstderr:\n%s", err, open.log.String())
+			}
+			witnessControlTrustGate(t, refused, served, honoured, strict, open)
+			strict.terminate(t)
+			_ = strict.exitWithin(t, drainWait)
+			p.covered.Redeem(t, cutEra, mechanismControlTrustGate)
 		},
 	},
 	{
 		name: "drain/preamble-absent-precut",
 		run: func(t *testing.T, p *peers) {
 			daemon := startPrecut(t, p.precut, precutBuildA)
-			conn := writePreamble(t, daemon)
-			daemon.aliveAfter(t, preambleSettle)
+			front := newRelay(t, daemon.socket)
+			conn := writePreamble(t, front)
+			daemon.witnessPreamble(t, front, preambleSettle)
 			awaitPeerClose(t, conn, aliveSettle)
-			p.covered.redeem(t, precutEra, mechanismPreamble, mechanismTrustGate)
+			p.covered.Redeem(t, precutEra, mechanismPreamble, mechanismTrustGate)
 			daemon.terminate(t)
 			_ = daemon.exitWithin(t, drainWait)
 		},
@@ -238,13 +285,17 @@ var gateCases = []gateCase{
 			assertCrispRefusal(t, wedged, elapsed, front, precutEra, cutEra)
 			daemon.aliveAfter(t, aliveSettle)
 
-			writePreamble(t, daemon)
+			repaired, _ := runPeer(t, p.cut, peerWait, "drain", "-home", daemon.home)
+			if repaired.Failure != "" || repaired.Reap != reapAbsent {
+				t.Fatalf("the incumbent that refused the handshake answered its own repair channel with %+v, want a delivered drain reaping %q",
+					repaired, reapAbsent)
+			}
 			if err := daemon.exitWithin(t, drainWait); err != nil {
 				t.Errorf("the incumbent that refused the handshake did not drain: %v\nstderr:\n%s",
 					err, daemon.log.String())
 			}
-			p.covered.redeem(t, cutEra, mechanismPreamble, mechanismGate)
-			p.covered.redeem(t, precutEra, mechanismGate)
+			p.covered.Redeem(t, cutEra, mechanismGate)
+			p.covered.Redeem(t, precutEra, mechanismGate)
 		},
 	},
 }
@@ -289,7 +340,7 @@ func TestProbeDeadlineNeedsBothTheStatusAndTheToken(t *testing.T) {
 			}
 		})
 	}
-	observe(t)
+	coverage.Observe(t)
 }
 
 func probeFailure(t *testing.T, code int, stderr string) error {
@@ -306,7 +357,7 @@ func TestPrecutBoundaryPredatesTheCut(t *testing.T) {
 		t.Fatalf("boundary %s is not older than the cut's first release %s: the pre-cut peer would compile against the rewrite",
 			precutBoundary, buildSkewDemotion)
 	}
-	observe(t)
+	coverage.Observe(t)
 }
 
 func TestMixedEra(t *testing.T) {
@@ -316,16 +367,16 @@ func TestMixedEra(t *testing.T) {
 		precut: buildPeer(t, precutEra),
 		cut:    buildPeer(t, cutEra),
 	}
-	p.covered = newManifest(t, precutBoundary, p.precut, p.cut)
-	t.Cleanup(func() { p.covered.finish(t) })
+	p.covered = coverage.NewManifest(t, precutBoundary, declaredBy(t, p.precut), declaredBy(t, p.cut))
+	t.Cleanup(func() { p.covered.Finish(t) })
 
 	for _, gate := range gateCases {
 		t.Run(gate.name, func(t *testing.T) {
 			gate.run(t, p)
-			observe(t)
+			coverage.Observe(t)
 		})
 	}
-	observe(t)
+	coverage.Observe(t)
 }
 
 // assertCrispRefusal redeems the daemon era's gate off the wire: the relay saw
@@ -351,10 +402,10 @@ func assertCrispRefusal(
 			len(crossings), maxHandshakeConnections)
 	}
 	answered := assertBothSidesFramed(t, crossings, clientEra, daemonEra)
-	if !answered || result.Failure != failureProtocolMismatch {
+	if !answered || result.Failure != failureProtocolMismatch || elapsed > refuseBound {
 		return
 	}
-	observedPresent(t, daemonEra, mechanismGate, fromWire, fmt.Sprintf(
+	coverage.ObservedPresent(t, daemonEra, mechanismGate, coverage.FromWire, fmt.Sprintf(
 		"the %s daemon answered each of the %d connections the refused %s client opened with its own frozen frame prefix, and that client read a typed %s out of the answer",
 		daemonEra, len(crossings), clientEra, failureProtocolMismatch,
 	))
@@ -442,8 +493,11 @@ func probeDeadline(err error) (bool, string) {
 		fmt.Sprintf("exited %d %s", exit.ExitCode(), saw)
 }
 
-func startCut(t *testing.T, p peer) *daemonProc {
+func startCut(t *testing.T, p peer, args ...string) *daemonProc {
 	t.Helper()
-	socket := filepath.Join(socketDir(t), "d.sock")
-	return startDaemon(t, p, socket, "serve", "-socket", socket)
+	home := socketDir(t)
+	daemon := startDaemon(t, p, filepath.Join(home, cutLabel, "daemon.sock"),
+		append([]string{"serve", "-home", home}, args...)...)
+	daemon.home = home
+	return daemon
 }

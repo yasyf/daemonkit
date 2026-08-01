@@ -21,11 +21,14 @@
 # the coverage table whole and its body free to be emptied unnoticed; the clause
 # makes that deletion an edit here, in front of a reviewer.
 
+case TestEveryFactReachesTheJournalThroughItsFrozenWitness asserts every fact this package files reaches the journal from the site mechanisms.txt reserves for it, and every site that file reserves files one
+case TestEveryRegisteredWitnessBranchesOnWhatItWasHanded asserts every site mechanisms.txt registers as a witness branches on the receiver or on an argument it was handed before it files, so no witness merely formats what it is passed
+case TestFrozenFixturesMatchRealWire asserts the frozen preamble and frame-prefix fixtures are the bytes internal/wire really writes, so the matrix redeems against the transport rather than against a copy of it
 case TestFrozenFramePrefixes asserts the two eras carry well-formed frame prefixes that differ, which is what lets either answer the other with a typed mismatch
 case TestFrozenPreambleCannotOpenAFrame asserts the frozen drain preamble opens a body larger than every frame cap in the fleet, so no era can mistake it for a frame
 case TestMixedEra asserts nothing of its own: it builds the two era peers, freezes the coverage manifest, and runs the matrix below
 case TestMixedEra/classify/cut asserts the cut peer's own unit tests pass, which is where that peer's failure classification is checked
-case TestMixedEra/drain/preamble
+case TestMixedEra/drain/control-trust-gate
 case TestMixedEra/drain/preamble-absent-precut
 case TestMixedEra/drain/preamble-emitted
 case TestMixedEra/drain/sigterm-cut
@@ -39,10 +42,13 @@ case TestMixedEra/wedge/18999
 case TestPrecutBoundaryPredatesTheCut asserts the pinned boundary release is older than the release that demoted the build gate, so the pre-cut peer cannot be compiled against the rewrite
 case TestProbeDeadlineNeedsBothTheStatusAndTheToken asserts the pre-cut start retries on the released peer's full probe signature and on nothing else
 case TestRelayCapturesEveryConnectionSeparately asserts the relay keeps each connection's bytes separate, which every claim redeemed against the wire depends on
-claim TestMixedEra/drain/preamble cut drain-preamble evidenced
+case TestTheGateReadsOnlyTheSubjectEra asserts the release gate reads coverage rows for the subject era alone, so a row of an era that predates the boundary cannot refuse a release
+case TestTheGateRefusesAStubPeerOnlyForTheSubjectEra asserts the release gate refuses a subject peer that names another era and reads no other era's peer row
+case TestTheGateRefusesExactlyTheUnredeemedStatuses asserts the release gate refuses every unredeemed status the manifest can report and no redeemed one
+claim TestMixedEra/drain/control-trust-gate cut drain-control-trust-gate evidenced
 claim TestMixedEra/drain/preamble-absent-precut precut drain-preamble evidenced
 claim TestMixedEra/drain/preamble-absent-precut precut drain-preamble-trust-gate entailed-by precut drain-preamble
-claim TestMixedEra/drain/preamble-emitted cut drain-preamble evidenced
+claim TestMixedEra/drain/preamble-emitted cut drain-preamble-emitted evidenced
 claim TestMixedEra/drain/sigterm-cut cut drain-sigterm evidenced
 claim TestMixedEra/drain/sigterm-precut precut drain-sigterm evidenced
 claim TestMixedEra/refuse/cut-client-precut-daemon cut protocol-gate evidenced
@@ -53,6 +59,5 @@ claim TestMixedEra/session/cut cut frame-v1 evidenced
 claim TestMixedEra/session/cut cut session evidenced
 claim TestMixedEra/session/precut precut frame-v1 evidenced
 claim TestMixedEra/session/precut precut session evidenced
-claim TestMixedEra/wedge/18999 cut drain-preamble evidenced
 claim TestMixedEra/wedge/18999 cut protocol-gate evidenced
 claim TestMixedEra/wedge/18999 precut protocol-gate evidenced

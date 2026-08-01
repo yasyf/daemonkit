@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/yasyf/daemonkit/ci/mixedera/coverage"
 )
 
 func echoUpstream(t *testing.T) string {
@@ -75,5 +77,5 @@ func TestRelayCapturesEveryConnectionSeparately(t *testing.T) {
 			t.Errorf("connection %d was answered with %q, want %q", i+1, crossings[i].answered, want)
 		}
 	}
-	observe(t)
+	coverage.Observe(t)
 }

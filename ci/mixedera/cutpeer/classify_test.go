@@ -7,8 +7,32 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/daemonkit/internal/wire"
 )
+
+func TestClassifyControlSeparatesTheTrustRefusalFromEveryOtherFailure(t *testing.T) {
+	tests := []struct {
+		name    string
+		err     error
+		failure string
+	}{
+		{"a trust refusal", daemonkit.ErrUntrusted, failureUntrusted},
+		{"a trust refusal under a wrap", fmt.Errorf("attach: %w", daemonkit.ErrUntrusted), failureUntrusted},
+		{"an incumbent already leaving", daemonkit.ErrDraining, failureDraining},
+		{"no listener at all", daemonkit.ErrAbsent, failureAbsent},
+		{"a drain whose exit went unobserved", daemonkit.ErrUnsettled, failureUnsettled},
+		{"the wrong incumbent", daemonkit.ErrWrongIncumbent, failureRefused},
+		{"anything else is transport", errors.New("dial unix: connection refused"), failureTransport},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyControl(tt.err).Failure; got != tt.failure {
+				t.Errorf("failure = %q, want %q", got, tt.failure)
+			}
+		})
+	}
+}
 
 func TestClassifyDialCallsItAMismatchOnlyWhenItCarriesThePeerProtocol(t *testing.T) {
 	tests := []struct {

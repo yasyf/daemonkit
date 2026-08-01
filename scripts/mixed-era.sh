@@ -25,7 +25,7 @@ fi
 stub=$(awk -F'\t' -v s="$subject" '$1 == "peer" && $2 == s && $3 != s { print $3 }' "$record")
 if [ -n "$stub" ]; then
 	echo "mixed-era: this release drives a \"$stub\" peer; the $subject era's real transport is not under test" >&2
-	echo "mixed-era: phase 2 replaces that peer. Until it does no tag can clear this gate, which is why release.yml does not list this workflow among the release job's needs." >&2
+	echo "mixed-era: a peer the harness builds for the $subject era has to name that era in its own conformance, and this one declared \"$stub\" instead — a stand-in wearing the $subject label. No tag clears this gate while the two disagree." >&2
 	status=1
 fi
 

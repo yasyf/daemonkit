@@ -1,6 +1,161 @@
-frame-v1
-protocol-gate
-session
-drain-sigterm
-drain-preamble
-drain-preamble-trust-gate
+# Every mechanism the mixed-era matrix names, one stanza each:
+#
+#   mechanism   <name>
+#   witness     <process|wire|peer> <the one function that may file that
+#                 mechanism's evidence of that class>
+#   era         <era> claimed|absent
+#   entailed-by <era> <mechanism>  (optional, repeatable per era)
+#   proposition <the exact claim the name denotes>
+#
+# Five things are frozen here, and the run refuses each one where this file and
+# the tree disagree:
+#
+#   the proposition — every era peer quotes its mechanism's proposition back in
+#     the conformance it declares, and the manifest refuses a peer whose text
+#     differs by a byte, so the two eras' columns cannot come to answer
+#     different questions;
+#   the name — no name twice, and no two names carrying one proposition, so a
+#     name cannot be aimed at what another name already denotes;
+#   the disposition — a peer claiming an era this file calls absent, or
+#     declaring an absence for an era it calls claimed, is refused, so dropping
+#     a peer's absence to turn an UNPROVEN row PROVEN is an edit here;
+#   the witness — a fact reaches the journal only from the site named for its
+#     mechanism and class, so an observation one witness already made cannot be
+#     filed a second time under another mechanism's name;
+#   the entailment — a row carried on another row's artifact rather than on one
+#     of its own is refused unless an "entailed-by" line above declares that
+#     exact pair, for that era, between two rows this file disposes of the same
+#     way. A mechanism naming no witness is redeemable by entailment alone, and
+#     one naming no entailment cannot be carried at all.
+#
+# A proposition is exactly what its witness observes, no wider: a clause the
+# matrix never checks makes a PROVEN cell mean less than it reads.
+#
+# WHAT THE COMPILER REFUSES
+#
+#   Everything this gate's verdict is made of lives in package
+#   ci/mixedera/coverage, and the harness in ci/mixedera imports that package
+#   rather than declaring it. None of that state is exported: not the coverage
+#   row a release is gated on, not the ledger of which observations happened,
+#   not the evidence journal, not the map of eras a record is rendered from, not
+#   the seal over these frozen files. So none of this compiles, from a case body
+#   or from anywhere else in the harness:
+#
+#     writing a row redeemed — the redemption verb decides, against the journal;
+#     marking a claim observed — a case marks its own line and nothing else, and
+#       a claim's line is marked only by the redemption that earned it, so a
+#       case emptied to bookkeeping reports nothing;
+#     dropping an era from the manifest, or building one that never covered it:
+#       every era this file disposes of has to be declared, so no record is left
+#       with nothing in it to refuse;
+#     appending to the evidence journal — the two observers are the only way in,
+#       and the witness binding runs inside them;
+#     re-sealing, or writing the sealed text, so that a later read sees a
+#       different file than the run started on.
+#
+#   Those five are the moves that cleared this gate as it stood before this
+#   pass, each one a line or two inside a case body. They are refused by the
+#   compiler now, rather than reported by an audit.
+#
+# WHAT THIS TEXT STILL BINDS
+#
+#   the five freezes above — proposition, name, disposition, witness,
+#     entailment — read back out of this file on every single read, so nothing
+#     holds a parsed copy of it, and a run that finds a frozen file no longer
+#     the one it started on carries no verdict.
+#   a registered witness branches. Every function named on a "witness" line is
+#     read out of the harness's own source and refused if it files a fact and
+#     nothing in its body branches on the receiver or on an argument it was
+#     handed.
+#   redemption follows a declared relation. Evidence redeems only the mechanism
+#     whose registered witness filed it, and an entailment redeems only along an
+#     "entailed-by" line above, at matching polarity, with the antecedent
+#     redeemed by evidence in that same case.
+#
+#   None of that refuses a redefinition carried through consistently — rewritten
+#   here and in both era peers, or flipped here and in the peer that declared
+#   it. That is by design: what this file buys is that the change is legible, in
+#   this commit, not that it is impossible.
+#
+# WHAT REMAINS POSSIBLE, AND FOR WHOM
+#
+#   What is left is the harness misreporting what it saw. Two shapes are known,
+#   and neither is closed:
+#
+#     daemonProc.signalled is the whole of drain-sigterm's attribution to
+#       SIGTERM, and it is an ordinary field of the harness's own process
+#       handle. A case body that sets it without signalling gets an exit the OS
+#       really reaped filed under a repair channel nothing used, and
+#       (*daemonProc).witnessDrain passes the branch audit precisely because it
+#       branches on that receiver. It is one of a class, not a lone oversight:
+#       every artifact this harness captures sits in the harness's own memory —
+#       the bytes the relay copied, the channel a process exit arrives on, this
+#       flag — and the boundary that would enclose that class encloses process
+#       spawning and socket serving, which is not what a coverage package is,
+#       and would not help anyway: the harness would still be the caller
+#       reporting what it saw. So this is a flag inside a case body, and it
+#       stays one.
+#     a registered witness gutted to a branch that decides nothing — always
+#       true, or placed after the filing call, or sitting in an unrelated
+#       closure — still passes the branch audit, which walks the body flat with
+#       no dominance or ordering analysis. Refusing that needs a decision
+#       procedure this gate does not have.
+#
+#   The record is also still written by the run that produces it; forming a
+#   verdict outside the run is the phase-2 TODO in ci/mixedera/coverage.
+#
+#   Which is the shape of the thing. This gate is built against drift and
+#   accident — a case deleted, a run filtered down by -run, a rename that
+#   orphans a requirement, a peer built against the wrong era, an absence
+#   quietly dropped, a name repointed at another claim — and not against its own
+#   author. A cross-era coverage gate is for the first. Nothing arranged inside
+#   one repository is for the second.
+
+mechanism frame-v1
+  witness wire (*relay).witness
+  era precut claimed
+  era cut claimed
+  proposition a packet the relay copied carries that era's frozen 6-byte frame identity at the head of its body: the DKS1 magic and the era's own protocol number
+
+mechanism protocol-gate
+  witness wire assertCrispRefusal
+  witness peer witnessVerdict
+  era precut claimed
+  era cut claimed
+  proposition a handshake between the two eras is promptly refused as a typed protocol mismatch
+
+mechanism session
+  witness peer witnessVerdict
+  era precut claimed
+  era cut claimed
+  proposition a client and a daemon at one protocol complete a request and its response over one unix socket
+
+mechanism drain-sigterm
+  witness process (*daemonProc).witnessDrain
+  era precut claimed
+  era cut claimed
+  proposition SIGTERM ends the daemon at exit status 0
+
+mechanism drain-preamble
+  witness process (*daemonProc).witnessPreamble
+  era precut absent
+  era cut absent
+  proposition a connection whose first bytes are the frozen two-byte drain preamble drains the daemon it reaches
+
+mechanism drain-preamble-emitted
+  witness wire assertPreambleAnswered
+  era precut absent
+  era cut claimed
+  proposition a daemon already draining answers a handshake it is still reading with exactly the frozen two-byte preamble and nothing else
+
+mechanism drain-preamble-trust-gate
+  era precut absent
+  era cut absent
+  entailed-by precut drain-preamble
+  proposition the drain an inbound frozen preamble admits is still authorized by Trust.Control, the preamble sitting above the trust gate, so an untrusted peer's preamble leaves the incumbent running
+
+mechanism drain-control-trust-gate
+  witness peer witnessControlTrustGate
+  era precut absent
+  era cut claimed
+  proposition a drain arriving on the control lane is authorized by Trust.Control: one peer's drain of a daemon whose control lane names a requirement that peer cannot prove is refused untrusted, that daemon still completes the same peer's session at one protocol on the socket it refused the drain from, and that same peer's drain of a daemon naming no control requirement is honoured, reaping the pid of the daemon it stopped

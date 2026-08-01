@@ -10,25 +10,29 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/yasyf/daemonkit/ci/mixedera/coverage"
 )
 
 const (
-	preambleFixture  = "drain-preamble"
-	precutFixture    = "frame-prefix-precut"
-	cutFixture       = "frame-prefix-cut"
-	mechanismFixture = "mechanisms.txt"
+	preambleFixture = "drain-preamble"
+	precutFixture   = "frame-prefix-precut"
+	cutFixture      = "frame-prefix-cut"
 
-	mechanismFrame     = "frame-v1"
-	mechanismGate      = "protocol-gate"
-	mechanismSession   = "session"
-	mechanismSigterm   = "drain-sigterm"
-	mechanismPreamble  = "drain-preamble"
-	mechanismTrustGate = "drain-preamble-trust-gate"
+	precutEra = coverage.PrecutEra
+	cutEra    = coverage.CutEra
+
+	mechanismFrame            = "frame-v1"
+	mechanismGate             = "protocol-gate"
+	mechanismSession          = "session"
+	mechanismSigterm          = "drain-sigterm"
+	mechanismPreamble         = "drain-preamble"
+	mechanismPreambleEmitted  = "drain-preamble-emitted"
+	mechanismTrustGate        = "drain-preamble-trust-gate"
+	mechanismControlTrustGate = "drain-control-trust-gate"
 
 	framePrefixOffset = 4
 	framePrefixBytes  = 6
@@ -36,35 +40,9 @@ const (
 	cutProtocol       = 2
 
 	preambleFrameBody = 1146224640
+
+	intakePoll = 5 * time.Millisecond
 )
-
-func readFrozen(name string) ([]string, error) {
-	raw, err := os.ReadFile(filepath.Join("testdata", "frozen", name))
-	if err != nil {
-		return nil, err
-	}
-	var lines []string
-	for line := range strings.Lines(string(raw)) {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		lines = append(lines, line)
-	}
-	if len(lines) == 0 {
-		return nil, fmt.Errorf("frozen fixture %s carries nothing", name)
-	}
-	return lines, nil
-}
-
-func frozenLines(t *testing.T, name string) []string {
-	t.Helper()
-	lines, err := readFrozen(name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return lines
-}
 
 func frameFixture(era string) string {
 	switch era {
@@ -83,7 +61,7 @@ func carriesFramePrefix(observed, want []byte) bool {
 
 func frozen(t *testing.T, name string) []byte {
 	t.Helper()
-	decoded, err := hex.DecodeString(strings.Join(frozenLines(t, name+".hex"), ""))
+	decoded, err := hex.DecodeString(strings.Join(coverage.FrozenLines(name+".hex"), ""))
 	if err != nil {
 		t.Fatalf("frozen fixture %s: %v", name, err)
 	}
@@ -119,7 +97,7 @@ func TestFrozenFramePrefixes(t *testing.T) {
 	if bytes.Equal(frozen(t, precutFixture), frozen(t, cutFixture)) {
 		t.Error("the two eras carry one frame identity, so neither can answer the other with a typed mismatch")
 	}
-	observe(t)
+	coverage.Observe(t)
 }
 
 func TestFrozenPreambleCannotOpenAFrame(t *testing.T) {
@@ -147,14 +125,17 @@ func TestFrozenPreambleCannotOpenAFrame(t *testing.T) {
 			}
 		})
 	}
-	observe(t)
+	coverage.Observe(t)
 }
 
-func writePreamble(t *testing.T, d *daemonProc) net.Conn {
+// writePreamble opens the preamble connection through the relay rather than
+// straight at the daemon, so what reached that daemon is bytes a third process
+// copied instead of a flag this case set on itself.
+func writePreamble(t *testing.T, front *relay) net.Conn {
 	t.Helper()
-	conn, err := net.Dial("unix", d.socket)
+	conn, err := net.Dial("unix", front.path)
 	if err != nil {
-		t.Fatalf("dial %s: %v", d.socket, err)
+		t.Fatalf("dial %s: %v", front.path, err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
 	if err := conn.SetWriteDeadline(time.Now().Add(drainWait)); err != nil {
@@ -163,23 +144,90 @@ func writePreamble(t *testing.T, d *daemonProc) net.Conn {
 	if _, err := conn.Write(frozen(t, preambleFixture)); err != nil {
 		t.Fatalf("write the frozen preamble: %v", err)
 	}
-	d.preambled = true
 	return conn
 }
 
-// assertPreambleCrossed redeems nothing on its own: it establishes that the
-// bytes the relay copied were exactly the frozen preamble, so a later clean
-// exit of d is evidence the preamble drained it.
-func assertPreambleCrossed(t *testing.T, d *daemonProc, crossings []exchange) {
+// parked is one handshake held across the drain edge. A cut daemon emits the
+// frozen preamble only to a peer whose hello it is still reading when the drain
+// begins — it closes its listener as the shutdown ladder's first stage, so no
+// connection opened after that edge reaches the wire at all — and holding back
+// the hello's last byte is how the harness puts a peer in exactly that state.
+type parked struct {
+	conn net.Conn
+	tail []byte
+}
+
+func parkHandshake(t *testing.T, front *relay) *parked {
 	t.Helper()
-	if len(crossings) != 1 {
-		t.Fatalf("the drain crossed %d connections, want exactly 1", len(crossings))
+	conn, err := net.Dial("unix", front.path)
+	if err != nil {
+		t.Fatalf("dial %s: %v", front.path, err)
 	}
+	t.Cleanup(func() { _ = conn.Close() })
+	if err := conn.SetDeadline(time.Now().Add(drainWait)); err != nil {
+		t.Fatal(err)
+	}
+	hello := helloPacket(t, cutProtocol)
+	if _, err := conn.Write(hello[:len(hello)-1]); err != nil {
+		t.Fatalf("park a handshake at %s: %v", front.path, err)
+	}
+	front.awaitCrossed(t, drainWait)
+	return &parked{conn: conn, tail: hello[len(hello)-1:]}
+}
+
+// answer completes the parked hello and reads every byte the daemon writes
+// before it closes.
+func (p *parked) answer(t *testing.T) []byte {
+	t.Helper()
+	if _, err := p.conn.Write(p.tail); err != nil {
+		t.Fatalf("complete the parked handshake: %v", err)
+	}
+	answered, err := io.ReadAll(p.conn)
+	if err != nil {
+		t.Fatalf("read the daemon's answer to the parked handshake: %v", err)
+	}
+	return answered
+}
+
+// awaitIntakeClosed waits out the drain edge: the shutdown ladder closes the
+// listener before any other stage, so a dial that no longer connects is what
+// tells the harness a parked handshake will now be answered as draining.
+func awaitIntakeClosed(t *testing.T, socket string, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for {
+		conn, err := net.Dial("unix", socket)
+		if err != nil {
+			return
+		}
+		_ = conn.Close()
+		if time.Now().After(deadline) {
+			t.Fatalf("the daemon at %s still accepted a connection %s after the drain began", socket, within)
+		}
+		time.Sleep(intakePoll)
+	}
+}
+
+// assertPreambleAnswered redeems the preamble against bytes the relay copied:
+// the daemon's whole answer to the parked handshake was the frozen preamble and
+// nothing else — no frame, no rejection ack, no hang.
+func assertPreambleAnswered(t *testing.T, answered []byte, crossings []exchange) {
+	t.Helper()
 	preamble := frozen(t, preambleFixture)
-	if opening := crossings[0].opened; !bytes.Equal(opening, preamble) {
-		t.Fatalf("the drain opened with %#x, want exactly the frozen preamble %#x", opening, preamble)
+	if !bytes.Equal(answered, preamble) {
+		t.Fatalf("the draining cut daemon answered the parked handshake with %#x, want exactly the frozen preamble %#x",
+			answered, preamble)
 	}
-	d.preambled = true
+	if len(crossings) != 1 {
+		t.Fatalf("the parked handshake crossed %d connections, want exactly 1", len(crossings))
+	}
+	if crossed := crossings[0].answered; !bytes.Equal(crossed, preamble) {
+		t.Fatalf("the relay copied %#x as the daemon's answer, want exactly the frozen preamble %#x", crossed, preamble)
+	}
+	coverage.ObservedPresent(t, cutEra, mechanismPreambleEmitted, coverage.FromWire, fmt.Sprintf(
+		"the relay copied exactly the frozen drain preamble %#x as the whole answer a draining cut daemon gave the handshake it was still reading when the drain began",
+		preamble,
+	))
 }
 
 func awaitPeerClose(t *testing.T, conn net.Conn, within time.Duration) {

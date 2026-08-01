@@ -17,12 +17,15 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/yasyf/daemonkit/ci/mixedera/coverage"
 )
 
 const (
 	readyLine      = "READY"
 	readyWait      = 60 * time.Second
 	peerWait       = 90 * time.Second
+	conformWait    = 30 * time.Second
 	drainWait      = 30 * time.Second
 	aliveSettle    = 3 * time.Second
 	preambleSettle = 15 * time.Second
@@ -43,6 +46,11 @@ const (
 	precutProbeToken = "mixedera-precut: trust-verifier-probe-deadline"
 
 	failureProtocolMismatch = "protocol-mismatch"
+	failureUntrusted        = "untrusted"
+
+	// reapAbsent is how a peer reports daemonkit.ReapAbsent: the pinned identity
+	// observed gone from the process table.
+	reapAbsent = "absent"
 )
 
 type peer struct {
@@ -68,6 +76,10 @@ type report struct {
 	PeerBuild    string       `json:"peer_build"`
 	Health       healthReport `json:"health"`
 	StopAcked    bool         `json:"stop_acked"`
+	Reap         string       `json:"reap"`
+	DrainedPID   int          `json:"drained_pid"`
+	Socket       string       `json:"socket"`
+	Self         string       `json:"self"`
 }
 
 type syncBuffer struct {
@@ -90,6 +102,7 @@ func (b *syncBuffer) String() string {
 
 type daemonProc struct {
 	era     string
+	home    string
 	socket  string
 	cmd     *exec.Cmd
 	log     *syncBuffer
@@ -99,7 +112,6 @@ type daemonProc struct {
 	err     error
 
 	signalled bool
-	preambled bool
 }
 
 // startFailure carries the peer's own exit and stderr so a caller can decide
@@ -218,31 +230,58 @@ func (d *daemonProc) await(t *testing.T, wait time.Duration) error {
 // itself reached for, so the case never names the mechanism it is about to claim.
 func (d *daemonProc) witnessDrain(t *testing.T) {
 	t.Helper()
-	switch {
-	case d.signalled:
-		observedPresent(t, d.era, mechanismSigterm, fromProcessTable,
+	if d.signalled {
+		coverage.ObservedPresent(t, d.era, mechanismSigterm, coverage.FromProcessTable,
 			fmt.Sprintf("the %s daemon at %s exited 0 after SIGTERM", d.era, d.socket))
-	case d.preambled:
-		observedPresent(t, d.era, mechanismPreamble, fromProcessTable,
-			fmt.Sprintf("the %s daemon at %s exited 0 after the frozen drain preamble reached it, with no signal sent",
-				d.era, d.socket))
+	}
+}
+
+// leftWithin reports whether the OS reaped this daemon inside the settle. It is
+// the one artifact under both directions of the preamble claim, and no case can
+// write it.
+func (d *daemonProc) leftWithin(t *testing.T, settle time.Duration) bool {
+	t.Helper()
+	select {
+	case err := <-d.exited:
+		d.record(err)
+		return true
+	case <-time.After(settle):
+		return false
 	}
 }
 
 func (d *daemonProc) aliveAfter(t *testing.T, settle time.Duration) {
 	t.Helper()
-	select {
-	case err := <-d.exited:
-		d.record(err)
+	if d.leftWithin(t, settle) {
 		t.Fatalf("%s daemon left while it was expected to hold the socket: %v\nstderr:\n%s",
-			d.era, err, d.log.String())
-	case <-time.After(settle):
+			d.era, d.err, d.log.String())
 	}
-	if d.preambled {
-		observedAbsent(t, d.era, mechanismPreamble, fromProcessTable,
-			fmt.Sprintf("the %s daemon at %s still held its socket %s after the frozen drain preamble reached it",
-				d.era, d.socket, settle))
+}
+
+// witnessPreamble redeems the preamble against two artifacts no case writes: the
+// bytes a relay copied to this daemon, and whether the OS reaped it afterwards.
+// It files whichever direction those two show, so an ABSENT row costs what a
+// PROVEN one costs — a preamble that never crossed the wire redeems nothing, and
+// a daemon that did drain on one is filed as having drained rather than as
+// having ignored it.
+func (d *daemonProc) witnessPreamble(t *testing.T, front *relay, settle time.Duration) {
+	t.Helper()
+	preamble := frozen(t, preambleFixture)
+	if !front.carried(preamble, drainWait) {
+		t.Fatalf("no connection the relay at %s copied opened with exactly the frozen drain preamble %#x, so nothing put that preamble in front of the %s daemon at %s and there is no absence here to redeem",
+			front.path, preamble, d.era, d.socket)
 	}
+	if d.leftWithin(t, settle) {
+		coverage.ObservedPresent(t, d.era, mechanismPreamble, coverage.FromProcessTable, fmt.Sprintf(
+			"the OS reaped the %s daemon at %s within %s of the relay carrying it the frozen drain preamble %#x",
+			d.era, d.socket, settle, preamble,
+		))
+		return
+	}
+	coverage.ObservedAbsent(t, d.era, mechanismPreamble, coverage.FromProcessTable, fmt.Sprintf(
+		"the %s daemon at %s still held its socket %s after the relay carried it the frozen drain preamble %#x",
+		d.era, d.socket, settle, preamble,
+	))
 }
 
 func (d *daemonProc) terminate(t *testing.T) {
@@ -264,6 +303,14 @@ func output(t *testing.T, p peer, wait time.Duration, args ...string) string {
 	return out
 }
 
+// declaredBy runs an era peer's own conformance verb, so what the manifest holds
+// that era to is the peer process's account of itself rather than this
+// harness's.
+func declaredBy(t *testing.T, p peer) coverage.Declaration {
+	t.Helper()
+	return coverage.Declaration{Era: p.era, JSON: output(t, p, conformWait, "conformance")}
+}
+
 func runPeer(t *testing.T, p peer, wait time.Duration, args ...string) (report, time.Duration) {
 	t.Helper()
 	started := time.Now()
@@ -273,26 +320,69 @@ func runPeer(t *testing.T, p peer, wait time.Duration, args ...string) (report, 
 	if err := json.Unmarshal([]byte(out), &decoded); err != nil {
 		t.Fatalf("decode %s report %q: %v", p.era, out, err)
 	}
-	witnessVerdict(t, p, decoded)
+	witnessVerdict(t, p, decoded, elapsed)
 	return decoded, elapsed
 }
 
 // witnessVerdict takes the built peer's own classification as evidence: the
 // harness cannot write it, because it is produced by a separate process from
-// what that process actually read off the socket.
-func witnessVerdict(t *testing.T, p peer, decoded report) {
+// what that process actually read off the socket. Each branch files only what
+// that verdict carries — a session at one protocol on both sides, or a mismatch
+// the peer typed inside the bound this gate calls prompt.
+func witnessVerdict(t *testing.T, p peer, decoded report, elapsed time.Duration) {
 	t.Helper()
 	switch {
-	case decoded.Session && decoded.PeerProtocol != 0:
-		observedPresent(t, p.era, mechanismSession, fromPeerVerdict, fmt.Sprintf(
-			"the %s peer completed a session at protocol %d against a peer at protocol %d",
-			p.era, decoded.Protocol, decoded.PeerProtocol,
+	case decoded.Session && decoded.Protocol == decoded.PeerProtocol:
+		coverage.ObservedPresent(t, p.era, mechanismSession, coverage.FromPeerVerdict, fmt.Sprintf(
+			"the %s peer completed a request and its response over one unix socket against a peer at its own protocol %d",
+			p.era, decoded.PeerProtocol,
 		))
 	case decoded.Failure == failureProtocolMismatch:
-		observedPresent(t, p.era, mechanismGate, fromPeerVerdict, fmt.Sprintf(
-			"the %s peer typed its own refusal as %s: %s", p.era, decoded.Failure, decoded.Detail,
+		if elapsed > refuseBound {
+			t.Fatalf("the %s peer typed its refusal as %s after %s, over the %s this gate calls prompt: a refusal that slow is the wedge, not the gate",
+				p.era, decoded.Failure, elapsed, refuseBound)
+		}
+		coverage.ObservedPresent(t, p.era, mechanismGate, coverage.FromPeerVerdict, fmt.Sprintf(
+			"the %s peer typed its own refusal as %s in %s: %s",
+			p.era, decoded.Failure, elapsed.Round(time.Millisecond), decoded.Detail,
 		))
 	}
+}
+
+// witnessControlTrustGate names every half of the control lane's drain trust
+// gate in one fact, so none redeems it alone: a gate that only ever refuses is
+// a broken lane, and one that only ever admits is no gate. It refuses each half
+// on the reports themselves rather than trusting its caller to have refused it,
+// because a witness that only formats what it is handed leaves its row PROVEN
+// with the calling case emptied. All three halves are the peer process's own
+// verdicts on what it read back — the refusal, the session the refusing
+// incumbent went on to complete, and the reap.
+func witnessControlTrustGate(t *testing.T, refused, served, honoured report, strict, open *daemonProc) {
+	t.Helper()
+	switch {
+	case refused.Failure != failureUntrusted:
+		t.Fatalf("the cut daemon at %s, whose control lane names a requirement this peer cannot prove, answered that peer's drain with %+v, want %s",
+			strict.socket, refused, failureUntrusted)
+	case !served.Session || served.Protocol != served.PeerProtocol:
+		t.Fatalf("the cut daemon that refused this peer's drain answered that same peer's business-lane session with %+v, want a session completed at one protocol: a control-lane refusal leaves the incumbent serving",
+			served)
+	case served.Socket != strict.socket:
+		t.Fatalf("the session that outlived the refused drain ran against %q, want the socket the drain was refused from, %q",
+			served.Socket, strict.socket)
+	case honoured.Failure != "" || honoured.Reap != reapAbsent:
+		t.Fatalf("the drain of a cut daemon naming no control requirement = %+v, want a delivered drain reaping %q",
+			honoured, reapAbsent)
+	case honoured.DrainedPID != open.cmd.Process.Pid:
+		t.Fatalf("the honoured drain proves pid %d gone, want the daemon it stopped, %d",
+			honoured.DrainedPID, open.cmd.Process.Pid)
+	case refused.Self != served.Self || served.Self != honoured.Self:
+		t.Fatalf("the refusal, the session, and the drain name themselves %q, %q, and %q: this gate is one peer identity meeting two daemons, not three peers meeting one each",
+			refused.Self, served.Self, honoured.Self)
+	}
+	coverage.ObservedPresent(t, cutEra, mechanismControlTrustGate, coverage.FromPeerVerdict, fmt.Sprintf(
+		"the cut peer %s, whose drain the cut daemon at %s typed %s because that daemon's control lane names a requirement the peer cannot prove, completed a session at protocol %d against that same socket, and drained the cut daemon at %s that names no control requirement, reaping %q for pid %d",
+		refused.Self, strict.socket, refused.Failure, served.PeerProtocol, open.socket, honoured.Reap, honoured.DrainedPID,
+	))
 }
 
 func run(t *testing.T, cmd *exec.Cmd, wait time.Duration) (string, error) {
