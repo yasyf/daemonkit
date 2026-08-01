@@ -116,6 +116,8 @@ public final class SocketClient: @unchecked Sendable {
     /// Blocks until the server's phase stream reports ``SessionPhase/ready``.
     /// Throws ``RuntimeFailedError`` on failed and ``SessionDrainingError`` on
     /// draining, mirroring internal/wire.Client.WaitReady bounded by deadline.
+    /// The `onPhase` observer has already returned for the snapshot that
+    /// releases this call.
     public func waitReady(deadline: Date) async throws {
         try await core.waitReady(deadline: deadline)
     }
@@ -252,8 +254,6 @@ final class SocketClientCore: @unchecked Sendable {
     private let eventChannel: SocketBoundedChannel<SocketEvent>
     private let phaseGate: PhaseGate
     private let onPhase: (@Sendable (PhaseSnapshot) -> Void)?
-    var openCommitHook: (@Sendable () async -> Void)?
-    var requestWriteStartHook: (@Sendable () -> Void)?
     var requestSettlementHook: (@Sendable () async -> Void)?
     var requestSettlementWaitHook: (@Sendable () async -> Void)?
     var requestSendAdmissionHook: (@Sendable () async -> Void)?
@@ -555,8 +555,8 @@ extension SocketClientCore {
 
     private func receiveLifecycle(_ frame: SessionFrame) async throws {
         let snapshot = try SessionHandshakeCodec.decodeLifecycle(frame.payload)
-        phaseGate.update(snapshot)
         onPhase?(snapshot)
+        phaseGate.update(snapshot)
     }
 
     var currentPhase: PhaseSnapshot {

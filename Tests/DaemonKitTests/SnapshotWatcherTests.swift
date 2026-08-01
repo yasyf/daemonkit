@@ -58,6 +58,15 @@ private final class StateBox<S: Sendable>: @unchecked Sendable {
     }
 }
 
+private extension StateBox where S == Snap {
+    var loadedValues: [Int] {
+        all.compactMap { state in
+            guard case let .loaded(snap) = state else { return nil }
+            return snap.value
+        }
+    }
+}
+
 private struct WaitTimeout: Error {}
 
 private func waitUntil(_ seconds: Double = 3, _ condition: @Sendable () -> Bool) async throws {
@@ -262,12 +271,7 @@ struct SnapshotWatcherTests {
         try Data(#"{"identity":"test.snapshot.v1","schema_version":1,"fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","value":2}"#.utf8).write(to: tmp)
         #expect(rename(tmp.path, file.path) == 0)
 
-        try await waitUntil { box.count >= 2 }
-        guard case let .loaded(latest) = try #require(box.all.last) else {
-            Issue.record("expected updated .loaded, got \(box.all)")
-            return
-        }
-        #expect(latest.value == 2)
+        try await waitUntil { box.loadedValues.contains(2) }
     }
 
     @Test func droppingAStartedWatcherReleasesItsDirectoryFD() async throws {

@@ -1,23 +1,23 @@
 // Command wire-test-server is the Swift integration rig's Go entrypoint: a
 // real internal/wire server on a unix socket, a fixed op catalog covering what
 // the Swift client suites exercise, and a -phases script driving the stub
-// runtime's lifecycle. It prints READY <socket> once listening and exits on
-// stdin EOF or SIGTERM, so orphan cleanup is unconditional even if the test
-// runner dies.
+// runtime's lifecycle. The script advances one step per line on stdin, so the
+// caller decides when a transition happens rather than racing a hold. It
+// prints READY <socket> once listening and exits on stdin EOF or SIGTERM, so
+// orphan cleanup is unconditional even if the test runner dies.
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/yasyf/daemonkit/internal/trust"
 	"github.com/yasyf/daemonkit/internal/wire"
@@ -31,11 +31,6 @@ func main() {
 	}
 }
 
-type phaseStep struct {
-	phase wire.Phase
-	hold  time.Duration
-}
-
 func run() error {
 	socket := flag.String("socket", "", "unix socket path (required)")
 	schema := flag.String("schema", "", "the server's own schema digest (required)")
@@ -44,7 +39,7 @@ func run() error {
 		accepted = append(accepted, v)
 		return nil
 	})
-	phases := flag.String("phases", "ready", `phase script: "ready" | "starting:200ms,ready" | "ready,draining:1s"`)
+	phases := flag.String("phases", "ready", `phase script advanced one step per stdin line: "ready" | "starting,ready" | "ready,draining"`)
 	controlTeam := flag.String("control-team", "", "Trust.Control team identifier")
 	controlIdentifier := flag.String("control-identifier", "", "Trust.Control signing identifier")
 	flag.Parse()
@@ -58,7 +53,7 @@ func run() error {
 
 	rt := wiretest.NewStubRuntime()
 	rt.SetHandle(handle)
-	rt.SetPhase(script[0].phase, nil)
+	rt.SetPhase(script[0], nil)
 
 	cfg := wire.Config{Schemas: append(wire.Schemas{*schema}, accepted...)}
 	if *controlTeam != "" {
@@ -80,38 +75,25 @@ func run() error {
 	}
 	fmt.Printf("READY %s\n", *socket)
 
-	go func() {
-		_, _ = io.Copy(io.Discard, os.Stdin)
-		cancel()
-	}()
-	go runPhases(ctx, rt, script)
+	go runPhases(rt, script, cancel)
 
 	return server.Serve(ctx, ln)
 }
 
-func parsePhases(script string) ([]phaseStep, error) {
+func parsePhases(script string) ([]wire.Phase, error) {
 	names := map[string]wire.Phase{
 		"starting": wire.PhaseStarting,
 		"ready":    wire.PhaseReady,
 		"draining": wire.PhaseDraining,
 		"failed":   wire.PhaseFailed,
 	}
-	var steps []phaseStep
+	var steps []wire.Phase
 	for _, entry := range strings.Split(script, ",") {
-		name, hold, _ := strings.Cut(strings.TrimSpace(entry), ":")
-		phase, ok := names[name]
+		phase, ok := names[strings.TrimSpace(entry)]
 		if !ok {
-			return nil, fmt.Errorf("unknown phase %q", name)
+			return nil, fmt.Errorf("unknown phase %q", entry)
 		}
-		step := phaseStep{phase: phase}
-		if hold != "" {
-			d, err := time.ParseDuration(hold)
-			if err != nil {
-				return nil, fmt.Errorf("phase %q hold: %w", name, err)
-			}
-			step.hold = d
-		}
-		steps = append(steps, step)
+		steps = append(steps, phase)
 	}
 	if len(steps) == 0 {
 		return nil, fmt.Errorf("empty phase script")
@@ -119,39 +101,38 @@ func parsePhases(script string) ([]phaseStep, error) {
 	return steps, nil
 }
 
-func runPhases(ctx context.Context, rt *wiretest.StubRuntime, script []phaseStep) {
-	for i, step := range script {
-		if i > 0 {
-			rt.SetPhase(step.phase, nil)
+func runPhases(rt *wiretest.StubRuntime, script []wire.Phase, done func()) {
+	lines := bufio.NewScanner(os.Stdin)
+	for step := 1; lines.Scan(); step++ {
+		if step >= len(script) {
+			fmt.Fprintf(os.Stderr, "wire-test-server: phase advance %d past script %v\n", step, script)
+			os.Exit(1)
 		}
-		if step.hold == 0 {
-			continue
-		}
-		select {
-		case <-time.After(step.hold):
-		case <-ctx.Done():
-			return
-		}
+		rt.SetPhase(script[step], nil)
 	}
+	done()
 }
 
 func handle(ctx context.Context, req wire.Request) (any, error) {
 	switch req.Op {
 	case "test.echo.v1":
 		return echoValue(req.Payload), nil
-	case "test.sleep.v1":
-		var body struct {
-			Milliseconds int `json:"ms"`
+	case "test.drain.v1":
+		// Ranging with no time bound is what makes this an ordering guarantee
+		// for its Swift tests rather than a race, and it holds only because
+		// session.deliverRequestChunks selects on deliveryDone and the session
+		// context, never on requestCtx. Hardening wire to also close
+		// state.chunks on requestCtx.Done() — reasonable in itself — silently
+		// gives this loop the request's own deadline as a bound and turns
+		// those tests back into wall-clock races.
+		received := []string{}
+		for chunk := range req.Chunks {
+			if chunk.End && len(chunk.Payload) == 0 {
+				continue
+			}
+			received = append(received, string(chunk.Payload))
 		}
-		if err := json.Unmarshal(req.Payload, &body); err != nil {
-			return nil, fmt.Errorf("sleep payload: %w", err)
-		}
-		select {
-		case <-time.After(time.Duration(body.Milliseconds) * time.Millisecond):
-			return echoValue(req.Payload), nil
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+		return map[string]any{"chunks": received}, nil
 	case "test.reject.v1":
 		var body struct {
 			Code   string `json:"code"`

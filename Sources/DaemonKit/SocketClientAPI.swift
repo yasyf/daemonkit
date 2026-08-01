@@ -185,16 +185,6 @@ extension SocketClient {
         core.abort()
     }
 
-    var openCommitHook: (@Sendable () async -> Void)? {
-        get { core.openCommitHook }
-        set { core.openCommitHook = newValue }
-    }
-
-    var requestWriteStartHook: (@Sendable () -> Void)? {
-        get { core.requestWriteStartHook }
-        set { core.requestWriteStartHook = newValue }
-    }
-
     var requestSettlementHook: (@Sendable () async -> Void)? {
         get { core.requestSettlementHook }
         set { core.requestSettlementHook = newValue }

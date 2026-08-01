@@ -20,8 +20,10 @@ enum GoWireServerError: Error, CustomStringConvertible {
 }
 
 /// Launches the prebuilt Go wire test server (internal/wire/testserver) over a
-/// fresh short unix socket, exposing its path once it prints READY. Teardown
-/// closes stdin so the server exits even if the runner dies.
+/// fresh short unix socket, exposing its path once it prints READY. A phase
+/// script advances only on ``advancePhase()``, so a lifecycle transition is
+/// something a test orders rather than races. Teardown closes stdin so the
+/// server exits even if the runner dies.
 final class GoWireServer: @unchecked Sendable {
     static let schema = "suite.v1"
 
@@ -67,6 +69,10 @@ final class GoWireServer: @unchecked Sendable {
         self.process = process
         try process.run()
         try Self.waitForReady(output.fileHandleForReading)
+    }
+
+    func advancePhase() throws {
+        try stdin.fileHandleForWriting.write(contentsOf: Data("\n".utf8))
     }
 
     func shutdown() {

@@ -72,10 +72,8 @@ extension SocketClientCore {
                 deadlineMilliseconds: deadlineMilliseconds
             )) {
                 marker.markStarted()
-                self.requestWriteStartHook?()
             }
             committed = true
-            await openCommitHook?()
             try Task.checkCancellation()
         } catch is CancellationError {
             try await settleCanceledOpen(id: id, state: state, committed: committed)

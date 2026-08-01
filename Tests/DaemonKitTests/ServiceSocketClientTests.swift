@@ -53,7 +53,7 @@ struct ServiceSocketClientTests {
     }
 
     @Test func waitReadyCrossesStartingToReady() async throws {
-        let server = try GoWireServer(phases: "starting:300ms,ready")
+        let server = try GoWireServer(phases: "starting,ready")
         defer { server.shutdown() }
         let observed = PhaseRecorder()
         let client = try await SocketClient(
@@ -65,6 +65,7 @@ struct ServiceSocketClientTests {
         defer { client.abort() }
 
         #expect(client.phase.phase == .starting)
+        try server.advancePhase()
         try await client.waitReady(deadline: deadline(10))
         #expect(client.phase.phase == .ready)
         #expect(observed.phases.contains(.ready))
@@ -128,8 +129,7 @@ struct ServiceSocketClientTests {
         try await client.waitReady(deadline: deadline())
 
         let call = try await client.open(
-            operation: "test.sleep.v1",
-            payload: Data(#"{"ms":300}"#.utf8),
+            operation: "test.drain.v1",
             endInput: false,
             deadline: deadline()
         )
@@ -140,7 +140,7 @@ struct ServiceSocketClientTests {
         let terminal = try await call.response()
         #expect(terminal.error == nil)
         #expect(!terminal.rejected)
-        #expect(try jsonObject(terminal.payload)["ms"] as? Int == 300)
+        #expect(try jsonObject(terminal.payload)["chunks"] as? [String] == ["a", "b"])
         await #expect(throws: SessionTransportError.invalidFrame("request stream already ended")) {
             try await call.sendChunk(Data("c".utf8))
         }
@@ -158,8 +158,7 @@ struct ServiceSocketClientTests {
         try await client.waitReady(deadline: deadline())
 
         let call = try await client.open(
-            operation: "test.sleep.v1",
-            payload: Data(#"{"ms":300}"#.utf8),
+            operation: "test.drain.v1",
             endInput: false,
             deadline: deadline()
         )
