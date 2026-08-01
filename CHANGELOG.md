@@ -78,7 +78,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps the old receipts as evidence rather than deleting them. The archive is
   one rename, so concurrent openers produce exactly one `.bak`, and it covers
   only the product doing it — a sibling installed beside it that an older
-  binary still manages keeps the lock path that binary opens by name.
+  binary still manages keeps the lock path that binary opens by name. An
+  occupied name rotates to `<Product>.bak.2`, `.bak.3`, and on: a downgrade to a
+  pre-cut release recreates the tree at the old path, and nothing on either side
+  of that downgrade removes an archive, so the re-upgrade meets its own. Failing
+  there would fail every operation the deployment is ever asked to do; no era's
+  evidence is overwritten by the era that follows it.
 - The `launchd` package carries `//go:build darwin`. Its files compiled
   anywhere and failed only at runtime, exec'ing `/bin/launchctl`; they now fail
   at build time, which is the guarantee the rest of the module already gives.
@@ -86,7 +91,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ghrelease`, `paths`, `version` — are recorded per platform in
   `ci/exported.txt`. `ci/portable.txt` declares the whole linux-portable
   partition, module-private packages included, and
-  `scripts/portable-gate.sh` gates it in both directions.
+  `scripts/portable-gate.sh` gates it in both directions. The directions do not
+  share a remedy: `--write` records an undeclared gain and refuses outright
+  while any declared package is regressed, since regenerating over a regression
+  would drop the package from the manifest and launder the broken boundary into
+  an approved one in one command. A regression prints the linux build and vet
+  output that explains it, and the command to reproduce it.
 
 ### Fixed
 

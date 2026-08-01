@@ -258,14 +258,24 @@ func (l layout) ensureMetadata() error {
 // the old tree as evidence instead of destroying it. The legacy directory is
 // shared by every product installed beside this one, so only this deployment's
 // own subtree moves — a sibling an older binary still manages keeps the lock
-// file path that binary opens by name. The rename is itself the one-shot: two
-// openers racing it produce one archive, and the loser finds the source gone.
+// file path that binary opens by name.
+//
+// The name rotates because a downgrade to a pre-cut release recreates the tree,
+// and nothing on either side of that downgrade removes an archive: an occupied
+// name has to yield the next one rather than fail, or the re-upgrade wedges the
+// deployment for good. os.Rename never replaces a directory, so the attempt is
+// itself both the occupancy test and the one-shot — no stat precedes it, and
+// two openers racing the same tree still produce one archive, the loser seeing
+// the source gone rather than a free name.
 func (l layout) archiveLegacy() error {
-	switch err := renameDurable(l.legacy, l.legacy+".bak"); {
-	case errors.Is(err, os.ErrNotExist):
-		return nil
-	case err != nil:
-		return fmt.Errorf("deploy: archive legacy metadata %q: %w", l.legacy, err)
+	archive := l.legacy + ".bak"
+	for n := 2; ; n++ {
+		switch err := renameDurable(l.legacy, archive); {
+		case err == nil, errors.Is(err, os.ErrNotExist):
+			return nil
+		case !errors.Is(err, os.ErrExist):
+			return fmt.Errorf("deploy: archive legacy metadata %q: %w", l.legacy, err)
+		}
+		archive = fmt.Sprintf("%s.bak.%d", l.legacy, n)
 	}
-	return nil
 }

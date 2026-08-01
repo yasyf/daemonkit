@@ -4,7 +4,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"sync"
+	"syscall"
 	"testing"
 )
 
@@ -107,40 +110,118 @@ func TestEnsureMetadataArchivesTheLegacyTree(t *testing.T) {
 	f.wantCanonical("one")
 }
 
-// TestArchiveLegacyIsOneShotUnderConcurrentOpeners holds the archive to exactly
-// one rename. Openers race here — ensureMetadata runs before the deployment
-// lock exists to be held — and a second archive of the same tree would strand
-// half the evidence under a name nothing ever looks for.
-func TestArchiveLegacyIsOneShotUnderConcurrentOpeners(t *testing.T) {
+// TestArchiveLegacyRotatesPastAPriorArchive holds the archive to the one path a
+// downgrade takes. A pre-cut binary run against a state directory this package
+// already archived recreates the legacy tree, and the next open here meets its
+// own prior archive — nothing on either side of that downgrade ever removes one.
+// Refusing there fails ensureMetadata, and with it every operation the
+// deployment will ever be asked to do, forever. The name rotates instead, and
+// no era's evidence is overwritten by the era that follows it.
+func TestArchiveLegacyRotatesPastAPriorArchive(t *testing.T) {
 	f := newFixture(t)
-	plantLegacyDeployment(t, f.root, "Example")
-
-	errs := make([]error, 8)
-	var wg sync.WaitGroup
-	wg.Add(len(errs))
-	for i := range errs {
-		go func() {
-			defer wg.Done()
-			errs[i] = f.deploy.layout.ensureMetadata()
-		}()
+	archives := []string{
+		f.deploy.layout.legacy + ".bak",
+		f.deploy.layout.legacy + ".bak.2",
+		f.deploy.layout.legacy + ".bak.3",
 	}
-	wg.Wait()
-	for i, err := range errs {
-		if err != nil {
-			t.Fatalf("opener %d: ensureMetadata: %v", i, err)
+	for era := range archives {
+		legacy := plantLegacyDeployment(t, f.root, "Example")
+		if err := os.WriteFile(filepath.Join(legacy, "era"), []byte(strconv.Itoa(era)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.deploy.layout.ensureMetadata(); err != nil {
+			t.Fatalf("era %d: ensureMetadata: %v", era, err)
+		}
+		if fileExists(legacy) {
+			t.Fatalf("era %d: the legacy tree is still at the path a cut-era read chokes on", era)
 		}
 	}
 
-	entries, err := os.ReadDir(filepath.Join(f.root, legacyMetadataDir))
-	if err != nil {
+	for era, archive := range archives {
+		body, err := os.ReadFile(filepath.Join(archive, "era"))
+		if err != nil {
+			t.Fatalf("read the archived era: %v", err)
+		}
+		if string(body) != strconv.Itoa(era) {
+			t.Fatalf("%s holds era %s, want %d: one archive overwrote another", archive, body, era)
+		}
+		if !fileExists(filepath.Join(archive, "prior.app", "Contents", "MacOS", "example")) {
+			t.Fatalf("%s lost the prior generation its legacy tree stranded", archive)
+		}
+	}
+
+	if _, err := f.deploy.Install(f.ctx(), f.candidate("Source", "1.0", "one")); err != nil {
+		t.Fatalf("Install over three archived legacy trees: %v", err)
+	}
+	f.wantCanonical("one")
+}
+
+// TestArchiveLegacyIsOneShotUnderConcurrentOpeners holds the archive to exactly
+// one rename. Openers race here — ensureMetadata runs before the deployment
+// lock exists to be held — and a second archive of the same tree would strand
+// half the evidence under a name nothing ever looks for. Rotation does not
+// weaken that: the loser of the race finds the source gone, not a free name.
+func TestArchiveLegacyIsOneShotUnderConcurrentOpeners(t *testing.T) {
+	tests := []struct {
+		name  string
+		prior []string
+		want  []string
+	}{
+		{"the first archive", nil, []string{"Example.bak"}},
+		{"a prior archive stands", []string{"Example.bak"}, []string{"Example.bak", "Example.bak.2"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFixture(t)
+			for _, name := range tt.prior {
+				plantLegacyDeployment(t, f.root, name)
+			}
+			plantLegacyDeployment(t, f.root, "Example")
+
+			errs := make([]error, 8)
+			var wg sync.WaitGroup
+			wg.Add(len(errs))
+			for i := range errs {
+				go func() {
+					defer wg.Done()
+					errs[i] = f.deploy.layout.ensureMetadata()
+				}()
+			}
+			wg.Wait()
+			for i, err := range errs {
+				if err != nil {
+					t.Fatalf("opener %d: ensureMetadata: %v", i, err)
+				}
+			}
+
+			entries, err := os.ReadDir(filepath.Join(f.root, legacyMetadataDir))
+			if err != nil {
+				t.Fatal(err)
+			}
+			archives := make([]string, 0, len(entries))
+			for _, entry := range entries {
+				archives = append(archives, entry.Name())
+			}
+			if !slices.Equal(archives, tt.want) {
+				t.Fatalf("the racing openers left %v, want exactly %v", archives, tt.want)
+			}
+		})
+	}
+}
+
+// TestArchiveLegacyLeavesTheLoopOnAnUnrotatableFailure holds rotation to the
+// one failure a later name can answer. Every other failure has to leave the
+// loop: a non-directory at the archive path never becomes free, so retrying it
+// spins ensureMetadata forever instead of surfacing the broken state.
+func TestArchiveLegacyLeavesTheLoopOnAnUnrotatableFailure(t *testing.T) {
+	f := newFixture(t)
+	plantLegacyDeployment(t, f.root, "Example")
+	if err := os.WriteFile(f.deploy.layout.legacy+".bak", nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	archives := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		archives = append(archives, entry.Name())
-	}
-	if len(archives) != 1 || archives[0] != "Example.bak" {
-		t.Fatalf("the racing openers left %v, want exactly [Example.bak]", archives)
+
+	if err := f.deploy.layout.ensureMetadata(); !errors.Is(err, syscall.ENOTDIR) {
+		t.Fatalf("ensureMetadata over a file at the archive path = %v, want ENOTDIR", err)
 	}
 }
 
