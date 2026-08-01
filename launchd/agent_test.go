@@ -31,7 +31,7 @@ const goldenPlist = `<?xml version="1.0" encoding="UTF-8"?>
     <string>com.example.worker</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/worker</string>
+        <string>/usr/local/bin/daemonkit-worker</string>
         <string>daemon</string>
     </array>
     <key>RunAtLoad</key>
@@ -78,7 +78,7 @@ const goldenPlist = `<?xml version="1.0" encoding="UTF-8"?>
 func TestAgentPlistGoldenCarriesOwnerMarker(t *testing.T) {
 	agent := Agent{
 		Label:                       "com.example.worker",
-		Program:                     "/usr/local/bin/worker",
+		Program:                     "/usr/local/bin/daemonkit-worker",
 		Args:                        []string{"daemon"},
 		LogPath:                     "/Users/example/Library/Logs/worker.log",
 		Env:                         map[string]string{"PATH": "/usr/bin"},

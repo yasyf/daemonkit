@@ -1,22 +1,33 @@
 package proc
 
 import (
+	"context"
 	"path/filepath"
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 )
 
-func newTestStore(t *testing.T) (*Store, string) {
+func openTestStore(t testing.TB, path string) *Store {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "records.dkstate")
-	s, err := OpenStore(path)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s, err := OpenStore(ctx, path)
 	if err != nil {
 		t.Fatalf("OpenStore() = %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	return s, path
+	return s
 }
+
+func newTestStore(t testing.TB) (*Store, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "records.dkstate")
+	return openTestStore(t, path), path
+}
+
+func unheld(*Child) {}
 
 type funcProber struct {
 	probeFn   func(pid int) (procInfo, error)

@@ -119,7 +119,7 @@ func TestReapPIDReuseDuringGraceIsNeverKilled(t *testing.T) {
 func TestReapProbeErrorFailsClosedAndKeepsRecord(t *testing.T) {
 	s, path := newTestStore(t)
 	rec := record{PID: 4242, Start: 1, Boot: testBoot, Generation: s.generation + 1}
-	if err := s.add(rec); err != nil {
+	if err := s.add(t.Context(), rec); err != nil {
 		t.Fatalf("add() = %v", err)
 	}
 	prober := &funcProber{probeFn: func(int) (procInfo, error) {
@@ -210,7 +210,7 @@ func TestReapSIGKILLProvenAbsenceIsTerminated(t *testing.T) {
 func TestReapRemovesRecordOnlyAfterPostKillAbsence(t *testing.T) {
 	s, path := newTestStore(t)
 	rec := record{PID: 4242, Start: 1, Boot: testBoot, Generation: s.generation + 1}
-	if err := s.add(rec); err != nil {
+	if err := s.add(t.Context(), rec); err != nil {
 		t.Fatalf("add() = %v", err)
 	}
 	killed := false
@@ -249,7 +249,7 @@ func TestReapRemovesRecordOnlyAfterPostKillAbsence(t *testing.T) {
 func TestReapRetainsRecordWhenKilledProcessNeverSettles(t *testing.T) {
 	s, path := newTestStore(t)
 	rec := record{PID: 4242, Start: 1, Boot: testBoot, Generation: s.generation + 1}
-	if err := s.add(rec); err != nil {
+	if err := s.add(t.Context(), rec); err != nil {
 		t.Fatalf("add() = %v", err)
 	}
 	prober := &funcProber{probeFn: func(int) (procInfo, error) {

@@ -1,10 +1,12 @@
 package proc
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
 
+	"github.com/yasyf/daemonkit/durable"
 	"github.com/yasyf/daemonkit/internal/state"
 )
 
@@ -67,11 +69,15 @@ func holds(value records, id identity) bool {
 	return false
 }
 
-// Store is one daemon's durable record file behind its one writer goroutine.
-// The caller holds the singleton flock before opening it (Serve's own step
-// precedes recover), so the writer loop is the only serialization needed.
+// Store is one daemon's durable record file behind its one writer goroutine,
+// guarded for its whole life by the exclusive lock its open took. The lock
+// lives with the file it guards, and every entry point that mutates or
+// reclaims from a record store goes through OpenStore, so two owners of one
+// record path exclude each other structurally. ReadOwner is the one lock-free
+// reader, and it proves nothing.
 type Store struct {
 	file       *state.File[records]
+	lock       *durable.Lock
 	generation uint64
 	archived   string
 
@@ -83,16 +89,33 @@ type Store struct {
 	prober   prober
 	signaler signaler
 	clock    clock
-
-	beforeRelease func(pid int)
 }
 
-// OpenStore binds the record file, mints this instance's generation, and
-// starts the writer. It performs no reaping; the one read it makes seeds the
+// LockPath is the exclusive lock one record store's owner holds for its whole
+// life.
+func LockPath(path string) string { return path + ".lock" }
+
+// OpenStore takes the record store's exclusive lock, binds the record file,
+// mints this instance's generation, and starts the writer. ctx must carry a
+// deadline; it bounds the lock acquisition, and contention through it returns
+// durable.ErrLockBusy. It performs no reaping; the one read it makes seeds the
 // writer's value so a later persist can never drop prior-generation records,
 // and an archived era's cores are re-persisted as prior-generation records so
 // a crash before Recover cannot orphan them.
-func OpenStore(path string) (*Store, error) {
+func OpenStore(ctx context.Context, path string) (*Store, error) {
+	lock, err := durable.AcquireLock(ctx, LockPath(path))
+	if err != nil {
+		return nil, err
+	}
+	s, err := openLocked(path, lock)
+	if err != nil {
+		_ = lock.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+func openLocked(path string, lock *durable.Lock) (*Store, error) {
 	generation, err := mintGeneration()
 	if err != nil {
 		return nil, err
@@ -111,6 +134,7 @@ func OpenStore(path string) (*Store, error) {
 	}
 	s := &Store{
 		file:       file,
+		lock:       lock,
 		generation: generation,
 		archived:   loaded.Archived,
 		ops:        make(chan func(*records)),
@@ -127,12 +151,12 @@ func OpenStore(path string) (*Store, error) {
 // Generation is this instance's record tag, surfaced as Health.Generation.
 func (s *Store) Generation() uint64 { return s.generation }
 
-// Close idempotently waits out the writer loop. Live children are the
-// caller's to settle first (Serve's drain order).
+// Close idempotently waits out the writer loop and releases the store's lock.
+// Live children are the caller's to settle first (Serve's drain order).
 func (s *Store) Close() error {
 	s.closeOnce.Do(func() { close(s.closed) })
 	<-s.done
-	return nil
+	return s.lock.Close()
 }
 
 func (s *Store) writer(value records) {
@@ -156,7 +180,10 @@ func (s *Store) send(op func(*records)) bool {
 	}
 }
 
-func (s *Store) add(rec record) error {
+// An add that reports failure leaves no record: the queued write outlives the
+// caller's deadline, so an expiry that merely reported would record a process
+// the caller was told this generation does not own.
+func (s *Store) add(ctx context.Context, rec record) error {
 	reply := make(chan error, 1)
 	sent := s.send(func(value *records) {
 		next := retained(*value, rec.id())
@@ -180,7 +207,14 @@ func (s *Store) add(rec record) error {
 	if !sent {
 		return errors.New("proc: record store is closed")
 	}
-	return <-reply
+	select {
+	case err := <-reply:
+		return err
+	case <-ctx.Done():
+		expiry := fmt.Errorf("proc: record %d did not land within the caller's deadline: %w", rec.PID, ctx.Err())
+		<-s.retire(rec.id())
+		return expiry
+	}
 }
 
 // A store failure is RecordAbandoned, never a control edge: the caller bounds

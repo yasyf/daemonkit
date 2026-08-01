@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/internal/flock"
+	"github.com/yasyf/daemonkit/internal/proc"
 	"github.com/yasyf/daemonkit/internal/wire"
 	"github.com/yasyf/daemonkit/paths"
 )
@@ -172,7 +173,8 @@ func TestServeAbandonedStageParksUntilSignalled(t *testing.T) {
 		t.Fatalf("Serve returned %+v with a wedged product; want a parked process", out.drained)
 	case <-time.After(3 * time.Second):
 	}
-	if _, err := (flock.Spec{Path: socket + ".lock", Mode: flock.Exclusive, Deadline: time.Second}).TryAcquire(); err == nil {
+	recordLock := proc.LockPath(d.RecordPath())
+	if _, err := (flock.Spec{Path: recordLock, Mode: flock.Exclusive, Deadline: time.Second}).TryAcquire(); err == nil {
 		t.Fatal("flock was released while parked over abandoned stages")
 	}
 

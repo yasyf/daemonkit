@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/yasyf/daemonkit/internal/flock"
+	"github.com/yasyf/daemonkit/durable"
 	"github.com/yasyf/daemonkit/internal/proc"
 	"github.com/yasyf/daemonkit/internal/trust"
 	"github.com/yasyf/daemonkit/internal/wire"
@@ -28,7 +28,7 @@ type Ctx struct {
 	// Context is cancelled when the drain begins.
 	Context context.Context
 	// Reclaimed is the prior generation's children, already settled.
-	Reclaimed []proc.Reclaimed
+	Reclaimed []Reclaimed
 	// Report publishes the product's half of Health.Detail, verbatim bytes.
 	// A detail past MaxDetail(MaxFrame) is refused whole and logged at error:
 	// the last published detail stands and the health verb keeps answering,
@@ -36,6 +36,11 @@ type Ctx struct {
 	Report func(detail []byte)
 	// Stop begins a product-initiated drain.
 	Stop func(error)
+
+	// owner is the process-ownership scope Run, Spawn, and Adopt dispatch to.
+	// Serve and Owned.Ctx are the only things that set it, so the zero Ctx
+	// refuses the verbs loudly instead of spawning into a scope nothing owns.
+	owner *Owned
 }
 
 // Product is the consumer's daemon. Handle owns dispatch — no route table,
@@ -137,18 +142,20 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 	if err != nil {
 		return Drained{}, err
 	}
-	lock, err := ownListener(ctx, socket, time.Duration(d.shutdownGrace()))
-	if err != nil {
+	if err := probeIncumbent(socket); err != nil {
 		return Drained{}, err
 	}
-	store, err := proc.OpenStore(el.record())
+	ownCtx, cancelOwn := d.shutdownGrace().mint("own").Context(ctx)
+	store, err := proc.OpenStore(ownCtx, el.record())
+	cancelOwn()
 	if err != nil {
-		_ = lock.Close()
+		if errors.Is(err, durable.ErrLockBusy) {
+			return Drained{}, fmt.Errorf("%w: record store lock held through the wait: %w", ErrBusy, err)
+		}
 		return Drained{}, fmt.Errorf("daemonkit: open record store: %w", err)
 	}
 	if _, err := store.RecordOwner(build); err != nil {
 		_ = store.Close()
-		_ = lock.Close()
 		return Drained{}, fmt.Errorf("daemonkit: record owner: %w", err)
 	}
 	recoverCtx, cancelRecover := d.shutdownGrace().mint("recover").Context(ctx)
@@ -157,17 +164,16 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 	if recoverErr != nil {
 		slog.Warn("daemonkit: recovery incomplete; undetermined records kept", "err", recoverErr)
 	}
+	owned := newOwned(store, reclaimed)
 	_ = os.Remove(socket)
 	ln, err := net.Listen("unix", socket)
 	if err != nil {
 		_ = store.Close()
-		_ = lock.Close()
 		return Drained{}, fmt.Errorf("daemonkit: bind listener: %w", err)
 	}
 	if err := os.Chmod(socket, 0o600); err != nil {
 		_ = ln.Close()
 		_ = store.Close()
-		_ = lock.Close()
 		return Drained{}, fmt.Errorf("daemonkit: chmod listener: %w", err)
 	}
 
@@ -183,7 +189,6 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 	if err != nil {
 		_ = ln.Close()
 		_ = store.Close()
-		_ = lock.Close()
 		return Drained{}, err
 	}
 
@@ -209,9 +214,10 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 	defer cancelActivation()
 	product, startErr := start(Ctx{
 		Context:   activationCtx,
-		Reclaimed: reclaimed,
+		Reclaimed: owned.Reclaimed(),
 		Report:    rt.report,
 		Stop:      func(error) { rt.Drain() },
+		owner:     owned,
 	})
 	var serveErr error
 	serveReturned := false
@@ -228,14 +234,14 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 		}
 	}
 
-	drained := runShutdownLadder(d.shutdownGrace(), server, product, store, cancelActivation) //nolint:contextcheck // the ladder runs after the caller's ctx is cancelled by design: its own budget is the only deadline
+	drained := runShutdownLadder(d.shutdownGrace(), server, product, owned, cancelActivation) //nolint:contextcheck // the ladder runs after the caller's ctx is cancelled by design: its own budget is the only deadline
 	drained.Archived = archived
 	cancelServe()
 	if !serveReturned {
 		serveErr = <-serveDone
 	}
 	if len(drained.Abandoned) == 0 {
-		_ = lock.Close()
+		_ = owned.store.Close()
 		return drained, errors.Join(startErr, serveErr)
 	}
 	slog.Error("daemonkit: shutdown abandoned stages; retaining flock until stopped",
@@ -274,7 +280,7 @@ func runShutdownLadder(
 	shutdown Grace,
 	server *wire.Server,
 	product Product,
-	store *proc.Store,
+	owned *Owned,
 	cancelActivation context.CancelFunc,
 ) Drained {
 	budget := shutdown.mint("shutdown")
@@ -294,13 +300,27 @@ func runShutdownLadder(
 		stage(StageProductDrain, runStage(work.Share("drain", drainShare), product.Drain))
 		stage(StageProductClose, runStage(work.Share("close", closeShare), product.Close))
 	}
-	stage(StageChildren, runStage(children, func(tail Budget) error {
-		closeErr := store.Close()
+	stage(StageChildren, provenStage(children, func(tail Budget) error {
 		settleCtx, cancel := tail.Context(context.Background())
 		defer cancel()
-		return errors.Join(closeErr, server.Settle(settleCtx))
+		return errors.Join(owned.settle(settleCtx), server.Settle(settleCtx))
 	}))
 	return drained
+}
+
+// provenStage is runStage for the one stage whose error IS the verdict: the
+// children tail answers "did everything drain", so an in-time ErrUnsettled
+// abandons rather than releasing the flock over a process still in the table.
+// Every other stage settles on an in-time failure, where the error names work
+// that ran and failed rather than resources still held.
+func provenStage(budget Budget, run func(Budget) error) bool {
+	proven := make(chan bool, 1)
+	inTime := runStage(budget, func(b Budget) error {
+		err := run(b)
+		proven <- err == nil
+		return err
+	})
+	return inTime && <-proven
 }
 
 // settleRequests joins admitted dispatch and waits every written terminal's
@@ -350,39 +370,21 @@ func runStage(budget Budget, run func(Budget) error) bool {
 	}
 }
 
-// ownListener is the fossil listen() ownership primitive: TryAcquire the
-// socket-adjacent flock, probe for a live incumbent listener, then wait out
-// a dying incumbent's lock bounded by wait.
-func ownListener(ctx context.Context, socket string, wait time.Duration) (*flock.Handle, error) {
-	spec := flock.Spec{Path: socket + ".lock", Mode: flock.Exclusive, Deadline: wait}
-	lock, err := spec.TryAcquire()
-	if err != nil && !errors.Is(err, flock.ErrLockBusy) {
-		return nil, fmt.Errorf("daemonkit: acquire listener lock: %w", err)
-	}
-	conn, probeErr := net.DialTimeout("unix", socket, 100*time.Millisecond)
-	if probeErr == nil {
+// probeIncumbent is the fossil listen() ownership probe: a socket that still
+// accepts names a live incumbent, and no takeover exists here. Singleton
+// ownership itself lives in the record store's lock, which the store open
+// takes, so an OwnProcesses scope over the same record excludes a serving
+// daemon and cannot reclaim its children.
+func probeIncumbent(socket string) error {
+	conn, err := net.DialTimeout("unix", socket, 100*time.Millisecond)
+	if err == nil {
 		_ = conn.Close()
-		if lock != nil {
-			_ = lock.Close()
-		}
-		return nil, ErrBusy
+		return ErrBusy
 	}
-	if !errors.Is(probeErr, os.ErrNotExist) && !errors.Is(probeErr, syscall.ENOENT) && !errors.Is(probeErr, syscall.ECONNREFUSED) {
-		if lock != nil {
-			_ = lock.Close()
-		}
-		return nil, fmt.Errorf("daemonkit: probe incumbent listener: %w", probeErr)
+	if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOENT) && !errors.Is(err, syscall.ECONNREFUSED) {
+		return fmt.Errorf("daemonkit: probe incumbent listener: %w", err)
 	}
-	if lock == nil {
-		lock, err = spec.Acquire(ctx)
-		if errors.Is(err, context.DeadlineExceeded) {
-			return nil, fmt.Errorf("%w: lock held through wait: %w", ErrBusy, err)
-		}
-		if err != nil {
-			return nil, fmt.Errorf("daemonkit: wait for listener lock: %w", err)
-		}
-	}
-	return lock, nil
+	return nil
 }
 
 // TODO: digest the image this process is executing — the cdhash csops already

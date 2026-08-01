@@ -31,10 +31,12 @@ var (
 	ErrWrongIncumbent = errors.New("daemonkit: incumbent is not the expected runtime")
 
 	// ErrUnsettled means the target was still in the process table when ctx
-	// ended: a delivered drain whose exit was not yet observed, or a Settle
-	// whose recorded incumbent is still live. The incumbent keeps draining on
-	// its own Shutdown budget; re-observe with Settle.
-	ErrUnsettled = errors.New("daemonkit: daemon did not provably exit")
+	// ended: a delivered drain whose exit was not yet observed, a Settle whose
+	// recorded incumbent is still live, or an owned child, adopted record, or
+	// ownership scope whose settlement outran its deadline. The target keeps
+	// settling on its own ladder; re-observe with Settle, or leave the record
+	// for the next generation to reclaim.
+	ErrUnsettled = errors.New("daemonkit: process did not provably exit")
 
 	// errPinMoved means the process answering on a pinned session is no longer
 	// the one the attach pinned: the incumbent was replaced between two reads.

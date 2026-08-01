@@ -131,7 +131,7 @@ func TestResolvePythonToolRejectsVersionTraversal(t *testing.T) {
 		Schema: 1, Name: "t", Kind: PythonTool, Version: VersionSource{Static: "../../../evil"},
 		Tool: &ToolSpec{Dist: "t", Entrypoint: "t"},
 	}
-	if _, err := store.Resolve(context.Background(), desc, WithUV("/bin/true")); !errors.Is(err, ErrUnsafeArchive) {
+	if _, err := store.Resolve(context.Background(), desc, WithUV("/usr/bin/true")); !errors.Is(err, ErrUnsafeArchive) {
 		t.Fatalf("Resolve() = %v, want ErrUnsafeArchive", err)
 	}
 }

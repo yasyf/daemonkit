@@ -161,7 +161,7 @@ func (f *fixture) recordOwner(t *testing.T) proc.Identity {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	store, err := proc.OpenStore(path)
+	store, err := proc.OpenStore(f.within(30*time.Second), path)
 	if err != nil {
 		t.Fatalf("OpenStore: %v", err)
 	}
@@ -1226,7 +1226,9 @@ func TestOpenRefusesALabelWhoseRecordPathEscapesTheStateRoot(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(escaped), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	store, err := proc.OpenStore(escaped)
+	openCtx, cancelOpen := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancelOpen()
+	store, err := proc.OpenStore(openCtx, escaped)
 	if err != nil {
 		t.Fatalf("OpenStore: %v", err)
 	}

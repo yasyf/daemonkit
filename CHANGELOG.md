@@ -38,8 +38,156 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   absent file, `UpdateUnlocked` — is something daemonkit's own record ladder in
   `deploy/record.go` declined when it was written with a free hand.
 
+- Public subprocess supervision: `Cmd` and its `Run`/`Spawn`/`Adopt` verbs,
+  exposed twice from one implementation — as methods on `Ctx`, bound to a
+  serving daemon's record store, and on the `*Owned` scope `OwnProcesses` opens
+  for a CLI with no daemon, no socket, and no wire. `Run` returns a bounded
+  `RunResult` beside its error, never discarding output on failure: a nonzero
+  exit lands in `*ExitError`, an overflowed stream in `ErrTruncated` with the
+  capped bytes still in hand, and a spent budget in an error matching
+  `context.DeadlineExceeded`. `Spawn` returns a `*Child` whose channel is
+  established and whose stderr is already draining before the child is
+  released, so it can never block on an unwired pipe or race its own recording;
+  the channel is a closed enum — `ChannelNone`, `ChannelHandoff` (a socketpair
+  end at fd 3), `ChannelStdio` (stdin and stdout joined into one
+  deadline-aware `net.Conn`) — and `Child.Conn` hands the parent end out
+  exactly once. `Adopt` records a process whose fork the caller had to own and
+  returns a `*Tracked` that signals and observes but never waits: two waiters
+  on one pid is a lost wakeup, so `Stop` returns a `Reap` and `Release` retires
+  a record. `Owned.Close` and `Serve`'s `StageChildren` answer over one held
+  set, and a verb enters that set before it can start anything: admission and
+  registration are one step under one lock, so the whole spawn — `posix_spawn`,
+  the fsynced record, the exec verify, the release — runs inside a claim the
+  settle already sees. A settle waits an admitted verb out rather than
+  snapshotting past it, and a verb that has not finished starting when the
+  deadline runs out is an `ErrUnsettled` fault naming the verb, never a `nil`
+  answered over the process it already started. Within that set a `Run` holds
+  its child for the run's duration exactly as `Spawn` does, so an in-flight
+  `Run` is terminated and proven gone before `err == nil` or an empty
+  `Drained.Abandoned` is published, and the settled run returns the bytes
+  it collected beside an `*ExitError` naming the fatal signal. Proven gone means
+  proven: a settlement ladder that times out with nothing proved publishes
+  `ReapUndetermined`, and that child stays registered so `Close` faults with
+  `ErrUnsettled` instead of answering `nil` over a process still in the table.
+  Nor does settling a run pin its caller — the post-terminal EOF drain and the
+  stdin wait are bounded by the settlement deadline the demand carried, so a
+  descendant that inherited a pipe cannot hold the run open for the rest of a
+  budget the scope already stopped spending. A child abandoned mid-`Spawn`
+  settles on the settlement grace, not on whatever deadline the caller happened
+  to hand down. A verb reaching a settled scope is refused in daemonkit's own
+  register, never the record store's, and so is a verb handed a context with no
+  budget left — before a child exists to abort, and never as the lock's
+  wording, which would name a contention that never happened. A dedicated
+  session whose survivors outlast their own settlement publishes undetermined
+  too: the leader's exit is not the
+  group's, so a leader proven gone over members that were not is no proof.
+  Descendants are covered by the child's session and only by it. `Run` always
+  spawns into a dedicated one, so a run settles whatever its command forked and
+  not merely the command; a `Spawn` without `Cmd.Session` settles the child it
+  started and nothing below it; and a descendant that `setsid()`s out of its
+  session leaves the only scope the kernel offers, so it is neither signalled
+  nor counted. `NewGate` is the record-before-first-instruction guarantee for that
+  caller — a wrapper that signals readiness on fd 3, parks on fd 4, and execs
+  the target only on `Release`. `NewCapture` bounds a child's stderr without
+  ever blocking it, `ClaimHandoff` and `CloseInheritedFDs` are the child half,
+  and `Owned.Ctx` mints a `Ctx` so product code written against a daemon runs
+  unchanged under a CLI-owned scope.
+
+- `Cmd.Exec` — the trust posture the executable behind `Cmd.Path` must prove
+  before its child runs one instruction, required on every `Run` and `Spawn`.
+  `posix_spawn(START_SUSPENDED)` stops the child at its entry point *after* the
+  kernel has established the CodeDirectory, so the full shipping verifier reads
+  the exact image that will run, in place, against a process that has not
+  executed an instruction; the token comes from `task_name_for_pid` +
+  `task_info(TASK_AUDIT_TOKEN)`, and a failed verify returns into the existing
+  abort path — the child is killed and reaped and `ErrUntrusted` comes back,
+  never a live-looking `*Child` that instantly reports 137. `Serving` is a
+  two-constructor sum, so the dangerous posture is not the zero value:
+  `ServingSigned(r)` pins a bundle, and `ServingSameUser()` is the named waiver
+  a Python interpreter, a platform binary, or a homebrew tool takes. Spawn
+  never copies, stages, or rewrites `Path` — App Group entitlement grants
+  attach to the deployed path, so the recorded image, the verified image, and
+  the running image are one file. The signed-acceptance half of this needs the
+  `.trust-fixtures` signed binaries, which CI does not build; what CI covers is
+  the denial, the abort, and the token read against a suspended child.
+
 ### Changed
 
+- **Breaking.** `Run` always gives its child a dedicated session, and a `Cmd`
+  naming `Cmd.Session` on `Run` is refused at the boundary — the same shape as
+  `Cmd.MaxOutput` being refused on `Spawn`. A run is bounded, disposable, and
+  run to completion, so a command that outlives itself through a fork is a
+  leak, not a posture worth a field; `Spawn` keeps `Cmd.Session` as a real
+  choice, since a long-lived co-process may legitimately want the caller's
+  session or its own. This is what makes `Owned.Close`'s "every live child
+  terminated and proven gone" true of a `Run` child: before it, terminating a
+  run's child signalled the child alone — it had inherited the *caller's*
+  process group — and its own fork survived a `Close` that answered `nil`.
+
+  Three consequences a `Run` caller sees. The run no longer settles until its
+  whole session has, so the abnormal teardown path pays the session's own
+  settlement grace after the child's ladder: a scope holding a SIGTERM-ignoring
+  run child needs roughly 15s of `Close` budget where 12s sufficed, and a
+  `Close` sized only for the child ladder now returns `ErrUnsettled` on a shape
+  that used to answer `nil`. The command is no longer in the caller's process
+  group, so it receives neither the terminal's SIGINT nor a controlling tty. And
+  a descendant the command forked is terminated with it — including one that was
+  holding the run's stdout pipe, which used to keep the drain open to the
+  deadline and hand back `ErrTruncated`. The one shape still outside the scope
+  is a descendant that `setsid()`s out of the session; macOS offers nothing that
+  survives that, and it is documented rather than claimed.
+- A `Run` whose hold refuses carries the teardown's verdict out. The refusal
+  admitted before the spawn and held after it, so an `Owned.Close` completing in
+  that window tore the child down on the settlement grace and discarded the
+  exit — an undetermined terminal there reached nobody, though it is the only
+  settlement that child would ever get. The hold's error is now joined with the
+  undetermined verdict, and the terminal rides out in the result rather than a
+  zero value.
+- **Breaking.** The daemon's singleton lock moves from `socket + ".lock"` to
+  `recordPath + ".lock"`, and is taken inside the record store's open rather
+  than beside it. `Daemon.RecordPath` is exported and the store open took no
+  lock at all, so `OwnProcesses(ctx, d.RecordPath())` against a serving daemon
+  was constructible and its reclaim would have killed that daemon's live
+  children. The lock now lives where the invariant lives: `Serve` and
+  `OwnProcesses` take the identical lock on the identical path, and a second
+  owner is refused before it can read a record. Contention on the
+  `OwnProcesses` side is `durable.ErrLockBusy`, never `ErrBusy` — that one
+  means a live incumbent owns the socket, which is a different fact — and
+  `Serve` keeps its socket probe for exactly that detection.
+- **Breaking.** `Ctx.Reclaimed` is `[]Reclaimed`, the root package's own type;
+  it was `[]proc.Reclaimed`, an `internal/` type in an exported signature that
+  no consumer could name. `Exit` gains `Signal`, and `Code` is now `-1` on a
+  signal death rather than `128 + signal`, so a status and a signal can never
+  be confused for one another.
+- **Breaking.** The interim `daemonkit.Run(ctx, *proc.Store, proc.Cmd)` is
+  deleted. Its own doc admitted no external module could call it — both its
+  parameter and its result were `internal/` types; `Owned.Run` and `Ctx.Run`
+  are the surface it stood in for.
+- A `Run` stream that is not the whole stream is an error, not data. Overflow
+  used to set a `Truncated` flag beside a nil error, which a caller parsing the
+  stream had to know to check; it is now `ErrTruncated`, with the retained bytes
+  still in the `RunResult`, so nothing is discarded and a forgotten cap is loud.
+  The sentinel covers both shortfalls it can carry — a stream past its cap and a
+  drain severed at the settlement deadline — since a caller parsing either gets
+  a prefix, not the output. The
+  default cap rises from 1 MiB to 4 MiB, and one `Cmd.MaxOutput` replaces the
+  separate stdout and stderr limits. The cap bounds what a run retains, not
+  what it allocates to retain it: retention grows geometrically with every
+  growth clamped to the cap, so a silent command no longer pays the whole cap
+  up front and a command that fills it no longer pays several times over on
+  `append`'s doubling.
+- Duplicate `Cmd.Env` keys are a boundary refusal. `posix_spawn` passes envp
+  verbatim, and both macOS `__findenv` and Go's `syscall.copyenv` return the
+  *first* occurrence — so the "copy the environment and append an override"
+  pattern silently ran children on the original value. Deduplicate before the
+  boundary. The `DAEMONKIT_SPAWNED_*` namespace is daemonkit's own: a
+  caller-supplied key there is refused, an inherited one is stripped, and a
+  `ChannelHandoff` spawn appends exactly the attach nonce and the conveyed
+  `Cmd.Limits` after the caller's environment. The nonce is not a secret — any
+  same-UID process reads a peer's environment through `KERN_PROCARGS2` — and
+  nothing leans on it as one: its role is fd-mixup defence, proof that the
+  attaching peer inherited fd 3 from this exec. The child unsets both variables
+  as it claims the descriptor.
 - Durable writes create no directories. `durablefile.WriteFileDurable` ran an
   implicit `mkdir -p` at a hardcoded 0700, a mode that silently disagreed with
   call sites owning their directory at another one; `durable.WriteFile` returns

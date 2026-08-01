@@ -12,17 +12,17 @@ import (
 func TestSpawnHandoffReachesChildAtFD3(t *testing.T) {
 	s, _ := newTestStore(t)
 	marker := filepath.Join(t.TempDir(), "received")
-	child, err := s.Spawn(Cmd{
+	child, err := s.Spawn(t.Context(), Cmd{
 		Path:    "/bin/sh",
 		Args:    []string{"-c", "cat <&3 > " + marker},
-		Handoff: true,
-	})
+		Channel: ChannelHandoff,
+	}, nil)
 	if err != nil {
 		t.Fatalf("Spawn() = %v", err)
 	}
-	parent, err := child.Handoff()
+	parent, err := child.TakeChannel()
 	if err != nil {
-		t.Fatalf("Handoff() = %v", err)
+		t.Fatalf("TakeChannel() = %v", err)
 	}
 	if _, err := parent.Write([]byte("over fd 3")); err != nil {
 		t.Fatalf("write handoff: %v", err)
@@ -46,19 +46,19 @@ func TestSpawnHandoffReachesChildAtFD3(t *testing.T) {
 	if string(got) != "over fd 3" {
 		t.Fatalf("child read %q from fd 3", got)
 	}
-	if _, err := child.Handoff(); err == nil {
-		t.Fatal("Handoff() is not single-take")
+	if _, err := child.TakeChannel(); err == nil {
+		t.Fatal("TakeChannel() is not single-take")
 	}
 }
 
-func TestHandoffAbsentWithoutCmdHandoff(t *testing.T) {
+func TestChannelAbsentWithoutCmdChannel(t *testing.T) {
 	s, _ := newTestStore(t)
-	child, err := s.Spawn(Cmd{Path: "/bin/sleep", Args: []string{"0"}})
+	child, err := s.Spawn(t.Context(), Cmd{Path: "/bin/sleep", Args: []string{"0"}}, nil)
 	if err != nil {
 		t.Fatalf("Spawn() = %v", err)
 	}
-	if _, err := child.Handoff(); err == nil {
-		t.Fatal("Handoff() returned an endpoint for a handoff-less spawn")
+	if _, err := child.TakeChannel(); err == nil {
+		t.Fatal("TakeChannel() returned an endpoint for a channel-less spawn")
 	}
 	<-child.Done()
 }

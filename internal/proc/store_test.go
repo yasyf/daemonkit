@@ -21,7 +21,7 @@ func storeHolds(t *testing.T, path string, id identity) bool {
 func TestAddIsObservedByPostWriteReRead(t *testing.T) {
 	s, path := newTestStore(t)
 	rec := record{PID: 4242, Start: 1, Boot: testBoot, Generation: s.generation, Comm: "child"}
-	if err := s.add(rec); err != nil {
+	if err := s.add(t.Context(), rec); err != nil {
 		t.Fatalf("add() = %v", err)
 	}
 	if !storeHolds(t, path, rec.id()) {
@@ -32,7 +32,7 @@ func TestAddIsObservedByPostWriteReRead(t *testing.T) {
 func TestRetireByIdentityCoreSurvivesCosmeticDrift(t *testing.T) {
 	s, path := newTestStore(t)
 	rec := record{PID: 4242, Start: 1, Boot: testBoot, Generation: s.generation, Comm: "before"}
-	if err := s.add(rec); err != nil {
+	if err := s.add(t.Context(), rec); err != nil {
 		t.Fatalf("add() = %v", err)
 	}
 	file := state.New[records](path, recordSchema)
@@ -65,7 +65,7 @@ func TestRetireAbsentIdentityObservesRemoval(t *testing.T) {
 func TestRetireStoreFailureIsAbandonedNeverClaimed(t *testing.T) {
 	s, path := newTestStore(t)
 	rec := record{PID: 4242, Start: 1, Boot: testBoot, Generation: s.generation}
-	if err := s.add(rec); err != nil {
+	if err := s.add(t.Context(), rec); err != nil {
 		t.Fatalf("add() = %v", err)
 	}
 	dir := filepath.Dir(path)
@@ -101,11 +101,7 @@ func TestOpenStoreArchivesUnknownSchemaAndRecoverReapsItsCores(t *testing.T) {
 		t.Fatalf("store future frame: %v", err)
 	}
 
-	s, err := OpenStore(path)
-	if err != nil {
-		t.Fatalf("OpenStore() = %v", err)
-	}
-	t.Cleanup(func() { _ = s.Close() })
+	s := openTestStore(t, path)
 	prober := &funcProber{probeFn: func(int) (procInfo, error) {
 		t.Fatal("cross-boot core was probed")
 		return procInfo{}, nil
@@ -138,7 +134,7 @@ func TestReopenBeforeRecoverStillReclaimsArchivedCores(t *testing.T) {
 		t.Fatalf("store future frame: %v", err)
 	}
 
-	first, err := OpenStore(path)
+	first, err := OpenStore(ladderContext(t, 5*time.Second), path)
 	if err != nil {
 		t.Fatalf("first OpenStore() = %v", err)
 	}
@@ -146,11 +142,7 @@ func TestReopenBeforeRecoverStillReclaimsArchivedCores(t *testing.T) {
 		t.Fatalf("first Close() = %v", err)
 	}
 
-	second, err := OpenStore(path)
-	if err != nil {
-		t.Fatalf("second OpenStore() = %v", err)
-	}
-	t.Cleanup(func() { _ = second.Close() })
+	second := openTestStore(t, path)
 	second.prober = &funcProber{probeFn: func(int) (procInfo, error) { return procInfo{}, errNoProc }}
 
 	reclaimed, _, err := second.Recover(ladderContext(t, time.Second), nil)
@@ -173,11 +165,7 @@ func TestArchivedSessionCoreRecoversItsSessionMembers(t *testing.T) {
 		t.Fatalf("store future frame: %v", err)
 	}
 
-	s, err := OpenStore(path)
-	if err != nil {
-		t.Fatalf("OpenStore() = %v", err)
-	}
-	t.Cleanup(func() { _ = s.Close() })
+	s := openTestStore(t, path)
 
 	enumerated := false
 	s.prober = &funcProber{

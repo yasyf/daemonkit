@@ -13,12 +13,12 @@ func TestSpawnRecordDurableBeforeFirstInstruction(t *testing.T) {
 	s, path := newTestStore(t)
 	marker := filepath.Join(t.TempDir(), "ran")
 	checked := false
-	s.beforeRelease = func(pid int) {
+	verify := func(pid int) error {
 		checked = true
 		loaded, err := state.New[records](path, recordSchema).Load()
 		if err != nil {
 			t.Errorf("raw re-read before release: %v", err)
-			return
+			return nil
 		}
 		found := false
 		for _, rec := range loaded.Value.Live {
@@ -32,7 +32,7 @@ func TestSpawnRecordDurableBeforeFirstInstruction(t *testing.T) {
 		info, err := probeProc(pid)
 		if err != nil {
 			t.Errorf("probe suspended child: %v", err)
-			return
+			return nil
 		}
 		if !info.stopped {
 			t.Error("child is not SSTOP before its record's fsync returned")
@@ -40,9 +40,10 @@ func TestSpawnRecordDurableBeforeFirstInstruction(t *testing.T) {
 		if _, err := os.Stat(marker); !os.IsNotExist(err) {
 			t.Errorf("command side effect exists before release: %v", err)
 		}
+		return nil
 	}
 
-	child, err := s.Spawn(Cmd{Path: "/bin/sh", Args: []string{"-c", "touch " + marker}})
+	child, err := s.Spawn(t.Context(), Cmd{Path: "/bin/sh", Args: []string{"-c", "touch " + marker}, Verify: verify}, nil)
 	if err != nil {
 		t.Fatalf("Spawn() = %v", err)
 	}
@@ -91,18 +92,14 @@ func TestRecoverSettlesSuspendedChildWithDurableRecord(t *testing.T) {
 		t.Fatal("spawned child is not suspended")
 	}
 	rec := record{PID: pid, Start: info.start, Boot: boot, Generation: s.generation}
-	if err := s.add(rec); err != nil {
+	if err := s.add(t.Context(), rec); err != nil {
 		t.Fatalf("add() = %v", err)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	next, err := OpenStore(path)
-	if err != nil {
-		t.Fatalf("OpenStore() = %v", err)
-	}
-	t.Cleanup(func() { _ = next.Close() })
+	next := openTestStore(t, path)
 	reclaimed, _, err := next.Recover(ladderContext(t, 1500*time.Millisecond), nil)
 	if err != nil {
 		t.Fatalf("Recover() error = %v", err)

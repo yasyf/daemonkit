@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/internal/flock"
+	"github.com/yasyf/daemonkit/internal/proc"
 	"github.com/yasyf/daemonkit/internal/realhome"
 	"github.com/yasyf/daemonkit/internal/wire"
 	"github.com/yasyf/daemonkit/paths"
@@ -113,7 +114,7 @@ func TestServeDrainVerbDrivesReturn(t *testing.T) {
 		t.Fatalf("product drained=%t closed=%t, want both", product.drained.Load(), product.closed.Load())
 	}
 
-	lock, err := flock.Spec{Path: socket + ".lock", Mode: flock.Exclusive, Deadline: time.Second}.TryAcquire()
+	lock, err := flock.Spec{Path: proc.LockPath(d.RecordPath()), Mode: flock.Exclusive, Deadline: time.Second}.TryAcquire()
 	if err != nil {
 		t.Fatalf("flock after Serve returned = %v, want released", err)
 	}

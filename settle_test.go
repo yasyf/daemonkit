@@ -24,7 +24,9 @@ func settleFixture(t *testing.T) (Daemon, proc.Owner) {
 	if err := el.state().EnsureStateDir(); err != nil {
 		t.Fatalf("EnsureStateDir: %v", err)
 	}
-	store, err := proc.OpenStore(el.record())
+	openCtx, cancelOpen := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancelOpen()
+	store, err := proc.OpenStore(openCtx, el.record())
 	if err != nil {
 		t.Fatalf("OpenStore: %v", err)
 	}

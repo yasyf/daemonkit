@@ -17,7 +17,7 @@ func TestRunPartialStdinConsumerSucceeds(t *testing.T) {
 		Path:  "/usr/bin/head",
 		Args:  []string{"-c", "100"},
 		Stdin: bytes.Repeat([]byte("x"), 1<<20),
-	})
+	}, unheld)
 	if result.Exit.Code != 0 {
 		t.Fatalf("Exit.Code = %d, want 0 (head -c exits cleanly)", result.Exit.Code)
 	}

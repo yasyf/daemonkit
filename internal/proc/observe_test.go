@@ -83,11 +83,7 @@ func TestObserveClassification(t *testing.T) {
 
 func TestRecordOwnerRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "records.dkstate")
-	store, err := OpenStore(path)
-	if err != nil {
-		t.Fatalf("OpenStore: %v", err)
-	}
-	defer store.Close()
+	store := openTestStore(t, path)
 
 	if _, ok, err := ReadOwner(path); err != nil || ok {
 		t.Fatalf("ReadOwner(fresh) = ok=%t err=%v, want no owner", ok, err)
@@ -161,17 +157,13 @@ func TestReadOwnerRefusesIllFormedRecords(t *testing.T) {
 
 func TestOwnerSurvivesRecordWrites(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "records.dkstate")
-	store, err := OpenStore(path)
-	if err != nil {
-		t.Fatalf("OpenStore: %v", err)
-	}
-	defer store.Close()
+	store := openTestStore(t, path)
 	owner, err := store.RecordOwner("build-digest")
 	if err != nil {
 		t.Fatalf("RecordOwner: %v", err)
 	}
 	rec := record{PID: 54321, Start: 7, Boot: 9, Generation: store.Generation()}
-	if err := store.add(rec); err != nil {
+	if err := store.add(t.Context(), rec); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	<-store.retire(rec.id())

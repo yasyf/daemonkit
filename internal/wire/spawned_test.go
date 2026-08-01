@@ -55,7 +55,9 @@ func runSpawnedChild() {
 
 func spawnChild(t *testing.T, envNonce []byte) *proc.Child {
 	t.Helper()
-	store, err := proc.OpenStore(filepath.Join(t.TempDir(), "records.dkstate"))
+	openCtx, cancelOpen := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancelOpen()
+	store, err := proc.OpenStore(openCtx, filepath.Join(t.TempDir(), "records.dkstate"))
 	if err != nil {
 		t.Fatalf("OpenStore() = %v", err)
 	}
@@ -64,15 +66,15 @@ func spawnChild(t *testing.T, envNonce []byte) *proc.Child {
 	if err != nil {
 		t.Fatalf("os.Executable() = %v", err)
 	}
-	child, err := store.Spawn(proc.Cmd{
+	child, err := store.Spawn(t.Context(), proc.Cmd{
 		Path:    executable,
-		Handoff: true,
+		Channel: proc.ChannelHandoff,
 		Env: append(
 			os.Environ(),
 			spawnedChildEnv+"=1",
 			wire.SpawnedNonceEnv+"="+hex.EncodeToString(envNonce),
 		),
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("Spawn() = %v", err)
 	}
@@ -81,14 +83,9 @@ func spawnChild(t *testing.T, envNonce []byte) *proc.Child {
 
 func handoffConn(t *testing.T, child *proc.Child) *net.UnixConn {
 	t.Helper()
-	file, err := child.Handoff()
+	conn, err := child.TakeChannel()
 	if err != nil {
-		t.Fatalf("Handoff() = %v", err)
-	}
-	conn, err := net.FileConn(file)
-	_ = file.Close()
-	if err != nil {
-		t.Fatalf("FileConn() = %v", err)
+		t.Fatalf("TakeChannel() = %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
 	return conn.(*net.UnixConn)
