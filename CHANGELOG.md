@@ -68,6 +68,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `launchctl enable` as a side effect of a read, which also wrote a permanent
   root-owned override-database entry per label that uninstall never removes. A
   loaded-but-disabled agent is therefore no longer silently re-enabled.
+- **Breaking.** A deployment's durable state moved from
+  `.daemonkit-deployment/<Product>` to `.daemonkit-deploy/<Product>`, and the
+  first open of a deployment renames its own tree at the old path to a
+  `<Product>.bak` sibling. The rename is not cosmetic: every record `deploy`
+  reads now decodes with `DisallowUnknownFields` against types this cut
+  renamed, so a v0.20.10-shaped tree fails to decode on 100% of installed
+  machines. Archiving it turns that hard failure into a clean re-install and
+  keeps the old receipts as evidence rather than deleting them. The archive is
+  one rename, so concurrent openers produce exactly one `.bak`, and it covers
+  only the product doing it — a sibling installed beside it that an older
+  binary still manages keeps the lock path that binary opens by name.
+- The `launchd` package carries `//go:build darwin`. Its files compiled
+  anywhere and failed only at runtime, exec'ing `/bin/launchctl`; they now fail
+  at build time, which is the guarantee the rest of the module already gives.
+  The exported packages that survive off darwin — `artifact`, `bundle`,
+  `ghrelease`, `paths`, `version` — are recorded per platform in
+  `ci/exported.txt`. `ci/portable.txt` declares the whole linux-portable
+  partition, module-private packages included, and
+  `scripts/portable-gate.sh` gates it in both directions.
 
 ### Fixed
 

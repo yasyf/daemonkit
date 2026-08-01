@@ -20,6 +20,9 @@ const (
 	removalIdentity    = "daemonkit.deploy.removal.v1"
 	serviceIdentity    = "daemonkit.deploy.services.v1"
 	recordSchema       = 1
+
+	metadataDir       = ".daemonkit-deploy"
+	legacyMetadataDir = ".daemonkit-deployment"
 )
 
 // swapRecord names the one fact a resume cannot recompute: which generation
@@ -203,12 +206,13 @@ type layout struct {
 	candidate  string
 	prior      string
 	removed    string
+	legacy     string
 }
 
 func layoutFor(appPath string) layout {
 	name := strings.TrimSuffix(filepath.Base(appPath), ".app")
 	root := filepath.Dir(appPath)
-	metadata := filepath.Join(root, ".daemonkit-deployment", name)
+	metadata := filepath.Join(root, metadataDir, name)
 	return layout{
 		canonical:  appPath,
 		metadata:   metadata,
@@ -220,6 +224,7 @@ func layoutFor(appPath string) layout {
 		candidate:  filepath.Join(root, "."+name+".daemonkit-candidate.app"),
 		prior:      filepath.Join(metadata, "prior.app"),
 		removed:    filepath.Join(metadata, "removed.app"),
+		legacy:     filepath.Join(root, legacyMetadataDir, name),
 	}
 }
 
@@ -228,6 +233,9 @@ func (l layout) ensureMetadata() error {
 	resolved, err := filepath.EvalSymlinks(root)
 	if err != nil || resolved != root {
 		return fmt.Errorf("%w: install directory is not a canonical real path", ErrConflict)
+	}
+	if err := l.archiveLegacy(); err != nil {
+		return err
 	}
 	for _, dir := range []string{filepath.Dir(l.metadata), l.metadata} {
 		if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
@@ -239,6 +247,25 @@ func (l layout) ensureMetadata() error {
 		if err := durablefile.SyncDir(filepath.Dir(dir)); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// archiveLegacy moves this deployment's pre-rename metadata tree aside. Every
+// record in it names fields this package no longer has, and readRecord refuses
+// an unknown field, so the first read on an installed machine would fail hard
+// rather than converge; a rename turns that into a clean re-install and keeps
+// the old tree as evidence instead of destroying it. The legacy directory is
+// shared by every product installed beside this one, so only this deployment's
+// own subtree moves — a sibling an older binary still manages keeps the lock
+// file path that binary opens by name. The rename is itself the one-shot: two
+// openers racing it produce one archive, and the loser finds the source gone.
+func (l layout) archiveLegacy() error {
+	switch err := renameDurable(l.legacy, l.legacy+".bak"); {
+	case errors.Is(err, os.ErrNotExist):
+		return nil
+	case err != nil:
+		return fmt.Errorf("deploy: archive legacy metadata %q: %w", l.legacy, err)
 	}
 	return nil
 }

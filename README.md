@@ -76,9 +76,9 @@ disappears cannot leave a stale row behind.
 |---|---|---|---|
 | `artifact` | resolves a version-exact executable from a declarative descriptor, for the cc-family's one central "give me the binary that matches my version" primitive. | 16 | 2230 |
 | `bundle` | reads a macOS .app's Info.plist and resolves the stable bundle paths a daemon installs to. | 5 | 198 |
-| `deploy` | owns sealed installation, activation, supersession, and removal of one fixed signed application. | 14 | 4748 |
+| `deploy` | owns sealed installation, activation, supersession, and removal of one fixed signed application. | 15 | 4942 |
 | `ghrelease` | queries GitHub for a repository's latest published release. | 2 | 170 |
-| `launchd` | is the value-type model for one exact macOS user LaunchAgent and the stateless primitives that apply it. | 12 | 2463 |
+| `launchd` | is the value-type model for one exact macOS user LaunchAgent and the stateless primitives that apply it. | 12 | 2487 |
 | `paths` | owns the canonical state-directory layout under the user's home directory, resolved through the passwd database — never the caller's HOME or CLAUDE_CONFIG_DIR — so a sandboxed environment cannot relocate state. | 4 | 209 |
 | `templates` | — | 2 | 218 |
 | `version` | classifies and compares release and development builds for launcher-owned runtime settlement and release ordering. | 2 | 302 |
@@ -112,7 +112,7 @@ policy, plan, and generation only from sealed state. `UninstallCurrentInstalled`
 owns quiescence and crash-recoverable namespace removal. Consumers never write a
 candidate path, swap the installed app, inspect private JSON, or remove the
 canonical app. Exact v1 receipts, service state, and locks live beside the app
-under `.daemonkit-deployment/<Product>`.
+under `.daemonkit-deploy/<Product>`.
 
 ## The consumer trust contract
 

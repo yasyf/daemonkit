@@ -1,6 +1,6 @@
 package proc
 
-// TODO(v<cut+1>): delete this sweep and the go.etcd.io/bbolt dependency with it.
+// TODO(v0.22.0): delete this sweep and the go.etcd.io/bbolt dependency with it.
 
 import (
 	"context"

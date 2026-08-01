@@ -12,6 +12,11 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
+# The docs job runs on ubuntu, and a darwin-tagged package drops out of
+# `go list ./...` entirely under any other GOOS — launchd would silently
+# vanish from the rendered table.
+export GOOS=darwin
+
 targets=(
   "README.md"
   "AGENTS.md"

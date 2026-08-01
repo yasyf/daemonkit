@@ -2,9 +2,9 @@
 // against a checked-in allowlist, so no export appears or disappears unreviewed.
 //
 // The census walks every non-internal, non-main package of the module under each
-// supported GOOS/GOARCH pair. daemonkit is macOS-only, so darwin is the whole
-// list and every recorded symbol is available on it. Output is one sorted line
-// per symbol:
+// supported GOOS/GOARCH pair: darwin, where the whole module lives, and linux,
+// limited to the portable subset ci/portable.txt declares and
+// scripts/portable-gate.sh proves. Output is one sorted line per symbol:
 //
 //	<package>\t<kind>\t<symbol>\t<platform>
 //
@@ -33,10 +33,16 @@ import (
 type platform struct {
 	goos   string
 	goarch string
+	// manifest, when set, limits the lane to the module-relative package
+	// directories that file lists, so a lane records only the surface a
+	// consumer on this GOOS can actually link against. A package whose files
+	// merely lack a build constraint still fails to compile off darwin.
+	manifest string
 }
 
 var platforms = []platform{
 	{goos: "darwin", goarch: "arm64"},
+	{goos: "linux", goarch: "amd64", manifest: "ci/portable.txt"},
 }
 
 type symbol struct {
@@ -156,8 +162,13 @@ func collect(dir string, p platform) (map[symbol]bool, error) {
 	ctx.CgoEnabled = false
 	ctx.UseAllFiles = false
 
+	only, err := manifested(dir, p.manifest)
+	if err != nil {
+		return nil, err
+	}
+
 	found := map[symbol]bool{}
-	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+	err = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -170,6 +181,9 @@ func collect(dir string, p platform) (map[symbol]bool, error) {
 		}
 		if skipDir(rel, d.Name()) {
 			return fs.SkipDir
+		}
+		if only != nil && !only[filepath.ToSlash(rel)] {
+			return nil
 		}
 		pkg, err := ctx.ImportDir(path, 0)
 		if err != nil {
@@ -190,6 +204,23 @@ func collect(dir string, p platform) (map[symbol]bool, error) {
 		return nil
 	})
 	return found, err
+}
+
+// manifested reads a lane's package manifest into a lookup set, or returns nil
+// for a lane that censuses every package it walks.
+func manifested(dir, manifest string) (map[string]bool, error) {
+	if manifest == "" {
+		return nil, nil
+	}
+	lines, err := readLines(filepath.Join(dir, manifest))
+	if err != nil {
+		return nil, err
+	}
+	only := make(map[string]bool, len(lines))
+	for _, line := range lines {
+		only[line] = true
+	}
+	return only, nil
 }
 
 func skipDir(rel, name string) bool {

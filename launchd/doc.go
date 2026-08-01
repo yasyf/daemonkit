@@ -1,3 +1,5 @@
+//go:build darwin
+
 // Package launchd is the value-type model for one exact macOS user LaunchAgent
 // and the stateless primitives that apply it.
 //

@@ -60,6 +60,20 @@ jobs:
       - name: Build (pure)
         run: CGO_ENABLED=0 go build ./...
 
+  # The subset fleet consumers that ship linux build against. Cross-compiles,
+  # so a linux runner is both cheap and the honest host for it.
+  portable:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Portable subset gate
+        run: ./scripts/portable-gate.sh
+
   # Static analysis type-checks the tree, so it runs for darwin. GOOS/GOARCH
   # keep it on a cheap linux runner instead of billing macOS minutes 10x.
   lint:
