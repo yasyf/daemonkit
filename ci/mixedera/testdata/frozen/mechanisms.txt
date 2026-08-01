@@ -7,18 +7,21 @@
 #   entailed-by <era> <mechanism>  (optional, repeatable per era)
 #   proposition <the exact claim the name denotes>
 #
-# Five things are frozen here, and the run refuses each one where this file and
-# the tree disagree:
+# Five things are frozen here, and the run refuses whatever it is handed that
+# disagrees with each:
 #
-#   the proposition — every era peer quotes its mechanism's proposition back in
-#     the conformance it declares, and the manifest refuses a peer whose text
+#   the proposition — each era's declared conformance quotes its mechanism's
+#     proposition back, and the manifest refuses a declaration whose text
 #     differs by a byte, so the two eras' columns cannot come to answer
-#     different questions;
+#     different questions. The freeze binds the declaration — a string the
+#     harness hands the manifest — and nothing here binds that string to a
+#     peer process;
 #   the name — no name twice, and no two names carrying one proposition, so a
 #     name cannot be aimed at what another name already denotes;
-#   the disposition — a peer claiming an era this file calls absent, or
-#     declaring an absence for an era it calls claimed, is refused, so dropping
-#     a peer's absence to turn an UNPROVEN row PROVEN is an edit here;
+#   the disposition — a declaration claiming an era this file calls absent, or
+#     one declaring an absence for an era it calls claimed, is refused, so
+#     dropping a declared absence to turn an UNPROVEN row PROVEN is an edit
+#     here;
 #   the witness — a fact reaches the journal only from the site named for its
 #     mechanism and class, so an observation one witness already made cannot be
 #     filed a second time under another mechanism's name;
@@ -45,17 +48,19 @@
 #     marking a claim observed — a case marks its own line and nothing else, and
 #       a claim's line is marked only by the redemption that earned it, so a
 #       case emptied to bookkeeping reports nothing;
-#     dropping an era from the manifest, or building one that never covered it:
-#       every era this file disposes of has to be declared, so no record is left
-#       with nothing in it to refuse;
+#     dropping an era from the manifest — its rows and its era map are
+#       unexported; and a manifest built without every era this file disposes
+#       of is refused before the matrix runs, so no record is left with
+#       nothing in it to refuse;
 #     appending to the evidence journal — the two observers are the only way in,
 #       and the witness binding runs inside them;
-#     re-sealing, or writing the sealed text, so that a later read sees a
-#       different file than the run started on.
+#     writing the sealed text — and a second Bind is refused — so a later read
+#       cannot be given a different file than the run started on.
 #
 #   Those five are the moves that cleared this gate as it stood before this
-#   pass, each one a line or two inside a case body. They are refused by the
-#   compiler now, rather than reported by an audit.
+#   pass, each one a line or two of state assignment inside a case body. As
+#   they were written, each is a compile error now rather than a finding for
+#   an audit.
 #
 # WHAT THIS TEXT STILL BINDS
 #
@@ -79,37 +84,58 @@
 #
 # WHAT REMAINS POSSIBLE, AND FOR WHOM
 #
-#   What is left is the harness misreporting what it saw. Two shapes are known,
-#   and neither is closed:
+#   What is left is the harness misreporting what it saw, and it is not a list
+#   of known holes but the shape of every witness: each one is handed the
+#   artifact it judges — a parameter, or a field of the harness's own handle —
+#   and in a single-process harness that artifact is a value the caller can
+#   build. So every PROVEN cell is reachable from a case body with no process,
+#   no socket, and no frozen-file edit:
 #
-#     daemonProc.signalled is the whole of drain-sigterm's attribution to
-#       SIGTERM, and it is an ordinary field of the harness's own process
-#       handle. A case body that sets it without signalling gets an exit the OS
-#       really reaped filed under a repair channel nothing used, and
-#       (*daemonProc).witnessDrain passes the branch audit precisely because it
-#       branches on that receiver. It is one of a class, not a lone oversight:
-#       every artifact this harness captures sits in the harness's own memory —
-#       the bytes the relay copied, the channel a process exit arrives on, this
-#       flag — and the boundary that would enclose that class encloses process
-#       spawning and socket serving, which is not what a coverage package is,
-#       and would not help anyway: the harness would still be the caller
-#       reporting what it saw. So this is a flag inside a case body, and it
-#       stays one.
+#     (*daemonProc).witnessDrain files an exit as SIGTERM's whenever signalled
+#       is set, and signalled is an ordinary field of the harness's own process
+#       handle: the witness is callable on a struct literal no daemon ever
+#       backed, no exit the OS reaped required, and it passes the branch audit
+#       precisely because it branches on that receiver;
+#     witnessVerdict and witnessControlTrustGate judge report values their
+#       caller decoded — or built;
+#     the conformance the proposition and disposition freezes bind is
+#       Declaration.JSON, a string the manifest's caller supplies. That each
+#       string is a peer process's own output is declaredBy's doing, and
+#       declaredBy is harness code like the rest;
+#     the class on every filed fact — "a process exit the OS reaped", "bytes
+#       the relay copied" — is an EvidenceKind the witness passes as an
+#       argument. The witness binding checks (site, mechanism, kind) and never
+#       that an artifact of that class exists, so the journal's vocabulary is a
+#       label the harness picks — the mechanism under both entries above;
 #     a registered witness gutted to a branch that decides nothing — always
 #       true, or placed after the filing call, or sitting in an unrelated
 #       closure — still passes the branch audit, which walks the body flat with
 #       no dominance or ordering analysis. Refusing that needs a decision
 #       procedure this gate does not have.
 #
-#   The record is also still written by the run that produces it; forming a
-#   verdict outside the run is the phase-2 TODO in ci/mixedera/coverage.
+#   The boundary that would enclose this class encloses process spawning and
+#   socket serving, which is not what a coverage package is — and would not
+#   help: the harness would still be the caller reporting what it saw.
+#
+#   The record is written by the run that produces it, and not by this package
+#   alone: scripts/mixed-era.sh exports MIXED_ERA_COVERAGE to the whole
+#   ./ci/mixedera/... invocation, so any package in that run can write the
+#   release record outside every binding here. Narrowing that export is the
+#   script's edit, not this file's. Forming the verdict outside the run is the
+#   phase-2 TODO in ci/mixedera/coverage.
+#
+#   A peer built against the wrong era is caught for the precut peer, whose
+#   refusal cases go red the moment the two transports agree; for the cut peer
+#   — the threat being a stand-in that never runs the tree's transport — the
+#   check reduces to the era string its own conformance declares, compared by
+#   scripts/mixed-era.sh at tag time against a record this run wrote.
 #
 #   Which is the shape of the thing. This gate is built against drift and
 #   accident — a case deleted, a run filtered down by -run, a rename that
-#   orphans a requirement, a peer built against the wrong era, an absence
-#   quietly dropped, a name repointed at another claim — and not against its own
-#   author. A cross-era coverage gate is for the first. Nothing arranged inside
-#   one repository is for the second.
+#   orphans a requirement, a peer accidentally built against the wrong era, an
+#   absence quietly dropped, a name repointed at another claim — and not
+#   against its own author. A cross-era coverage gate is for the first. Nothing
+#   arranged inside one repository is for the second.
 
 mechanism frame-v1
   witness wire (*relay).witness

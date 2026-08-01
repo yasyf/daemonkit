@@ -140,11 +140,16 @@ type (
 type Grace time.Duration
 
 // Program has two constructors — its two policies — and no fields to set.
-type Program struct{ path string }
+// No constructor writes anything: placement is Ensure's, under the start lock.
+type Program struct{ policy placement }
 
-// Staged copies the executable to a digest-keyed path outside any versioned
-// install directory, so a package upgrade cannot delete the running program.
-func Staged() (Program, error)
+// Stable runs the daemon from a copy of the invoking executable, kept at
+// ~/.daemonkit/bin/<Label>: outside any versioned install directory, so a
+// package upgrade cannot delete the running program, and fixed across
+// upgrades, so the plist's Program key stays put and path-keyed TCC grants
+// survive. It reads the executable only to learn which build it is; Ensure
+// makes the copy.
+func Stable() (Program, error)
 
 // InBundle names an executable inside a signed .app and never copies it:
 // macOS keys TCC and notification grants to identifier, team, and path.
@@ -196,9 +201,11 @@ func (b Budget) Share(name string, of float64) Budget
 // live at once — the property is non-starvation, not mutual exclusion.
 func (b Budget) Reserve(name string, of float64) (work, tail Budget)
 
-// ValidateForServe rejects a Daemon whose durations cannot bound anything:
-// each Grace must fall in (0, 24h]. Serve calls it once, at the config
-// boundary, so no arithmetic below it can overflow or invert.
+// ValidateForServe rejects a Daemon no derivation may see: the Label must be
+// one launchd itself would accept, since every path, lock, socket, and job
+// name is joined from it, and each Grace must fall in (0, 24h]. Serve and
+// deploy.Open run it once, at the config boundary, so no arithmetic below it
+// can overflow or invert.
 func (d Daemon) ValidateForServe() error
 
 func (b Budget) Left() time.Duration
@@ -489,7 +496,7 @@ residue is quarantined below the table, not dressed as invariants.
 | I16 | Broken-era durable state never blocks the release that fixes it — and cannot orphan children | `Open` has no failed-schema path. The record file's envelope — the schema int and each record's `{pid, start, boot, generation}` identity core — is frozen forever, additive-only beyond it. An unknown-schema file yields its identity cores for the reap sweep, then archives aside; `Drained.Archived` / `Ctx.Reclaimed` name what happened. Repair without amnesia. |
 | I17 | The business lane cannot spell a lifecycle request | `Client` and `Control` are distinct types with disjoint method sets; server-side, control verbs are frame kinds dispatched before the op mux, and handlers receive `Caller` — identity as data, no methods. |
 | I18 | `Delivered` never replays | `Outcome` is closed; the client's replay predicate admits exactly `NotSent`. captain-hook's "rejected before dispatch" mislabel of `Unproven` has no site: the outcome is returned, not interpreted. |
-| I19 | A test binary cannot fork-bomb the machine | There is no self-exec verb to intercept: nothing in the module execs `os.Executable()`, and no argv-dispatched child mode exists for a test binary to re-enter. (`os.Executable()` survives in exactly one place — `Staged()`, which *copies* bytes and never execs. The earlier wording claimed the symbol appears nowhere, which is false and was caught by the phase-0 build.) `scripts/test.sh` stays as CI hygiene — the rule outlives the hazard. |
+| I19 | A test binary cannot fork-bomb the machine | There is no self-exec verb to intercept: nothing in the module execs `os.Executable()`, and no argv-dispatched child mode exists for a test binary to re-enter. (`os.Executable()` survives only as a read: `Stable()` and `Serve`'s build digest hash the bytes at that path, and `version.Running` stats it for a dev build's mtime — nothing execs it, and the copy `Ensure` places is written, never run, by this module. The earlier wording claimed the symbol appears nowhere, which is false and was caught by the phase-0 build.) `scripts/test.sh` stays as CI hygiene — the rule outlives the hazard. |
 | I23 | The trust path cannot block | Every read is a `csops_audittoken` against kernel memory: no file opened, no daemon contacted, no CoreFoundation object built. There is no abandonment path, no leaked M, and no verification budget to subdivide — so the hang the verifier child existed to survive has no site to occur at. |
 | I24 | The status word is interpreted in exactly one place | `internal/trust` hands the kernel's word to `csposture.Check` unmodified; no verifier owns a bit table. A clause added there reaches every caller, so the two-verifier divergence (P0 `7059185`) cannot re-form by transcription. |
 | I25 | An unverified peer cannot consume a protected role's capacity | Session capacity is acquired only after the peer's role is verified (`wire/server.go:501` stays after `:463`). The per-role capacity-1 reservation is what keeps the trust-gated Drain verb reachable under flood; anything acquired earlier is a denial primitive an unverified peer can hold, and `identity.Role` is peer-supplied. |
@@ -728,8 +735,9 @@ produced three incompatible schema epochs in two days. Hence the gates below, no
    release but an open migration: its fleet-build leg stays red, and fleet-build joins the
    release gate only when every leg is green.
 6. **Bundle identity is untouched** — labels, teams, signing identifiers, install paths
-   unchanged; no TCC or notification grant resets. `Staged()`'s digest-keyed program path is a
-   plist change per consumer and needs one real-machine re-bootstrap test before the cut (§12).
+   unchanged; no TCC or notification grant resets. `Stable()`'s Label-keyed program path —
+   `~/.daemonkit/bin/<Label>`, fixed across upgrades — is a plist change per consumer and needs
+   one real-machine re-bootstrap test before the cut (§12).
 
 ---
 
@@ -892,7 +900,7 @@ Deliberately absent, so the next agent does not re-add the cruft:
 2. **synckit's `spawned` service kind**: live users? If yes, `Cmd` gains a handoff option
    carrying K16's dup-then-prove fd rule — one function, not a subsystem. If no, it stays dead.
 3. **authkit and cc-pool ladders are unaudited** — either could carry a sixth divergence axis.
-4. **`Staged()`'s plist `Program` change** is a live launchd re-bootstrap per consumer — needs
+4. **`Stable()`'s plist `Program` change** is a live launchd re-bootstrap per consumer — needs
    one real-machine test before wave 1.
 5. **The observe payload's final field set** — `Health` as specced; confirm cookiesync/reposync
    decode `Detail` without a wrapper change.

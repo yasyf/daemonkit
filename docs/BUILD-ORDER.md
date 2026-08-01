@@ -127,7 +127,7 @@ dependency-only; there are no waves, because there is no overlap window to stage
 
 | Order | Repos | Constraint |
 |---|---|---|
-| 1 (parallel) | synckit, captain-hook, cc-orchestrate, fusekit | each owns both ends of its socket — no cross-repo wire compatibility. One real-machine `Staged()` re-bootstrap test before the tag (DESIGN §12.4) |
+| 1 (parallel) | synckit, captain-hook, cc-orchestrate, fusekit | each owns both ends of its socket — no cross-repo wire compatibility. One real-machine `Stable()` re-bootstrap test before the tag (DESIGN §12.4) |
 | 2 (lockstep ×3) | cc-interact + cc-present + cc-review | cc-present/cc-review import daemonkit directly *and* consume cc-interact's launcher. Signed-app end-to-end: `Ensure` against a real signed DR |
 | 3 | cc-notes, reposync, cc-patch, claude-pool/cc-pool, cookiesync | consume order 1–2's surfaces. cc-notes rewrites its source-text contract test (`release_contract_test.go`) in the same change; cc-patch is a `launchd`-leaf bump |
 

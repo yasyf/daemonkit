@@ -20,15 +20,17 @@
 // in ci/mixedera/coverage, which exports the redemption verbs and nothing this
 // package can assign. What is left here is the harness: it builds the two era
 // peers, drives them at each other, and observes. It cannot write a row
-// redeemed, mark a claim observed, drop an era from the record, file a fact past
-// the witness mechanisms.txt reserves, or rewrite the frozen text it reads —
-// each of those is a compile error rather than a finding.
+// redeemed, mark a claim observed, drop an era from the record, or rewrite the
+// frozen text it reads — that state is unexported, so each is a compile error
+// rather than a finding — and a fact filed past the witness mechanisms.txt
+// reserves is refused at the journal.
 //
-// What no package boundary reaches is this harness misreporting what it saw. A
-// witness here is free to branch on the wrong value, and
-// (*daemonProc).witnessDrain attributes a clean exit to SIGTERM on a field this
-// package sets when it signals. Those are edits to a witness body, where a
-// reviewer reads them.
+// What no package boundary reaches is this harness misreporting what it saw:
+// every witness is handed the artifact it judges — a parameter, or a field of
+// the harness's own handle, as (*daemonProc).witnessDrain attributes a clean
+// exit to SIGTERM on a field this package sets when it signals — and a case
+// body can build that artifact itself. What remains possible, and for whom, is
+// accounted for in testdata/frozen/mechanisms.txt.
 package mixedera
 
 import (

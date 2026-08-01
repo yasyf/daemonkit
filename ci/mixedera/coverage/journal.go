@@ -42,8 +42,9 @@ var evidence = journal{held: map[string][]fact{}}
 
 // ObservedPresent files a fact the harness observed happening. It reaches the
 // journal only from the site mechanisms.txt reserves for that mechanism's
-// evidence of that class, read off the call stack rather than taken from the
-// caller's word.
+// evidence of that class — the site read off the call stack rather than taken
+// from the caller's word; the class is the caller's word, a label no artifact
+// is checked against.
 func ObservedPresent(t *testing.T, era, mechanism string, kind EvidenceKind, detail string) {
 	t.Helper()
 	evidence.record(t, era, mechanism, fact{present: true, kind: kind, detail: detail})
