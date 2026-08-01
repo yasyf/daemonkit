@@ -34,17 +34,28 @@ jobs:
           - binrun
           - cc-present
           - cc-review
-    # daemonkit is macOS-only, so its consumers cross-compile for darwin here
-    # rather than billing macOS minutes across every leg of the fleet.
+    # daemonkit is macOS-only, so its consumers cross-compile here rather than
+    # billing macOS minutes across every leg of the fleet. Which platforms a leg
+    # cross-compiles for is the consumer's own declaration in ci/fleet-refs.txt,
+    # which the script reads; GOARCH is the fleet's shipped arch throughout.
     env:
       CGO_ENABLED: "0"
-      GOOS: darwin
       GOARCH: arm64
     steps:
       - name: Check out daemonkit
         uses: actions/checkout@v7
         with:
           path: daemonkit
+
+      # Both halves of the gate read ci/fleet-refs.txt through the script, so a
+      # leg pointed at a migration branch checks out the tree it then builds.
+      - name: Resolve the ref ${{ matrix.repo }} builds
+        id: ref
+        working-directory: daemonkit
+        run: |
+          set -euo pipefail
+          ref="$(./scripts/fleet-build.sh --ref ${{ matrix.repo }})"
+          echo "ref=$ref" >>"$GITHUB_OUTPUT"
 
       # FLEET_TOKEN reaches private consumers; GITHUB_TOKEN covers the public
       # ones. A denied checkout skips the leg with a loud warning instead of
@@ -55,6 +66,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: yasyf/${{ matrix.repo }}
+          ref: ${{ steps.ref.outputs.ref }}
           token: ${{ secrets.FLEET_TOKEN || secrets.GITHUB_TOKEN }}
           path: ${{ matrix.repo }}
           persist-credentials: false
@@ -65,6 +77,33 @@ jobs:
           echo "::warning title=fleet-build skipped ${{ matrix.repo }}::checkout of yasyf/${{ matrix.repo }} was denied — this consumer was NOT built against daemonkit. Grant a FLEET_TOKEN with read access to it."
           echo "### :warning: fleet-build skipped \`${{ matrix.repo }}\`" >>"$GITHUB_STEP_SUMMARY"
           echo "Checkout was denied, so this consumer was not compiled against daemonkit." >>"$GITHUB_STEP_SUMMARY"
+
+      # A consumer that also sits on cc-interact, cc-notes, reposync or synckit
+      # otherwise resolves them from their published tags, so this leg measures
+      # a peer nobody can fix here and reports its break as daemonkit's. Each
+      # peer joins the same go.work; one the token cannot reach falls back to
+      # its tag, loudly.
+      - name: Check out the fleet substrate ${{ matrix.repo }} sits on
+        if: steps.consumer.outcome == 'success'
+        working-directory: daemonkit
+        env:
+          FLEET_TOKEN: ${{ secrets.FLEET_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          peers="$(./scripts/fleet-build.sh --cone "${{ matrix.repo }}")"
+          for peer in $peers; do
+            ref="$(./scripts/fleet-build.sh --ref "$peer")"
+            args=(--quiet --depth 1)
+            [[ -z "$ref" ]] || args+=(--branch "$ref")
+            if git clone "${args[@]}" \
+              "https://x-access-token:${FLEET_TOKEN}@github.com/yasyf/$peer" \
+              "${GITHUB_WORKSPACE}/$peer"; then
+              git -C "${GITHUB_WORKSPACE}/$peer" remote set-url origin "https://github.com/yasyf/$peer"
+              echo "cone: $peer${ref:+ at $ref}"
+            else
+              echo "::warning title=fleet-build could not reach $peer::${{ matrix.repo }} builds against the published $peer rather than its tree, so a break in that peer reads as daemonkit's."
+            fi
+          done
 
       - uses: actions/setup-go@v6
         if: steps.consumer.outcome == 'success'

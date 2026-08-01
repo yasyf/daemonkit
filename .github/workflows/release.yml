@@ -23,7 +23,7 @@ jobs:
     needs: verify-tag-on-main
     runs-on: ubuntu-latest
     steps:
-      - name: Require successful CI and guide checks for the tagged commit
+      - name: Require every main gate to be green for the tagged commit
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -48,6 +48,9 @@ jobs:
           }
           require_workflow CI
           require_workflow Guides
+          require_workflow "Export census"
+          require_workflow "Docs drift"
+          require_workflow "Mixed era"
 
   release:
     # TODO(phase 2): add the mixed-era workflow back to this list once the cut

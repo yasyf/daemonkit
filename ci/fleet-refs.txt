@@ -1,0 +1,26 @@
+# The ref each fleet-build leg builds, and the GOOS set it builds it for.
+#
+#   <repo> <ref> [goos[,goos]...]
+#
+# The ref points a leg at the branch carrying that consumer's migration while it
+# is still in flight, so the gate measures the tree that is about to merge
+# rather than a main that still pins the old daemonkit. scripts/fleet-build.sh
+# --ref REPO prints it and the workflow checks that out, so both halves of the
+# gate read this file through one parser. Every consumer carries a line and the
+# script refuses a file that leaves one out, because an omitted leg silently
+# builds a branch nobody chose. The GOOS set stays optional and defaults to
+# darwin.
+#
+# GOOS defaults to darwin: daemonkit is macOS-only and its consumers ship there.
+# binrun also ships linux and is the fleet's linux canary for the portable
+# subset, so its leg builds both and a linux-only break stops being invisible.
+synckit         main
+reposync        main
+captain-hook    main
+cc-notes        main
+cc-patch        main
+cc-orchestrate  main
+cc-interact     main
+binrun          main    darwin,linux
+cc-present      main
+cc-review       main

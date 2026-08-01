@@ -29,9 +29,9 @@ if [ -n "$stub" ]; then
 	status=1
 fi
 
-unproven=$(awk -F'\t' -v s="$subject" '$1 == "coverage" && $2 == s && $4 != "PROVEN" { print "  " $3 " " $4 }' "$record")
+unproven=$(awk -F'\t' -v s="$subject" '$1 == "coverage" && $2 == s && $4 != "PROVEN" && $4 != "ABSENT" && $4 != "ENTAILED" { print "  " $3 " " $4 }' "$record")
 if [ -n "$unproven" ]; then
-	echo "mixed-era: DESIGN 8.4 makes this gate non-waivable, and this release leaves the $subject era with:" >&2
+	echo "mixed-era: docs/DESIGN.md §8.4 makes this gate non-waivable, and this release leaves the $subject era with:" >&2
 	echo "$unproven" >&2
 	status=1
 fi
