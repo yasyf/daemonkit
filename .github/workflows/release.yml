@@ -53,10 +53,11 @@ jobs:
           require_workflow "Mixed era"
 
   release:
-    # TODO(phase 2): add the mixed-era workflow back to this list once the cut
-    # peer stops being a stub. Until then GITHUB_REF_TYPE=tag refuses every run
-    # — correctly, the cut era's real transport is not under test — so gating a
-    # tag on it blocks releases for a reason no release can fix.
+    # TODO(phase 2): gate the tag on mixed-era's tag mode once the cut peer
+    # drives Control.Drain. verify-main-gates already requires the Mixed era
+    # workflow in branch mode; GITHUB_REF_TYPE=tag additionally refuses on
+    # drain-preamble-trust-gate UNPROVEN, which no release can redeem — root
+    # Control.Drain exists and is trust-gated, the cut peer is not yet on it.
     needs: [verify-tag-on-main, verify-main-gates]
     runs-on: ubuntu-latest
     steps:

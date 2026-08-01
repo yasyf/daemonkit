@@ -11,6 +11,12 @@
 # never carries a committed `replace` or a committed go.work, and the consumer
 # checkouts are never mutated (AGENTS.md § Repository Structure).
 #
+# The cone is the consumer's fleet requires intersected with the fleet set
+# itself, so every overlaid peer is one ci/fleet-refs.txt pins a ref for. A peer
+# outside that set keeps the published version the consumer already resolved,
+# which is what its leg is meant to measure; overlaying it would join the
+# workspace at whatever its default branch holds — the one tree nobody chose.
+#
 # A checkout counts only when its own go.mod declares the module the leg is for,
 # so a directory that merely carries the name cannot stand in for it; a consumer
 # with no such checkout fails its leg instead of being cloned from remote main,
@@ -18,7 +24,24 @@
 #
 # ci/fleet-refs.txt declares each leg's ref and GOOS set; `--ref REPO` prints
 # that ref and `--cone REPO` the substrate it needs, so the workflow checks out
-# exactly the trees this script expects to build.
+# exactly the trees this script expects to build. A checkout that is not the
+# tree its declared ref names is marked `*` rather than refused, because a local
+# run legitimately builds a dirty or repointed peer: the verdict is real, it is
+# just not a verdict about the ref the file names.
+#
+# Not covered, by construction. A leg compiles one configuration — the pure
+# CGO_ENABLED=0 default-tag build, cross-compiled from a linux runner:
+#   cc-pool's cmd/cc-pool-runtime-archive (//go:build darwin && cgo) and
+#   fusekit's `-tags fuse` tree both need CGO_ENABLED=1 plus native
+#   libfuse/fuse-t headers, which no cross-compile supplies. Their own CI builds
+#   them on native runners; a daemonkit break confined to those files reaches
+#   this gate as a green leg.
+#
+#   fusekit's generators write "github.com/yasyf/daemonkit/wire" into the Go
+#   they emit and read the wire model to emit Swift, and a leg compiles the
+#   checked-in output rather than regenerating it. A daemonkit change that only
+#   moves what those generators emit breaks fusekit's codegen drift check, not
+#   any compile run here.
 #
 # Usage:
 #   scripts/fleet-build.sh                # every consumer
@@ -38,7 +61,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 owner="yasyf"
-default_repos="synckit reposync captain-hook cc-notes cc-patch cc-orchestrate cc-interact binrun cc-present cc-review"
+default_repos="synckit fusekit reposync captain-hook cc-notes cc-patch cc-orchestrate cc-interact binrun cc-present cc-review cc-pool cookiesync"
 refs_file="$root/ci/fleet-refs.txt"
 default_goos="darwin"
 
@@ -68,7 +91,7 @@ while [[ "$#" -gt 0 ]]; do
       shift 2
       ;;
     -h | --help)
-      sed -n '2,34p' "${BASH_SOURCE[0]}" | cut -c3-
+      awk 'NR > 1 && /^#/ { print substr($0, 3); next } NR > 1 { exit }' "${BASH_SOURCE[0]}"
       exit 0
       ;;
     *)
@@ -97,6 +120,8 @@ check_refs() {
     esac
     seen="$seen $repo"
     [[ -n "$ref" ]] || fail "ci/fleet-refs.txt leaves $repo without a ref"
+    [[ ! "$ref" =~ ^[0-9a-fA-F]{7,40}$ ]] ||
+      fail "ci/fleet-refs.txt gives $repo the commit $ref; a ref must name a branch or tag, because a leg that needs $repo in its cone clones it with git clone --branch"
     [[ -z "$rest" ]] || fail "ci/fleet-refs.txt gives $repo more than \"<repo> <ref> [goos,...]\""
   done < <(grep -Ev '^[[:space:]]*(#|$)' "$refs_file")
   for repo in $default_repos; do
@@ -143,9 +168,12 @@ checkout_of() {
 }
 
 # Every github.com/<owner> module the consumer requires, direct or indirect.
+# A `replace`/`exclude` block's body names modules the consumer does not require,
+# so the whole block is skipped, not just the line opening it.
 fleet_requires() {
   awk -v prefix="github.com/$owner/" '
-    $1 == "replace" || $1 == "exclude" { next }
+    $1 == "replace" || $1 == "exclude" { directive = ($NF == "("); next }
+    directive { directive = ($1 != ")"); next }
     {
       for (i = 1; i < NF; i++) {
         if (index($i, prefix) == 1 && substr($(i + 1), 1, 1) == "v") { print $i }
@@ -155,14 +183,18 @@ fleet_requires() {
 }
 
 # The fleet substrate the consumer checked out at $1 sits on, named by repo:
-# every module it requires under the owner's prefix but itself and daemonkit.
+# every module it requires under the owner's prefix but itself and daemonkit,
+# and only those the fleet set carries a declared ref for.
 cone_of() {
-  local self required
+  local self required peer
   self="$(module_of "$1")"
   for required in $(fleet_requires "$1"); do
     [[ "$required" != "github.com/$owner/daemonkit" ]] || continue
     [[ "$required" != "$self" ]] || continue
-    echo "${required##*/}"
+    peer="${required##*/}"
+    case " $default_repos " in
+      *" $peer "*) echo "$peer" ;;
+    esac
   done
 }
 
@@ -175,6 +207,26 @@ describe_checkout() {
   dirty=""
   [[ -z "$(git -C "$dir" status --porcelain 2>/dev/null)" ]] || dirty="-dirty"
   echo "$(git -C "$dir" rev-parse --abbrev-ref HEAD) $rev$dirty"
+}
+
+# Empty when the checkout at $1 is the tree repo $2's declared ref names, `*`
+# otherwise — another commit, local modifications, or no git at all. A worktree
+# detached at exactly that ref's commit is that tree and goes unmarked, which is
+# why this compares commits rather than branch names.
+ref_mark() {
+  local head declared
+  head="$(git -C "$1" rev-parse HEAD 2>/dev/null || true)"
+  declared="$(git -C "$1" rev-parse --verify --quiet "$(declared "$2" 2)^{commit}" 2>/dev/null || true)"
+  [[ -n "$head" && "$head" == "$declared" && -z "$(git -C "$1" status --porcelain 2>/dev/null)" ]] || echo "*"
+}
+
+# Adds $1 to the roster the trailer explains `*` for. A repo reaches this both as
+# its own leg and as another leg's cone peer, so the roster is a set.
+record_off_ref() {
+  case " $off_ref_repos " in
+    *" $1 "*) ;;
+    *) off_ref_repos="$off_ref_repos $1" ;;
+  esac
 }
 
 # A workspace build treats every `use` member as a main module, so the go
@@ -222,6 +274,7 @@ tmp="$(mktemp -d "${tmp_base%/}/fleet-build.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 
 failed_repos=""
+off_ref_repos=""
 dk_rev="$(describe_checkout "$root")"
 
 echo "fleet-build: daemonkit $root ($dk_rev)"
@@ -271,11 +324,16 @@ for repo in $repos; do
 
   for dir in "$root" "$source_dir" $cone; do restore_manifest "$dir" "$work"; done
 
+  mark="$(ref_mark "$source_dir" "$repo")"
+  [[ -z "$mark" ]] || record_off_ref "$repo"
   printf '  %-6s %-15s %-13s ref %-14s pin %-9s %s (%s)\n' \
-    "$verdict" "$repo" "$goos_set" "$(declared "$repo" 2)" \
+    "$verdict$mark" "$repo" "$goos_set" "$(declared "$repo" 2)" \
     "$(pinned_daemonkit "$source_dir")" "$source_dir" "$(describe_checkout "$source_dir")"
   for dir in $cone; do
-    printf '         cone %s (%s)\n' "$(basename "$dir")" "$(describe_checkout "$dir")"
+    peer="$(basename "$dir")"
+    peer_mark="$(ref_mark "$dir" "$peer")"
+    [[ -z "$peer_mark" ]] || record_off_ref "$peer"
+    printf '         %-5s %s (%s)\n' "cone$peer_mark" "$peer" "$(describe_checkout "$dir")"
   done
 done
 
@@ -296,5 +354,7 @@ failed="$(words "$failed_repos")"
 
 echo
 echo "fleet-build: $((total - failed))/$total built, $failed failed"
+[[ -z "$off_ref_repos" ]] ||
+  echo "fleet-build: * marks a checkout that is not the tree ci/fleet-refs.txt's ref names — another commit, or local modifications — so its verdict is not one about that ref. Off-ref checkouts:$off_ref_repos"
 
 [[ -z "$failed_repos" ]] || exit 1

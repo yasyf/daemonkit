@@ -25,6 +25,7 @@ jobs:
       matrix:
         repo:
           - synckit
+          - fusekit
           - reposync
           - captain-hook
           - cc-notes
@@ -34,6 +35,8 @@ jobs:
           - binrun
           - cc-present
           - cc-review
+          - cc-pool
+          - cookiesync
     # daemonkit is macOS-only, so its consumers cross-compile here rather than
     # billing macOS minutes across every leg of the fleet. Which platforms a leg
     # cross-compiles for is the consumer's own declaration in ci/fleet-refs.txt,
@@ -78,11 +81,13 @@ jobs:
           echo "### :warning: fleet-build skipped \`${{ matrix.repo }}\`" >>"$GITHUB_STEP_SUMMARY"
           echo "Checkout was denied, so this consumer was not compiled against daemonkit." >>"$GITHUB_STEP_SUMMARY"
 
-      # A consumer that also sits on cc-interact, cc-notes, reposync or synckit
-      # otherwise resolves them from their published tags, so this leg measures
-      # a peer nobody can fix here and reports its break as daemonkit's. Each
-      # peer joins the same go.work; one the token cannot reach falls back to
-      # its tag, loudly.
+      # A consumer that also sits on a migrating peer — cc-interact, cc-notes,
+      # fusekit, synckit — otherwise resolves it from its published tag, so the
+      # leg measures a peer nobody can fix here and reports its break as
+      # daemonkit's. The cone is intersected with the fleet set, so every peer
+      # named here has a ci/fleet-refs.txt ref of its own; it joins the same
+      # go.work at that ref, and one the token cannot reach falls back to its
+      # tag, loudly.
       - name: Check out the fleet substrate ${{ matrix.repo }} sits on
         if: steps.consumer.outcome == 'success'
         working-directory: daemonkit
@@ -93,13 +98,11 @@ jobs:
           peers="$(./scripts/fleet-build.sh --cone "${{ matrix.repo }}")"
           for peer in $peers; do
             ref="$(./scripts/fleet-build.sh --ref "$peer")"
-            args=(--quiet --depth 1)
-            [[ -z "$ref" ]] || args+=(--branch "$ref")
-            if git clone "${args[@]}" \
+            if git clone --quiet --depth 1 --branch "$ref" \
               "https://x-access-token:${FLEET_TOKEN}@github.com/yasyf/$peer" \
               "${GITHUB_WORKSPACE}/$peer"; then
               git -C "${GITHUB_WORKSPACE}/$peer" remote set-url origin "https://github.com/yasyf/$peer"
-              echo "cone: $peer${ref:+ at $ref}"
+              echo "cone: $peer at $ref"
             else
               echo "::warning title=fleet-build could not reach $peer::${{ matrix.repo }} builds against the published $peer rather than its tree, so a break in that peer reads as daemonkit's."
             fi

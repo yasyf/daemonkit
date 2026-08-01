@@ -11,10 +11,15 @@
 # builds a branch nobody chose. The GOOS set stays optional and defaults to
 # darwin.
 #
+# A ref names a branch or tag, never a commit. Any repo listed here may also be
+# another leg's cone peer, and a cone peer is fetched with git clone --branch,
+# which no commit satisfies. The script refuses a commit-shaped ref outright.
+#
 # GOOS defaults to darwin: daemonkit is macOS-only and its consumers ship there.
 # binrun also ships linux and is the fleet's linux canary for the portable
 # subset, so its leg builds both and a linux-only break stops being invisible.
 synckit         main
+fusekit         main
 reposync        main
 captain-hook    main
 cc-notes        main
@@ -24,3 +29,5 @@ cc-interact     main
 binrun          main    darwin,linux
 cc-present      main
 cc-review       main
+cc-pool         main
+cookiesync      main
