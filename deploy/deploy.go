@@ -70,17 +70,18 @@ type Config struct {
 
 	// Daemon names the daemon the application serves, so quiesce can reach it
 	// and readiness can be observed. Trust.Serving pins what the process
-	// answering on the socket must prove — without it an absence proof is
-	// forgeable by any same-UID process that binds the socket first.
+	// answering on the socket must prove — under ServingSameUser an absence
+	// proof is forgeable by any same-UID process that binds the socket first.
 	//
-	// Leaving it nil is the caller's risk to take, and deploy takes it rather
-	// than refusing: no irreversible step here rests on that proof alone. Each
-	// one also requires the executable-scoped inventory, which reads the
-	// kernel's own process table and no same-UID process can forge, so a forged
-	// socket proof buys a swap or a removal nothing — it still has to be true
-	// that no process of this deployment is running. A Serving that is set is
-	// held to the same terms as Requirement: Open renders it once, so a policy
-	// that could admit nobody fails there rather than at the first attach.
+	// Naming that waiver is the caller's risk to take, and deploy takes it
+	// rather than refusing: no irreversible step here rests on that proof
+	// alone. Each one also requires the executable-scoped inventory, which
+	// reads the kernel's own process table and no same-UID process can forge,
+	// so a forged socket proof buys a swap or a removal nothing — it still has
+	// to be true that no process of this deployment is running. A ServingSigned
+	// posture is held to the same terms as Requirement: Open validates it once,
+	// so a policy that could admit nobody fails there rather than at the first
+	// attach.
 	Daemon daemonkit.Daemon
 
 	// Agents is the exact LaunchAgent set activation converges launchd to.
@@ -121,10 +122,9 @@ func Open(config Config) (*Deployment, error) {
 	if err := config.Daemon.ValidateForServe(); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrConfig, err)
 	}
-	if serving := config.Daemon.Trust.Serving; serving != nil {
-		if _, err := designatedRequirement(*serving); err != nil {
-			return nil, fmt.Errorf("%w: Daemon.Trust.Serving: %w", ErrConfig, err)
-		}
+	client, err := daemonkit.Open(config.Daemon)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrConfig, err)
 	}
 	if len(config.Agents) == 0 {
 		return nil, fmt.Errorf("%w: at least one agent is required", ErrConfig)
@@ -148,7 +148,7 @@ func Open(config Config) (*Deployment, error) {
 		requirement: requirement,
 		verify:      codesignVerifier{},
 		run:         execRunner,
-		client:      daemonkit.Open(config.Daemon),
+		client:      client,
 		inventory:   Inventory,
 	}, nil
 }

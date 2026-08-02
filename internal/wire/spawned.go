@@ -6,11 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/yasyf/daemonkit/internal/proc"
 	"github.com/yasyf/daemonkit/internal/trust"
 )
 
@@ -35,42 +33,51 @@ type SessionLimits struct {
 
 // SpawnedSessionConfig configures one static business child session.
 type SpawnedSessionConfig struct {
+	// Conn is the claimed child end of proc's Cmd.Handoff socketpair.
+	// RunSpawnedSession owns it from the call on and closes it on every return.
+	Conn net.Conn
 	// Nonce is the 32-byte single-use attach nonce the parent minted, conveyed
 	// via SpawnedNonceEnv. Fd-mixup defence, not a secret.
-	Nonce    []byte
-	Schema   string
-	Limits   SessionLimits
-	Handlers []HandlerSpec
+	Nonce   []byte
+	Schema  string
+	Limits  SessionLimits
+	Runtime Runtime
 }
 
 // SpawnedClientConfig configures one static business parent session.
 type SpawnedClientConfig struct {
 	// Conn is the parent end of proc's Cmd.Handoff socketpair, from Child.Handoff.
-	Conn   *net.UnixConn
+	Conn   net.Conn
 	Nonce  []byte
 	Schema string
 	Limits SessionLimits
 }
 
-// SpawnedClient is one sealed parent session with bounded calls and events.
-type SpawnedClient struct{ client *Client }
-
-// RunSpawnedSession claims the inherited handoff descriptor via
-// proc.ClaimHandoff and serves exactly one business session on it. A wrong,
-// absent, or repeated nonce closes the connection and returns the error: the
-// child exits, it does not negotiate.
+// RunSpawnedSession serves exactly one business session on the claimed handoff
+// descriptor. A wrong, absent, or repeated nonce closes the connection and
+// returns the error: the child exits, it does not negotiate.
 func RunSpawnedSession(ctx context.Context, config SpawnedSessionConfig) error {
+	if config.Conn == nil {
+		return errors.New("wire: spawned Conn is required")
+	}
+	conn, ok := config.Conn.(*net.UnixConn)
+	if !ok {
+		_ = config.Conn.Close()
+		return fmt.Errorf("wire: spawned handoff is %T, want unix stream", config.Conn)
+	}
 	if len(config.Nonce) != spawnedNonceBytes {
+		_ = conn.Close()
 		return fmt.Errorf("wire: spawned nonce must be %d bytes", spawnedNonceBytes)
 	}
 	if config.Schema == "" {
+		_ = conn.Close()
 		return errors.New("wire: spawned Schema is required")
 	}
-	rt, err := newSpawnedRuntime(config.Handlers)
-	if err != nil {
-		return err
+	if config.Runtime == nil {
+		_ = conn.Close()
+		return errors.New("wire: spawned Runtime is required")
 	}
-	server, err := NewServer(rt, Config{
+	server, err := NewServer(config.Runtime, Config{
 		Schemas:     Schemas{config.Schema},
 		Concurrency: config.Limits.Concurrency,
 		MaxFrame:    config.Limits.MaxFrame,
@@ -78,25 +85,8 @@ func RunSpawnedSession(ctx context.Context, config SpawnedSessionConfig) error {
 		Write:       config.Limits.WriteTimeout,
 	})
 	if err != nil {
+		_ = conn.Close()
 		return err
-	}
-	file, err := proc.ClaimHandoff()
-	if err != nil {
-		return fmt.Errorf("wire: claim spawned handoff: %w", err)
-	}
-	fileConn, err := net.FileConn(file)
-	closeErr := file.Close()
-	if err != nil {
-		return errors.Join(fmt.Errorf("wire: adopt spawned handoff: %w", err), closeErr)
-	}
-	if closeErr != nil {
-		_ = fileConn.Close()
-		return closeErr
-	}
-	conn, ok := fileConn.(*net.UnixConn)
-	if !ok {
-		_ = fileConn.Close()
-		return fmt.Errorf("wire: spawned handoff is %T, want unix stream", fileConn)
 	}
 	peer, err := trust.PeerCredentials(conn)
 	if err != nil {
@@ -155,7 +145,7 @@ func authorizeSpawnedConn(net.Conn) error { return nil }
 // peer: credentials read from a self-created socketpair name the creator —
 // the parent itself — so a check here would only ever judge this process.
 // Confinement is directional, by construction of the pair.
-func NewSpawnedClient(ctx context.Context, config SpawnedClientConfig) (*SpawnedClient, error) {
+func NewSpawnedClient(ctx context.Context, config SpawnedClientConfig) (*Client, error) {
 	if config.Conn == nil {
 		return nil, errors.New("wire: spawned Conn is required")
 	}
@@ -174,7 +164,7 @@ func NewSpawnedClient(ctx context.Context, config SpawnedClientConfig) (*Spawned
 		}
 		return conn, nil
 	}
-	client, err := NewClient(ctx, ClientConfig{
+	return NewClient(ctx, ClientConfig{
 		Dial:                    dial,
 		Authorize:               authorizeSpawnedConn,
 		Lane:                    LaneBusiness,
@@ -186,86 +176,4 @@ func NewSpawnedClient(ctx context.Context, config SpawnedClientConfig) (*Spawned
 		WriteTimeout:            config.Limits.WriteTimeout,
 		CancelSettlementTimeout: config.Limits.CancelSettlementTimeout,
 	})
-	if err != nil {
-		return nil, err
-	}
-	return &SpawnedClient{client: client}, nil
 }
-
-// Call sends one unary request and waits for its terminal response.
-func (c *SpawnedClient) Call(ctx context.Context, op Op, payload []byte) (Result, error) {
-	return c.client.Call(ctx, op, payload)
-}
-
-// OpenStream starts one request with bounded bidirectional streaming.
-func (c *SpawnedClient) OpenStream(
-	ctx context.Context,
-	op Op,
-	payload []byte,
-	endInput bool,
-) (*ClientCall, error) {
-	return c.client.Open(ctx, op, payload, endInput)
-}
-
-// Events returns the bounded server-pushed event stream.
-func (c *SpawnedClient) Events() <-chan Event { return c.client.Events() }
-
-// WireBuild returns this session's exact static schema identity.
-func (c *SpawnedClient) WireBuild() string { return c.client.WireBuild() }
-
-// Close sends GoAway and joins all client session loops, bounded by ctx.
-func (c *SpawnedClient) Close(ctx context.Context) error { return c.client.Close(ctx) }
-
-// Abort tears down the session and joins all client session loops.
-func (c *SpawnedClient) Abort(cause error) error { return c.client.Abort(cause) }
-
-type spawnedRuntime struct {
-	handlers map[Op]HandlerSpec
-	serial   sync.Mutex
-}
-
-func newSpawnedRuntime(specs []HandlerSpec) (*spawnedRuntime, error) {
-	if len(specs) == 0 {
-		return nil, errors.New("wire: spawned handlers are required")
-	}
-	handlers := make(map[Op]HandlerSpec, len(specs))
-	for _, spec := range specs {
-		if spec.Op == "" || spec.Handler == nil {
-			return nil, errors.New("wire: spawned operation and handler are required")
-		}
-		if strings.HasPrefix(string(spec.Op), reservedOpPrefix) {
-			return nil, fmt.Errorf("wire: spawned op %q uses daemonkit's private namespace", spec.Op)
-		}
-		if _, exists := handlers[spec.Op]; exists {
-			return nil, fmt.Errorf("wire: spawned op %q is duplicated", spec.Op)
-		}
-		handlers[spec.Op] = spec
-	}
-	return &spawnedRuntime{handlers: handlers}, nil
-}
-
-func (r *spawnedRuntime) Handle(ctx context.Context, req Request) (any, error) {
-	spec, ok := r.handlers[req.Op]
-	if !ok {
-		return nil, fmt.Errorf("wire: unknown op %q", req.Op)
-	}
-	if !spec.Concurrent {
-		r.serial.Lock()
-		defer r.serial.Unlock()
-	}
-	return spec.Handler(ctx, req)
-}
-
-func (r *spawnedRuntime) Phase() PhaseSnapshot {
-	return PhaseSnapshot{Sequence: 1, Phase: PhaseReady}
-}
-
-func (r *spawnedRuntime) WaitPhase(ctx context.Context, after uint64) (PhaseSnapshot, error) {
-	if after == 0 {
-		return r.Phase(), nil
-	}
-	<-ctx.Done()
-	return PhaseSnapshot{}, ctx.Err()
-}
-
-func (*spawnedRuntime) Drain() {}

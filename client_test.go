@@ -10,6 +10,18 @@ import (
 	"github.com/yasyf/daemonkit/internal/proc"
 )
 
+// openClient states the same-user posture a test daemon takes and fails the
+// test on a Daemon Open refuses.
+func openClient(t *testing.T, d Daemon) *Client {
+	t.Helper()
+	d.Trust.Serving = ServingSameUser()
+	client, err := Open(d)
+	if err != nil {
+		t.Fatalf("Open() = %v", err)
+	}
+	return client
+}
+
 // TestObserveGoneCadenceIsClamped keeps a caller's give-up bound from becoming
 // the resolution at which an exit is observed: a 24h Settle deadline once
 // derived a 22m30s cadence, so a daemon gone a second after the first probe

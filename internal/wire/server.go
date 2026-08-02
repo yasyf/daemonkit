@@ -24,10 +24,12 @@ const (
 )
 
 // Trust holds the per-lane requirements. The same-EUID floor is unconditional
-// and not expressible here; a nil requirement is explicit UID-only trust.
+// and not expressible here; a nil Control requirement and an empty Business
+// set are explicit UID-only trust. A business peer is admitted by any element
+// of the set, so one lane can name several genuinely different signed bundles.
 type Trust struct {
 	Control  *trust.Requirement
-	Business *trust.Requirement
+	Business []trust.Requirement
 }
 
 // Config configures one Server. Every queue and cap derives from Concurrency.
@@ -68,7 +70,8 @@ type Server struct {
 	businessSlots chan struct{}
 	handleSem     chan struct{}
 
-	admitted atomic.Int64
+	admitted    atomic.Int64
+	lastSession atomic.Uint64
 
 	mu           sync.Mutex
 	serveCtx     context.Context
@@ -244,13 +247,15 @@ func (s *Server) startConnection(ctx context.Context, conn *net.UnixConn) error 
 		s.rejectHandshake(conn, codec, ResponseCodePeerUntrusted, ErrUntrustedPeer)
 		return fmt.Errorf("wire: identify peer: %w", err)
 	}
-	requirement := s.cfg.Trust.Business
+	var verified error
 	if hello.Lane == LaneControl {
-		requirement = s.cfg.Trust.Control
+		verified = trust.Verify(peer, s.cfg.Trust.Control)
+	} else {
+		verified = trust.VerifyAny(peer, s.cfg.Trust.Business)
 	}
-	if err := trust.Verify(peer, requirement); err != nil {
+	if verified != nil {
 		s.rejectHandshake(conn, codec, ResponseCodePeerUntrusted, ErrUntrustedPeer)
-		err = fmt.Errorf("wire: verify peer: %w", err)
+		err := fmt.Errorf("wire: verify peer: %w", verified)
 		// The peer sees only PeerUntrusted; an infrastructure failure is not a
 		// policy denial and must be loud on the daemon side. A peer that exited
 		// before verification completed is an expected per-connection outcome,
@@ -361,6 +366,7 @@ func (s *Server) runSession(
 	defer cancel()
 	sess := &session{
 		server:       s,
+		id:           s.lastSession.Add(1),
 		conn:         conn,
 		codec:        codec,
 		ctx:          sessCtx,

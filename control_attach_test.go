@@ -49,7 +49,7 @@ func TestControlAttachPinsTheAcceptingProcess(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	control := awaitControl(ctx, t, Open(d))
+	control := awaitControl(ctx, t, openClient(t, d))
 	t.Cleanup(func() {
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer closeCancel()
@@ -97,17 +97,21 @@ func TestControlRefusesAnUntrustedServer(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	warmup := awaitControl(ctx, t, Open(d))
+	warmup := awaitControl(ctx, t, openClient(t, d))
 	if err := warmup.Close(ctx); err != nil {
 		t.Fatalf("Close() = %v", err)
 	}
 
 	pinned := d
-	pinned.Trust.Serving = &Requirement{
+	pinned.Trust.Serving = ServingSigned(Requirement{
 		TeamID:            "SXKCTF23Q2",
 		SigningIdentifier: "com.yasyf.daemonkit.not-this-binary",
+	})
+	pinnedClient, err := Open(pinned)
+	if err != nil {
+		t.Fatalf("Open(pinned) = %v", err)
 	}
-	control, err := Open(pinned).Control(ctx)
+	control, err := pinnedClient.Control(ctx)
 	if !errors.Is(err, ErrUntrusted) {
 		if err == nil {
 			_ = control.Close(ctx)
@@ -115,7 +119,7 @@ func TestControlRefusesAnUntrustedServer(t *testing.T) {
 		t.Fatalf("Control() = %v, want ErrUntrusted for a daemon that cannot prove the deployed identity", err)
 	}
 
-	unpinned := awaitControl(ctx, t, Open(d))
+	unpinned := awaitControl(ctx, t, openClient(t, d))
 	if _, err := unpinned.Drain(ctx, Expect{}); err != nil {
 		t.Fatalf("Drain() = %v", err)
 	}

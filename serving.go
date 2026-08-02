@@ -47,6 +47,24 @@ func (sameUserServing) requirement() *Requirement { return nil }
 
 func (s Serving) stated() bool { return s.policy != nil }
 
+// validate is the config-boundary check on a stated posture: the posture is
+// one of the two constructors, and a pinned requirement is one a peer could
+// satisfy. It runs where a refusal names the field, so a policy admitting
+// nobody fails there rather than at the first attach.
+func (s Serving) validate(field string) error {
+	if !s.stated() {
+		return fmt.Errorf("daemonkit: %s is unstated (ServingSigned or ServingSameUser)", field)
+	}
+	req := s.policy.requirement()
+	if req == nil {
+		return nil
+	}
+	if err := wireRequirement(req).Validate(); err != nil {
+		return fmt.Errorf("daemonkit: %s: %w", field, err)
+	}
+	return nil
+}
+
 // verifyProcess runs the posture against a live process, which may be a child
 // suspended at its entry point. The same-user waiver has nothing to read: a
 // posix_spawn child carries this process's own UID by construction, so the

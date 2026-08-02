@@ -134,8 +134,11 @@ func newFixture(t *testing.T) *fixture {
 	deployment, err := Open(Config{
 		App:         app,
 		Requirement: daemonkit.Requirement{TeamID: testTeamID, SigningIdentifier: testSigning},
-		Daemon:      daemonkit.Daemon{Label: daemonkit.Label("daemonkit-deploy-test-" + filepath.Base(root))},
-		Agents:      []launchd.Agent{agent},
+		Daemon: daemonkit.Daemon{
+			Label: daemonkit.Label("daemonkit-deploy-test-" + filepath.Base(root)),
+			Trust: daemonkit.Trust{Serving: daemonkit.ServingSameUser()},
+		},
+		Agents: []launchd.Agent{agent},
 	})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -1145,8 +1148,11 @@ func TestOpenRejectsInvalidConfig(t *testing.T) {
 	valid := Config{
 		App:         "/opt/Example.app",
 		Requirement: daemonkit.Requirement{TeamID: testTeamID, SigningIdentifier: testSigning},
-		Daemon:      daemonkit.Daemon{Label: "example"},
-		Agents:      []launchd.Agent{{Label: "l", Program: "/opt/Example.app/Contents/MacOS/x"}},
+		Daemon: daemonkit.Daemon{
+			Label: "example",
+			Trust: daemonkit.Trust{Serving: daemonkit.ServingSameUser()},
+		},
+		Agents: []launchd.Agent{{Label: "l", Program: "/opt/Example.app/Contents/MacOS/x"}},
 	}
 	mutate := func(f func(*Config)) Config {
 		config := valid
@@ -1175,7 +1181,11 @@ func TestOpenRejectsInvalidConfig(t *testing.T) {
 		{"relative program", mutate(func(c *Config) { c.Agents[0].Program = "Contents/MacOS/x" })},
 		{"unclean program", mutate(func(c *Config) { c.Agents[0].Program = "/opt/Example.app/./Contents/MacOS/x" })},
 		{"serving requirement that admits nobody", mutate(func(c *Config) {
-			c.Daemon.Trust.Serving = &daemonkit.Requirement{TeamID: testTeamID}
+			c.Daemon.Trust.Serving = daemonkit.ServingSigned(daemonkit.Requirement{TeamID: testTeamID})
+		})},
+		{"unstated serving posture", mutate(func(c *Config) { c.Daemon.Trust.Serving = daemonkit.Serving{} })},
+		{"business set stated but empty", mutate(func(c *Config) {
+			c.Daemon.Trust.Business = daemonkit.Requirements{}
 		})},
 		{"relative executable", mutate(func(c *Config) { c.Executables = []string{"hookd"} })},
 		{"unclean executable", mutate(func(c *Config) { c.Executables = []string{"/usr/bin/../bin/true"} })},
@@ -1192,7 +1202,7 @@ func TestOpenRejectsInvalidConfig(t *testing.T) {
 		t.Fatalf("Open(valid): %v", err)
 	}
 	pinned := mutate(func(c *Config) {
-		c.Daemon.Trust.Serving = &daemonkit.Requirement{TeamID: testTeamID, SigningIdentifier: testSigning}
+		c.Daemon.Trust.Serving = daemonkit.ServingSigned(daemonkit.Requirement{TeamID: testTeamID, SigningIdentifier: testSigning})
 	})
 	if _, err := Open(pinned); err != nil {
 		t.Fatalf("Open with a pinned serving requirement: %v", err)
@@ -1244,8 +1254,11 @@ func TestOpenRefusesALabelWhoseRecordPathEscapesTheStateRoot(t *testing.T) {
 	deployment, err := Open(Config{
 		App:         app,
 		Requirement: daemonkit.Requirement{TeamID: testTeamID, SigningIdentifier: testSigning},
-		Daemon:      daemonkit.Daemon{Label: label},
-		Agents:      []launchd.Agent{{Label: "l", Program: filepath.Join(app, "Contents", "MacOS", "x")}},
+		Daemon: daemonkit.Daemon{
+			Label: label,
+			Trust: daemonkit.Trust{Serving: daemonkit.ServingSameUser()},
+		},
+		Agents: []launchd.Agent{{Label: "l", Program: filepath.Join(app, "Contents", "MacOS", "x")}},
 	})
 	if err == nil {
 		found, readErr := deployment.recordedIdentities()
@@ -1283,7 +1296,10 @@ func TestOpenResolvesDeclaredExecutables(t *testing.T) {
 	deployment, err := Open(Config{
 		App:         app,
 		Requirement: daemonkit.Requirement{TeamID: testTeamID, SigningIdentifier: testSigning},
-		Daemon:      daemonkit.Daemon{Label: "example"},
+		Daemon: daemonkit.Daemon{
+			Label: "example",
+			Trust: daemonkit.Trust{Serving: daemonkit.ServingSameUser()},
+		},
 		Agents:      []launchd.Agent{{Label: "l", Program: filepath.Join(app, "Contents", "MacOS", "x")}},
 		Executables: []string{link},
 	})

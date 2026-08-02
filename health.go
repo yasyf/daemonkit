@@ -2,22 +2,26 @@ package daemonkit
 
 import "github.com/yasyf/daemonkit/internal/wire"
 
-// detailEnvelopeReserve is what one health terminal spends outside the
-// product's detail: the report's own fields, the response envelope, and the
-// frame header.
-const detailEnvelopeReserve Bytes = 4 << 10
+// frameEnvelopeReserve is what one terminal spends outside the bytes it
+// carries: the terminal's own fields, the response envelope, and the frame
+// header.
+const frameEnvelopeReserve Bytes = 4 << 10
 
 // MaxDetail is the largest Ctx.Report a daemon serving frames of maxFrame
-// bytes may publish, zero meaning MaxFrame's own default. encoding/json
-// base64s Health.Detail, so a report claims four bytes of frame for every
-// three it carries, beside the envelope reserve. A larger report cannot be
-// serialized, and a health terminal that cannot be written kills the session
-// that asked — so Report refuses one instead.
-func MaxDetail(maxFrame Bytes) Bytes {
+// bytes may publish, zero meaning MaxFrame's own default. A larger report
+// cannot be serialized, and a health terminal that cannot be written kills the
+// session that asked — so Report refuses one instead.
+func MaxDetail(maxFrame Bytes) Bytes { return maxFramedBytes(maxFrame) }
+
+// maxFramedBytes is the largest []byte one terminal of a maxFrame session can
+// carry, zero meaning MaxFrame's own default: encoding/json base64s a []byte,
+// so it claims four bytes of frame for every three it holds, beside the
+// envelope reserve.
+func maxFramedBytes(maxFrame Bytes) Bytes {
 	if maxFrame <= 0 {
 		maxFrame = wire.DefaultMaxFrame
 	}
-	usable := maxFrame - detailEnvelopeReserve
+	usable := maxFrame - frameEnvelopeReserve
 	if usable <= 0 {
 		return 0
 	}

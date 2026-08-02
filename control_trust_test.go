@@ -10,7 +10,7 @@ import (
 )
 
 // TestAttachNeverCallsAFailedVerificationAbsent pins the one ordering
-// constraint in classifyAttach: every one of trust's denials can wrap ENOENT
+// constraint in classifyWire: every one of trust's denials can wrap ENOENT
 // out of csops (internal/trust/verify.go denyErrno), and ErrAbsent promises a
 // proven no-listener. A squatter holding the socket, a kernel that answered a
 // shape this build cannot read, and a peer that exited mid-verification are
@@ -28,15 +28,15 @@ func TestAttachNeverCallsAFailedVerificationAbsent(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			fromKernel := fmt.Errorf("%w: csops op 16: %w", tt.deny, syscall.ENOENT)
-			err := classifyAttach(fmt.Errorf("wire: authorize accepting peer: %w", classifyServingTrust(fromKernel)))
+			err := classifyWire(fmt.Errorf("wire: authorize accepting peer: %w", classifyServingTrust(fromKernel)))
 			if errors.Is(err, ErrAbsent) {
-				t.Errorf("classifyAttach() = %v, want no ErrAbsent for a peer that failed verification", err)
+				t.Errorf("classifyWire() = %v, want no ErrAbsent for a peer that failed verification", err)
 			}
 			if got := errors.Is(err, ErrUntrusted); got != tt.untrusted {
 				t.Errorf("errors.Is(err, ErrUntrusted) = %t, want %t (err = %v)", got, tt.untrusted, err)
 			}
 			if !errors.Is(err, tt.deny) {
-				t.Errorf("classifyAttach() = %v, want the %v cause preserved", err, tt.deny)
+				t.Errorf("classifyWire() = %v, want the %v cause preserved", err, tt.deny)
 			}
 		})
 	}

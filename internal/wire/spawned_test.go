@@ -16,6 +16,7 @@ import (
 
 	"github.com/yasyf/daemonkit/internal/proc"
 	"github.com/yasyf/daemonkit/internal/wire"
+	"github.com/yasyf/daemonkit/internal/wire/wiretest"
 )
 
 const (
@@ -46,17 +47,30 @@ func runSpawnedChild() {
 			os.Exit(72)
 		}
 	}
+	file, err := proc.ClaimHandoff()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "spawned child: claim handoff: %v\n", err)
+		os.Exit(72)
+	}
+	conn, err := net.FileConn(file)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "spawned child: adopt handoff: %v\n", err)
+		os.Exit(72)
+	}
+	_ = file.Close()
+	rt := wiretest.NewStubRuntime()
+	rt.SetHandle(func(_ context.Context, req wire.Request) (any, error) {
+		if req.Op != "child.echo.v1" {
+			return nil, fmt.Errorf("spawned child: unknown op %q", req.Op)
+		}
+		return json.RawMessage(req.Payload), nil
+	})
 	err = wire.RunSpawnedSession(context.Background(), wire.SpawnedSessionConfig{
-		Nonce:  nonce,
-		Schema: "spawned.v1",
-		Limits: limits,
-		Handlers: []wire.HandlerSpec{{
-			Op:         "child.echo.v1",
-			Concurrent: true,
-			Handler: func(_ context.Context, req wire.Request) (any, error) {
-				return json.RawMessage(req.Payload), nil
-			},
-		}},
+		Conn:    conn,
+		Nonce:   nonce,
+		Schema:  "spawned.v1",
+		Limits:  limits,
+		Runtime: rt,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "spawned child: %v\n", err)
@@ -93,14 +107,14 @@ func spawnChild(t *testing.T, envNonce []byte, extraEnv ...string) *proc.Child {
 	return child
 }
 
-func handoffConn(t *testing.T, child *proc.Child) *net.UnixConn {
+func handoffConn(t *testing.T, child *proc.Child) net.Conn {
 	t.Helper()
 	conn, err := child.TakeChannel()
 	if err != nil {
 		t.Fatalf("TakeChannel() = %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	return conn.(*net.UnixConn)
+	return conn
 }
 
 func awaitExit(t *testing.T, child *proc.Child) proc.Exit {

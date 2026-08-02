@@ -11,9 +11,15 @@ import (
 	"github.com/yasyf/daemonkit/launchd"
 )
 
-// Open prepares a client for d's daemon and performs no I/O. Every verb
-// refuses a context without a deadline: all stall bounds derive from it.
-func Open(d Daemon) *Client {
+// Open prepares a client for d's daemon and performs no I/O beyond
+// validation: ValidateForClient runs here, so an unstated Trust.Serving or a
+// malformed Daemon fails at construction with a config error naming the
+// field — not at first Call inside a retry loop. Every verb refuses a context
+// without a deadline: all stall bounds derive from it.
+func Open(d Daemon) (*Client, error) {
+	if err := d.ValidateForClient(); err != nil {
+		return nil, err
+	}
 	c := &Client{
 		daemon:     d,
 		probe:      proc.ProbeIdentity,
@@ -24,7 +30,7 @@ func Open(d Daemon) *Client {
 		launchctl:  launchctl,
 	}
 	c.serving = c.servedHealth
-	return c
+	return c, nil
 }
 
 // Client reaches one daemon named by its Daemon identity. Every field past the
@@ -43,9 +49,9 @@ type Client struct {
 }
 
 // record is the durable owner record's path, derived past the Label rule
-// wherever a verb is about to read it. Open derives nothing: a Label no path
-// may be joined from has to be refused where a refusal can be returned, which
-// is the verb and never the constructor.
+// wherever a verb is about to read it. The rule runs at each derivation rather
+// than once at the constructor, so a path added later inherits it instead of
+// restating a weaker one beside it.
 func (c *Client) record() (string, error) {
 	el, err := c.daemon.Label.element()
 	if err != nil {

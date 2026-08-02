@@ -55,9 +55,13 @@ type Product interface {
 
 // Request is one admitted business request.
 type Request struct {
-	Op     string
-	Body   []byte
+	Op   string
+	Body []byte
+	// Caller is the immediate socket peer's kernel identity as data — behind a
+	// byte proxy it is the proxy, not the originator.
 	Caller Caller
+	// Session names the accepted session this request arrived on.
+	Session Session
 }
 
 // Reply is one terminal business response.
@@ -69,6 +73,21 @@ type Caller struct {
 	UID uint32
 	PID int
 }
+
+// Session is one accepted client session: a comparable token products key
+// per-session state by, with the close signal that releases it.
+type Session struct {
+	id   uint64
+	done <-chan struct{}
+}
+
+// ID returns this session's identifier, unique and monotonic within the
+// serving process.
+func (s Session) ID() uint64 { return s.id }
+
+// Done closes once this exact session has settled and been dropped, so the
+// state keyed by it can be released.
+func (s Session) Done() <-chan struct{} { return s.done }
 
 // Drained is what a shutdown achieved. A non-empty Abandoned deliberately
 // retains the flock and parks the process rather than releasing resources
@@ -180,7 +199,7 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 	rt := newServeRuntime(int(MaxDetail(d.MaxFrame)))
 	server, err := wire.NewServer(rt, wire.Config{
 		Schemas:     d.wireSchemas(),
-		Trust:       wire.Trust{Control: wireRequirement(d.Trust.Control), Business: wireRequirement(d.Trust.Business)},
+		Trust:       wire.Trust{Control: wireRequirement(d.Trust.Control), Business: wireRequirements(d.Trust.Business)},
 		Concurrency: d.Concurrency,
 		MaxFrame:    int(d.MaxFrame),
 		Handshake:   time.Duration(d.Handshake),
@@ -416,7 +435,23 @@ func wireRequirement(r *Requirement) *trust.Requirement {
 	if r == nil {
 		return nil
 	}
-	requirement := &trust.Requirement{
+	requirement := wiredRequirement(*r)
+	return &requirement
+}
+
+func wireRequirements(rs Requirements) []trust.Requirement {
+	if rs == nil {
+		return nil
+	}
+	wired := make([]trust.Requirement, len(rs))
+	for i, r := range rs {
+		wired[i] = wiredRequirement(r)
+	}
+	return wired
+}
+
+func wiredRequirement(r Requirement) trust.Requirement {
+	requirement := trust.Requirement{
 		TeamID:            r.TeamID,
 		SigningIdentifier: r.SigningIdentifier,
 		RequiredAppGroup:  r.RequiredAppGroup,
@@ -465,15 +500,7 @@ func (r *serveRuntime) Handle(ctx context.Context, req wire.Request) (any, error
 	r.mu.Lock()
 	product := r.product
 	r.mu.Unlock()
-	reply, err := product.Handle(ctx, Request{
-		Op:     string(req.Op),
-		Body:   req.Payload,
-		Caller: Caller{UID: uint32(req.Peer.UID), PID: req.Peer.Token.PID()}, //nolint:gosec // kernel UIDs are non-negative
-	})
-	if err != nil {
-		return nil, err
-	}
-	return reply, nil
+	return handleBusiness(ctx, req, product.Handle)
 }
 
 func (r *serveRuntime) Phase() wire.PhaseSnapshot {

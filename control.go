@@ -37,12 +37,12 @@ func (e Expect) mismatch(build string, generation uint64) bool {
 //
 // The proof reaches exactly one identity, and only as far as whatever named
 // it: Control judges the process answering for it against Trust.Serving —
-// floor alone when nil, which any same-UID socket squatter clears — and
-// Settle reads its identity out of a same-UID-writable owner record. Neither
-// says anything about orphaned children, a second instance, or a separate app
-// executable. Gating an irreversible action — uninstall, deactivation — on
-// Stopped alone is therefore unsound: pin Trust.Serving to a code-signing
-// requirement and require an executable-scoped inventory of the real process
+// the floor alone under ServingSameUser, which any same-UID socket squatter
+// clears — and Settle reads its identity out of a same-UID-writable owner
+// record. Neither says anything about orphaned children, a second instance, or
+// a separate app executable. Gating an irreversible action — uninstall,
+// deactivation — on Stopped alone is therefore unsound: state Trust.Serving as
+// ServingSigned and require an executable-scoped inventory of the real process
 // table to be empty besides.
 type Stopped struct {
 	Before Health
@@ -131,7 +131,7 @@ func (c *Client) Control(ctx context.Context) (*Control, error) {
 		},
 	})
 	if err != nil {
-		return nil, classifyAttach(err)
+		return nil, classifyWire(err)
 	}
 	pinned, report, err := assemblePin(os.Getpid(), servingPID, c.probe, func() (wire.HealthReport, error) {
 		return session.Health(ctx)
@@ -150,17 +150,17 @@ func (c *Client) Control(ctx context.Context) (*Control, error) {
 
 // authorizeServer judges the process accepting for this client, between dial
 // and the hello write, off one PeerCredentials read that serves the
-// unconditional same-EUID floor, the requirement against the peer's audit
-// token, and the PID the attach pins. A nil requirement is explicit UID-only
-// trust, exactly as on the serving side. It returns the judged connection's
-// peer PID: per-connection state is established inside the authorization, so
-// nothing but immutable config survives to a replacement connection.
-func authorizeServer(conn *net.UnixConn, requirement *Requirement) (int, error) {
+// unconditional same-EUID floor, the posture against the peer's audit token,
+// and the PID the attach pins. ServingSameUser is the named waiver, exactly as
+// on the serving side. It returns the judged connection's peer PID:
+// per-connection state is established inside the authorization, so nothing but
+// immutable config survives to a replacement connection.
+func authorizeServer(conn *net.UnixConn, serving Serving) (int, error) {
 	peer, err := trust.PeerCredentials(conn)
 	if err != nil {
 		return 0, fmt.Errorf("daemonkit: read serving peer identity: %w", err)
 	}
-	if err := trust.Verify(peer, wireRequirement(requirement)); err != nil {
+	if err := trust.Verify(peer, wireRequirement(serving.policy.requirement())); err != nil {
 		return 0, classifyServingTrust(err)
 	}
 	return peer.Token.PID(), nil
@@ -206,15 +206,21 @@ func assemblePin(
 	return pinned, report, nil
 }
 
-func classifyAttach(err error) error {
+// classifyWire turns one wire-side failure into the root sentinel a caller
+// branches on: an attach refusal on either lane, or a business dispatch
+// rejection. One function reads them all, so a rejection and an attach naming
+// the same condition cannot answer with two different sentinels.
+func classifyWire(err error) error {
 	switch {
 	case errors.Is(err, wire.ErrDraining):
 		return ErrDraining
+	case errors.Is(err, wire.ErrNotReady):
+		return ErrNotReady
 	case errors.Is(err, ErrUntrusted):
 		return err
 	case errors.Is(err, wire.ErrUntrustedPeer), errors.Is(err, trust.ErrUntrustedPeer):
 		return fmt.Errorf("%w: %w", ErrUntrusted, err)
-	case errors.Is(err, trust.ErrNoVerifier), errors.Is(err, trust.ErrPeerGone):
+	case errors.Is(err, ErrNoVerifier), errors.Is(err, ErrPeerGone):
 		return err
 	case errors.Is(err, syscall.ENOENT), errors.Is(err, os.ErrNotExist), errors.Is(err, syscall.ECONNREFUSED):
 		return fmt.Errorf("%w: %w", ErrAbsent, err)

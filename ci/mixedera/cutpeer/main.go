@@ -248,7 +248,14 @@ func drain(args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), controlTimeout)
 	defer cancel()
 
-	client := daemonkit.Open(daemonkit.Daemon{Label: label, Schemas: []daemonkit.Schema{cutSchema}})
+	client, err := daemonkit.Open(daemonkit.Daemon{
+		Label:   label,
+		Schemas: []daemonkit.Schema{cutSchema},
+		Trust:   daemonkit.Trust{Serving: daemonkit.ServingSameUser()},
+	})
+	if err != nil {
+		return fmt.Errorf("open: %w", err)
+	}
 	control, err := client.Control(ctx)
 	if err != nil {
 		return emit(classifyControl(err))

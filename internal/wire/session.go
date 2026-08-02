@@ -22,6 +22,10 @@ const reservedOpPrefix = "daemon."
 // AcceptedSession is a server-authenticated persistent client session.
 type AcceptedSession struct{ s *session }
 
+// ID returns this session's identifier, unique and monotonic within the
+// serving process.
+func (s *AcceptedSession) ID() uint64 { return s.s.id }
+
 // Peer returns the kernel identity captured once from the accepted socket.
 func (s *AcceptedSession) Peer() trust.Peer { return s.s.peer }
 
@@ -46,6 +50,7 @@ func (s *AcceptedSession) PushEvent(ctx context.Context, event Event) error {
 
 type session struct {
 	server       *Server
+	id           uint64
 	conn         net.Conn
 	codec        *Codec
 	ctx          context.Context

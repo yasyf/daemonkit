@@ -37,8 +37,8 @@ func TestMaxDetail(t *testing.T) {
 		maxFrame Bytes
 		want     Bytes
 	}{
-		{"default frame", 0, (wire.DefaultMaxFrame - detailEnvelopeReserve) * 3 / 4},
-		{"explicit frame", 16 << 20, ((16 << 20) - detailEnvelopeReserve) * 3 / 4},
+		{"default frame", 0, (wire.DefaultMaxFrame - frameEnvelopeReserve) * 3 / 4},
+		{"explicit frame", 16 << 20, ((16 << 20) - frameEnvelopeReserve) * 3 / 4},
 		{"frame smaller than the envelope", 1 << 10, 0},
 	}
 	for _, tt := range tests {

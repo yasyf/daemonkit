@@ -169,7 +169,8 @@ type PolicyDigest string
 // value can express its absence.
 type Trust struct {
 	Control  *Requirement // nil: floor alone. Gates Control and the wire Drain verb.
-	Business *Requirement // nil: floor alone. captain-hook sets both.
+	Business Requirements  // nil: floor alone. Any element admits; captain-hook sets both.
+	Serving  Serving       // what the process answering on the socket must prove.
 }
 
 type Restart uint8
@@ -262,9 +263,13 @@ type Product interface {
 type Reloader interface{ Reload(Budget) error }
 
 type Request struct {
-	Op     string
-	Body   []byte
-	Caller Caller // identity as data: no methods, no authority
+	Op   string
+	Body []byte
+	// Caller is the immediate socket peer's kernel identity as data — behind a
+	// byte proxy it is the proxy, not the originator.
+	Caller Caller
+	// Session names the accepted session this request arrived on.
+	Session Session
 }
 
 type Reply struct{ Body []byte }
@@ -274,11 +279,20 @@ type Caller struct {
 	PID int
 }
 
+// Session is one accepted client session: a comparable token products key
+// per-session state by, with the close signal that releases it.
+type Session struct{ /* unexported: id + done channel */ }
+
+func (s Session) ID() uint64
+func (s Session) Done() <-chan struct{}
+
 // ── reaching ────────────────────────────────────────────────────────────────
 
-// Open prepares a client and performs no I/O. Every call refuses a context
-// without a deadline: all stall bounds derive from it.
-func Open(d Daemon) *Client
+// Open prepares a client and performs no I/O beyond validation: an unstated
+// Trust.Serving or a malformed Daemon fails here, not at first Call. Every call
+// refuses a context without a deadline: all stall bounds derive from it.
+func Open(d Daemon) (*Client, error)
+func (Daemon) ValidateForClient() error
 
 func (*Client) Call(ctx context.Context, req Request) (Reply, Outcome, error)
 func (*Client) Health(ctx context.Context) (Health, error) // floor-only; answers during drain

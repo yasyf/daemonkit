@@ -43,9 +43,17 @@ func (c *Child) Conn() (net.Conn, error) {
 	if c.channel == ChannelNone {
 		return nil, errors.New("daemonkit: this child was spawned on ChannelNone and has no channel")
 	}
+	return c.takeChannel()
+}
+
+// takeChannel is the single take Conn and Business share, so the collision is
+// one named refusal in either order.
+func (c *Child) takeChannel() (net.Conn, error) {
 	conn, err := c.child.TakeChannel()
 	if err != nil {
-		return nil, fmt.Errorf("daemonkit: take the spawned channel: %w", err)
+		return nil, fmt.Errorf(
+			"daemonkit: Child.Conn and Child.Business consume the one channel end, once between them: %w", err,
+		)
 	}
 	return conn, nil
 }

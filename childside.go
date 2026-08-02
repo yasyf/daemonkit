@@ -1,6 +1,7 @@
 package daemonkit
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -44,6 +45,66 @@ func ClaimHandoff() (net.Conn, error) {
 	}
 	return handoff.conn, nil
 }
+
+// Handler serves one admitted request on a spawned session.
+type Handler func(ctx context.Context, req Request) (Reply, error)
+
+// ServeSpawned is the child half of a ChannelHandoff spawn: it claims fd 3 —
+// ClaimHandoff's structural check, so the pair's creator is proven to be this
+// process's parent at the same UID — adopts the session limits the parent
+// conveyed alongside the nonce, echoes the nonce, and serves exactly one
+// session until ctx ends or the parent closes the channel. contract's limits
+// must be zero or equal to the conveyed ones; disagreement refuses before
+// serving. The claim is the same single take ClaimHandoff makes, so one after
+// the other, in either order, is a named refusal. A spawned server is not a
+// daemon — no flock, no owner record, no launchd job, no drain ladder.
+func ServeSpawned(ctx context.Context, contract Contract, handle Handler) error {
+	if err := contract.validate(); err != nil {
+		return err
+	}
+	if handle == nil {
+		return errors.New("daemonkit: ServeSpawned requires a handler")
+	}
+	handoff, err := claimSpawnedHandoff()
+	if err != nil {
+		return err
+	}
+	limits, err := contract.adopt(handoff.limits)
+	if err != nil {
+		_ = handoff.conn.Close()
+		return err
+	}
+	return wire.RunSpawnedSession(ctx, wire.SpawnedSessionConfig{
+		Conn:    handoff.conn,
+		Nonce:   handoff.nonce,
+		Schema:  string(contract.Schema),
+		Limits:  sessionLimits(limits),
+		Runtime: spawnedRuntime{handle: handle},
+	})
+}
+
+// spawnedRuntime is the child half's wire.Runtime: one session that is ready
+// the moment it is served, with no lifecycle to publish and no drain ladder to
+// run behind it.
+type spawnedRuntime struct{ handle Handler }
+
+func (r spawnedRuntime) Handle(ctx context.Context, req wire.Request) (any, error) {
+	return handleBusiness(ctx, req, r.handle)
+}
+
+func (spawnedRuntime) Phase() wire.PhaseSnapshot {
+	return wire.PhaseSnapshot{Sequence: 1, Phase: wire.PhaseReady}
+}
+
+func (r spawnedRuntime) WaitPhase(ctx context.Context, after uint64) (wire.PhaseSnapshot, error) {
+	if after == 0 {
+		return r.Phase(), nil
+	}
+	<-ctx.Done()
+	return wire.PhaseSnapshot{}, ctx.Err()
+}
+
+func (spawnedRuntime) Drain() {}
 
 // claimSpawnedHandoff performs the one claim both child-side entry points
 // share. The DAEMONKIT_SPAWNED_* variables are read once and unset here: they

@@ -1,9 +1,15 @@
 package daemonkit
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/yasyf/daemonkit/internal/trust"
+)
 
 // Sentinel identity is load-bearing: consumers alias these and match with
-// errors.Is across module boundaries. Each is declared exactly once, here.
+// errors.Is across module boundaries. Each is declared exactly once, here,
+// and one this module already declares deeper down is aliased rather than
+// re-declared, so the two spellings cannot name two errors.
 var (
 	// ErrBusy means Serve found a live incumbent owning the socket; no
 	// takeover exists here.
@@ -24,6 +30,27 @@ var (
 
 	// ErrUntrusted means the peer failed a lane's trust requirement.
 	ErrUntrusted = errors.New("daemonkit: peer failed trust verification")
+
+	// ErrPeerGone means the process accepting on the socket ended its
+	// execution generation before verification could finish: the ordinary
+	// daemon-restart race, never a verdict about the peer. It is
+	// internal/trust's own sentinel, so the branch this package already has on
+	// it and any branch a consumer writes are the same identity.
+	ErrPeerGone = trust.ErrPeerGone
+
+	// ErrNoVerifier means a requirement was stated with no code-identity
+	// verifier to run it — a build defect, never a trust verdict. It is
+	// internal/trust's own sentinel, aliased for the same reason.
+	ErrNoVerifier = trust.ErrNoVerifier
+
+	// ErrOversize means the Call body is larger than the session's MaxFrame
+	// can carry once the envelope is on it. Nothing was written.
+	ErrOversize = errors.New("daemonkit: payload exceeds the session's MaxFrame")
+
+	// ErrLaneClosed means a business lane will not acquire another session:
+	// Close took it, or its one caller-authenticated session failed
+	// terminally.
+	ErrLaneClosed = errors.New("daemonkit: business lane is closed")
 
 	// ErrWrongIncumbent means a non-zero Expect field disagreed with the
 	// pinned incumbent's served Health (Drain) or with the durable owner

@@ -75,6 +75,35 @@ func (r Requirement) Digest() PolicyDigest {
 	return PolicyDigest(hex.EncodeToString(sum[:]))
 }
 
+// Requirements is a disjunction of full requirements: a peer is admitted by
+// any one element. An app and its File Provider extension are two genuinely
+// different signed bundles, each carrying its own entitlements and app group,
+// and each element states its own — so the disjunction stays strictly stronger
+// than the single TeamID-only requirement Validate refuses.
+//
+// A nil Requirements is the unset field. A non-nil set with no elements is a
+// disjunction over nothing, which admits nobody; ValidateForServe refuses it
+// rather than letting it read as the unset field.
+type Requirements []Requirement
+
+// Digest is the set's policy digest. It covers each element's own digest in
+// sorted order, so the same set written in two orders cannot produce two
+// digests, and the element count, so a set never shares a digest with one of
+// its members.
+func (rs Requirements) Digest() PolicyDigest {
+	elements := make([]string, len(rs))
+	for i, requirement := range rs {
+		elements[i] = string(requirement.Digest())
+	}
+	sort.Strings(elements)
+	buf := binary.BigEndian.AppendUint64(nil, uint64(len(elements)))
+	for _, element := range elements {
+		buf = appendDigestString(buf, element)
+	}
+	sum := sha256.Sum256(buf)
+	return PolicyDigest(hex.EncodeToString(sum[:]))
+}
+
 func appendDigestString(buf []byte, value string) []byte {
 	buf = binary.BigEndian.AppendUint64(buf, uint64(len(value)))
 	return append(buf, value...)

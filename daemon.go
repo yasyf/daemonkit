@@ -1,6 +1,7 @@
 package daemonkit
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"time"
@@ -80,6 +81,16 @@ func (d Daemon) shutdownGrace() Grace {
 	return d.Shutdown
 }
 
+// ownSchema is the application protocol this build speaks, empty when the
+// daemon declares none; the business lane refuses that at its config boundary
+// rather than attaching under a schema no daemon accepts.
+func (d Daemon) ownSchema() Schema {
+	if len(d.Schemas) == 0 {
+		return ""
+	}
+	return d.Schemas[0]
+}
+
 func (d Daemon) wireSchemas() wire.Schemas {
 	schemas := make(wire.Schemas, len(d.Schemas))
 	for i, schema := range d.Schemas {
@@ -108,20 +119,43 @@ const maxGrace = Grace(24 * time.Hour)
 // socket, and job name is joined from it; every Grace must lie in (0, 24h],
 // zero meaning its documented default. Rejecting the range here is what keeps
 // every deadline downstream of mint within budget arithmetic's exact domain.
+// Trust.Business, when stated at all, must name at least one requirement: a
+// disjunction over nothing admits nobody, and reading as the unset field
+// instead would open the lane to every same-UID peer.
 func (d Daemon) ValidateForServe() error {
 	if _, err := d.Label.element(); err != nil {
 		return err
 	}
-	for _, g := range []struct {
-		field string
-		grace Grace
-	}{
-		{"Shutdown", d.Shutdown},
-		{"Handshake", d.Handshake},
-	} {
-		if g.grace < 0 || g.grace > maxGrace {
-			return fmt.Errorf("daemonkit: %s grace %v is outside (0, 24h]", g.field, time.Duration(g.grace))
-		}
+	if err := d.Shutdown.validate("Shutdown"); err != nil {
+		return err
+	}
+	if err := d.Handshake.validate("Handshake"); err != nil {
+		return err
+	}
+	if d.Trust.Business != nil && len(d.Trust.Business) == 0 {
+		return errors.New("daemonkit: Trust.Business is stated but empty; leave it nil for the same-EUID floor alone")
+	}
+	return nil
+}
+
+// ValidateForClient is the config-boundary check Open runs once: every Grace a
+// client consumes lies in (0, 24h], Label is present, and Trust.Serving is
+// stated. It mirrors ValidateForServe on the client's half of the Daemon
+// value — Handshake bounds admission on the serving side and no client verb
+// reads it, so it is not judged here.
+func (d Daemon) ValidateForClient() error {
+	if _, err := d.Label.element(); err != nil {
+		return err
+	}
+	if err := d.Shutdown.validate("Shutdown"); err != nil {
+		return err
+	}
+	return d.Trust.Serving.validate("Trust.Serving")
+}
+
+func (g Grace) validate(field string) error {
+	if g < 0 || g > maxGrace {
+		return fmt.Errorf("daemonkit: %s grace %v is outside (0, 24h]", field, time.Duration(g))
 	}
 	return nil
 }
@@ -131,22 +165,10 @@ func (d Daemon) ValidateForServe() error {
 // can express its absence.
 type Trust struct {
 	Control  *Requirement // nil: floor alone. Gates Control and the wire Drain verb.
-	Business *Requirement // nil: floor alone.
+	Business Requirements // nil: floor alone. Any element admits.
 	// Serving is what the process answering on the socket must prove to a
-	// client attaching to it — the identity the consumer deployed. It is the
-	// client's half of the control lane's authorization and the daemon never
-	// reads it. nil: floor alone, which admits any same-UID process that binds
-	// the socket first.
-	//
-	// A floor-only Serving leaves the absence proof forgeable, not merely
-	// weak: a same-UID process that unlinks the socket and re-binds it clears
-	// the floor, self-attests its own honest PID through the attach
-	// handshake, and its own exit is then a true Stopped{ReapAbsent} for a
-	// daemon still running behind it. A caller gating an irreversible action
-	// on that proof must pin Serving to a code-signing requirement and
-	// corroborate with an executable-scoped inventory of the real process
-	// table.
-	Serving *Requirement
+	// client attaching to it; the daemon never reads it.
+	Serving Serving
 }
 
 // Restart is launchd's relaunch policy for the daemon's job.

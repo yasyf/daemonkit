@@ -24,7 +24,7 @@ import (
 )
 
 func TestEnsureRequiresDeadline(t *testing.T) {
-	client := Open(Daemon{Label: "com.example.ensure"})
+	client := openClient(t, Daemon{Label: "com.example.ensure"})
 	if _, err := client.Ensure(context.Background()); err == nil {
 		t.Fatal("Ensure() without a deadline succeeded")
 	}
@@ -37,14 +37,14 @@ func TestEnsureRequiresDeadline(t *testing.T) {
 func TestEnsureNamesAnUnsetProgram(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
-	_, err := Open(Daemon{Label: "com.example.ensure"}).Ensure(ctx)
+	_, err := openClient(t, Daemon{Label: "com.example.ensure"}).Ensure(ctx)
 	if err == nil || !strings.Contains(err.Error(), "Daemon.Program is unset") {
 		t.Fatalf("Ensure() error = %v, want the unset Program named", err)
 	}
 }
 
 func TestWaitReadyRequiresDeadline(t *testing.T) {
-	client := Open(Daemon{Label: "com.example.ensure"})
+	client := openClient(t, Daemon{Label: "com.example.ensure"})
 	if _, err := client.WaitReady(context.Background()); err == nil {
 		t.Fatal("WaitReady() without a deadline succeeded")
 	}
@@ -123,9 +123,10 @@ func TestLabelIsRefusedUnlessLaunchdWouldAcceptIt(t *testing.T) {
 // file, a binary copy, or a plist created anywhere under it — or above it, where
 // a traversal lands — fails the door that created it.
 //
-// RecordPath is the one derivation that states the layout without running the
-// rule, so it is driven here for what it must not do: it names an escaped path
-// and reads nothing at it.
+// Every client verb is reached through Open, which runs the rule, so Open is
+// the door the verbs stand behind. RecordPath is the one derivation that
+// states the layout without running the rule, so it is driven here for what it
+// must not do: it names an escaped path and reads nothing at it.
 func TestNoPathIsJoinedFromALabelLaunchdWouldRefuse(t *testing.T) {
 	root := escapeRoot(t)
 	program, err := Stable()
@@ -139,9 +140,7 @@ func TestNoPathIsJoinedFromALabelLaunchdWouldRefuse(t *testing.T) {
 		"../daemon", "bin/daemon", "/daemon", "daemon/", "com example", "com.example.daemon\n",
 	} {
 		t.Run(fmt.Sprintf("%q", string(bad)), func(t *testing.T) {
-			daemon := Daemon{Label: bad, Program: program}
-			client := Open(daemon)
-			client.launchctl = (&launchctlRecorder{}).run
+			daemon := Daemon{Label: bad, Program: program, Trust: Trust{Serving: ServingSameUser()}}
 			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 			defer cancel()
 
@@ -150,20 +149,14 @@ func TestNoPathIsJoinedFromALabelLaunchdWouldRefuse(t *testing.T) {
 				refuses bool
 				run     func() error
 			}{
-				{"Ensure", true, func() error { _, err := client.Ensure(ctx); return err }},
-				{"Control", true, func() error { _, err := client.Control(ctx); return err }},
-				{"WaitReady", true, func() error { _, err := client.WaitReady(ctx); return err }},
-				{"Settle", true, func() error {
-					_, err := client.Settle(ctx, Expect{Build: "b", Generation: 1})
-					return err
-				}},
+				{"Open", true, func() error { _, err := Open(daemon); return err }},
 				{"Serve", true, func() error {
 					_, err := Serve(ctx, daemon, func(Ctx) (Product, error) { return nil, nil })
 					return err
 				}},
 				{"ValidateForServe", true, daemon.ValidateForServe},
+				{"ValidateForClient", true, daemon.ValidateForClient},
 				{"Daemon.agent", true, func() error { _, err := daemon.agent(); return err }},
-				{"inventoryClear", true, func() error { return client.inventoryClear(proc.Identity{}) }},
 				{"RecordPath", false, func() error {
 					record := daemon.RecordPath()
 					if _, err := os.Stat(record); !errors.Is(err, fs.ErrNotExist) {
@@ -569,12 +562,12 @@ func TestInventoryClearProvesAbsenceOverTheProcessTable(t *testing.T) {
 	if err := os.WriteFile(unrun, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 		t.Fatalf("write program: %v", err)
 	}
-	idle := Open(Daemon{Label: inventoryLabel, Program: Program{policy: bundled{file: unrun}}})
+	idle := openClient(t, Daemon{Label: inventoryLabel, Program: Program{policy: bundled{file: unrun}}})
 	idle.identities = liveAt(realPath(t, selfPath(t)))
 	if err := idle.inventoryClear(proc.Identity{}); err != nil {
 		t.Fatalf("inventoryClear() error = %v, want a clear inventory", err)
 	}
-	running := Open(Daemon{Label: inventoryLabel, Program: Program{policy: bundled{file: realPath(t, selfPath(t))}}})
+	running := openClient(t, Daemon{Label: inventoryLabel, Program: Program{policy: bundled{file: realPath(t, selfPath(t))}}})
 	if err := running.inventoryClear(proc.Identity{}); !errors.Is(err, ErrUnsettled) {
 		t.Fatalf("inventoryClear() over this very process = %v, want ErrUnsettled", err)
 	}
@@ -616,7 +609,7 @@ func TestInventoryClearHoldsOnlyItsOwnUnnameableHusk(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			client := Open(Daemon{Label: inventoryLabel, Program: Program{policy: bundled{file: unrun}}})
+			client := openClient(t, Daemon{Label: inventoryLabel, Program: Program{policy: bundled{file: unrun}}})
 			client.identities = huskAt(husk)
 			err := client.inventoryClear(tt.observed)
 			if tt.wantErr == nil {
@@ -657,7 +650,7 @@ func TestInventoryClearQueriesTheProgramPathAlone(t *testing.T) {
 		t.Fatalf("place the stranger: %v", err)
 	}
 	var queried []string
-	client := Open(Daemon{Label: label, Program: program})
+	client := openClient(t, Daemon{Label: label, Program: program})
 	client.identities = func(path string) (proc.Report, error) {
 		queried = append(queried, path)
 		return proc.Report{}, nil
@@ -692,7 +685,7 @@ func TestInventoryClearNeverPassesOnAnUnresolvedProgram(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			client := Open(Daemon{Label: inventoryLabel, Program: Program{policy: bundled{file: tt.program}}})
+			client := openClient(t, Daemon{Label: inventoryLabel, Program: Program{policy: bundled{file: tt.program}}})
 			client.identities = liveAt(realPath(t, self))
 			if err := client.inventoryClear(proc.Identity{}); !errors.Is(err, tt.wantErr) {
 				t.Fatalf("inventoryClear() error = %v, want %v", err, tt.wantErr)
@@ -905,7 +898,7 @@ func TestSettleObservesUntilTheDecisionIsKnowable(t *testing.T) {
 			home := ladderHome(t)
 			agent := ladderAgent(t, home)
 			seen := 0
-			client := Open(Daemon{Label: Label(agent.Label)})
+			client := openClient(t, Daemon{Label: Label(agent.Label)})
 			client.serving = servingScript(tt.script, &seen)
 			client.readOwner = func(string) (proc.Owner, bool, error) { return proc.Owner{}, false, nil }
 			client.launchctl = (&launchctlRecorder{}).run
@@ -962,7 +955,7 @@ func newEnsureOnceHarness(t *testing.T, serving []observation, owners func(strin
 	}
 	h := &ensureOnceHarness{launchd: &launchctlRecorder{}}
 	h.agent = ladderAgent(t, home)
-	h.client = Open(Daemon{Label: Label(h.agent.Label), Program: Program{policy: bundled{file: unrun}}})
+	h.client = openClient(t, Daemon{Label: Label(h.agent.Label), Program: Program{policy: bundled{file: unrun}}})
 	seen := 0
 	h.client.serving = servingScript(serving, &seen)
 	h.client.readOwner = owners
@@ -1079,7 +1072,7 @@ func TestEnsureConvergesOnAnUpgradedBundle(t *testing.T) {
 		t.Fatalf("InBundle() error = %v", err)
 	}
 	daemon := Daemon{Label: "com.example.bundled", Program: program}
-	client := Open(daemon)
+	client := openClient(t, daemon)
 
 	upgraded := []byte("#!/bin/sh\nexit 1\n")
 	if err := os.WriteFile(exe, upgraded, 0o700); err != nil {
@@ -1551,7 +1544,7 @@ func TestEvictHandsTheSessionsPinToTheProof(t *testing.T) {
 				t.Fatalf("write program: %v", err)
 			}
 			startControlChild(t, tt.label)
-			client := Open(Daemon{
+			client := openClient(t, Daemon{
 				Label:    Label(tt.label),
 				Program:  Program{policy: bundled{file: unrun}},
 				Schemas:  []Schema{"test.v1"},
@@ -1704,7 +1697,7 @@ func TestEnsureReObservesWhenTheIncumbentMovesUnderIt(t *testing.T) {
 	home := ladderHome(t)
 	agent := ladderAgent(t, home)
 	seen := 0
-	client := Open(Daemon{Label: Label(agent.Label), Program: Program{policy: bundled{file: agent.Program}}})
+	client := openClient(t, Daemon{Label: Label(agent.Label), Program: Program{policy: bundled{file: agent.Program}}})
 	client.serving = servingScript([]observation{{report: servedReport(wire.PhaseReady, "stale", 7)}}, &seen)
 	client.readOwner = func(string) (proc.Owner, bool, error) { return recordedOwner("a stranger", 99), true, nil }
 	client.observe = func(proc.Identity) (proc.Reap, bool, error) { return proc.ReapAbsent, true, nil }
@@ -1739,7 +1732,7 @@ func TestEnsureOnceReportsTheRaceWhenItsBudgetIsGone(t *testing.T) {
 	home := ladderHome(t)
 	agent := ladderAgent(t, home)
 	seen := 0
-	client := Open(Daemon{Label: Label(agent.Label), Program: Program{policy: bundled{file: agent.Program}}})
+	client := openClient(t, Daemon{Label: Label(agent.Label), Program: Program{policy: bundled{file: agent.Program}}})
 	client.serving = servingScript([]observation{{report: servedReport(wire.PhaseReady, "stale", 7)}}, &seen)
 	client.readOwner = func(string) (proc.Owner, bool, error) { return recordedOwner("a stranger", 99), true, nil }
 	client.observe = func(proc.Identity) (proc.Reap, bool, error) { return proc.ReapAbsent, true, nil }
@@ -1798,7 +1791,7 @@ func TestEnsureRefusesAPassItCannotFinish(t *testing.T) {
 	agent := ladderAgent(t, home)
 	seen := 0
 	var last time.Duration
-	client := Open(Daemon{Label: Label(agent.Label), Program: Program{policy: bundled{file: agent.Program}}})
+	client := openClient(t, Daemon{Label: Label(agent.Label), Program: Program{policy: bundled{file: agent.Program}}})
 	client.serving = func(ctx context.Context) (wire.HealthReport, proc.Identity, error) {
 		seen++
 		last = left(ctx)
@@ -1848,7 +1841,7 @@ func TestEnsurePlacesTheProgramOnlyUnderTheStartLock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stable() error = %v", err)
 	}
-	client := Open(Daemon{Label: label, Program: program})
+	client := openClient(t, Daemon{Label: label, Program: program})
 	client.launchctl = (&launchctlRecorder{}).run
 	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
 	defer cancel()

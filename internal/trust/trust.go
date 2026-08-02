@@ -81,8 +81,46 @@ func Verify(peer Peer, req *Requirement) error {
 	if req == nil {
 		return nil
 	}
+	return judge(peer.Token, *req)
+}
+
+// VerifyAny enforces Floor, then admits the peer if any req matches. An empty
+// set is explicit UID-only trust, exactly as a nil req is for Verify. Every
+// disjunct is judged against the same audit token, so a denial that is not a
+// policy mismatch — ErrPeerGone, ErrNoVerifier, an invalid requirement — denies
+// the whole set: no later disjunct could be judged more soundly than the one
+// that already failed to read the kernel. When every disjunct is a policy
+// mismatch the denial joins them all and is ErrUntrustedPeer.
+func VerifyAny(peer Peer, reqs []Requirement) error {
+	if err := Floor(peer.UID); err != nil {
+		return err
+	}
+	if len(reqs) == 0 {
+		return nil
+	}
+	return anyOf(reqs, func(req Requirement) error { return judge(peer.Token, req) })
+}
+
+// anyOf folds the per-requirement verdicts into the set's one verdict. It is
+// the disjunction itself, separated from the kernel seam it is folded over.
+func anyOf(reqs []Requirement, judged func(Requirement) error) error {
+	denials := make([]error, 0, len(reqs))
+	for _, req := range reqs {
+		err := judged(req)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, ErrUntrustedPeer) {
+			return err
+		}
+		denials = append(denials, err)
+	}
+	return errors.Join(denials...)
+}
+
+func judge(token proc.AuditToken, req Requirement) error {
 	if err := req.Validate(); err != nil {
 		return err
 	}
-	return verifyRequirement(peer.Token, *req)
+	return verifyRequirement(token, req)
 }

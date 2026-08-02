@@ -182,14 +182,3 @@ type StreamResponse struct {
 	Chunks <-chan []byte
 	Value  any
 }
-
-// Handler runs one spawned-session request. Its context is cancelled by a
-// cancel frame, disconnect, session shutdown, or the client deadline.
-type Handler func(ctx context.Context, req Request) (any, error)
-
-// HandlerSpec defines one spawned-session handler.
-type HandlerSpec struct {
-	Op         Op
-	Handler    Handler
-	Concurrent bool
-}

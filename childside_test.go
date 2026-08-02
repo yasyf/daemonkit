@@ -40,6 +40,12 @@ func runChildRole(role string) int {
 		return childCloseInheritedFDs()
 	case "coprocess":
 		return childCoprocess()
+	case "serve-spawned":
+		return childServeSpawned(Contract{Schema: spawnedSchema})
+	case "serve-spawned-skew":
+		return childServeSpawned(Contract{Schema: spawnedSchema, MaxFrame: 2 << 20})
+	case "claim-then-serve":
+		return childClaimThenServe()
 	}
 	fmt.Fprintf(os.Stderr, "child: unknown role %q\n", role)
 	return 64

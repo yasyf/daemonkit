@@ -105,6 +105,7 @@ func newLane(t *testing.T, label string, shutdown time.Duration, restart daemonk
 		Program:  program,
 		Args:     []string{home, label},
 		Schemas:  []daemonkit.Schema{"daemonkit.e2e.v1"},
+		Trust:    daemonkit.Trust{Serving: daemonkit.ServingSameUser()},
 		Shutdown: daemonkit.Grace(shutdown),
 		Restart:  restart,
 	}
@@ -142,7 +143,13 @@ func (l *lane) behavior(t *testing.T, body string) {
 	}
 }
 
-func (l *lane) client() *daemonkit.Client { return daemonkit.Open(l.daemon) }
+func (l *lane) client() *daemonkit.Client {
+	client, err := daemonkit.Open(l.daemon)
+	if err != nil {
+		l.t.Fatalf("Open: %v", err)
+	}
+	return client
+}
 
 func (l *lane) ctx(budget time.Duration) context.Context {
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
