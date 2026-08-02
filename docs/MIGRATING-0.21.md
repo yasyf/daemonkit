@@ -217,6 +217,24 @@ requirement, because the control lane admits one session server-wide.
 
 ## Watch for
 
+- **`MaxFrame` is not your payload ceiling.** A terminal is base64'd and carries a 4 KiB envelope
+  reserve, so the largest body a session moves is `(MaxFrame - 4096) * 3/4` — about 75% of the
+  number you set. In v0.20 the wire carried the body raw and `MaxFrame` was the payload ceiling,
+  so any consumer that sized `MaxFrame` for a specific payload loses a quarter of it on the way
+  across. Size it from the payload instead, and pin it with `daemonkit.MaxDetail(MaxFrame)`, which
+  reports the real ceiling:
+
+  ```go
+  const maxPayload = 64 << 20
+  // The smallest frame whose MaxDetail is at least maxPayload.
+  const maxFrame = (maxPayload*4+2)/3 + 4<<10
+  ```
+
+  This bites hardest where an oversize payload is handled by falling back rather than failing:
+  cc-interact's guard-edit gate silently stopped seeing whole-Write payloads between 48 and 64 MiB
+  and allowed the edits through. Assert the ceiling in a test — `MaxDetail(spec.MaxFrame) >=
+  maxPayload` — so a future change to the reserve or the encoding fails loudly.
+
 - **State directory rename.** Deployment state moved to `.daemonkit-deploy/<name>/`. The old tree
   is archived on first open rather than decode-failed.
 - **Signed policy digests change.** Consumers that bake a requirement digest — captain-hook's
