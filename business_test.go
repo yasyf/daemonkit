@@ -8,6 +8,9 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -22,14 +25,18 @@ const (
 	codedOp        = "coded"
 	bareOp         = "bare"
 	wrappedOp      = "wrapped"
+	blockOp        = "block"
 )
 
 type businessProduct struct{}
 
-func (businessProduct) Handle(_ context.Context, req Request) (Reply, error) {
+func (businessProduct) Handle(ctx context.Context, req Request) (Reply, error) {
 	switch req.Op {
 	case echoOp:
 		return Reply{Body: req.Body}, nil
+	case blockOp:
+		<-ctx.Done()
+		return Reply{}, ctx.Err()
 	case codedOp:
 		return Reply{}, &ProductError{Code: "quota_exhausted", Message: "no quota left"}
 	case bareOp:
@@ -49,9 +56,14 @@ func (businessProduct) Close(Budget) error { return nil }
 // a terminal crosses the exact encode the daemon uses, and returns its socket.
 func serveBusiness(t *testing.T) string {
 	t.Helper()
+	return serveBusinessConfig(t, wire.Config{Schemas: wire.Schemas{businessSchema}})
+}
+
+func serveBusinessConfig(t *testing.T, cfg wire.Config) string {
+	t.Helper()
 	rt := newServeRuntime(int(MaxDetail(0)))
 	rt.ready(businessProduct{})
-	server, err := wire.NewServer(rt, wire.Config{Schemas: wire.Schemas{businessSchema}})
+	server, err := wire.NewServer(rt, cfg)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -187,6 +199,182 @@ func TestBusinessOverConnClosesOnItsSingleSessionsTerminalFailure(t *testing.T) 
 	if !Undispatched(closed) {
 		t.Error("Undispatched() = false for a lane that refused before writing")
 	}
+}
+
+// TestBusinessSurvivesACallersOwnDeadlineOnItsSingleSession is the other half
+// of "retire only on transport failure": a caller's expired context produces
+// the same PreSendFailure and PostSendFailure a severed socket does, on a
+// session whose peer is answering and whose frame stream is intact. The one
+// session a caller-authenticated lane will ever have must outlive it. The
+// deadline rides the wire, so the abandoned call's own verdict is a race the
+// server may win — its settled terminal arriving as a delivered failure
+// instead of ctx.Err() — and either loser is the call's own, never the
+// lane's.
+func TestBusinessSurvivesACallersOwnDeadlineOnItsSingleSession(t *testing.T) {
+	lane := dialBusiness(t, serveBusiness(t), Contract{Schema: businessSchema})
+	expired, expiredCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer expiredCancel()
+	if _, err := lane.Call(expired, blockOp, nil); err == nil || errors.Is(err, ErrLaneClosed) {
+		t.Fatalf("Call() = %v, want the abandoned call's own failure", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	reply, err := lane.Call(ctx, echoOp, []byte("after the deadline"))
+	if err != nil {
+		t.Fatalf("Call() = %v, want a reply on a session no transport failure touched", err)
+	}
+	if string(reply.Body) != "after the deadline" {
+		t.Fatalf("Call() body = %q, want %q", reply.Body, "after the deadline")
+	}
+}
+
+// failingWrites passes the handshake through and then, once armed, fails
+// every write with EPIPE while reads stay healthy — a transport whose break
+// only the writer can observe.
+type failingWrites struct {
+	net.Conn
+	armed atomic.Bool
+}
+
+func (c *failingWrites) Write(b []byte) (int, error) {
+	if c.armed.Load() {
+		return 0, syscall.EPIPE
+	}
+	return c.Conn.Write(b)
+}
+
+// TestBusinessRetiresOnTheCallThatBrokeTheTransport is the transport half of
+// "retire only on transport failure" under the one ordering the reader cannot
+// observe: the write itself is the first evidence the session is dead. A dead
+// lane must not stay alive — once a send broke the transport, every Call
+// fails and ErrLaneClosed arrives promptly and terminally.
+func TestBusinessRetiresOnTheCallThatBrokeTheTransport(t *testing.T) {
+	sock := serveBusiness(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	raw, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	conn := &failingWrites{Conn: raw}
+	lane, err := BusinessOverConn(ctx, conn, Contract{Schema: businessSchema})
+	if err != nil {
+		t.Fatalf("BusinessOverConn: %v", err)
+	}
+	if _, err := lane.Call(ctx, echoOp, []byte("first")); err != nil {
+		t.Fatalf("Call() = %v, want a reply", err)
+	}
+	conn.armed.Store(true)
+	if _, err := lane.Call(ctx, echoOp, []byte("second")); err == nil {
+		t.Fatal("Call() on a broken transport succeeded")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		_, err := lane.Call(ctx, echoOp, []byte("after the break"))
+		if errors.Is(err, ErrLaneClosed) {
+			return
+		}
+		if err == nil {
+			t.Fatal("Call() on a broken transport succeeded")
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Call() = %v, want ErrLaneClosed once the write failure retired the session", err)
+		}
+	}
+}
+
+// TestBusinessDemultiplexesLateTerminalsByRequestID drives the reuse the
+// deadline-survival rule licenses: each abandoned call's terminal arrives
+// around the next request's flight, and every reply must settle its own id —
+// a positional or reused-id stream would hand round k's late terminal to
+// round k+1's caller.
+func TestBusinessDemultiplexesLateTerminalsByRequestID(t *testing.T) {
+	lane := dialBusiness(t, serveBusiness(t), Contract{Schema: businessSchema})
+	for round := range 10 {
+		expired, expiredCancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		_, err := lane.Call(expired, blockOp, []byte(fmt.Sprintf("abandoned %d", round)))
+		expiredCancel()
+		if err == nil || errors.Is(err, ErrLaneClosed) {
+			t.Fatalf("round %d: Call() = %v, want the abandoned call's own failure", round, err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		want := fmt.Sprintf("round %d", round)
+		reply, err := lane.Call(ctx, echoOp, []byte(want))
+		cancel()
+		if err != nil {
+			t.Fatalf("round %d: Call() = %v, want a reply", round, err)
+		}
+		if string(reply.Body) != want {
+			t.Fatalf("round %d: Call() body = %q, want %q", round, reply.Body, want)
+		}
+	}
+}
+
+// TestBusinessReleasesConcurrencySlotsAbandonedCallsHeld pins the accounting
+// half of session reuse: on a server admitting one request at a time, every
+// abandoned call must settle and release its slot or the lane deadlocks at
+// Concurrency, and a Close after the abandonments must find the pending set
+// drained rather than wait out its whole deadline.
+func TestBusinessReleasesConcurrencySlotsAbandonedCallsHeld(t *testing.T) {
+	sock := serveBusinessConfig(t, wire.Config{Schemas: wire.Schemas{businessSchema}, Concurrency: 1})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	lane, err := BusinessOverConn(ctx, conn, Contract{Schema: businessSchema})
+	if err != nil {
+		t.Fatalf("BusinessOverConn: %v", err)
+	}
+	for round := range 8 {
+		expired, expiredCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		_, err := lane.Call(expired, blockOp, nil)
+		expiredCancel()
+		if err == nil || errors.Is(err, ErrLaneClosed) {
+			t.Fatalf("round %d: Call() = %v, want the abandoned call's own failure", round, err)
+		}
+	}
+	reply, err := lane.Call(ctx, echoOp, []byte("after the abandonments"))
+	if err != nil {
+		t.Fatalf("Call() = %v, want a reply through the slot the abandonments released", err)
+	}
+	if string(reply.Body) != "after the abandonments" {
+		t.Fatalf("Call() body = %q, want %q", reply.Body, "after the abandonments")
+	}
+	start := time.Now()
+	if err := lane.Close(ctx); err != nil {
+		t.Fatalf("Close() = %v", err)
+	}
+	if waited := time.Since(start); waited > 2*time.Second {
+		t.Fatalf("Close() waited %v on calls that should already be settled", waited)
+	}
+}
+
+// TestBusinessConcurrentDeadlinesAndCloseRace races expiring calls, live
+// calls, retirement, and Close on one lane; the assertions are the race
+// detector's and the deadline on every verb.
+func TestBusinessConcurrentDeadlinesAndCloseRace(t *testing.T) {
+	lane := dialBusiness(t, serveBusiness(t), Contract{Schema: businessSchema})
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 5 {
+				expired, expiredCancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+				_, _ = lane.Call(expired, blockOp, nil)
+				expiredCancel()
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				_, _ = lane.Call(ctx, echoOp, []byte("race"))
+				cancel()
+			}
+		}()
+	}
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer closeCancel()
+	_ = lane.Close(closeCtx)
+	wg.Wait()
 }
 
 // TestBusinessSurvivesATypedRejectionOnItsSingleSession is the refusal/failure

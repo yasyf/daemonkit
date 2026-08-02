@@ -309,6 +309,13 @@ func (c *Client) PeerWireIdentity() WireIdentity { return c.peer }
 // WireBuild returns the schema identity presented by this session.
 func (c *Client) WireBuild() string { return c.schema }
 
+// Failure returns the error that broke this session's transport, or nil while
+// it is still usable. A caller's own expired context is not one of them:
+// responses are demultiplexed by request id, so a terminal that arrives after
+// its caller gave up settles that id and is discarded, leaving the frame
+// stream in step for the next request.
+func (c *Client) Failure() error { return c.sessionErr() }
+
 // Events returns the bounded server-pushed event stream.
 func (c *Client) Events() <-chan Event { return c.eventOut }
 

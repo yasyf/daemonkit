@@ -117,7 +117,8 @@ func refused(err error) error { return &callError{outcome: wire.PreSendFailure, 
 // Business prepares the lane and performs no I/O, so it exists before the
 // daemon does. The session is acquired on first Call and re-acquired after
 // any session failure; a typed rejection is the peer's own answer on a session
-// it proves alive by answering, so it retires nothing. Each acquisition runs
+// it proves alive by answering, so it retires nothing, and neither does a Call
+// the caller's own deadline ends. Each acquisition runs
 // the same-EUID floor and the
 // Trust.Serving verify on the live socket peer's audit token before any byte,
 // the wire hello included, is written; there is no path to dispatch, or to the
@@ -243,7 +244,8 @@ func authorizeCallerAuthenticated(net.Conn) error { return nil }
 // ErrNotReady (retryable; wait with Client.WaitReady), ErrDraining,
 // ErrUntrusted, ErrPeerGone, ErrNoVerifier, and ErrOversize are typed refusals
 // that provably never dispatched; *ProductError is the product's own delivered
-// failure; anything else is transport loss with delivery unknown.
+// failure; anything else is transport loss or the caller's own expired
+// context, with delivery unknown.
 func (b *Business) Call(ctx context.Context, op string, body []byte) (Reply, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		return Reply{}, errors.New("daemonkit: Call requires a context deadline")
@@ -256,7 +258,7 @@ func (b *Business) Call(ctx context.Context, op string, body []byte) (Reply, err
 		return Reply{}, refused(err)
 	}
 	result, err := session.Call(ctx, wire.Op(op), body)
-	if err != nil || (result.Outcome != wire.Delivered && result.Outcome != wire.Rejected) {
+	if retiring(session, result.Outcome) {
 		b.retire(session)
 	}
 	if rejection := result.Rejection(); rejection != nil {
@@ -330,6 +332,16 @@ func (b *Business) acquire(ctx context.Context) (*wire.Client, error) {
 		}
 	}
 	return nil, denial
+}
+
+// retiring asks the transport whether it is broken instead of reading it off
+// an outcome that conflates two causes: a caller's own expired context
+// produces the same PreSendFailure and PostSendFailure a severed socket does,
+// on a peer that is still answering. DeliveryUnknown is the one outcome that
+// answers by itself — a half-written frame desyncs the stream whoever caused
+// it, and the writer publishes that state before it fails the session.
+func retiring(session *wire.Client, outcome wire.Outcome) bool {
+	return session.Failure() != nil || outcome == wire.DeliveryUnknown
 }
 
 // retire drops the session a Call just failed on, so the next Call verifies
