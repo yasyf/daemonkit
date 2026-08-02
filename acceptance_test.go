@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -128,16 +129,13 @@ func TestConsumerForeignExecutableOverStdio(t *testing.T) {
 // "did everything drain".
 func TestConsumerCLIScopeReclaimsAPriorGeneration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "daemon.records")
+	marker := fmt.Sprintf("dkcli%d", time.Now().UnixNano())
 
 	leaked, err := OwnProcesses(bounded(t, 20*time.Second), path)
 	if err != nil {
 		t.Fatalf("first OwnProcesses() = %v", err)
 	}
-	child, err := leaked.Spawn(bounded(t, 20*time.Second), Cmd{
-		Path: "/bin/sleep",
-		Args: []string{"600"},
-		Exec: ServingSameUser(),
-	}, ChannelNone, nil)
+	child, err := leaked.Spawn(bounded(t, 20*time.Second), parksAs(marker+"-orphan"), ChannelNone, nil)
 	if err != nil {
 		t.Fatalf("Spawn() = %v", err)
 	}
@@ -159,15 +157,11 @@ func TestConsumerCLIScopeReclaimsAPriorGeneration(t *testing.T) {
 	if reclaimed[0].Exit.Reap != ReapTerminated && reclaimed[0].Exit.Reap != ReapAbsent {
 		t.Fatalf("Reclaimed()[0] = %+v, want a settled outcome the caller can gate on", reclaimed[0])
 	}
-	if alive(orphan) {
+	if aliveAs(orphan, marker+"-orphan") {
 		t.Fatalf("orphan %d survived the next generation's reclaim", orphan)
 	}
 
-	live, err := next.Spawn(bounded(t, 20*time.Second), Cmd{
-		Path: "/bin/sleep",
-		Args: []string{"600"},
-		Exec: ServingSameUser(),
-	}, ChannelNone, nil)
+	live, err := next.Spawn(bounded(t, 20*time.Second), parksAs(marker+"-live"), ChannelNone, nil)
 	if err != nil {
 		t.Fatalf("Spawn() = %v", err)
 	}
@@ -176,8 +170,20 @@ func TestConsumerCLIScopeReclaimsAPriorGeneration(t *testing.T) {
 	if err := next.Close(closeCtx); err != nil {
 		t.Fatalf("Close() = %v, want everything drained", err)
 	}
-	if alive(live.PID()) {
+	if aliveAs(live.PID(), marker+"-live") {
 		t.Fatalf("pid %d survived the scope's Close", live.PID())
+	}
+}
+
+// parksAs is a child that parks forever with the marker in its argv, so
+// aliveAs can tell it from whatever inherits its pid — a bare /bin/sleep
+// carries nothing to match on. It ignores no signal, so it still dies on the
+// first rung of any ladder.
+func parksAs(marker string) Cmd {
+	return Cmd{
+		Path: "/bin/sh",
+		Args: []string{"-c", "while :; do sleep 60; done # " + marker},
+		Exec: ServingSameUser(),
 	}
 }
 

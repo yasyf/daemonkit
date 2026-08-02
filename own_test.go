@@ -460,14 +460,17 @@ func TestOwnedCloseSettlesAnInFlightRun(t *testing.T) {
 }
 
 // runForksADescendant's child forks a descendant onto its own streams — the
-// run's pipes stay with the leader — publishes both pids, then parks. Neither
+// run's pipes stay with the leader — publishes both pids, then parks. Leader
+// and descendant both keep the marker in their argv — neither execs it away —
+// so a survivor is identified rather than merely observed at a pid. Neither
 // process ignores SIGTERM, so what the descendant's survival measures is
 // scope, not ladder patience.
-func runForksADescendant(pidFile, holderFile string) Cmd {
+func runForksADescendant(pidFile, holderFile, marker string) Cmd {
 	publish := func(path, pid string) string {
 		return "echo " + pid + " > " + path + ".tmp; mv " + path + ".tmp " + path + "; "
 	}
-	script := "sleep 600 >/dev/null 2>&1 & " + publish(holderFile, "$!") + publish(pidFile, "$$") + "exec sleep 600"
+	holder := "/bin/sh -c 'while :; do sleep 60; done # " + marker + "-descendant' >/dev/null 2>&1 & "
+	script := holder + publish(holderFile, "$!") + publish(pidFile, "$$") + "wait # " + marker + "-leader"
 	return Cmd{
 		Path: "/bin/sh",
 		Args: []string{"-c", script},
@@ -489,10 +492,11 @@ func TestOwnedCloseDrainsARunChildsDescendants(t *testing.T) {
 	}
 	pidFile := filepath.Join(dir, "run.pid")
 	holderFile := filepath.Join(dir, "holder.pid")
+	marker := fmt.Sprintf("dkdrain%d", time.Now().UnixNano())
 	ran := make(chan struct{})
 	go func() {
 		defer close(ran)
-		_, _ = owned.Run(bounded(t, 120*time.Second), runForksADescendant(pidFile, holderFile))
+		_, _ = owned.Run(bounded(t, 120*time.Second), runForksADescendant(pidFile, holderFile, marker))
 	}()
 	pid := awaitPID(t, pidFile)
 	holder := awaitPID(t, holderFile)
@@ -502,10 +506,10 @@ func TestOwnedCloseDrainsARunChildsDescendants(t *testing.T) {
 	if err := owned.Close(closeCtx); err != nil {
 		t.Fatalf("Close() = %v, want every live child settled", err)
 	}
-	if alive(pid) {
+	if aliveAs(pid, marker+"-leader") {
 		t.Fatalf("the in-flight Run's child %d survived Close", pid)
 	}
-	if alive(holder) {
+	if aliveAs(holder, marker+"-descendant") {
 		t.Fatalf("the Run child's descendant %d survived a Close that answered a clean drain", holder)
 	}
 	select {
@@ -517,15 +521,18 @@ func TestOwnedCloseDrainsARunChildsDescendants(t *testing.T) {
 
 // forkedHolderRun's child forks a descendant that inherits the run's stdout
 // pipe and outlives it, then parks ignoring SIGTERM so settlement runs its
-// whole ladder. An ignored disposition survives exec, so the exec'd sleep adds
-// no further descendant of its own.
-func forkedHolderRun(pidFile, holderFile string) Cmd {
+// whole ladder — the ignored disposition survives the descendant's own exec.
+// Leader and descendant both keep the marker in their argv, so a survivor is
+// identified rather than merely observed at a pid.
+func forkedHolderRun(pidFile, holderFile, marker string) Cmd {
 	publish := func(path, pid string) string {
 		return "echo " + pid + " > " + path + ".tmp; mv " + path + ".tmp " + path + "; "
 	}
+	holder := "/bin/sh -c 'while :; do sleep 60; done # " + marker + "-descendant' & "
+	script := "trap '' TERM; " + holder + publish(holderFile, "$!") + publish(pidFile, "$$") + "wait # " + marker + "-leader"
 	return Cmd{
 		Path: "/bin/sh",
-		Args: []string{"-c", "trap '' TERM; sleep 600 & " + publish(holderFile, "$!") + publish(pidFile, "$$") + "exec sleep 600"},
+		Args: []string{"-c", script},
 		Exec: ServingSameUser(),
 	}
 }
@@ -545,9 +552,10 @@ func TestOwnedCloseDoesNotPinAnInFlightRunToItsOwnDeadline(t *testing.T) {
 	}
 	pidFile := filepath.Join(dir, "run.pid")
 	holderFile := filepath.Join(dir, "holder.pid")
+	marker := fmt.Sprintf("dkpipe%d", time.Now().UnixNano())
 	ran := make(chan time.Time, 1)
 	go func() {
-		_, _ = owned.Run(bounded(t, 60*time.Second), forkedHolderRun(pidFile, holderFile))
+		_, _ = owned.Run(bounded(t, 60*time.Second), forkedHolderRun(pidFile, holderFile, marker))
 		ran <- time.Now()
 	}()
 	pid := awaitPID(t, pidFile)
@@ -559,10 +567,10 @@ func TestOwnedCloseDoesNotPinAnInFlightRunToItsOwnDeadline(t *testing.T) {
 	if err := owned.Close(closeCtx); err != nil {
 		t.Fatalf("Close() = %v, want every live child settled", err)
 	}
-	if alive(pid) {
+	if aliveAs(pid, marker+"-leader") {
 		t.Fatalf("the in-flight Run's child %d survived Close", pid)
 	}
-	if alive(holder) {
+	if aliveAs(holder, marker+"-descendant") {
 		t.Fatalf("the descendant %d holding the run's pipe survived Close", holder)
 	}
 
