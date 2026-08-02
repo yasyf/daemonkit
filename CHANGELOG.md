@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-08-02
+
 ### Added
 
 - `durable` — a public leaf package of durable filesystem verbs.
@@ -1158,7 +1160,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.20.10...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/yasyf/daemonkit/compare/v0.20.10...v0.21.0
 [0.20.10]: https://github.com/yasyf/daemonkit/compare/v0.20.9...v0.20.10
 [0.20.9]: https://github.com/yasyf/daemonkit/compare/v0.20.8...v0.20.9
 [0.20.8]: https://github.com/yasyf/daemonkit/compare/v0.20.7...v0.20.8
