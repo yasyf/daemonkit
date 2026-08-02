@@ -50,6 +50,11 @@ func (c *scmRightsCodec) peek(dst []byte) error {
 	return nil
 }
 
+func (c *scmRightsCodec) discard() {
+	closeDescriptors(c.pending)
+	c.pending = nil
+}
+
 func (c *scmRightsCodec) readFrame(maxFrame int, peeked []byte) (frame Frame, sidecar frameSidecar, err error) {
 	received := c.pending
 	c.pending = nil
@@ -90,8 +95,7 @@ func (c *scmRightsCodec) readFrame(maxFrame int, peeked []byte) (frame Frame, si
 		return Frame{}, nil, err
 	}
 
-	if frame.Kind == FrameRequest && frame.Op == brokerHandoffOp &&
-		frame.Flags == FlagEnd && frame.Tenant == "" {
+	if frame.Kind == FrameRequest && frame.Op == brokerHandoffOp && frame.Flags == FlagEnd {
 		if len(received) != 1 {
 			return Frame{}, nil, fmt.Errorf("%w: handoff requires exactly one descriptor", errInvalidFrameSidecar)
 		}

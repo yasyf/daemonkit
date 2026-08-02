@@ -90,7 +90,7 @@ func TestFrozenFixturesMatchRealWire(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), refuseBound)
 		defer cancel()
 		_, err := wire.NewClient(ctx, wire.ClientConfig{
-			Dial: wire.UnixDialer(sock), Lane: wire.LaneBusiness, Schema: contractSchema,
+			Dial: wire.UnixDialer(sock), Authorize: wiretest.AuthorizeTestServer, Lane: wire.LaneBusiness, Schema: contractSchema,
 		})
 		var mismatch *wire.ProtocolMismatchError
 		if !errors.As(err, &mismatch) || mismatch.Theirs != 1 || mismatch.Ours != wire.ProtocolVersion {

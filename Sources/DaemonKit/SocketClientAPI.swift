@@ -87,7 +87,6 @@ extension SocketClient {
     /// Opens a request. Set endInput false when request chunks will follow.
     public func open(
         operation: String,
-        tenant: String = "",
         payload: Data = Data(),
         endInput: Bool = true,
         deadline: Date? = nil
@@ -95,7 +94,6 @@ extension SocketClient {
         try await core.open(
             owner: self,
             operation: operation,
-            tenant: tenant,
             payload: payload,
             endInput: endInput,
             deadline: deadline
@@ -105,18 +103,16 @@ extension SocketClient {
     /// Sends a unary request and waits for its terminal response.
     public func call(
         operation: String,
-        tenant: String = "",
         payload: Data = Data(),
         deadline: Date? = nil
     ) async throws -> SocketTerminal {
-        let call = try await open(operation: operation, tenant: tenant, payload: payload, deadline: deadline)
+        let call = try await open(operation: operation, payload: payload, deadline: deadline)
         return try await call.response()
     }
 
     /// Performs one unary attempt and returns the exact transport outcome.
     public func attempt(
         operation: String,
-        tenant: String = "",
         payload: Data = Data(),
         deadline: Date
     ) async -> SocketCallAttempt {
@@ -125,7 +121,6 @@ extension SocketClient {
             call = try await core.openClassified(
                 owner: self,
                 operation: operation,
-                tenant: tenant,
                 payload: payload,
                 endInput: true,
                 deadline: deadline

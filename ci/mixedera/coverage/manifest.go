@@ -375,8 +375,12 @@ func (m *Manifest) entailed() []string {
 				continue
 			}
 			entry := m.covered[era][frozen.name]
-			carried = append(carried, fmt.Sprintf("`%s` · `%s` — entailed by `%s` · `%s`: %s",
-				era, frozen.name, entry.antecedent.era, entry.antecedent.mechanism, entry.absence))
+			line := fmt.Sprintf("`%s` · `%s` — entailed by `%s` · `%s`",
+				era, frozen.name, entry.antecedent.era, entry.antecedent.mechanism)
+			if entry.absence != "" {
+				line += ": " + entry.absence
+			}
+			carried = append(carried, line)
 		}
 	}
 	return carried

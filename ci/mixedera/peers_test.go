@@ -284,6 +284,33 @@ func (d *daemonProc) witnessPreamble(t *testing.T, front *relay, settle time.Dur
 	))
 }
 
+// witnessPreambleTrustGate redeems the preamble's trust gate against the same
+// two artifacts witnessPreamble reads — the bytes a relay copied and whether
+// the OS reaped the daemon they crossed to — for the one configuration that
+// separates the gate from the drain: a daemon whose control lane names a
+// requirement the preamble's writer cannot prove. It refuses a preamble the
+// relay never carried, and files the direction the process table shows, so a
+// strict daemon the preamble did drain is filed as drained rather than gated.
+func (d *daemonProc) witnessPreambleTrustGate(t *testing.T, front *relay, settle time.Duration) {
+	t.Helper()
+	preamble := frozen(t, preambleFixture)
+	if !front.carried(preamble, drainWait) {
+		t.Fatalf("no connection the relay at %s copied opened with exactly the frozen drain preamble %#x, so nothing put that preamble in front of the strict %s daemon at %s and there is no refusal here to redeem",
+			front.path, preamble, d.era, d.socket)
+	}
+	if d.leftWithin(t, settle) {
+		coverage.ObservedAbsent(t, d.era, mechanismTrustGate, coverage.FromProcessTable, fmt.Sprintf(
+			"the OS reaped the strict %s daemon at %s within %s of the relay carrying it the frozen drain preamble %#x",
+			d.era, d.socket, settle, preamble,
+		))
+		return
+	}
+	coverage.ObservedPresent(t, d.era, mechanismTrustGate, coverage.FromProcessTable, fmt.Sprintf(
+		"the strict %s daemon at %s still held its socket %s after the relay carried it the frozen drain preamble %#x",
+		d.era, d.socket, settle, preamble,
+	))
+}
+
 func (d *daemonProc) terminate(t *testing.T) {
 	t.Helper()
 	if err := d.cmd.Process.Signal(syscall.SIGTERM); err != nil {

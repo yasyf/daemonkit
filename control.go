@@ -100,7 +100,9 @@ type Control struct {
 //
 // Authorization runs in both directions. The daemon judges the attaching
 // client against Trust.Control; the client judges the process accepting for
-// it against Trust.Serving, on the same kernel-held code-signing state and
+// it against Trust.Serving — between dial and the hello write, so nothing the
+// accepting process answers, a forged drain preamble included, is believed
+// before it proves itself — on the same kernel-held code-signing state and
 // over the same unconditional same-EUID floor. Without it a same-UID process
 // that rebinds the socket answers the pin with its own honest identity and
 // hands back an absence proof for a daemon that is still running.
@@ -116,32 +118,22 @@ func (c *Client) Control(ctx context.Context) (*Control, error) {
 	if err != nil {
 		return nil, fmt.Errorf("daemonkit: derive socket path: %w", err)
 	}
-	var conn *net.UnixConn
-	base := wire.UnixDialer(socket)
-	dial := func(ctx context.Context) (net.Conn, error) {
-		netConn, err := base(ctx)
-		if err != nil {
-			return nil, err
-		}
-		conn = netConn.(*net.UnixConn)
-		return netConn, nil
-	}
+	var servingPID int
 	session, err := wire.NewClient(ctx, wire.ClientConfig{
-		Dial: dial, Lane: wire.LaneControl, MaxFrame: int(c.daemon.MaxFrame),
+		Dial: wire.UnixDialer(socket), Lane: wire.LaneControl, MaxFrame: int(c.daemon.MaxFrame),
+		Authorize: func(conn net.Conn) error {
+			pid, err := authorizeServer(conn.(*net.UnixConn), c.daemon.Trust.Serving)
+			if err != nil {
+				return err
+			}
+			servingPID = pid
+			return nil
+		},
 	})
 	if err != nil {
 		return nil, classifyAttach(err)
 	}
-	peer, err := proc.PeerCredentials(conn)
-	if err != nil {
-		_ = session.Abort(err)
-		return nil, fmt.Errorf("daemonkit: read socket peer: %w", err)
-	}
-	if err := authorizeServer(conn, peer.UID, c.daemon.Trust.Serving); err != nil {
-		_ = session.Abort(err)
-		return nil, err
-	}
-	pinned, report, err := assemblePin(os.Getpid(), peer.PID, c.probe, func() (wire.HealthReport, error) {
+	pinned, report, err := assemblePin(os.Getpid(), servingPID, c.probe, func() (wire.HealthReport, error) {
 		return session.Health(ctx)
 	})
 	if err != nil {
@@ -156,26 +148,35 @@ func (c *Client) Control(ctx context.Context) (*Control, error) {
 	}, nil
 }
 
-// authorizeServer judges the process accepting for this client: the
-// unconditional same-EUID floor, then requirement against the peer's audit
-// token. A nil requirement is explicit UID-only trust, exactly as on the
-// serving side.
-func authorizeServer(conn *net.UnixConn, uid int, requirement *Requirement) error {
-	if err := trust.Floor(uid); err != nil {
-		return fmt.Errorf("%w: serving peer: %w", ErrUntrusted, err)
-	}
-	req := wireRequirement(requirement)
-	if req == nil {
-		return nil
-	}
+// authorizeServer judges the process accepting for this client, between dial
+// and the hello write, off one PeerCredentials read that serves the
+// unconditional same-EUID floor, the requirement against the peer's audit
+// token, and the PID the attach pins. A nil requirement is explicit UID-only
+// trust, exactly as on the serving side. It returns the judged connection's
+// peer PID: per-connection state is established inside the authorization, so
+// nothing but immutable config survives to a replacement connection.
+func authorizeServer(conn *net.UnixConn, requirement *Requirement) (int, error) {
 	peer, err := trust.PeerCredentials(conn)
 	if err != nil {
-		return fmt.Errorf("%w: read serving peer identity: %w", ErrUntrusted, err)
+		return 0, fmt.Errorf("daemonkit: read serving peer identity: %w", err)
 	}
-	if err := trust.Verify(peer, req); err != nil {
+	if err := trust.Verify(peer, wireRequirement(requirement)); err != nil {
+		return 0, classifyServingTrust(err)
+	}
+	return peer.Token.PID(), nil
+}
+
+// classifyServingTrust keeps trust's three denials disjoint through the root
+// sentinel: only a policy mismatch is ErrUntrusted. A peer that exited before
+// verification completed (trust.ErrPeerGone) and a configured requirement with
+// no verifier (trust.ErrNoVerifier) stay their own errors — an absence race
+// and a build defect are not trust verdicts, and a caller branching on
+// ErrUntrusted must never conflate them with one.
+func classifyServingTrust(err error) error {
+	if errors.Is(err, trust.ErrUntrustedPeer) {
 		return fmt.Errorf("%w: serving peer: %w", ErrUntrusted, err)
 	}
-	return nil
+	return fmt.Errorf("daemonkit: serving peer: %w", err)
 }
 
 // assemblePin runs the attach pin in the documented order: self-pin refusal,
@@ -209,10 +210,14 @@ func classifyAttach(err error) error {
 	switch {
 	case errors.Is(err, wire.ErrDraining):
 		return ErrDraining
+	case errors.Is(err, ErrUntrusted):
+		return err
+	case errors.Is(err, wire.ErrUntrustedPeer), errors.Is(err, trust.ErrUntrustedPeer):
+		return fmt.Errorf("%w: %w", ErrUntrusted, err)
+	case errors.Is(err, trust.ErrNoVerifier), errors.Is(err, trust.ErrPeerGone):
+		return err
 	case errors.Is(err, syscall.ENOENT), errors.Is(err, os.ErrNotExist), errors.Is(err, syscall.ECONNREFUSED):
 		return fmt.Errorf("%w: %w", ErrAbsent, err)
-	case errors.Is(err, wire.ErrUntrustedPeer):
-		return fmt.Errorf("%w: %w", ErrUntrusted, err)
 	default:
 		return err
 	}

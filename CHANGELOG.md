@@ -113,6 +113,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking.** The wire's `Tenant` header is reserved and must be empty. Its
+  two length bytes and its position stay in the frozen frame layout — the
+  golden fixtures are byte-identical and every era still decodes every other's
+  frames — but no live session may populate it: `Call`, `Open`, and their
+  spawned-session and Swift mirrors drop the parameter, `wire.Request` drops
+  the field, and the Go codec's per-kind contract refuses a request or stream
+  frame carrying one, in both directions. Nothing in the fleet ever set it, and
+  a routing key the transport neither reads nor authorizes is a field that
+  looks load-bearing while carrying an attacker's string into a consumer's
+  handler. The Swift codec keeps the clause on every kind but `.request`, and
+  `SessionFrame.tenant` is still public and settable, so a Swift caller that
+  populates it by hand encodes a frame its own codec admits and a Go daemon
+  refuses as structurally invalid.
+
+- **Breaking.** `Serve` admits the frozen two-byte drain preamble as an inbound
+  request, below the protocol gate and above the trust gate — what
+  `docs/DESIGN.md` invariant I14, Device 4, and step 7 of the serve ladder have
+  specified since the cut, and what the tree did not do. A connection whose
+  first bytes are the preamble is dispatched to the trust-gated drain path
+  without a frame, a version, or a schema ever being read, so a new-era
+  successor can gracefully drain an old-era incumbent across a protocol bump
+  instead of falling back to SIGTERM; `Trust.Control` still authorizes it, so
+  an untrusted peer's preamble leaves the incumbent serving. The mixed-era
+  matrix's `drain-preamble` and `drain-preamble-trust-gate` rows leave their
+  declared cut-era absence and are redeemed against real daemons on the
+  process table: the open one the OS reaped, and the strict one still holding
+  its socket after an untrusted peer's preamble reached it. The SIGTERM path
+  is unchanged and remains the mechanism of record:
+  measured on a real machine, launchd sends exactly one, the forwarder consumes
+  it, and the process dies at `ExitTimeOut` — six seconds of a held flock the
+  preamble now avoids.
+
 - **Breaking.** `Run` always gives its child a dedicated session, and a `Cmd`
   naming `Cmd.Session` on `Run` is refused at the boundary — the same shape as
   `Cmd.MaxOutput` being refused on `Spawn`. A run is bounded, disposable, and
@@ -345,6 +377,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wedging every open of an upgraded daemon.
 
 ### Security
+
+- The Go client judges the process accepting for it before it writes a byte.
+  `ClientConfig.Authorize` runs between the dial and the hello, and is
+  required — a constructor whose connection needs no judging passes a named
+  waiver rather than leaving the field nil. `Control` passes `authorizeServer`,
+  so `Trust.Serving` is now enforced ahead of the handshake instead of after
+  it. Previously the whole handshake completed first, which let a same-UID
+  process that unlinked and rebound the socket forge the two-byte drain
+  preamble and pin a consumer in `WaitReady`'s retry loop, forge a build
+  mismatch and drive it into a redeploy, or harvest the schema digest — none of
+  which required surviving verification, because verification ran after the
+  damage. The captured-connection closure `Control` used to reach the dialed
+  socket is gone with it: per-connection state is established inside the
+  authorization, so nothing but immutable config survives to a replacement
+  connection. The Swift client carries no counterpart: it still connects,
+  adopts the codec, and completes the handshake without judging the accepting
+  process, so every forgery listed above remains open against a Swift
+  consumer.
+
+- `trust`'s three denials stay disjoint through the root sentinel. Only a
+  policy mismatch is `ErrUntrusted`; a peer that exited before verification
+  completed and a configured requirement with no verifier keep their own
+  identities. They had been flattened together, so a caller branching on
+  `ErrUntrusted` read an absence race and a build defect as a trust verdict.
+
+- The spawned business lane no longer verifies itself. `NewSpawnedClient` read
+  peer credentials from the parent's own end of a socketpair and checked them
+  against a floor-only requirement — credentials on a self-created pair name
+  the creator, so the gate authenticated nothing while reading as protection.
+  The lane's real property is directional confinement: the pair is a channel no
+  other process has a path to dial. The nonce is documented for what it is —
+  fd-mixup defence, not a secret, since any same-UID process reads a peer's
+  environment via `KERN_PROCARGS2`.
 
 - Swift daemons apply the same-UID floor unconditionally. It was guarded behind an
   optional session policy that defaults to nil, so `getpeereid` ran and its result

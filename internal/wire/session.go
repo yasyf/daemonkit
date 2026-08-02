@@ -324,7 +324,7 @@ func (s *session) receiveRequest(ctx context.Context, frame Frame, sidecar frame
 	if frame.ID == 0 || frame.Op == "" || frame.Sequence != 0 {
 		return fmt.Errorf("%w: request frame", ErrInvalidFrame)
 	}
-	if frame.Op == brokerHandoffOp && (frame.Flags != FlagEnd || frame.Tenant != "" || sidecar == nil) {
+	if frame.Op == brokerHandoffOp && (frame.Flags != FlagEnd || sidecar == nil) {
 		return fmt.Errorf("%w: invalid broker handoff request", errInvalidFrameSidecar)
 	}
 	if frame.Op != brokerHandoffOp && sidecar != nil {
@@ -457,7 +457,6 @@ func (s *session) dispatch(requestCtx context.Context, frame Frame, state *reque
 		return s.server.rt.Handle(requestCtx, Request{
 			ID:      frame.ID,
 			Op:      frame.Op,
-			Tenant:  frame.Tenant,
 			Peer:    s.peer,
 			Schema:  s.schema,
 			Payload: append([]byte(nil), frame.Payload...),

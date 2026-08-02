@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -17,7 +18,10 @@ import (
 	"github.com/yasyf/daemonkit/internal/wire"
 )
 
-const spawnedChildEnv = "DAEMONKIT_WIRE_SPAWNED_CHILD"
+const (
+	spawnedChildEnv         = "DAEMONKIT_WIRE_SPAWNED_CHILD"
+	spawnedChildMaxFrameEnv = "DAEMONKIT_WIRE_SPAWNED_CHILD_MAXFRAME"
+)
 
 // TestMain branches on the child marker before m.Run so a spawned copy of this
 // binary serves its session and exits instead of re-entering the suite — the
@@ -35,9 +39,17 @@ func runSpawnedChild() {
 		fmt.Fprintf(os.Stderr, "spawned child: decode nonce: %v\n", err)
 		os.Exit(72)
 	}
+	var limits wire.SessionLimits
+	if declared := os.Getenv(spawnedChildMaxFrameEnv); declared != "" {
+		if limits.MaxFrame, err = strconv.Atoi(declared); err != nil {
+			fmt.Fprintf(os.Stderr, "spawned child: declared max frame: %v\n", err)
+			os.Exit(72)
+		}
+	}
 	err = wire.RunSpawnedSession(context.Background(), wire.SpawnedSessionConfig{
 		Nonce:  nonce,
 		Schema: "spawned.v1",
+		Limits: limits,
 		Handlers: []wire.HandlerSpec{{
 			Op:         "child.echo.v1",
 			Concurrent: true,
@@ -53,7 +65,7 @@ func runSpawnedChild() {
 	os.Exit(0)
 }
 
-func spawnChild(t *testing.T, envNonce []byte) *proc.Child {
+func spawnChild(t *testing.T, envNonce []byte, extraEnv ...string) *proc.Child {
 	t.Helper()
 	openCtx, cancelOpen := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancelOpen()
@@ -69,11 +81,11 @@ func spawnChild(t *testing.T, envNonce []byte) *proc.Child {
 	child, err := store.Spawn(t.Context(), proc.Cmd{
 		Path:    executable,
 		Channel: proc.ChannelHandoff,
-		Env: append(
+		Env: append(append(
 			os.Environ(),
 			spawnedChildEnv+"=1",
 			wire.SpawnedNonceEnv+"="+hex.EncodeToString(envNonce),
-		),
+		), extraEnv...),
 	}, nil)
 	if err != nil {
 		t.Fatalf("Spawn() = %v", err)
@@ -119,7 +131,7 @@ func TestSpawnedSessionRoundTripOverCmdHandoff(t *testing.T) {
 	if client.WireBuild() != "spawned.v1" {
 		t.Fatalf("WireBuild() = %q", client.WireBuild())
 	}
-	result, err := client.Call(ctx, "child.echo.v1", "", []byte(`{"hello":"child"}`))
+	result, err := client.Call(ctx, "child.echo.v1", []byte(`{"hello":"child"}`))
 	if err != nil {
 		t.Fatalf("Call() = %v", err)
 	}
@@ -131,6 +143,34 @@ func TestSpawnedSessionRoundTripOverCmdHandoff(t *testing.T) {
 	}
 	if exit := awaitExit(t, child); exit.Code != 0 {
 		t.Fatalf("child exit = %+v, want code 0", exit)
+	}
+}
+
+func TestSpawnedSessionEnforcesDeclaredMaxFrame(t *testing.T) {
+	nonce := make([]byte, 32)
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatal(err)
+	}
+	child := spawnChild(t, nonce, spawnedChildMaxFrameEnv+"=1048576")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client, err := wire.NewSpawnedClient(ctx, wire.SpawnedClientConfig{
+		Conn: handoffConn(t, child), Nonce: nonce, Schema: "spawned.v1",
+	})
+	if err != nil {
+		t.Fatalf("NewSpawnedClient() = %v", err)
+	}
+	result, err := client.Call(ctx, "child.echo.v1", []byte(`{"hello":"child"}`))
+	if err != nil || result.Outcome != wire.Delivered {
+		t.Fatalf("Call() under the declared bound = %v %v", result.Outcome, err)
+	}
+	oversized := make([]byte, 2<<20)
+	if _, err := client.Call(ctx, "child.echo.v1", oversized); err == nil {
+		t.Fatal("Call() over the declared 1 MiB bound succeeded: the child did not enforce its declaration")
+	}
+	_ = client.Abort(nil)
+	if exit := awaitExit(t, child); exit.Code != 71 {
+		t.Fatalf("child exit = %+v, want the refusal code 71 for the over-bound frame", exit)
 	}
 }
 

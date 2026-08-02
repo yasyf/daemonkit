@@ -64,7 +64,7 @@ func (s *Server) InFlight() int { return int(s.admitted.Load()) }
 // Health asks the daemon.health verb on this session and decodes its report.
 // A rejected result returns the typed RejectionError.
 func (c *Client) Health(ctx context.Context) (HealthReport, error) {
-	result, err := c.Call(ctx, healthOp, "", nil)
+	result, err := c.Call(ctx, healthOp, nil)
 	if err != nil {
 		return HealthReport{}, err
 	}
@@ -88,5 +88,5 @@ func decodeHealthReport(payload []byte) (HealthReport, error) {
 // Drain dispatches the trust-gated drain verb and returns the transport
 // result so the caller can distinguish a typed refusal from a lost terminal.
 func (c *Client) Drain(ctx context.Context) (Result, error) {
-	return c.Call(ctx, drainControlOp, "", nil)
+	return c.Call(ctx, drainControlOp, nil)
 }

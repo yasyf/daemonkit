@@ -34,7 +34,7 @@ func TestInFlightCoversResponseWrite(t *testing.T) {
 	if err := client.WaitReady(ctx); err != nil {
 		t.Fatalf("WaitReady() = %v", err)
 	}
-	call, err := client.Open(ctx, "test.echo.v1", "", nil, true)
+	call, err := client.Open(ctx, "test.echo.v1", nil, true)
 	if err != nil {
 		t.Fatalf("Open() = %v", err)
 	}
@@ -87,7 +87,7 @@ func TestClientCloseHonorsContextDeadline(t *testing.T) {
 	if err := client.WaitReady(ctx); err != nil {
 		t.Fatalf("WaitReady() = %v", err)
 	}
-	if _, err := client.Open(ctx, "test.echo.v1", "", nil, true); err != nil {
+	if _, err := client.Open(ctx, "test.echo.v1", nil, true); err != nil {
 		t.Fatalf("Open() = %v", err)
 	}
 	<-blocked
@@ -110,7 +110,7 @@ func dialBusinessFrame(t *testing.T, sock string, maxFrame int) *wire.Client {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	client, err := wire.NewClient(ctx, wire.ClientConfig{
-		Dial: wire.UnixDialer(sock), Lane: wire.LaneBusiness, Schema: testSchema, MaxFrame: maxFrame,
+		Dial: wire.UnixDialer(sock), Authorize: wiretest.AuthorizeTestServer, Lane: wire.LaneBusiness, Schema: testSchema, MaxFrame: maxFrame,
 	})
 	if err != nil {
 		t.Fatalf("NewClient() = %v", err)

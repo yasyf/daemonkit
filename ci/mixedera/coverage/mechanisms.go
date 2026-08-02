@@ -174,10 +174,12 @@ func readMechanisms() (lexicon, error) {
 	return read, nil
 }
 
-// entailmentsHold refuses a declared entailment that carries a row on one this
-// file disposes of the other way. An entailment redeems a claim against no
-// artifact of its own, so the polarities have to meet: a present fact is no
-// proof of an absence, and an absence proves nothing present.
+// entailmentsHold refuses a declared entailment that carries a row this file
+// disposes of as claimed, or one it disposes of the other way from its
+// antecedent. An entailment redeems a claim against no artifact of its own, so
+// it reaches exactly one shape: an absence that follows from another absence.
+// A claimed row names a mechanism this era ships, and a mechanism that ships
+// leaves artifacts — it is redeemed against one or it is not redeemed.
 func (l lexicon) entailmentsHold() error {
 	for _, held := range l.ordered {
 		for _, era := range []string{PrecutEra, CutEra} {
@@ -192,6 +194,9 @@ func (l lexicon) entailmentsHold() error {
 			case !frozen:
 				return fmt.Errorf("%s entails %q's %s era by %q, which is no mechanism here",
 					MechanismPath, held.name, era, antecedent)
+			case held.dispositions[era] != dispositionAbsent:
+				return fmt.Errorf("%s entails %q's %s era, disposed %s, by %q: an entailment redeems a row against no artifact of its own, so it carries only an absence that follows from another absence. A %s row names a mechanism this era ships, and one that ships leaves artifacts — redeem it against one, or dispose of the era %s",
+					MechanismPath, held.name, era, held.dispositions[era], antecedent, dispositionClaimed, dispositionAbsent)
 			case backing.dispositions[era] != held.dispositions[era]:
 				return fmt.Errorf("%s entails %q's %s era, disposed %s, by %q's, disposed %s: an entailment carries one row on another of the same polarity, so a present fact cannot redeem an absence",
 					MechanismPath, held.name, era, held.dispositions[era], antecedent, backing.dispositions[era])

@@ -97,6 +97,15 @@ type Dialer func(ctx context.Context) (net.Conn, error)
 // ClientConfig configures one persistent multiplexed client session.
 type ClientConfig struct {
 	Dial Dialer
+	// Authorize judges the process accepting the dialed connection, between
+	// Dial and the hello write, so no handshake byte reaches an unjudged peer
+	// and nothing a socket squatter answers — a forged drain preamble, a forged
+	// build mismatch — is believed before the peer proves itself. Required: a
+	// constructor whose connection needs no judging passes a named waiver. It
+	// runs against the exact connection the session uses, so per-connection
+	// state is established by Dial and Authorize together and nothing but this
+	// immutable config survives to a replacement connection.
+	Authorize func(net.Conn) error
 	// Lane selects control or business.
 	Lane Lane
 	// Schema is the business lane's RPC-schema digest; empty on control.
@@ -104,7 +113,10 @@ type ClientConfig struct {
 	// Nonce attaches a spawned session; empty everywhere else.
 	Nonce []byte
 	// Concurrency derives the stream and event buffers; 8 when zero.
-	Concurrency             int
+	Concurrency int
+	// MaxFrame caps each encoded frame; DefaultMaxFrame when zero, and at
+	// most maxFrameCeiling so no legal length prefix reads as the drain
+	// preamble.
 	MaxFrame                int
 	HandshakeTimeout        time.Duration
 	WriteTimeout            time.Duration
@@ -113,7 +125,7 @@ type ClientConfig struct {
 
 // UnaryClient is a unary request transport.
 type UnaryClient interface {
-	Call(context.Context, Op, string, []byte) (Result, error)
+	Call(context.Context, Op, []byte) (Result, error)
 	WireBuild() string
 }
 
@@ -217,6 +229,10 @@ func NewClient(ctx context.Context, config ClientConfig) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("wire: dial: %w", err)
 	}
+	if err := config.Authorize(conn); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("wire: authorize accepting peer: %w", err)
+	}
 	codec := NewCodec(conn)
 	if config.MaxFrame > 0 {
 		codec.MaxFrame = config.MaxFrame
@@ -269,6 +285,9 @@ func validateClientConfig(config ClientConfig) error {
 	if config.Dial == nil {
 		return errors.New("wire: Dial is required")
 	}
+	if config.Authorize == nil {
+		return errors.New("wire: Authorize is required; judge the accepting peer or pass a named waiver")
+	}
 	if !config.Lane.valid() {
 		return fmt.Errorf("wire: invalid lane %q", config.Lane)
 	}
@@ -277,6 +296,9 @@ func validateClientConfig(config ClientConfig) error {
 	}
 	if config.Lane == LaneControl && (config.Schema != "" || len(config.Nonce) != 0) {
 		return errors.New("wire: control lane carries no schema or nonce")
+	}
+	if config.MaxFrame > maxFrameCeiling {
+		return fmt.Errorf("wire: MaxFrame %d admits a frame whose length prefix opens with the drain preamble; the cap stays at or below %#x", config.MaxFrame, maxFrameCeiling)
 	}
 	return nil
 }
@@ -319,8 +341,8 @@ func (c *Client) WaitReady(ctx context.Context) error {
 
 // Call sends a unary request without response streaming and waits for its
 // terminal response.
-func (c *Client) Call(ctx context.Context, op Op, tenant string, payload []byte) (Result, error) {
-	call, err := c.open(ctx, op, tenant, payload, true, false)
+func (c *Client) Call(ctx context.Context, op Op, payload []byte) (Result, error) {
+	call, err := c.open(ctx, op, payload, true, false)
 	if err != nil {
 		outcome := PreSendFailure
 		var openErr *OpenError
@@ -335,14 +357,13 @@ func (c *Client) Call(ctx context.Context, op Op, tenant string, payload []byte)
 // Open starts a request that may return a streamed response. endInput marks
 // payload as the complete request body; pass false to follow it with SendChunk
 // and CloseSend.
-func (c *Client) Open(ctx context.Context, op Op, tenant string, payload []byte, endInput bool) (*ClientCall, error) {
-	return c.open(ctx, op, tenant, payload, endInput, true)
+func (c *Client) Open(ctx context.Context, op Op, payload []byte, endInput bool) (*ClientCall, error) {
+	return c.open(ctx, op, payload, endInput, true)
 }
 
 func (c *Client) open(
 	ctx context.Context,
 	op Op,
-	tenant string,
 	payload []byte,
 	endInput bool,
 	responseStream bool,
@@ -369,7 +390,7 @@ func (c *Client) open(
 	if endInput {
 		flags |= FlagEnd
 	}
-	frame := Frame{Kind: FrameRequest, Flags: flags, ID: id, Op: op, Tenant: tenant, Payload: append([]byte(nil), payload...)}
+	frame := Frame{Kind: FrameRequest, Flags: flags, ID: id, Op: op, Payload: append([]byte(nil), payload...)}
 	if deadline, ok := ctx.Deadline(); ok {
 		frame.DeadlineUnixMilli = deadline.UnixMilli()
 	}

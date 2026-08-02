@@ -155,7 +155,7 @@ func startControlServer(t *testing.T, rt wire.Runtime, serving wire.Serving) *wi
 	})
 	ctx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer dialCancel()
-	session, err := wire.NewClient(ctx, wire.ClientConfig{Dial: wire.UnixDialer(sock), Lane: wire.LaneControl})
+	session, err := wire.NewClient(ctx, wire.ClientConfig{Dial: wire.UnixDialer(sock), Authorize: wiretest.AuthorizeTestServer, Lane: wire.LaneControl})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}

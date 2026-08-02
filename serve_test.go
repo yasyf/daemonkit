@@ -13,6 +13,7 @@ import (
 	"github.com/yasyf/daemonkit/internal/proc"
 	"github.com/yasyf/daemonkit/internal/realhome"
 	"github.com/yasyf/daemonkit/internal/wire"
+	"github.com/yasyf/daemonkit/internal/wire/wiretest"
 	"github.com/yasyf/daemonkit/paths"
 )
 
@@ -165,7 +166,7 @@ func awaitControlSession(t *testing.T, socket string) *wire.Client {
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		session, err := wire.NewClient(ctx, wire.ClientConfig{
-			Dial: wire.UnixDialer(socket), Lane: wire.LaneControl,
+			Dial: wire.UnixDialer(socket), Authorize: wiretest.AuthorizeTestServer, Lane: wire.LaneControl,
 		})
 		cancel()
 		if err == nil {

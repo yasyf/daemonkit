@@ -165,7 +165,7 @@ mechanism drain-sigterm
 mechanism drain-preamble
   witness process (*daemonProc).witnessPreamble
   era precut absent
-  era cut absent
+  era cut claimed
   proposition a connection whose first bytes are the frozen two-byte drain preamble drains the daemon it reaches
 
 mechanism drain-preamble-emitted
@@ -175,8 +175,9 @@ mechanism drain-preamble-emitted
   proposition a daemon already draining answers a handshake it is still reading with exactly the frozen two-byte preamble and nothing else
 
 mechanism drain-preamble-trust-gate
+  witness process (*daemonProc).witnessPreambleTrustGate
   era precut absent
-  era cut absent
+  era cut claimed
   entailed-by precut drain-preamble
   proposition the drain an inbound frozen preamble admits is still authorized by Trust.Control, the preamble sitting above the trust gate, so an untrusted peer's preamble leaves the incumbent running
 

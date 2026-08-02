@@ -24,7 +24,6 @@ extension SocketClientCore {
     func open(
         owner: SocketClient,
         operation: String,
-        tenant: String = "",
         payload: Data = Data(),
         endInput: Bool = true,
         deadline: Date? = nil
@@ -33,7 +32,6 @@ extension SocketClientCore {
             return try await openClassified(
                 owner: owner,
                 operation: operation,
-                tenant: tenant,
                 payload: payload,
                 endInput: endInput,
                 deadline: deadline
@@ -46,7 +44,6 @@ extension SocketClientCore {
     func openClassified(
         owner: SocketClient,
         operation: String,
-        tenant: String,
         payload: Data,
         endInput: Bool,
         deadline: Date?
@@ -54,7 +51,6 @@ extension SocketClientCore {
         let deadlineMilliseconds = deadline.map(SessionTime.unixMilliseconds) ?? 0
         try validateRequest(
             operation: operation,
-            tenant: tenant,
             payload: payload,
             endInput: endInput,
             deadlineMilliseconds: deadlineMilliseconds
@@ -66,7 +62,6 @@ extension SocketClientCore {
             try await writer.writeTracked(requestFrame(
                 id: id,
                 operation: operation,
-                tenant: tenant,
                 payload: payload,
                 endInput: endInput,
                 deadlineMilliseconds: deadlineMilliseconds
@@ -106,7 +101,6 @@ extension SocketClientCore {
         let deadlineMilliseconds = SessionTime.unixMilliseconds(deadline)
         try validateRequest(
             operation: brokerHandoffOperation,
-            tenant: "",
             payload: payload,
             endInput: true,
             deadlineMilliseconds: deadlineMilliseconds
@@ -119,7 +113,6 @@ extension SocketClientCore {
                 requestFrame(
                     id: id,
                     operation: brokerHandoffOperation,
-                    tenant: "",
                     payload: payload,
                     endInput: true,
                     deadlineMilliseconds: deadlineMilliseconds
@@ -168,7 +161,6 @@ extension SocketClientCore {
 private extension SocketClientCore {
     func validateRequest(
         operation: String,
-        tenant: String,
         payload: Data,
         endInput: Bool,
         deadlineMilliseconds: Int64
@@ -183,7 +175,6 @@ private extension SocketClientCore {
             let body = try SessionFrameCodec.encode(requestFrame(
                 id: 1,
                 operation: operation,
-                tenant: tenant,
                 payload: payload,
                 endInput: endInput,
                 deadlineMilliseconds: deadlineMilliseconds
@@ -252,7 +243,6 @@ private extension SocketClientCore {
     func requestFrame(
         id: UInt64,
         operation: String,
-        tenant: String,
         payload: Data,
         endInput: Bool,
         deadlineMilliseconds: Int64
@@ -263,7 +253,6 @@ private extension SocketClientCore {
             id: id,
             deadlineUnixMilliseconds: deadlineMilliseconds,
             operation: operation,
-            tenant: tenant,
             payload: payload
         )
     }

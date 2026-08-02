@@ -38,7 +38,9 @@ type Config struct {
 	Trust Trust
 	// Concurrency bounds business sessions and in-flight Handles; 8 when zero.
 	Concurrency int
-	// MaxFrame caps each encoded frame; DefaultMaxFrame when zero.
+	// MaxFrame caps each encoded frame; DefaultMaxFrame when zero, and at
+	// most maxFrameCeiling so no legal length prefix reads as the drain
+	// preamble.
 	MaxFrame int
 	// Handshake bounds the whole admission of one connection; 10s when zero.
 	Handshake time.Duration
@@ -87,6 +89,9 @@ func NewServer(rt Runtime, cfg Config) (*Server, error) {
 	}
 	if len(cfg.Schemas) == 0 || cfg.Schemas.Own() == "" {
 		return nil, errors.New("wire: Schemas is required")
+	}
+	if cfg.MaxFrame > maxFrameCeiling {
+		return nil, fmt.Errorf("wire: MaxFrame %d admits a frame whose length prefix opens with the drain preamble; the cap stays at or below %#x", cfg.MaxFrame, maxFrameCeiling)
 	}
 	concurrency := cfg.Concurrency
 	if concurrency <= 0 {
@@ -194,10 +199,11 @@ func (s *Server) AdoptHandoff(conn *net.UnixConn) error {
 	return s.startConnection(ctx, conn)
 }
 
-// startConnection walks the admission gate stack in order: hello read under
-// the short pre-verification deadline, drain preamble, trust, schema, lane
-// capacity — capacity strictly after verification, so nothing an unverified
-// peer holds is lane state — then the phase-carrying ack.
+// startConnection walks the admission gate stack in order: the inbound drain
+// preamble peek, hello read under the short pre-verification deadline, drain
+// preamble, trust, schema, lane capacity — capacity strictly after
+// verification, so nothing an unverified peer holds is lane state — then the
+// phase-carrying ack.
 func (s *Server) startConnection(ctx context.Context, conn *net.UnixConn) error {
 	start := time.Now()
 	codec := NewCodec(conn)
@@ -205,6 +211,14 @@ func (s *Server) startConnection(ctx context.Context, conn *net.UnixConn) error 
 	if err := codec.SetDeadline(earlierDeadline(ctx, start.Add(s.handshakeReadTimeout()))); err != nil {
 		_ = conn.Close()
 		return err
+	}
+	drain, err := codec.PeekPreamble()
+	if err != nil {
+		_ = conn.Close()
+		return err
+	}
+	if drain {
+		return s.admitPreambleDrain(ctx, conn, start)
 	}
 	hello, err := readClientHello(codec)
 	if err != nil {
@@ -281,6 +295,34 @@ func (s *Server) startConnection(ctx context.Context, conn *net.UnixConn) error 
 	}
 	codec.WriteTimeout = s.writeTimeout()
 	go s.serveSession(ctx, conn, codec, hello, peer, generation, release)
+	return nil
+}
+
+// admitPreambleDrain is the repair channel's protocol-blind admission: the
+// frozen two-byte preamble sits below the protocol gate — no frame, no
+// version, no schema — and above the trust gate, so the drain it requests is
+// still authorized by Trust.Control and an untrusted peer's preamble leaves
+// the runtime serving. The connection is answered with nothing: the requester
+// observes the drain out of the process table, and the close is its cue.
+func (s *Server) admitPreambleDrain(ctx context.Context, conn *net.UnixConn, start time.Time) error {
+	defer func() { _ = conn.Close() }()
+	peer, err := trust.PeerCredentials(conn)
+	if err != nil {
+		return fmt.Errorf("wire: identify draining peer: %w", err)
+	}
+	if err := trust.Verify(peer, s.cfg.Trust.Control); err != nil {
+		err = fmt.Errorf("wire: verify draining peer: %w", err)
+		if !errors.Is(err, trust.ErrUntrustedPeer) && !errors.Is(err, trust.ErrPeerGone) {
+			s.log.Error("wire: peer verification infrastructure failure", "err", err)
+		}
+		return err
+	}
+	s.log.Info("wire: drain admitted on the frozen preamble", "peer_pid", peer.Token.PID())
+	drainCtx, cancel := context.WithDeadline(ctx, start.Add(s.handshakeTimeout()))
+	defer cancel()
+	if _, err := s.executeDrain(drainCtx); err != nil {
+		return fmt.Errorf("wire: preamble drain: %w", err)
+	}
 	return nil
 }
 

@@ -12,9 +12,18 @@ import (
 )
 
 // drainPreamble is the two bytes 0x4452 ("DR") a draining server emits instead
-// of a hello ack. They can never open a frame: read as the head of a length
-// prefix they declare a body over 1 GiB, above every MaxFrame in the fleet.
+// of a hello ack, and the protocol-blind drain request a server admits below
+// the protocol gate and above the trust gate. They can never open a frame:
+// read as the head of a length prefix they declare a body over 1 GiB, above
+// the maxFrameCeiling both constructors enforce.
 var drainPreamble = [2]byte{0x44, 0x52}
+
+// maxFrameCeiling is the largest frame cap NewServer and NewClient admit: one
+// below 0x44520000, the smallest body length whose four-byte prefix opens
+// with drainPreamble. The preamble dispatch is sound only while no legal
+// frame's length prefix can begin with those two bytes, so the bound is
+// enforced at both constructors rather than assumed of every deployment.
+const maxFrameCeiling = 0x4452<<16 - 1
 
 // Codec reads and writes exact-version length-prefixed frames over one
 // connection. Reads and writes are independently serialized and safe from any
@@ -57,7 +66,9 @@ func (c *Codec) ClearDeadline() error {
 // PeekPreamble reads the next two bytes through the codec's read path and
 // reports whether they are the drain preamble. Bytes that are not the preamble
 // are stashed and consumed as the first bytes of the next frame read, on the
-// SCM_RIGHTS path with any rights received at frame byte zero held intact.
+// SCM_RIGHTS path with any rights received at frame byte zero held intact. A
+// preamble ends the connection's frame reading, so rights that arrived with it
+// have no frame left to reach and are closed here rather than stranded.
 func (c *Codec) PeekPreamble() (drain bool, err error) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
@@ -91,6 +102,9 @@ func (c *Codec) PeekPreamble() (drain bool, err error) {
 		return false, err
 	}
 	if [2]byte(head) == drainPreamble {
+		if c.rights != nil {
+			c.rights.discard()
+		}
 		return true, nil
 	}
 	c.peeked = head
@@ -233,7 +247,9 @@ func decodeValidFrame(body []byte) (Frame, error) {
 }
 
 // validateFrame layers the per-kind semantic contract over the generated
-// structural codec: which header fields each kind may populate.
+// structural codec: which header fields each kind may populate. Tenant is
+// reserved — its bytes stay in the frozen layout, and no kind may populate
+// it on a live session.
 func validateFrame(frame Frame) error {
 	if !frame.Kind.valid() {
 		return fmt.Errorf("%w: kind %d", ErrInvalidFrame, frame.Kind)
@@ -248,7 +264,8 @@ func validateFrame(frame Frame) error {
 			return fmt.Errorf("%w: handshake frame kind %d", ErrInvalidFrame, frame.Kind)
 		}
 	case FrameRequest:
-		if frame.ID == 0 || frame.Sequence != 0 || frame.DeadlineUnixMilli < 0 || frame.Op == "" {
+		if frame.ID == 0 || frame.Sequence != 0 || frame.DeadlineUnixMilli < 0 || frame.Op == "" ||
+			frame.Tenant != "" {
 			return fmt.Errorf("%w: request frame", ErrInvalidFrame)
 		}
 	case FrameResponse:

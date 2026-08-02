@@ -15,7 +15,7 @@ func dialControl(t *testing.T, sock string) *wire.Client {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	client, err := wire.NewClient(ctx, wire.ClientConfig{
-		Dial: wire.UnixDialer(sock), Lane: wire.LaneControl,
+		Dial: wire.UnixDialer(sock), Authorize: wiretest.AuthorizeTestServer, Lane: wire.LaneControl,
 	})
 	if err != nil {
 		t.Fatalf("NewClient() = %v", err)
@@ -88,7 +88,7 @@ func TestHealthVerbAnswersBelowPhaseGate(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	result, err := client.Call(ctx, "test.echo.v1", "", nil)
+	result, err := client.Call(ctx, "test.echo.v1", nil)
 	if err != nil {
 		t.Fatalf("Call() = %v", err)
 	}

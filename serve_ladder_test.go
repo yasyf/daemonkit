@@ -15,6 +15,7 @@ import (
 	"github.com/yasyf/daemonkit/internal/flock"
 	"github.com/yasyf/daemonkit/internal/proc"
 	"github.com/yasyf/daemonkit/internal/wire"
+	"github.com/yasyf/daemonkit/internal/wire/wiretest"
 	"github.com/yasyf/daemonkit/paths"
 )
 
@@ -114,7 +115,7 @@ func TestServeSettlesLargeReplyBeforeExit(t *testing.T) {
 	if err := session.WaitReady(ctx); err != nil {
 		t.Fatalf("WaitReady() = %v", err)
 	}
-	result, err := session.Call(ctx, "product.echo.v1", "", nil)
+	result, err := session.Call(ctx, "product.echo.v1", nil)
 	if err != nil {
 		t.Fatalf("Call() = %v", err)
 	}
@@ -297,7 +298,7 @@ func awaitBusinessSession(t *testing.T, socket string, maxFrame int) *wire.Clien
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		session, err := wire.NewClient(ctx, wire.ClientConfig{
-			Dial: wire.UnixDialer(socket), Lane: wire.LaneBusiness, Schema: "test.v1", MaxFrame: maxFrame,
+			Dial: wire.UnixDialer(socket), Authorize: wiretest.AuthorizeTestServer, Lane: wire.LaneBusiness, Schema: "test.v1", MaxFrame: maxFrame,
 		})
 		cancel()
 		if err == nil {

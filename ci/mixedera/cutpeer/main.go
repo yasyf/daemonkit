@@ -43,7 +43,6 @@ const (
 	label     = daemonkit.Label("mixedera")
 	cutSchema = "daemonkit.mixedera.cut.v2"
 	echoOp    = "mixedera.echo"
-	tenant    = "mixedera"
 
 	readyLine = "READY"
 
@@ -87,11 +86,6 @@ const (
 	propositionPreambleEmitted  = "a daemon already draining answers a handshake it is still reading with exactly the frozen two-byte preamble and nothing else"
 	propositionTrustGate        = "the drain an inbound frozen preamble admits is still authorized by Trust.Control, the preamble sitting above the trust gate, so an untrusted peer's preamble leaves the incumbent running"
 	propositionControlTrustGate = "a drain arriving on the control lane is authorized by Trust.Control: one peer's drain of a daemon whose control lane names a requirement that peer cannot prove is refused untrusted, that daemon still completes the same peer's session at one protocol on the socket it refused the drain from, and that same peer's drain of a daemon naming no control requirement is honoured, reaping the pid of the daemon it stopped"
-)
-
-const (
-	absentInboundPreamble = "docs/DESIGN.md specifies this in three places — invariant I14 (:487), Device 4 (:82-84), and step 7 of the serve ladder (:557) — and this tree does not implement it. internal/wire writes the preamble outbound only, at server.go:224 and :256, and Codec.PeekPreamble's one non-test caller is the client's own handshake at hello.go:137: no wire server drains on an inbound preamble."
-	absentPreambleGate    = "there is no preamble-admitted drain here to gate, so no Trust.Control verdict on one can be observed. The repair channel this era ships besides SIGTERM is the control lane, whose gate is drain-control-trust-gate, and readClientHello applies the protocol gate before the lane switch (hello.go:111) — so in this tree only SIGTERM is protocol-blind and I14's claim that the repair channel has no compatibility axis does not yet hold."
 )
 
 // strictControl is a Developer ID requirement no `go build` output can satisfy,
@@ -169,9 +163,9 @@ func declare() error {
 			mechanismGate:             {Proposition: propositionGate},
 			mechanismSession:          {Proposition: propositionSession},
 			mechanismSigterm:          {Proposition: propositionSigterm},
-			mechanismPreamble:         {Proposition: propositionPreamble, Absence: absentInboundPreamble},
+			mechanismPreamble:         {Proposition: propositionPreamble},
 			mechanismPreambleEmitted:  {Proposition: propositionPreambleEmitted},
-			mechanismTrustGate:        {Proposition: propositionTrustGate, Absence: absentPreambleGate},
+			mechanismTrustGate:        {Proposition: propositionTrustGate},
 			mechanismControlTrustGate: {Proposition: propositionControlTrustGate},
 		},
 	})
@@ -290,6 +284,12 @@ func classifyControl(err error) report {
 	return failed
 }
 
+// authorizeMatrixDaemon is this peer's named Authorize waiver: what the matrix
+// measures is the two eras' answers to each other on the socket — the refusal,
+// the preamble, the session — so the peer judges nothing before the handshake
+// and classifies exactly what it read back.
+func authorizeMatrixDaemon(net.Conn) error { return nil }
+
 // dial completes a real wire session on the business lane and reports it, or
 // classifies the wire error that refused it.
 func dial(args []string) error {
@@ -301,7 +301,8 @@ func dial(args []string) error {
 	defer cancel()
 
 	client, err := wire.NewClient(ctx, wire.ClientConfig{
-		Dial: wire.UnixDialer(socket), Lane: wire.LaneBusiness, Schema: cutSchema,
+		Dial: wire.UnixDialer(socket), Authorize: authorizeMatrixDaemon,
+		Lane: wire.LaneBusiness, Schema: cutSchema,
 		HandshakeTimeout: handshakeTimeout,
 	})
 	if err != nil {
@@ -313,7 +314,7 @@ func dial(args []string) error {
 		return emit(classifyDial(socket, err))
 	}
 	body := []byte(`{"op":"echo"}`)
-	result, err := client.Call(ctx, echoOp, tenant, body)
+	result, err := client.Call(ctx, echoOp, body)
 	if err != nil {
 		return emit(classifyDial(socket, err))
 	}

@@ -16,6 +16,11 @@ import (
 	"github.com/yasyf/daemonkit/internal/wire"
 )
 
+// AuthorizeTestServer is the harness's named Authorize waiver: every server a
+// test dials is one the same test process just started, so there is no
+// accepting peer to judge.
+func AuthorizeTestServer(net.Conn) error { return nil }
+
 // SocketDir returns a fresh directory short enough for a unix socket path
 // (macOS caps sun_path at 104 bytes; t.TempDir routinely exceeds it), removed
 // on t's cleanup.

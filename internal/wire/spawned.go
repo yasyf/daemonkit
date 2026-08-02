@@ -15,7 +15,10 @@ import (
 )
 
 // SpawnedNonceEnv carries the parent-minted attach nonce to a spawned child,
-// hex-encoded, alongside proc's Cmd.Handoff descriptor.
+// hex-encoded, alongside proc's Cmd.Handoff descriptor. The nonce is not a
+// secret — any same-UID process reads a peer's environment via KERN_PROCARGS2
+// — it is fd-mixup defence: proof the attaching peer inherited fd 3 from this
+// exec rather than some other descriptor plumbing.
 const SpawnedNonceEnv = "DAEMONKIT_SPAWNED_NONCE"
 
 const spawnedNonceBytes = 32
@@ -32,8 +35,8 @@ type SessionLimits struct {
 
 // SpawnedSessionConfig configures one static business child session.
 type SpawnedSessionConfig struct {
-	// Nonce is the 32-byte single-use attach secret the parent minted,
-	// conveyed via SpawnedNonceEnv.
+	// Nonce is the 32-byte single-use attach nonce the parent minted, conveyed
+	// via SpawnedNonceEnv. Fd-mixup defence, not a secret.
 	Nonce    []byte
 	Schema   string
 	Limits   SessionLimits
@@ -140,8 +143,18 @@ func RunSpawnedSession(ctx context.Context, config SpawnedSessionConfig) error {
 	return server.runSession(ctx, conn, codec, LaneBusiness, hello.Schema, peer, generation)
 }
 
+// authorizeSpawnedConn is the spawned lane's named Authorize waiver. The lane's
+// property is directional confinement, not peer identity: the conn is the
+// parent's own end of a kernel socketpair, a channel no other process has a
+// path to dial, so there is no accepting peer to judge — the child's nonce
+// check is the fd-mixup defence on the other end.
+func authorizeSpawnedConn(net.Conn) error { return nil }
+
 // NewSpawnedClient attaches the parent end of the handoff socketpair, carrying
-// the minted nonce, and completes the protocol-2 handshake.
+// the minted nonce, and completes the protocol-2 handshake. It verifies no
+// peer: credentials read from a self-created socketpair name the creator —
+// the parent itself — so a check here would only ever judge this process.
+// Confinement is directional, by construction of the pair.
 func NewSpawnedClient(ctx context.Context, config SpawnedClientConfig) (*SpawnedClient, error) {
 	if config.Conn == nil {
 		return nil, errors.New("wire: spawned Conn is required")
@@ -151,13 +164,6 @@ func NewSpawnedClient(ctx context.Context, config SpawnedClientConfig) (*Spawned
 	}
 	if config.Schema == "" {
 		return nil, errors.New("wire: spawned Schema is required")
-	}
-	peer, err := trust.PeerCredentials(config.Conn)
-	if err != nil {
-		return nil, fmt.Errorf("wire: identify spawned peer: %w", err)
-	}
-	if err := trust.Verify(peer, nil); err != nil {
-		return nil, fmt.Errorf("wire: verify spawned peer: %w", err)
 	}
 	var once sync.Once
 	dial := func(context.Context) (net.Conn, error) {
@@ -170,6 +176,7 @@ func NewSpawnedClient(ctx context.Context, config SpawnedClientConfig) (*Spawned
 	}
 	client, err := NewClient(ctx, ClientConfig{
 		Dial:                    dial,
+		Authorize:               authorizeSpawnedConn,
 		Lane:                    LaneBusiness,
 		Schema:                  config.Schema,
 		Nonce:                   config.Nonce,
@@ -186,19 +193,18 @@ func NewSpawnedClient(ctx context.Context, config SpawnedClientConfig) (*Spawned
 }
 
 // Call sends one unary request and waits for its terminal response.
-func (c *SpawnedClient) Call(ctx context.Context, op Op, tenant string, payload []byte) (Result, error) {
-	return c.client.Call(ctx, op, tenant, payload)
+func (c *SpawnedClient) Call(ctx context.Context, op Op, payload []byte) (Result, error) {
+	return c.client.Call(ctx, op, payload)
 }
 
 // OpenStream starts one request with bounded bidirectional streaming.
 func (c *SpawnedClient) OpenStream(
 	ctx context.Context,
 	op Op,
-	tenant string,
 	payload []byte,
 	endInput bool,
 ) (*ClientCall, error) {
-	return c.client.Open(ctx, op, tenant, payload, endInput)
+	return c.client.Open(ctx, op, payload, endInput)
 }
 
 // Events returns the bounded server-pushed event stream.

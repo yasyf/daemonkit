@@ -277,6 +277,25 @@ var gateCases = []gateCase{
 		},
 	},
 	{
+		name: "drain/preamble-cut",
+		run: func(t *testing.T, p *peers) {
+			strict := startCut(t, p.cut, "-strict")
+			strictFront := newRelay(t, strict.socket)
+			held := writePreamble(t, strictFront)
+			strict.witnessPreambleTrustGate(t, strictFront, aliveSettle)
+			awaitPeerClose(t, held, aliveSettle)
+			strict.terminate(t)
+			_ = strict.exitWithin(t, drainWait)
+
+			open := startCut(t, p.cut)
+			front := newRelay(t, open.socket)
+			conn := writePreamble(t, front)
+			open.witnessPreamble(t, front, preambleSettle)
+			awaitPeerClose(t, conn, aliveSettle)
+			p.covered.Redeem(t, cutEra, mechanismPreamble, mechanismTrustGate)
+		},
+	},
+	{
 		name: "wedge/18999",
 		run: func(t *testing.T, p *peers) {
 			daemon := startCut(t, p.cut)

@@ -113,14 +113,12 @@ func businessServiceClient(
 
 func genericServiceCall(
     operation: String,
-    tenant: String = "",
     payload: Data = Data(),
     replay: ServiceSocketReplayPolicy = .provenNonDispatch,
     deadline: Date
 ) -> ServiceSocketCall {
     ServiceSocketCall(
         operation: operation,
-        tenant: tenant,
         payload: payload,
         replay: replay,
         deadline: deadline

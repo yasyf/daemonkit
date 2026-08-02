@@ -30,6 +30,7 @@ case TestMixedEra asserts nothing of its own: it builds the two era peers, freez
 case TestMixedEra/classify/cut asserts the cut peer's own unit tests pass, which is where that peer's failure classification is checked
 case TestMixedEra/drain/control-trust-gate
 case TestMixedEra/drain/preamble-absent-precut
+case TestMixedEra/drain/preamble-cut
 case TestMixedEra/drain/preamble-emitted
 case TestMixedEra/drain/sigterm-cut
 case TestMixedEra/drain/sigterm-precut
@@ -48,6 +49,8 @@ case TestTheGateRefusesExactlyTheUnredeemedStatuses asserts the release gate ref
 claim TestMixedEra/drain/control-trust-gate cut drain-control-trust-gate evidenced
 claim TestMixedEra/drain/preamble-absent-precut precut drain-preamble evidenced
 claim TestMixedEra/drain/preamble-absent-precut precut drain-preamble-trust-gate entailed-by precut drain-preamble
+claim TestMixedEra/drain/preamble-cut cut drain-preamble evidenced
+claim TestMixedEra/drain/preamble-cut cut drain-preamble-trust-gate evidenced
 claim TestMixedEra/drain/preamble-emitted cut drain-preamble-emitted evidenced
 claim TestMixedEra/drain/sigterm-cut cut drain-sigterm evidenced
 claim TestMixedEra/drain/sigterm-precut precut drain-sigterm evidenced

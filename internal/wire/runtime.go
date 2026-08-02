@@ -116,7 +116,6 @@ const (
 type Request struct {
 	ID      uint64
 	Op      Op
-	Tenant  string
 	Peer    trust.Peer
 	Schema  string
 	Payload []byte

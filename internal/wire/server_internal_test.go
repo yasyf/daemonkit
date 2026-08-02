@@ -18,6 +18,8 @@ import (
 	"github.com/yasyf/daemonkit/internal/trust"
 )
 
+func authorizeTestServer(net.Conn) error { return nil }
+
 type stubRuntime struct{ phase Phase }
 
 func (r stubRuntime) Handle(context.Context, Request) (any, error) {
@@ -151,7 +153,7 @@ func TestSilentConnectionDoesNotBlockOtherAccepts(t *testing.T) {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	client, err := NewClient(ctx, ClientConfig{Dial: UnixDialer(sock), Lane: LaneBusiness, Schema: "test.v1"})
+	client, err := NewClient(ctx, ClientConfig{Dial: UnixDialer(sock), Authorize: authorizeTestServer, Lane: LaneBusiness, Schema: "test.v1"})
 	if err != nil {
 		t.Fatalf("NewClient() behind a silent connection = %v", err)
 	}
@@ -197,7 +199,7 @@ func TestPendingCapSaturationDropsWithoutWrite(t *testing.T) {
 	time.Sleep(700 * time.Millisecond)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	client, err := NewClient(ctx, ClientConfig{Dial: UnixDialer(sock), Lane: LaneBusiness, Schema: "test.v1"})
+	client, err := NewClient(ctx, ClientConfig{Dial: UnixDialer(sock), Authorize: authorizeTestServer, Lane: LaneBusiness, Schema: "test.v1"})
 	if err != nil {
 		t.Fatalf("NewClient() after pending slots recycled = %v", err)
 	}

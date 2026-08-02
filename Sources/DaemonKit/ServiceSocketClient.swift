@@ -3,20 +3,17 @@ import Foundation
 /// One deadline-bounded logical unary request against any ready session.
 public struct ServiceSocketCall: Sendable {
     public let operation: String
-    public let tenant: String
     public let payload: Data
     public let replay: ServiceSocketReplayPolicy
     public let deadline: Date
 
     public init(
         operation: String,
-        tenant: String = "",
         payload: Data = Data(),
         replay: ServiceSocketReplayPolicy = .provenNonDispatch,
         deadline: Date
     ) {
         self.operation = operation
-        self.tenant = tenant
         self.payload = payload
         self.replay = replay
         self.deadline = deadline
@@ -218,7 +215,6 @@ public actor ServiceSocketClient {
 
             let attempt = await current.1.attempt(
                 operation: request.operation,
-                tenant: request.tenant,
                 payload: request.payload,
                 deadline: request.deadline
             )

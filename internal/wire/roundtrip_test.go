@@ -47,7 +47,7 @@ func dialBusiness(t *testing.T, sock string) *wire.Client {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	client, err := wire.NewClient(ctx, wire.ClientConfig{
-		Dial: wire.UnixDialer(sock), Lane: wire.LaneBusiness, Schema: testSchema,
+		Dial: wire.UnixDialer(sock), Authorize: wiretest.AuthorizeTestServer, Lane: wire.LaneBusiness, Schema: testSchema,
 	})
 	if err != nil {
 		t.Fatalf("NewClient() = %v", err)
@@ -75,7 +75,7 @@ func TestBusinessRoundTrip(t *testing.T) {
 	if err := client.WaitReady(ctx); err != nil {
 		t.Fatalf("WaitReady() = %v", err)
 	}
-	result, err := client.Call(ctx, "test.echo.v1", "tenant-a", []byte(`{"n":42}`))
+	result, err := client.Call(ctx, "test.echo.v1", []byte(`{"n":42}`))
 	if err != nil {
 		t.Fatalf("Call() = %v", err)
 	}
@@ -103,7 +103,7 @@ func TestServerPushedEventsReachTheClient(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := client.Call(ctx, "any.op", "", []byte(`{}`)); err != nil {
+	if _, err := client.Call(ctx, "any.op", []byte(`{}`)); err != nil {
 		t.Fatalf("Call() = %v", err)
 	}
 	select {
@@ -138,7 +138,7 @@ func TestBidirectionalStreaming(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	call, err := client.Open(ctx, "stream.op", "", nil, false)
+	call, err := client.Open(ctx, "stream.op", nil, false)
 	if err != nil {
 		t.Fatalf("Open() = %v", err)
 	}
@@ -186,7 +186,7 @@ func TestSchemaAttachGateTypedRejection(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			client, err := wire.NewClient(ctx, wire.ClientConfig{
-				Dial: wire.UnixDialer(sock), Lane: wire.LaneBusiness, Schema: tt.schema,
+				Dial: wire.UnixDialer(sock), Authorize: wiretest.AuthorizeTestServer, Lane: wire.LaneBusiness, Schema: tt.schema,
 			})
 			if tt.wantErr == nil {
 				if err != nil {
@@ -214,13 +214,13 @@ func TestControlDrainVerbAndDrainPreamble(t *testing.T) {
 	sock, _ := startServer(t, rt, wire.Config{})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	control, err := wire.NewClient(ctx, wire.ClientConfig{Dial: wire.UnixDialer(sock), Lane: wire.LaneControl})
+	control, err := wire.NewClient(ctx, wire.ClientConfig{Dial: wire.UnixDialer(sock), Authorize: wiretest.AuthorizeTestServer, Lane: wire.LaneControl})
 	if err != nil {
 		t.Fatalf("control NewClient() = %v", err)
 	}
 	defer func() { _ = control.Abort(nil) }()
 
-	result, err := control.Call(ctx, "daemon.control.drain", "", []byte("{}"))
+	result, err := control.Call(ctx, "daemon.control.drain", []byte("{}"))
 	if err != nil {
 		t.Fatalf("drain Call() = %v", err)
 	}
@@ -233,7 +233,7 @@ func TestControlDrainVerbAndDrainPreamble(t *testing.T) {
 		t.Fatal("drain verb responded before Runtime.Drain ran")
 	}
 
-	_, err = wire.NewClient(ctx, wire.ClientConfig{Dial: wire.UnixDialer(sock), Lane: wire.LaneBusiness, Schema: testSchema})
+	_, err = wire.NewClient(ctx, wire.ClientConfig{Dial: wire.UnixDialer(sock), Authorize: wiretest.AuthorizeTestServer, Lane: wire.LaneBusiness, Schema: testSchema})
 	if !errors.Is(err, wire.ErrDraining) {
 		t.Fatalf("NewClient() against a draining server = %v, want ErrDraining via the preamble", err)
 	}
@@ -247,7 +247,7 @@ func TestBusinessLaneCannotReachControlVerbs(t *testing.T) {
 	defer cancel()
 
 	for _, op := range []wire.Op{"daemon.control.drain", "daemon.anything.else"} {
-		result, err := client.Call(ctx, op, "", []byte("{}"))
+		result, err := client.Call(ctx, op, []byte("{}"))
 		if err != nil {
 			t.Fatalf("Call(%q) = %v", op, err)
 		}
@@ -274,18 +274,18 @@ func TestControlSlotSurvivesBusinessSaturation(t *testing.T) {
 	business := dialBusiness(t, sock)
 	defer func() { _ = business.Abort(nil) }()
 	if _, err := wire.NewClient(ctx, wire.ClientConfig{
-		Dial: wire.UnixDialer(sock), Lane: wire.LaneBusiness, Schema: testSchema,
+		Dial: wire.UnixDialer(sock), Authorize: wiretest.AuthorizeTestServer, Lane: wire.LaneBusiness, Schema: testSchema,
 	}); !errors.Is(err, wire.ErrSessionCapacity) {
 		t.Fatalf("second business NewClient() = %v, want ErrSessionCapacity", err)
 	}
 
-	control, err := wire.NewClient(ctx, wire.ClientConfig{Dial: wire.UnixDialer(sock), Lane: wire.LaneControl})
+	control, err := wire.NewClient(ctx, wire.ClientConfig{Dial: wire.UnixDialer(sock), Authorize: wiretest.AuthorizeTestServer, Lane: wire.LaneControl})
 	if err != nil {
 		t.Fatalf("control NewClient() under business saturation = %v", err)
 	}
 	defer func() { _ = control.Abort(nil) }()
 
-	_, err = wire.NewClient(ctx, wire.ClientConfig{Dial: wire.UnixDialer(sock), Lane: wire.LaneControl})
+	_, err = wire.NewClient(ctx, wire.ClientConfig{Dial: wire.UnixDialer(sock), Authorize: wiretest.AuthorizeTestServer, Lane: wire.LaneControl})
 	if !errors.Is(err, wire.ErrSessionCapacity) {
 		t.Fatalf("second control NewClient() = %v, want ErrSessionCapacity (capacity-1 slot)", err)
 	}
@@ -302,7 +302,7 @@ func TestPhaseGateTypedRejections(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	result, err := client.Call(ctx, "some.op", "", []byte("{}"))
+	result, err := client.Call(ctx, "some.op", []byte("{}"))
 	if err != nil {
 		t.Fatalf("Call() while starting = %v", err)
 	}
@@ -317,7 +317,7 @@ func TestPhaseGateTypedRejections(t *testing.T) {
 	if err := client.WaitReady(ctx); err != nil {
 		t.Fatalf("WaitReady() after SetPhase(ready) = %v", err)
 	}
-	result, err = client.Call(ctx, "some.op", "", []byte("{}"))
+	result, err = client.Call(ctx, "some.op", []byte("{}"))
 	if err != nil || result.Outcome != wire.Delivered {
 		t.Fatalf("ready-phase call = %v %v, want delivery", result.Outcome, err)
 	}
