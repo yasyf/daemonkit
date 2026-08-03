@@ -1,1 +1,1 @@
-{"v":1,"lamport":6,"session":"cfa0f537-f63b-4af9-844c-1efcf2ab6814","ops":[{"kind":"set_criterion_status","id":"2e2f082df7ea11f806b79cb10c886385","status":"met","note":"the v0.20 wire package is deleted whole; internal/wire has no control.go and no captured-conn closure"}]}
+{"v":1,"lamport":7,"session":"cfa0f537-f63b-4af9-844c-1efcf2ab6814","ops":[{"kind":"set_status","status":"done"},{"kind":"link_commit","sha":"16b92657b03b7e0db313bd0f6cf5da4d6bb433d0"}]}
