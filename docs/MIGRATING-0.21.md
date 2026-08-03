@@ -235,6 +235,16 @@ requirement, because the control lane admits one session server-wide.
   and allowed the edits through. Assert the ceiling in a test — `MaxDetail(spec.MaxFrame) >=
   maxPayload` — so a future change to the reserve or the encoding fails loudly.
 
+- **Every plist already on disk is markerless, and `launchd.Remove` refuses it.** v0.21 renders a
+  `DAEMONKIT_AGENT_OWNER` environment key into each plist and treats its presence as that label's
+  store-free proof of ownership; v0.20's `service` package never wrote one. So an uninstall run
+  against a machine that has not yet had a v0.21 *install* hits `launchd.ErrNotOwned` on every
+  legacy label and leaves those agents loaded. Install first, or handle `ErrNotOwned` with a
+  legacy-removal path. `Apply` is unaffected — it archives the foreign plist aside and writes a
+  marked one, though the archive stays in `~/Library/LaunchAgents` afterward.
+
+  Two consumers hit this independently during migration, so assume it applies to yours.
+
 - **State directory rename.** Deployment state moved to `.daemonkit-deploy/<name>/`. The old tree
   is archived on first open rather than decode-failed.
 - **Signed policy digests change.** Consumers that bake a requirement digest — captain-hook's
