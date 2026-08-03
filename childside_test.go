@@ -44,6 +44,8 @@ func runChildRole(role string) int {
 		return childServeSpawned(Contract{Schema: spawnedSchema})
 	case "serve-spawned-skew":
 		return childServeSpawned(Contract{Schema: spawnedSchema, MaxFrame: 2 << 20})
+	case "serve-spawned-disconnect":
+		return childServeSpawnedDisconnect()
 	case "claim-then-serve":
 		return childClaimThenServe()
 	}

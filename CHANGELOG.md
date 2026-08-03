@@ -6,6 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.3] - 2026-08-03
+
+### Added
+
+- `Session.Disconnected` — closes when the session's transport ends, before
+  in-flight handlers necessarily return; `Done` keeps its settle-after-handlers
+  meaning, and Disconnected never closes after Done. The internal wire layer
+  already told the two edges apart, but the root `Session` exposed only `Done`,
+  which fires after every in-flight handler returns — so fusekit's
+  native-session supervision had no way to present a FUSE mount as unavailable
+  the moment its backing process died mid-handler; the loss only surfaced after
+  blocked reads drained. A spawned session closes Disconnected the same way,
+  when its handoff channel ends.
+
 ## [0.21.2] - 2026-08-03
 
 ### Fixed
@@ -1211,7 +1225,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.21.2...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.21.3...HEAD
+[0.21.3]: https://github.com/yasyf/daemonkit/compare/v0.21.2...v0.21.3
 [0.21.2]: https://github.com/yasyf/daemonkit/compare/v0.21.1...v0.21.2
 [0.21.1]: https://github.com/yasyf/daemonkit/compare/v0.21.0...v0.21.1
 [0.21.0]: https://github.com/yasyf/daemonkit/compare/v0.20.10...v0.21.0

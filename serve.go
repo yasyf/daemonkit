@@ -75,10 +75,11 @@ type Caller struct {
 }
 
 // Session is one accepted client session: a comparable token products key
-// per-session state by, with the close signal that releases it.
+// per-session state by, with the close signals that release it.
 type Session struct {
-	id   uint64
-	done <-chan struct{}
+	id           uint64
+	done         <-chan struct{}
+	disconnected <-chan struct{}
 }
 
 // ID returns this session's identifier, unique and monotonic within the
@@ -88,6 +89,14 @@ func (s Session) ID() uint64 { return s.id }
 // Done closes once this exact session has settled and been dropped, so the
 // state keyed by it can be released.
 func (s Session) Done() <-chan struct{} { return s.done }
+
+// Disconnected closes when this session's transport ends — the peer is gone
+// and no new requests are admitted — before in-flight handlers necessarily
+// return, so a product can publish unavailability while blocked work is
+// still settling. It never closes after Done: every session closes
+// Disconnected first and Done once settled. On a spawned session it closes
+// when the handoff channel ends.
+func (s Session) Disconnected() <-chan struct{} { return s.disconnected }
 
 // Drained is what a shutdown achieved. A non-empty Abandoned deliberately
 // retains the flock and parks the process rather than releasing resources

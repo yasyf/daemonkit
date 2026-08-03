@@ -61,8 +61,13 @@ func serveBusiness(t *testing.T) string {
 
 func serveBusinessConfig(t *testing.T, cfg wire.Config) string {
 	t.Helper()
+	return serveBusinessProduct(t, cfg, businessProduct{})
+}
+
+func serveBusinessProduct(t *testing.T, cfg wire.Config, product Product) string {
+	t.Helper()
 	rt := newServeRuntime(int(MaxDetail(0)))
-	rt.ready(businessProduct{})
+	rt.ready(product)
 	server, err := wire.NewServer(rt, cfg)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)

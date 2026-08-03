@@ -16,6 +16,7 @@ const (
 	spawnedClaimOp   = "child.claim.v1"
 	spawnedSessionOp = "child.session.v1"
 	spawnedFailOp    = "child.fail.v1"
+	spawnedHoldOp    = "child.hold.v1"
 )
 
 var spawnedLimits = Limits{MaxFrame: 1 << 20, Concurrency: 4}
@@ -48,6 +49,46 @@ func childServeSpawned(contract Contract) int {
 		return 68
 	}
 	return 0
+}
+
+// childServeSpawnedDisconnect serves one session whose handler blocks on its
+// own Session.Disconnected, then reports whether the edge fired while the
+// handler was still in flight — Done still open — carrying the verdict out as
+// the exit code.
+func childServeSpawnedDisconnect() int {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	verdicts := make(chan string, 1)
+	served := ServeSpawned(ctx, Contract{Schema: spawnedSchema}, func(_ context.Context, req Request) (Reply, error) {
+		if req.Op != spawnedHoldOp {
+			return Reply{}, fmt.Errorf("child: unknown op %q", req.Op)
+		}
+		fmt.Fprintln(os.Stderr, "child: holding")
+		select {
+		case <-req.Session.Disconnected():
+		case <-ctx.Done():
+			verdicts <- "disconnected-never-closed"
+			return Reply{}, ctx.Err()
+		}
+		select {
+		case <-req.Session.Done():
+			verdicts <- "done-closed-mid-handler"
+		default:
+			verdicts <- "disconnected-before-return"
+		}
+		return Reply{}, errors.New("peer gone")
+	})
+	select {
+	case verdict := <-verdicts:
+		if verdict != "disconnected-before-return" {
+			fmt.Fprintf(os.Stderr, "child: %s\n", verdict)
+			return 69
+		}
+		return 0
+	default:
+		fmt.Fprintf(os.Stderr, "child: no handler observed the disconnect (ServeSpawned = %v)\n", served)
+		return 70
+	}
 }
 
 // childClaimThenServe is D8(ii)'s child side in the ClaimHandoff-first order:
@@ -129,6 +170,46 @@ func TestChildBusinessRoundTripsOverTheSpawnedHandoff(t *testing.T) {
 	}
 	if exit := <-child.Done(); exit.Code != 0 {
 		t.Fatalf("Exit = %+v, stderr %q", exit, stderr.Bytes())
+	}
+}
+
+// TestSpawnedSessionDisconnectedFiresMidHandler pins the spawned lane to the
+// daemon lane's ordering: the single session's Disconnected closes when the
+// handoff channel ends, while a blocked handler is still in flight and before
+// Done settles. The child carries the verdict out as its exit code.
+func TestSpawnedSessionDisconnectedFiresMidHandler(t *testing.T) {
+	child, stderr := spawnBusinessChild(t, "serve-spawned-disconnect")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	lane, err := child.Business(ctx, Contract{Schema: spawnedSchema})
+	if err != nil {
+		t.Fatalf("Business() = %v (stderr %q)", err, stderr.Bytes())
+	}
+	go func() { _, _ = lane.Call(ctx, spawnedHoldOp, nil) }()
+	awaitCapture(t, stderr, "child: holding")
+
+	severCtx, severCancel := context.WithDeadline(context.Background(), time.Now())
+	defer severCancel()
+	_ = lane.Close(severCtx)
+
+	select {
+	case exit := <-child.Done():
+		if exit.Code != 0 {
+			t.Fatalf("Exit = %+v, stderr %q", exit, stderr.Bytes())
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the child did not exit after the handoff channel was severed")
+	}
+}
+
+func awaitCapture(t *testing.T, capture *Capture, marker string) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for !strings.Contains(string(capture.Bytes()), marker) {
+		if time.Now().After(deadline) {
+			t.Fatalf("child never wrote %q (stderr %q)", marker, capture.Bytes())
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

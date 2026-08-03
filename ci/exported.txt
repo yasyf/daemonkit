@@ -209,6 +209,7 @@
 .	func	ServingSameUser	darwin
 .	func	ServingSigned	darwin
 .	type	Session	darwin
+.	method	Session.Disconnected	darwin
 .	method	Session.Done	darwin
 .	method	Session.ID	darwin
 .	func	Stable	darwin

@@ -393,7 +393,7 @@ func requestOf(req wire.Request) Request {
 		Op:      string(req.Op),
 		Body:    req.Payload,
 		Caller:  Caller{UID: uint32(req.Peer.UID), PID: req.Peer.Token.PID()}, //nolint:gosec // kernel UIDs are non-negative
-		Session: Session{id: req.Session.ID(), done: req.Session.Done()},
+		Session: Session{id: req.Session.ID(), done: req.Session.Done(), disconnected: req.Session.Disconnected()},
 	}
 }
 
