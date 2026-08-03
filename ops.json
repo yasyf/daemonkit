@@ -1,1 +1,1 @@
-{"v":1,"lamport":5,"session":"cfa0f537-f63b-4af9-844c-1efcf2ab6814","ops":[{"kind":"set_criterion_status","id":"c26cf50616a476e0b5562967b28ce276","status":"met","note":"childside.go's ClaimHandoff godoc names ServeSpawned, defined at childside.go:61 — the symbol exists"}]}
+{"v":1,"lamport":6,"session":"cfa0f537-f63b-4af9-844c-1efcf2ab6814","ops":[{"kind":"set_status","status":"done"},{"kind":"link_commit","sha":"16b92657b03b7e0db313bd0f6cf5da4d6bb433d0"}]}
