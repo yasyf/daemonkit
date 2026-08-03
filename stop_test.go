@@ -209,12 +209,41 @@ func TestStopDrainsTheLiveIncumbentAndRemovesItsAgent(t *testing.T) {
 	}
 }
 
+// TestStopWorksWithoutAProgram is the launcher shape: a Daemon declaring only
+// its Label — no Program to render or scan — on a machine upgraded from the
+// pre-marker era, where a markerless plist sits at the label with no owner
+// record and no listener. Stop proceeds without an inventory to consult and
+// the removal's own bootout is what takes down anything launchd still runs
+// under the label.
+func TestStopWorksWithoutAProgram(t *testing.T) {
+	ladderHome(t)
+	label := Label("com.example.stopnoprog")
+	path := installedAgentPlist(t, label, false)
+	client := openClient(t, Daemon{Label: label})
+	rec := &launchctlRecorder{}
+	client.launchctl = rec.run
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	if err := client.Stop(ctx); err != nil {
+		t.Fatalf("Stop() = %v", err)
+	}
+
+	if want := []string{"bootout"}; !slices.Equal(rec.verbs, want) {
+		t.Fatalf("verbs = %v, want %v", rec.verbs, want)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("legacy plist survived Stop: %v", err)
+	}
+}
+
 // TestStopSettlesTheRecordedIncumbent is the session-less arm: no listener,
 // but the durable owner record names an incumbent, and Stop proves that exact
-// identity out of the process table before it succeeds.
+// identity out of the process table before it succeeds. The Daemon declares no
+// Program — the record arm's proof reads the process table by recorded
+// identity and needs none.
 func TestStopSettlesTheRecordedIncumbent(t *testing.T) {
 	d, _ := departedOwnerFixture(t)
-	d.Program = unrunProgram(t)
 	client := openClient(t, d)
 	rec := &launchctlRecorder{}
 	client.launchctl = rec.run

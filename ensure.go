@@ -459,6 +459,14 @@ func repairWedged(recordPath string, target incumbent) error {
 // can attribute it. Settling a recorded identity out of the table is the half
 // that covers a recorded process whose executable is gone.
 func (c *Client) inventoryClear(observed proc.Identity) error {
+	if c.daemon.Program.policy == nil {
+		// A Daemon that declares no Program names no executable this gate could
+		// scan: the query set is empty by construction, not unresolved, so the
+		// gate holds vacuously. Only Stop can arrive this way — Ensure refuses an
+		// unset Program before its first observation — and Stop's contract states
+		// what absence then rests on.
+		return nil
+	}
 	el, err := c.daemon.Label.element()
 	if err != nil {
 		return err

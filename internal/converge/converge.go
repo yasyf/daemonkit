@@ -85,6 +85,26 @@ func Observe(ctx context.Context, s Sources) (World, error) {
 	if s.Serving == nil || s.Recorded == nil || s.Launchctl == nil {
 		return World{}, errors.New("converge: Serving, Recorded, and Launchctl observers are required")
 	}
+	world, err := ObserveRuntime(ctx, s)
+	if err != nil {
+		return World{}, err
+	}
+	applied, err := launchd.Verify(ctx, s.Launchctl, s.Agent)
+	if err != nil {
+		return World{}, fmt.Errorf("converge: observe applied agent %q: %w", s.Agent.Label, err)
+	}
+	world.Applied = applied
+	return world, nil
+}
+
+// ObserveRuntime re-derives the runtime half of a World — the socket and the
+// owner record — leaving Applied unobserved. It is what a caller observes when
+// it decides nothing from launchd's configuration and may hold no Agent to
+// verify against: the label's agent is going away whatever state it is in.
+func ObserveRuntime(ctx context.Context, s Sources) (World, error) {
+	if s.Serving == nil || s.Recorded == nil {
+		return World{}, errors.New("converge: Serving and Recorded observers are required")
+	}
 	world := World{}
 	world.Health, world.Pinned, world.Attach = s.Serving(ctx)
 	owner, recorded, err := s.Recorded(s.RecordPath)
@@ -92,10 +112,5 @@ func Observe(ctx context.Context, s Sources) (World, error) {
 		return World{}, fmt.Errorf("converge: observe owner record: %w", err)
 	}
 	world.Owner, world.Recorded = owner, recorded
-	applied, err := launchd.Verify(ctx, s.Launchctl, s.Agent)
-	if err != nil {
-		return World{}, fmt.Errorf("converge: observe applied agent %q: %w", s.Agent.Label, err)
-	}
-	world.Applied = applied
 	return world, nil
 }

@@ -6,6 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.2] - 2026-08-03
+
+### Fixed
+
+- `Client.Stop` no longer requires a `Program`. Stop renders no LaunchAgent
+  and places nothing, so a launcher's Daemon declaring only its Label — one
+  that must answer "not installed" without ever constructing a Program — stops
+  with the same call. v0.21.1's Stop reached the agent derivation through a
+  nil placement and panicked on exactly that Daemon. Observation now splits
+  the runtime half (socket and owner record) from launchd's applied state,
+  and without a Program the no-record rung has no inventory to consult:
+  absence rests on the socket, the record, and the removal's own bootout,
+  which takes down anything launchd still runs under the label.
+
 ## [0.21.1] - 2026-08-03
 
 Both additions close the same v0.20-to-v0.21 transition wall, which three
@@ -1197,7 +1211,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.21.1...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.21.2...HEAD
+[0.21.2]: https://github.com/yasyf/daemonkit/compare/v0.21.1...v0.21.2
 [0.21.1]: https://github.com/yasyf/daemonkit/compare/v0.21.0...v0.21.1
 [0.21.0]: https://github.com/yasyf/daemonkit/compare/v0.20.10...v0.21.0
 [0.20.10]: https://github.com/yasyf/daemonkit/compare/v0.20.9...v0.20.10

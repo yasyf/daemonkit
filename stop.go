@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/yasyf/daemonkit/internal/converge"
 	"github.com/yasyf/daemonkit/internal/flock"
+	"github.com/yasyf/daemonkit/internal/proc"
 	"github.com/yasyf/daemonkit/launchd"
 )
 
@@ -23,11 +25,18 @@ import (
 // raced in is re-observed rather than stopped. One already draining, or a husk
 // whose listener is gone, is settled out of the process table from the durable
 // owner record — a recorded incumbent that will not leave is signalled at its
-// recorded identity first. No record at all leaves absence to the
-// executable-scoped inventory over this daemon's own program. Stopping a
-// stopped daemon is success. An attach the ladder cannot classify — an
-// untrusted peer holding the socket — propagates, and nothing is removed over
-// it.
+// recorded identity first. Stopping a stopped daemon is success. An attach the
+// ladder cannot classify — an untrusted peer holding the socket — propagates,
+// and nothing is removed over it.
+//
+// Stop needs no Program: it renders no LaunchAgent and places nothing, so a
+// launcher's Daemon that declares only the Label — one that must answer "not
+// installed" without constructing a Program — stops with the same call. What a
+// stated Program adds is the executable-scoped inventory at the no-record
+// rung, the one absence proof no record file can forge; a Daemon that declares
+// no Program names no executable that gate could scan, so there absence rests
+// on the socket, the record, and the bootout inside the removal, which takes
+// down whatever launchd still runs under the label.
 //
 // The LaunchAgent goes last, after departure is proven, so launchd never
 // relaunches what was just drained — and a relaunch that races the removal is
@@ -50,10 +59,6 @@ func (c *Client) Stop(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	agent, err := c.daemon.agent()
-	if err != nil {
-		return err
-	}
 	statePaths := el.state()
 	if err := statePaths.EnsureLockDir(); err != nil {
 		return fmt.Errorf("daemonkit: create lock dir: %w", err)
@@ -70,7 +75,7 @@ func (c *Client) Stop(ctx context.Context) error {
 	timer := time.NewTimer(attachCadence(ctx))
 	defer timer.Stop()
 	for {
-		err := c.stopOnce(ctx, agent)
+		err := c.stopOnce(ctx)
 		if err == nil {
 			break
 		}
@@ -95,8 +100,8 @@ func (c *Client) Stop(ctx context.Context) error {
 // as Ensure's settle does: a spent attach is the deadline and never absence, a
 // serving incumbent is evicted, and an absent or draining one is settled from
 // the record.
-func (c *Client) stopOnce(ctx context.Context, agent launchd.Agent) error {
-	world, err := c.observeWorld(ctx, agent)
+func (c *Client) stopOnce(ctx context.Context) error {
+	world, err := c.observeRuntime(ctx)
 	if err != nil {
 		return err
 	}
@@ -110,6 +115,23 @@ func (c *Client) stopOnce(ctx context.Context, agent launchd.Agent) error {
 		return c.proveRecorded(ctx, world)
 	}
 	return world.Attach
+}
+
+// observeRuntime is Stop's observation: the socket and the owner record, never
+// launchd's configuration. Stop decides nothing from Applied — the agent is
+// going away whatever state it is in — and skipping that leg is also what
+// frees Stop from Ensure's Program requirement: no agent is rendered, so a
+// Daemon that declares no Program still observes.
+func (c *Client) observeRuntime(ctx context.Context) (converge.World, error) {
+	record, err := c.record()
+	if err != nil {
+		return converge.World{}, err
+	}
+	return converge.ObserveRuntime(ctx, converge.Sources{
+		Serving:    c.servedHealth,
+		Recorded:   proc.ReadOwner,
+		RecordPath: record,
+	})
 }
 
 // removeAgent takes the label's LaunchAgent down once departure is proven,

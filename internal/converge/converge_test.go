@@ -192,6 +192,30 @@ func TestObserveFailsWhenTheRecordCannotBeRead(t *testing.T) {
 	}
 }
 
+// TestObserveRuntimeNeedsNoAgentOrLaunchctl pins the runtime half as its own
+// observation: the socket and the record are consulted, launchd never is, so a
+// caller holding no Agent still observes.
+func TestObserveRuntimeNeedsNoAgentOrLaunchctl(t *testing.T) {
+	owner := proc.Owner{PID: 42, Start: 3, Boot: 9, Generation: 7, Build: "b"}
+	world, err := ObserveRuntime(t.Context(), Sources{
+		Serving:    servingNone,
+		Recorded:   func(string) (proc.Owner, bool, error) { return owner, true, nil },
+		RecordPath: "/records",
+	})
+	if err != nil {
+		t.Fatalf("ObserveRuntime() error = %v", err)
+	}
+	if !world.Recorded || world.Owner != owner {
+		t.Fatalf("Owner = %+v recorded = %v, want %+v true", world.Owner, world.Recorded, owner)
+	}
+	if world.Applied {
+		t.Fatal("Applied = true, want the launchd leg left unobserved")
+	}
+	if _, err := ObserveRuntime(t.Context(), Sources{Serving: servingNone}); err == nil {
+		t.Fatal("ObserveRuntime() without a record reader succeeded")
+	}
+}
+
 func TestObserveRequiresEveryObserver(t *testing.T) {
 	agent := testAgent(t)
 	tests := []struct {
