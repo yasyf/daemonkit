@@ -6,6 +6,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.1] - 2026-08-03
+
+Both additions close the same v0.20-to-v0.21 transition wall, which three
+consumers hit independently: cc-patch and synckit each open-coded legacy plist
+removal, and cc-interact's reconciliation review found Stop/Ensure races and
+unremovable v0.20 plists (its findings D2/D3).
+
+### Added
+
+- `Client.Stop` — drain the incumbent and remove its LaunchAgent in one verb,
+  under the same state-directory start lock `Ensure` serializes on. Nothing
+  exported let a consumer's stop serialize with `Ensure` before, so a
+  hand-rolled stop raced it into false-success outcomes: a concurrent `Ensure`
+  could re-apply the agent the stop had just removed, or the stop could remove
+  the replacement `Ensure` had just started. Stop reuses Ensure's ladder aimed
+  at absence: a serving incumbent is drained through the control lane, pinned
+  to the build and generation just observed; one already draining, or a husk
+  with a dead listener, settles out of the process table from the durable
+  owner record, wedge repair included; no record at all leaves absence to the
+  executable-scoped inventory; and stopping a stopped daemon is success. The
+  LaunchAgent is removed last, after departure is proven, so launchd cannot
+  relaunch what was just drained. A markerless (pre-v0.21) plist at the label
+  is removed through `launchd.RemoveUnmarked` — the Client's own
+  `Daemon.Label` is the assertion that verb requires — so one `Stop` call is a
+  whole uninstall on a machine upgraded from v0.20.
+
+- `launchd.RemoveUnmarked` and `launchd.ErrMarked` — the named escape for the
+  pre-marker era. `Remove` refuses any plist without the
+  `DAEMONKIT_AGENT_OWNER` marker (`ErrNotOwned`), which is correct
+  steady-state but strands every pre-v0.21 install: v0.20 never wrote markers,
+  so uninstall paths hit `ErrNotOwned` on plists those consumers themselves
+  wrote. `RemoveUnmarked` boots out and deletes the label's agent only when
+  its plist is markerless — naming the label is the caller's ownership
+  assertion, the same prefix-guard pattern synckit's migration used — and a
+  plist carrying the marker refuses untouched with `ErrMarked`, so the two
+  verbs partition plist shapes exactly and neither bypasses the other.
+
 ## [0.21.0] - 2026-08-02
 
 ### Added
@@ -1160,7 +1197,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.21.1...HEAD
+[0.21.1]: https://github.com/yasyf/daemonkit/compare/v0.21.0...v0.21.1
 [0.21.0]: https://github.com/yasyf/daemonkit/compare/v0.20.10...v0.21.0
 [0.20.10]: https://github.com/yasyf/daemonkit/compare/v0.20.9...v0.20.10
 [0.20.9]: https://github.com/yasyf/daemonkit/compare/v0.20.8...v0.20.9

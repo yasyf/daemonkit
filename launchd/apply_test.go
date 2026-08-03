@@ -455,6 +455,103 @@ func TestRemoveRefusesAPlistWithoutTheOwnershipMarker(t *testing.T) {
 	}
 }
 
+func markerlessPlist(t *testing.T, dir, label string) (path, body string) {
+	t.Helper()
+	path = filepath.Join(dir, label+".plist")
+	body = "<?xml version=\"1.0\"?>\n<plist><dict><key>Label</key><string>" + label + "</string></dict></plist>\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path, body
+}
+
+// TestRemoveUnmarkedBootsOutAndDeletesTheMarkerlessLabel is the named escape
+// for the pre-marker era: the exact plist Remove refuses with ErrNotOwned goes,
+// on the caller's own assertion of the label.
+func TestRemoveUnmarkedBootsOutAndDeletesTheMarkerlessLabel(t *testing.T) {
+	dir := launchAgentsDir(t)
+	label := "com.example.legacy"
+	path, _ := markerlessPlist(t, dir, label)
+	rec := &recorder{loaded: true}
+
+	if err := Remove(context.Background(), rec.run, label); !errors.Is(err, ErrNotOwned) {
+		t.Fatalf("Remove of the legacy plist = %v, want %v", err, ErrNotOwned)
+	}
+	if err := RemoveUnmarked(context.Background(), rec.run, label); err != nil {
+		t.Fatalf("RemoveUnmarked: %v", err)
+	}
+
+	if want := []string{"bootout"}; !slices.Equal(rec.verbs, want) {
+		t.Fatalf("verbs = %v, want %v", rec.verbs, want)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("legacy plist survived removal: err=%v", err)
+	}
+}
+
+// TestRemoveUnmarkedRefusesAMarkedPlist keeps the escape an escape: a plist
+// carrying the marker is not the pre-marker shape, so only Remove's ordinary
+// ownership proof may take it down.
+func TestRemoveUnmarkedRefusesAMarkedPlist(t *testing.T) {
+	dir := launchAgentsDir(t)
+	agent := applyAgent(t, "com.example.marked")
+	path := installPlist(t, dir, agent)
+	rec := &recorder{loaded: true}
+
+	err := RemoveUnmarked(context.Background(), rec.run, agent.Label)
+	if !errors.Is(err, ErrMarked) {
+		t.Fatalf("RemoveUnmarked of a marked plist = %v, want %v", err, ErrMarked)
+	}
+	if len(rec.verbs) != 0 {
+		t.Fatalf("verbs = %v, want the marked job left loaded", rec.verbs)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("marked plist = %v, want it untouched", err)
+	}
+}
+
+// TestRemoveUnmarkedIsIdempotent mirrors Remove's no-op: with no plist at
+// daemonkit's path there is no legacy shape to clear, and launchd is asked
+// nothing.
+func TestRemoveUnmarkedIsIdempotent(t *testing.T) {
+	dir := launchAgentsDir(t)
+	label := "com.example.legacygone"
+	markerlessPlist(t, dir, label)
+	first := &recorder{loaded: true}
+	if err := RemoveUnmarked(context.Background(), first.run, label); err != nil {
+		t.Fatalf("first RemoveUnmarked: %v", err)
+	}
+	if want := []string{"bootout"}; !slices.Equal(first.verbs, want) {
+		t.Fatalf("first RemoveUnmarked verbs = %v, want %v", first.verbs, want)
+	}
+
+	second := &recorder{loaded: true}
+	if err := RemoveUnmarked(context.Background(), second.run, label); err != nil {
+		t.Fatalf("second RemoveUnmarked: %v", err)
+	}
+	if len(second.verbs) != 0 {
+		t.Fatalf("second RemoveUnmarked verbs = %v, want an empty label left alone", second.verbs)
+	}
+}
+
+// TestRemoveUnmarkedSucceedsWhenLaunchdDoesNotKnowTheLabel holds the other
+// half of the no-op: a legacy plist whose job launchd never loaded still goes.
+func TestRemoveUnmarkedSucceedsWhenLaunchdDoesNotKnowTheLabel(t *testing.T) {
+	dir := launchAgentsDir(t)
+	label := "com.example.legacyunknown"
+	path, _ := markerlessPlist(t, dir, label)
+	unknown := func(context.Context, string, ...string) (string, int, error) {
+		return "Boot-out failed: 3: No such process", launchctlNotLoadedExit, launchctlErr(launchctlNotLoadedExit)
+	}
+
+	if err := RemoveUnmarked(context.Background(), unknown, label); err != nil {
+		t.Fatalf("RemoveUnmarked: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("legacy plist survived removal: err=%v", err)
+	}
+}
+
 // TestVerify pins the observation Apply decides from: what launchd says about
 // the label, what sits at daemonkit's path, and nothing mutated either way.
 func TestVerify(t *testing.T) {
@@ -563,6 +660,10 @@ func TestApplyAndRemoveRequireARunner(t *testing.T) {
 		!strings.Contains(err.Error(), "runner is required") {
 		t.Fatalf("Remove with nil runner = %v, want a runner-required error", err)
 	}
+	if err := RemoveUnmarked(context.Background(), nil, "com.example.worker"); err == nil ||
+		!strings.Contains(err.Error(), "runner is required") {
+		t.Fatalf("RemoveUnmarked with nil runner = %v, want a runner-required error", err)
+	}
 }
 
 func TestRemoveRequiresACanonicalLabel(t *testing.T) {
@@ -570,6 +671,10 @@ func TestRemoveRequiresACanonicalLabel(t *testing.T) {
 	if err := Remove(context.Background(), okRunner, "../escape"); err == nil ||
 		!strings.Contains(err.Error(), "not canonical") {
 		t.Fatalf("Remove of a traversing label = %v, want a canonical-label refusal", err)
+	}
+	if err := RemoveUnmarked(context.Background(), okRunner, "../escape"); err == nil ||
+		!strings.Contains(err.Error(), "not canonical") {
+		t.Fatalf("RemoveUnmarked of a traversing label = %v, want a canonical-label refusal", err)
 	}
 }
 

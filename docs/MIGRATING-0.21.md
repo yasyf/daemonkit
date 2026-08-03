@@ -239,9 +239,14 @@ requirement, because the control lane admits one session server-wide.
   `DAEMONKIT_AGENT_OWNER` environment key into each plist and treats its presence as that label's
   store-free proof of ownership; v0.20's `service` package never wrote one. So an uninstall run
   against a machine that has not yet had a v0.21 *install* hits `launchd.ErrNotOwned` on every
-  legacy label and leaves those agents loaded. Install first, or handle `ErrNotOwned` with a
-  legacy-removal path. `Apply` is unaffected — it archives the foreign plist aside and writes a
-  marked one, though the archive stays in `~/Library/LaunchAgents` afterward.
+  legacy label and leaves those agents loaded. v0.21.1 adds the named escape:
+  `launchd.RemoveUnmarked` removes a label's agent only when its plist is markerless — naming the
+  label is your ownership assertion, so name only labels your product registered — and
+  `Client.Stop` falls back to it on `ErrNotOwned`, making one `Stop` call a whole uninstall on an
+  upgraded machine. Everything not routed through those two still hits the wall: any other
+  `launchd.Remove` call site refuses every legacy label it touches. `Apply` is
+  unaffected — it archives the foreign plist aside and writes a marked one, though the archive
+  stays in `~/Library/LaunchAgents` afterward.
 
   Two consumers hit this independently during migration, so assume it applies to yours.
 
