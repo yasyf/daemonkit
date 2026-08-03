@@ -1,20 +1,23 @@
 //go:build darwin
 
-// This file is daemonkit's only real-machine coverage: it bootstraps genuine
-// user LaunchAgents into gui/<uid>, lets launchd exec and supervise a real
-// daemon, and drives Ensure, Control.Drain, and the shutdown ladder against
-// them. Every other suite replaces /bin/launchctl with a recorder, so nothing
-// else in the tree has ever observed launchd's own behaviour: the exit-code
-// classifier, Verify's idempotence claim, the abandoned-stage park, and the
-// ExitTimeOut SIGKILL backstop are all covered here and nowhere else.
+// This file is daemonkit's real-machine launchd coverage: it bootstraps
+// genuine user LaunchAgents into gui/<uid>, lets launchd exec and supervise a
+// real daemon, and drives Ensure, Control.Drain, and the shutdown ladder
+// against them. The suite replaces /bin/launchctl with a double, so nothing in
+// it observes launchd's own behaviour: the exit-code classifier, Verify's
+// idempotence claim, the abandoned-stage park, and the ExitTimeOut SIGKILL
+// backstop are covered here and nowhere else.
 //
-// It mutates the machine, so it is opt-in: set DAEMONKIT_E2E_LAUNCHD=1 and it
-// runs, otherwise every test skips. Everything it installs carries the
-// e2eLabelPrefix, every label is fixed rather than minted per run (launchctl
-// enable writes a row into the root-owned disabled.<uid>.plist that no verb
-// can remove, so a per-run label would leak one row per run forever), and
-// sweepLabel boots out and unlinks each one on every exit path.
-package daemonkit_test
+// It lives under _e2e/, which the go tool excludes from ./... , because it
+// mutates the machine irreversibly: launchctl enable writes a row into the
+// root-owned /var/db/com.apple.xpc.launchd/disabled.<uid>.plist that no verb
+// removes. It is never part of scripts/test.sh; scripts/e2e-launchd.sh is the
+// only thing that runs it, and that script is invoked by hand. Nothing here is
+// conditional — there is no env gate and no skip. Everything it installs
+// carries the e2eLabelPrefix, every label is fixed rather than minted per run
+// so the leaked rows stay O(labels) rather than O(runs), and sweepLabel boots
+// out and unlinks each one on every exit path.
+package e2e
 
 import (
 	"context"
@@ -36,9 +39,6 @@ import (
 )
 
 const (
-	// e2eEnv opts a run in. Without it every test here skips, so a routine
-	// scripts/test.sh ./... never bootstraps a LaunchAgent.
-	e2eEnv = "DAEMONKIT_E2E_LAUNCHD"
 	// e2eLabelPrefix is what every label this file installs begins with, so a
 	// stranded job is attributable on sight.
 	e2eLabelPrefix = "com.yasyf.daemonkit.e2e."
@@ -77,7 +77,6 @@ type lane struct {
 // sun_path.
 func newLane(t *testing.T, label string, shutdown time.Duration, restart daemonkit.Restart) *lane {
 	t.Helper()
-	requireE2E(t)
 	sweepLabel(t, label)
 
 	home, err := os.MkdirTemp("/private/tmp", "dke-")
@@ -290,17 +289,6 @@ func parseInt(s string) (int64, error) {
 		n = n*10 + int64(c-'0')
 	}
 	return n, nil
-}
-
-func requireE2E(t *testing.T) {
-	t.Helper()
-	if os.Getenv(e2eEnv) != "1" {
-		t.Skipf("set %s=1 to run the real-launchd end-to-end suite", e2eEnv)
-	}
-	out, code, err := runLaunchctl(context.Background(), "print", "gui/"+itoa(os.Getuid()))
-	if err != nil || code != 0 {
-		t.Skipf("no bootstrappable gui/%d domain (code=%d err=%v): %s", os.Getuid(), code, err, firstLine(out))
-	}
 }
 
 func runLaunchctl(ctx context.Context, args ...string) (string, int, error) {

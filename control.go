@@ -133,9 +133,7 @@ func (c *Client) Control(ctx context.Context) (*Control, error) {
 	if err != nil {
 		return nil, classifyWire(err)
 	}
-	pinned, report, err := assemblePin(os.Getpid(), servingPID, c.probe, func() (wire.HealthReport, error) {
-		return session.Health(ctx)
-	})
+	pinned, report, err := assemblePin(ctx, os.Getpid(), servingPID, session)
 	if err != nil {
 		_ = session.Abort(err)
 		return nil, err
@@ -144,7 +142,7 @@ func (c *Client) Control(ctx context.Context) (*Control, error) {
 		session:    session,
 		pinned:     pinned,
 		generation: report.Generation,
-		observe:    c.observe,
+		observe:    proc.Observe,
 	}, nil
 }
 
@@ -182,19 +180,15 @@ func classifyServingTrust(err error) error {
 // assemblePin runs the attach pin in the documented order: self-pin refusal,
 // probe for {start, boot}, then the same-session health self-attestation that
 // proves the probed identity belongs to the session's peer.
-func assemblePin(
-	self, peerPID int,
-	probe func(int) (proc.Identity, error),
-	health func() (wire.HealthReport, error),
-) (proc.Identity, wire.HealthReport, error) {
+func assemblePin(ctx context.Context, self, peerPID int, session *wire.Client) (proc.Identity, wire.HealthReport, error) {
 	if peerPID == self {
 		return proc.Identity{}, wire.HealthReport{}, fmt.Errorf("daemonkit: refusing to pin own process %d", self)
 	}
-	pinned, err := probe(peerPID)
+	pinned, err := proc.ProbeIdentity(peerPID)
 	if err != nil {
 		return proc.Identity{}, wire.HealthReport{}, fmt.Errorf("daemonkit: probe peer %d: %w", peerPID, err)
 	}
-	report, err := health()
+	report, err := session.Health(ctx)
 	if err != nil {
 		return proc.Identity{}, wire.HealthReport{}, fmt.Errorf("daemonkit: health self-attestation: %w", err)
 	}

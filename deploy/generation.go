@@ -86,10 +86,6 @@ type signatureAttestation struct {
 	EntitlementsDigest SHA256
 }
 
-type verifier interface {
-	Verify(context.Context, string, string) (signatureAttestation, error)
-}
-
 // inspect attests the bundle at appPath against the deployment's designated
 // requirement and reports the version it declares. It is the only path to a
 // Generation: nothing else in this package mints one, so no fact in one is
@@ -98,7 +94,7 @@ func (d *Deployment) inspect(ctx context.Context, appPath string) (Generation, e
 	if err := validateCanonicalAppPath(appPath); err != nil {
 		return Generation{}, err
 	}
-	signature, err := d.verify.Verify(ctx, appPath, d.requirement)
+	signature, err := codesignVerifier{}.Verify(ctx, appPath, d.requirement)
 	if err != nil {
 		return Generation{}, fmt.Errorf("deploy: verify signed bundle: %w", err)
 	}

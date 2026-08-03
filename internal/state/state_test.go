@@ -317,7 +317,7 @@ func TestArchivesNeverOverwriteOneAnother(t *testing.T) {
 
 func TestLoadUnreadableFileIsError(t *testing.T) {
 	if os.Geteuid() == 0 {
-		t.Skip("root reads a 0000 file regardless of mode")
+		t.Fatal("this suite does not run as root: root reads a 0000 file regardless of mode, so the permission this test reads Load through does not exist")
 	}
 	path, file := seed(t, handFrame(uint32(era), `{"cores":[]}`, `{"note":"x"}`))
 	if err := os.Chmod(path, 0o000); err != nil {

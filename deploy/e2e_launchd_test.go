@@ -1,21 +1,27 @@
-//go:build darwin
+//go:build darwin && dke2e
 
-// This file is deploy's only real-machine coverage. Every other test in the
-// package replaces deployment.run with a recorder and deployment.inventory
-// with a literal, so the verb chain has never driven /bin/launchctl, never had
-// launchd exec a daemon, and never had its quiesce gate read the real process
+// This file is deploy's real-machine coverage. The rest of the package drives
+// a launchctl double, so the verb chain never drives /bin/launchctl, never has
+// launchd exec a daemon, and never has its quiesce gate read the real process
 // table.
 //
-// Exactly one boundary stays faked: deployment.verify. The designated
-// requirement deploy renders demands a Developer ID Application anchor
-// (`anchor apple generic` + the Team OU + the DevID leaf OIDs), this machine
-// holds no code-signing identity at all, and no signature it can produce
-// satisfies that requirement — so the codesign gate is unprovable here by
-// construction, not by choice. Everything downstream of it is real: the tree
-// copy, the swap record, the rename pair, launchctl bootstrap/bootout, the
-// launchd-spawned daemon, Control.Drain, and the executable-scoped inventory.
+// One relaxation, forced rather than chosen: the designated requirement deploy
+// renders demands a Developer ID Application anchor (`anchor apple generic` +
+// the Team OU + the DevID leaf OIDs), and no machine that builds this module
+// holds an identity that can mint one. The bundle is ad-hoc signed and the DR
+// narrows to its identifier clause, exactly as every other test in the package
+// does. Everything else is real: codesign, the tree copy, the swap record, the
+// rename pair, launchctl bootstrap/bootout, the launchd-spawned daemon,
+// Control.Drain, and the executable-scoped inventory.
 //
-// Opt in with DAEMONKIT_E2E_LAUNCHD=1; without it every test here skips.
+// The dke2e tag keeps it out of scripts/test.sh, because bootstrapping a real
+// LaunchAgent leaks a permanent row into the root-owned
+// /var/db/com.apple.xpc.launchd/disabled.<uid>.plist that no launchctl verb
+// removes. Its sibling at _e2e/launchd_test.go needs no tag — the go tool
+// skips an underscore-prefixed directory — but this one reads
+// deployment.requirement, which is package-private, so it cannot move out of
+// package deploy. scripts/e2e-launchd.sh is the only thing that runs it, and a
+// human invokes that script. Nothing here is conditional: no env gate, no skip.
 package deploy
 
 import (
@@ -34,7 +40,6 @@ import (
 )
 
 const (
-	e2eEnv          = "DAEMONKIT_E2E_LAUNCHD"
 	e2eAgentLabel   = "com.yasyf.daemonkit.e2e.deployagent"
 	e2eDaemonLabel  = "com.yasyf.daemonkit.e2e.deploy"
 	e2eHelperRel    = "Contents/MacOS/dkhelper"
@@ -55,7 +60,6 @@ type e2eFixture struct {
 
 func newE2EFixture(t *testing.T) *e2eFixture {
 	t.Helper()
-	requireE2ELaunchd(t)
 	bootoutE2E(t, e2eAgentLabel)
 
 	// The install root must be a canonical real path — layout.ensureMetadata
@@ -91,15 +95,18 @@ func newE2EFixture(t *testing.T) *e2eFixture {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	// The one fake. run and inventory stay real.
-	deployment.verify = fakeVerifier{}
+	// codesign, launchctl, and the process table are all real here. The one
+	// relaxation is the designated requirement: the bundle is ad-hoc signed,
+	// because no Developer ID identity exists on a developer machine or a CI
+	// runner to sign it any other way. See adhocRequirement.
+	deployment.requirement = adhocRequirement
 
 	f := &e2eFixture{t: t, root: root, home: home, app: app, deploy: deployment, agent: agent}
 	t.Cleanup(f.teardown)
 	return f
 }
 
-// e2eCandidate builds a real helper daemon into an unsigned .app skeleton and
+// e2eCandidate builds a real helper daemon into an ad-hoc signed .app and
 // returns the candidate naming it. variant is stamped through -ldflags so two
 // candidates differ in every byte the tree digest reads.
 func (f *e2eFixture) e2eCandidate(name, version, variant string) Candidate {
@@ -112,7 +119,9 @@ func (f *e2eFixture) e2eCandidate(name, version, variant string) Candidate {
 	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict>
 <key>CFBundleShortVersionString</key><string>%s</string>
-</dict></plist>`, version)
+<key>CFBundleExecutable</key><string>dkhelper</string>
+<key>CFBundleIdentifier</key><string>%s</string>
+</dict></plist>`, version, testSigning)
 	if err := os.WriteFile(filepath.Join(source, "Contents", "Info.plist"), []byte(plist), 0o644); err != nil {
 		f.t.Fatal(err)
 	}
@@ -127,6 +136,7 @@ func (f *e2eFixture) e2eCandidate(name, version, variant string) Candidate {
 	if out, err := build.CombinedOutput(); err != nil {
 		f.t.Fatalf("build helper %q: %v\n%s", variant, err, out)
 	}
+	signBundle(f.t, source)
 	digest, err := bundleTreeDigest(source)
 	if err != nil {
 		f.t.Fatal(err)
@@ -154,16 +164,6 @@ func (f *e2eFixture) teardown() {
 	plist := filepath.Join(f.home, "Library", "LaunchAgents", e2eAgentLabel+".plist")
 	_ = os.Remove(plist)
 	_ = os.RemoveAll(f.root)
-}
-
-func requireE2ELaunchd(t *testing.T) {
-	t.Helper()
-	if os.Getenv(e2eEnv) != "1" {
-		t.Skipf("set %s=1 to run the real-launchd deploy end-to-end", e2eEnv)
-	}
-	if _, code, err := e2eLaunchctl(context.Background(), "print", fmt.Sprintf("gui/%d", os.Getuid())); err != nil || code != 0 {
-		t.Skipf("no bootstrappable gui/%d domain (code=%d err=%v)", os.Getuid(), code, err)
-	}
 }
 
 func e2eLaunchctl(ctx context.Context, args ...string) (string, int, error) {

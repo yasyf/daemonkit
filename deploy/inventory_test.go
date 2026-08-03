@@ -171,6 +171,7 @@ func TestExecutablesCoversTheBundleMovedAside(t *testing.T) {
 	want := []string{
 		f.agent.Program,
 		filepath.Join(f.deploy.layout.prior, "Contents", "Library", "LoginItems", "helper"),
+		filepath.Join(f.deploy.layout.prior, "Contents", "MacOS", "example"),
 		filepath.Join(f.deploy.layout.candidate, "Contents", "MacOS", "example"),
 	}
 	slices.Sort(want)
@@ -203,6 +204,7 @@ func TestExecutablesCoversTheBundleMovedIntoTheRemovalSlot(t *testing.T) {
 	want := []string{
 		f.agent.Program,
 		filepath.Join(f.deploy.layout.removed, "Contents", "Library", "LoginItems", "helper"),
+		filepath.Join(f.deploy.layout.removed, "Contents", "MacOS", "example"),
 	}
 	slices.Sort(want)
 	if !slices.Equal(got, want) {
@@ -309,86 +311,89 @@ func TestGenerationSlotsNamesEveryBundleTheLayoutDerives(t *testing.T) {
 
 func TestRequireEmptyNamesTheSurvivors(t *testing.T) {
 	f := newFixture(t)
-	f.live = []LiveProcess{{PID: 321, Start: 77, Boot: 9, Executable: f.agent.Program}}
+	if _, err := f.deploy.Install(f.ctx(), f.candidate("Source", "1.0", "one")); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	child := f.live(f.agent.Program)
 	err := f.deploy.requireEmpty()
 	if !errors.Is(err, ErrLive) {
 		t.Fatalf("requireEmpty err = %v, want ErrLive", err)
 	}
-	if !isSentinel(err, errors.New("321")) || !isSentinel(err, errors.New(f.agent.Program)) {
-		t.Fatalf("requireEmpty err = %v, want the surviving pid and executable named", err)
+	pid := child.Process.Pid
+	if !isSentinel(err, errors.New(strconv.Itoa(pid))) || !isSentinel(err, errors.New(f.agent.Program)) {
+		t.Fatalf("requireEmpty err = %v, want pid %d and %q named", err, pid, f.agent.Program)
 	}
-	f.live = nil
+	f.settle(child, f.agent.Program)
 	if err := f.deploy.requireEmpty(); err != nil {
 		t.Fatalf("requireEmpty = %v, want nil", err)
 	}
 }
 
 // TestRequireEmptyHoldsOnlyItsOwnUnnameableHusk is the gate's precision in both
-// directions. Its own husk — the daemon whose bytes an upgrade unlinked — is in
+// directions, against husks the kernel really cannot name — a child of this
+// binary whose executable was unlinked out from under it. Its own husk is in
 // the owner record it wrote before binding, so the gate still refuses. The
 // stranger's husk is in no record of this deployment, and a gate that counted
 // it would never pass again on a machine that carries one.
 func TestRequireEmptyHoldsOnlyItsOwnUnnameableHusk(t *testing.T) {
+	t.Run("the husk this deployment's daemon recorded", func(t *testing.T) {
+		f := newFixture(t)
+		pid := f.husk(true)
+		err := f.deploy.requireEmpty()
+		if !errors.Is(err, ErrLive) {
+			t.Fatalf("requireEmpty err = %v, want ErrLive", err)
+		}
+		if !isSentinel(err, errors.New("unnameable")) || !isSentinel(err, errors.New(strconv.Itoa(pid))) {
+			t.Fatalf("requireEmpty err = %v, want the surviving pin named", err)
+		}
+	})
+	t.Run("a husk this deployment never recorded", func(t *testing.T) {
+		f := newFixture(t)
+		recorded := f.recordOwner(t)
+		pid := f.husk(false)
+		if pid == recorded.PID {
+			t.Fatalf("the husk took the recorded pid %d", pid)
+		}
+		if err := f.deploy.requireEmpty(); err != nil {
+			t.Fatalf("requireEmpty = %v, want a clear gate", err)
+		}
+	})
+	t.Run("a husk beside a daemon that recorded nothing", func(t *testing.T) {
+		f := newFixture(t)
+		f.husk(false)
+		if err := f.deploy.requireEmpty(); err != nil {
+			t.Fatalf("requireEmpty = %v, want a clear gate", err)
+		}
+	})
+}
+
+// TestAttributedComparesTheWholePin is the correlation the husk gate rests on,
+// held to inputs no live process can be made to take: the kernel hands a pid to
+// a stranger the moment its owner leaves, and a boot counter only moves across
+// a reboot. Both are reachable as values and neither is reachable as a process,
+// so this is where they are covered.
+func TestAttributedComparesTheWholePin(t *testing.T) {
+	recorded := proc.Identity{PID: 4242, Start: 77, Boot: 9}
 	tests := []struct {
-		name    string
-		record  bool
-		husk    func(proc.Identity) LiveProcess
-		wantErr error
+		name string
+		husk LiveProcess
+		want bool
 	}{
-		{
-			name:    "the husk this deployment's daemon recorded",
-			record:  true,
-			husk:    func(id proc.Identity) LiveProcess { return LiveProcess{PID: id.PID, Start: id.Start, Boot: id.Boot} },
-			wantErr: ErrLive,
-		},
-		{
-			name:   "a husk this deployment never recorded",
-			record: true,
-			husk: func(id proc.Identity) LiveProcess {
-				return LiveProcess{PID: id.PID + 1, Start: id.Start, Boot: id.Boot}
-			},
-		},
-		{
-			name:   "the recorded pid at an instance the record does not name",
-			record: true,
-			husk: func(id proc.Identity) LiveProcess {
-				return LiveProcess{PID: id.PID, Start: id.Start + 1, Boot: id.Boot}
-			},
-		},
-		{
-			name:   "the recorded pin from another boot session",
-			record: true,
-			husk: func(id proc.Identity) LiveProcess {
-				return LiveProcess{PID: id.PID, Start: id.Start, Boot: id.Boot + 1}
-			},
-		},
-		{
-			name: "a husk beside a daemon that recorded nothing",
-			husk: func(proc.Identity) LiveProcess { return LiveProcess{PID: 4242, Start: 77, Boot: 9} },
-		},
+		{"the recorded pin", LiveProcess{PID: 4242, Start: 77, Boot: 9}, true},
+		{"another pid at the recorded instance", LiveProcess{PID: 4243, Start: 77, Boot: 9}, false},
+		{"the recorded pid at an instance the record does not name", LiveProcess{PID: 4242, Start: 78, Boot: 9}, false},
+		{"the recorded pin from another boot session", LiveProcess{PID: 4242, Start: 77, Boot: 10}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			f := newFixture(t)
-			var recorded proc.Identity
-			if tt.record {
-				recorded = f.recordOwner(t)
-			}
-			f.unnameable = []LiveProcess{tt.husk(recorded)}
-			err := f.deploy.requireEmpty()
-			if tt.wantErr == nil {
-				if err != nil {
-					t.Fatalf("requireEmpty = %v, want a clear gate", err)
-				}
-				return
-			}
-			if !errors.Is(err, tt.wantErr) {
-				t.Fatalf("requireEmpty err = %v, want %v", err, tt.wantErr)
-			}
-			if !isSentinel(err, errors.New("unnameable")) || !isSentinel(err, errors.New(strconv.Itoa(recorded.PID))) {
-				t.Fatalf("requireEmpty err = %v, want the surviving pin named", err)
+			got := Survivors{Unnameable: []LiveProcess{tt.husk}}.attributed(recorded)
+			if (len(got) == 1) != tt.want {
+				t.Fatalf("attributed(%+v) = %+v, want attributed=%v", tt.husk, got, tt.want)
 			}
 		})
+	}
+	if got := (Survivors{Unnameable: []LiveProcess{{PID: 4242, Start: 77, Boot: 9}}}).attributed(); len(got) != 0 {
+		t.Fatalf("attributed() over an empty record = %+v, want none", got)
 	}
 }
 

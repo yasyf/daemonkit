@@ -32,7 +32,7 @@ func TestMkdirTreatsPresenceAsSuccess(t *testing.T) {
 // observable at all.
 func TestMkdirSyncsThroughAPresentDirectory(t *testing.T) {
 	if os.Geteuid() == 0 {
-		t.Skip("root bypasses the directory mode this test reads the fsync through")
+		t.Fatal("this suite does not run as root: root bypasses the directory mode this test reads the fsync through")
 	}
 	parent := filepath.Join(t.TempDir(), "metadata")
 	dir := filepath.Join(parent, "generation")

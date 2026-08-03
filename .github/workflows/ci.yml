@@ -55,6 +55,16 @@ jobs:
       - name: Vet
         # -unsafeptr=false: dlsym data-symbol FFI in trust/ (ccn 239201e).
         run: go vet -unsafeptr=false ./...
+
+      - name: Vet (out-of-suite e2e)
+        # No surface here is reached by ./... — _e2e and _e2e/trust are underscore-skipped
+        # and the deploy half is tag-gated — so without this they rot until someone runs
+        # the script. _e2e/trust needs a Developer ID identity no runner has, so vetting it
+        # is the only CI signal it gets.
+        run: |
+          go vet -unsafeptr=false ./_e2e
+          go vet -unsafeptr=false ./_e2e/trust
+          go vet -unsafeptr=false -tags dke2e ./deploy
       - name: Test (race, via the process-cap harness)
         run: ./scripts/test.sh -race ./...
       - name: Build (pure)

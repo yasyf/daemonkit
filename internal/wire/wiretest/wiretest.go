@@ -1,6 +1,5 @@
 // Package wiretest is the in-process harness for wire's transport and peer
-// tests: short-path socket dirs, a real client/server pair, a stub Runtime,
-// and a manually-advanced clock mirroring proc's seam.
+// tests: short-path socket dirs, a real client/server pair, and a stub Runtime.
 package wiretest
 
 import (
@@ -11,7 +10,6 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/yasyf/daemonkit/internal/wire"
 )
@@ -157,69 +155,4 @@ func (r *StubRuntime) Drain() {
 		close(r.Drained)
 		r.SetPhase(wire.PhaseDraining, nil)
 	})
-}
-
-// Clock is the time seam mirrored from proc: real wall time in production, a
-// FakeClock in tests.
-type Clock interface {
-	Now() time.Time
-	After(d time.Duration) <-chan time.Time
-}
-
-// FakeClock is a manually-advanced Clock: Now moves only on Advance, which fires
-// every waiter whose deadline has arrived.
-type FakeClock struct {
-	mu      sync.Mutex
-	now     time.Time
-	waiters []fakeWaiter
-}
-
-type fakeWaiter struct {
-	at time.Time
-	ch chan time.Time
-}
-
-var _ Clock = (*FakeClock)(nil)
-
-// NewFakeClock returns a FakeClock reading start until the first Advance.
-func NewFakeClock(start time.Time) *FakeClock {
-	return &FakeClock{now: start}
-}
-
-// Now returns the current fake time.
-func (c *FakeClock) Now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.now
-}
-
-// After returns a channel that fires once the fake clock reaches now+d. A
-// non-positive d fires immediately.
-func (c *FakeClock) After(d time.Duration) <-chan time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	ch := make(chan time.Time, 1)
-	at := c.now.Add(d)
-	if !at.After(c.now) {
-		ch <- c.now
-		return ch
-	}
-	c.waiters = append(c.waiters, fakeWaiter{at: at, ch: ch})
-	return ch
-}
-
-// Advance moves the clock forward by d and fires every waiter now due.
-func (c *FakeClock) Advance(d time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.now = c.now.Add(d)
-	kept := c.waiters[:0]
-	for _, w := range c.waiters {
-		if w.at.After(c.now) {
-			kept = append(kept, w)
-			continue
-		}
-		w.ch <- c.now
-	}
-	c.waiters = kept
 }

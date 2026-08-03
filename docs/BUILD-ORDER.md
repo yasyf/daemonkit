@@ -42,9 +42,14 @@ saturation is required, and none is permitted** — the kernel path performs no 
 daemon, so there is nothing for load to affect. This box reports `0 valid identities`; the fleet
 ships signed apps and `repo-bootstrap:apple-certs` mints them, so the gate is runnable (~30 min).
 
-**Also in phase 0:** **G4** — give the `DAEMONKIT_TRUST_E2E` suite and `scripts/trust-fixtures.sh`
-a CI or release-gate home. They appear in no workflow today, so **the signed-peer path is verified
-by nobody**, and G2 in phase 1 is meaningless without it. Requires a signing identity in CI: a
+**Also in phase 0:** **G4 — closed by measurement (cc-notes `bbdbd8c`): the signed-peer suite has
+no CI home.** It needs a Developer ID identity, and this box reports `0 valid identities` (line 43
+above) as does every runner; ad-hoc signing reports `TeamIdentifier=not set` and validation
+category ≠ 6, which `verifyToken` refuses. So the suite left `internal/trust` for `_e2e/trust/`,
+where the go tool cannot reach it, and `scripts/e2e-trust.sh` — which mints the fixtures and exits
+2 naming the missing identity — is its home; CI vets the package so it cannot rot silently.
+**The signed-peer path is therefore verified by whoever holds the identity and by nobody in CI**,
+and G2 in phase 1 rests on that hand run. Putting a signing identity in CI remains a
 release-infrastructure prerequisite, not a test chore.
 
 **Gates:** budget property tests; mixed-era harness runs (against a stub daemon until phase 3);

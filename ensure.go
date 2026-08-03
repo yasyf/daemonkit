@@ -244,8 +244,8 @@ func (c *Client) observeWorld(ctx context.Context, agent launchd.Agent) (converg
 		return converge.World{}, err
 	}
 	return converge.Observe(ctx, converge.Sources{
-		Serving:    c.serving,
-		Recorded:   c.readOwner,
+		Serving:    c.servedHealth,
+		Recorded:   proc.ReadOwner,
 		RecordPath: record,
 		Agent:      agent,
 		Launchctl:  c.launchctl,
@@ -388,7 +388,7 @@ func (c *Client) prove(ctx context.Context, target incumbent, observed proc.Iden
 		if recordErr != nil {
 			return recordErr
 		}
-		if err := repairWedged(record, target, c.readOwner, c.probe, c.kill); err != nil {
+		if err := repairWedged(record, target); err != nil {
 			return err
 		}
 		reproofCtx, cancelReproof := proving.Share("reproof", proveReproofShare).Context(ctx)
@@ -407,14 +407,8 @@ func (c *Client) prove(ctx context.Context, target incumbent, observed proc.Iden
 // {pid, start, boot} must still be live and match, so a PID the kernel has
 // since handed to a stranger is never signalled either. The identity, not the
 // number, is the address.
-func repairWedged(
-	recordPath string,
-	target incumbent,
-	readOwner func(string) (proc.Owner, bool, error),
-	probe func(int) (proc.Identity, error),
-	kill func(int, syscall.Signal) error,
-) error {
-	owner, ok, err := readOwner(recordPath)
+func repairWedged(recordPath string, target incumbent) error {
+	owner, ok, err := proc.ReadOwner(recordPath)
 	if err != nil {
 		return err
 	}
@@ -424,7 +418,7 @@ func repairWedged(
 	if target.expect().mismatch(owner.Build, owner.Generation) {
 		return ErrWrongIncumbent
 	}
-	live, err := probe(owner.PID)
+	live, err := proc.ProbeIdentity(owner.PID)
 	if errors.Is(err, proc.ErrNoProcess) {
 		return nil
 	}
@@ -434,7 +428,7 @@ func repairWedged(
 	if live.Start != owner.Start || live.Boot != owner.Boot {
 		return nil
 	}
-	if err := kill(owner.PID, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+	if err := syscall.Kill(owner.PID, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
 		return fmt.Errorf("daemonkit: terminate wedged incumbent %d: %w", owner.PID, err)
 	}
 	return nil
@@ -473,7 +467,7 @@ func (c *Client) inventoryClear(observed proc.Identity) error {
 	if err != nil {
 		return err
 	}
-	found, err := c.identities(program)
+	found, err := proc.ExecutableIdentities(program)
 	if err != nil {
 		return fmt.Errorf("daemonkit: inventory %q: %w", program, err)
 	}

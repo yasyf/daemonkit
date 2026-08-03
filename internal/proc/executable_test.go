@@ -119,6 +119,6 @@ func foreignPID(t *testing.T) int {
 			return pid
 		}
 	}
-	t.Skip("no process owned by another user to read")
+	t.Fatal("no process owned by another user; a live macOS always runs some, and without one this read proves nothing")
 	return 0
 }

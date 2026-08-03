@@ -100,10 +100,8 @@ type Deployment struct {
 	config      Config
 	layout      layout
 	requirement string
-	verify      verifier
 	run         launchd.Runner
 	client      *daemonkit.Client
-	inventory   func(...string) (Survivors, error)
 }
 
 // Open binds a deployment to its configuration and resolves the host
@@ -146,10 +144,8 @@ func Open(config Config) (*Deployment, error) {
 		config:      config,
 		layout:      layoutFor(config.App),
 		requirement: requirement,
-		verify:      codesignVerifier{},
 		run:         execRunner,
 		client:      client,
-		inventory:   Inventory,
 	}, nil
 }
 

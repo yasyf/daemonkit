@@ -300,7 +300,7 @@ func (d *Deployment) requireEmpty() error {
 	if err != nil {
 		return err
 	}
-	found, err := d.inventory(paths...)
+	found, err := Inventory(paths...)
 	if err != nil {
 		return err
 	}

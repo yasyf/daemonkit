@@ -3,11 +3,9 @@ package daemonkit
 import (
 	"context"
 	"errors"
-	"syscall"
 	"time"
 
 	"github.com/yasyf/daemonkit/internal/proc"
-	"github.com/yasyf/daemonkit/internal/wire"
 	"github.com/yasyf/daemonkit/launchd"
 )
 
@@ -20,17 +18,7 @@ func Open(d Daemon) (*Client, error) {
 	if err := d.ValidateForClient(); err != nil {
 		return nil, err
 	}
-	c := &Client{
-		daemon:     d,
-		probe:      proc.ProbeIdentity,
-		observe:    proc.Observe,
-		identities: proc.ExecutableIdentities,
-		readOwner:  proc.ReadOwner,
-		kill:       syscall.Kill,
-		launchctl:  launchctl,
-	}
-	c.serving = c.servedHealth
-	return c, nil
+	return &Client{daemon: d, launchctl: launchctl}, nil
 }
 
 // Client reaches one daemon named by its Daemon identity. Every field past the
@@ -38,14 +26,8 @@ func Open(d Daemon) (*Client, error) {
 // file, the socket, launchctl — bound once at Open so the repair ladder has no
 // boundary it reaches around.
 type Client struct {
-	daemon     Daemon
-	probe      func(int) (proc.Identity, error)
-	observe    func(proc.Identity) (proc.Reap, bool, error)
-	identities func(string) (proc.Report, error)
-	readOwner  func(string) (proc.Owner, bool, error)
-	kill       func(int, syscall.Signal) error
-	serving    func(context.Context) (wire.HealthReport, proc.Identity, error)
-	launchctl  launchd.Runner
+	daemon    Daemon
+	launchctl launchd.Runner
 }
 
 // record is the durable owner record's path, derived past the Label rule
@@ -91,7 +73,7 @@ func (c *Client) Settle(ctx context.Context, expect Expect) (Stopped, error) {
 	if err != nil {
 		return Stopped{}, err
 	}
-	owner, ok, err := c.readOwner(record)
+	owner, ok, err := proc.ReadOwner(record)
 	if err != nil {
 		return Stopped{}, err
 	}
@@ -101,7 +83,7 @@ func (c *Client) Settle(ctx context.Context, expect Expect) (Stopped, error) {
 	if expect.mismatch(owner.Build, owner.Generation) {
 		return Stopped{}, ErrWrongIncumbent
 	}
-	reap, err := observeGone(ctx, c.observe, owner.Identity())
+	reap, err := observeGone(ctx, proc.Observe, owner.Identity())
 	if err != nil {
 		return Stopped{}, err
 	}

@@ -110,7 +110,7 @@ func requireKernelReads(t *testing.T) {
 	t.Helper()
 	csopsOnce.Do(loadCsops)
 	if csopsErr != nil {
-		t.Skipf("csops_audittoken unavailable: %v", csopsErr)
+		t.Fatalf("csops_audittoken unavailable: %v — it is in libsystem_kernel on every darwin that builds this module, and without it there is no verifier to test", csopsErr)
 	}
 }
 

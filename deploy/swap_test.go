@@ -4,7 +4,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"slices"
 	"testing"
 
 	"github.com/yasyf/daemonkit"
@@ -147,11 +146,8 @@ func TestRecoverRefusesATornRenamePair(t *testing.T) {
 		{
 			name: "the recorded prior is not what the canonical path holds",
 			place: func(t *testing.T, f *fixture) {
-				if err := os.WriteFile(
-					f.deploy.layout.canonical+"/Contents/MacOS/example", []byte("tampered"), 0o755,
-				); err != nil {
-					t.Fatal(err)
-				}
+				write(t, f.deploy.layout.canonical, bundleBodyRel, "tampered", 0o644)
+				signBundle(t, f.deploy.layout.canonical)
 			},
 			want: ErrConflict,
 		},
@@ -159,11 +155,8 @@ func TestRecoverRefusesATornRenamePair(t *testing.T) {
 			name: "the staged candidate is not the recorded one",
 			place: func(t *testing.T, f *fixture) {
 				rename(t, f.deploy.layout.canonical, f.deploy.layout.prior)
-				if err := os.WriteFile(
-					f.deploy.layout.candidate+"/Contents/MacOS/example", []byte("tampered"), 0o755,
-				); err != nil {
-					t.Fatal(err)
-				}
+				write(t, f.deploy.layout.candidate, bundleBodyRel, "tampered", 0o644)
+				signBundle(t, f.deploy.layout.candidate)
 			},
 			want: ErrConflict,
 		},
@@ -214,7 +207,7 @@ func TestRecoverGatesTheResumedDestruction(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			f := newFixture(t)
 			f.crash("one", "two", tt.place)
-			f.live = []LiveProcess{{PID: 909, Executable: f.agent.Program}}
+			f.liveSlot()
 			if err := f.deploy.recover(f.ctx()); !errors.Is(err, ErrLive) {
 				t.Fatalf("recover err = %v, want ErrLive", err)
 			}
@@ -237,7 +230,7 @@ func TestRecoverResumesASettledSwapWithoutAGate(t *testing.T) {
 		}
 		rename(t, f.deploy.layout.candidate, f.deploy.layout.canonical)
 	})
-	f.live = []LiveProcess{{PID: 909, Executable: f.agent.Program}}
+	f.liveSlot()
 	if err := f.deploy.recover(f.ctx()); err != nil {
 		t.Fatalf("recover: %v", err)
 	}
@@ -339,19 +332,32 @@ func TestRetireSwapDestroysNoPriorItsRecordDoesNotName(t *testing.T) {
 	if !fileExists(stranded) {
 		t.Fatal("Install destroyed a generation no gate of its own ever scanned")
 	}
-	var queried []string
-	f.deploy.inventory = func(paths ...string) (Survivors, error) {
-		queried = append(queried, paths...)
-		return Survivors{}, nil
-	}
 	if err := f.deploy.Reset(f.ctx()); err != nil {
 		t.Fatalf("Reset: %v", err)
 	}
 	if fileExists(f.deploy.layout.prior) {
 		t.Fatal("Reset left the stranded prior tree behind")
 	}
-	if !slices.Contains(queried, stranded) {
-		t.Fatalf("Reset destroyed the stranded prior tree without scanning %q: %q", stranded, queried)
+}
+
+// TestResetScansTheStrandedPriorItReclaims is the other half of the same
+// bargain: the gated verb that reclaims the stranded tree has to have scanned
+// it, so a process running out of it refuses the reclaim.
+func TestResetScansTheStrandedPriorItReclaims(t *testing.T) {
+	f := newFixture(t)
+	if err := f.deploy.layout.ensureMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	stranded := f.runnableAt(filepath.Join(f.deploy.layout.prior, "Contents", "MacOS", "example"))
+	if _, err := f.deploy.Install(f.ctx(), f.candidate("Source", "1.0", "one")); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	f.live(stranded)
+	if err := f.deploy.Reset(f.ctx()); !errors.Is(err, ErrLive) {
+		t.Fatalf("Reset err = %v, want ErrLive: the stranded prior tree at %q is running", err, stranded)
+	}
+	if !fileExists(stranded) {
+		t.Fatal("Reset destroyed a stranded prior tree a live process was running")
 	}
 }
 
@@ -420,12 +426,12 @@ func (f *fixture) crash(prior, candidate string, place func(*testing.T, *fixture
 
 func (f *fixture) wantCanonical(body string) {
 	f.t.Helper()
-	got, err := os.ReadFile(f.deploy.layout.canonical + "/Contents/MacOS/example")
+	got, err := os.ReadFile(filepath.Join(f.deploy.layout.canonical, bundleBodyRel))
 	if err != nil {
-		f.t.Fatalf("read canonical executable: %v", err)
+		f.t.Fatalf("read canonical body: %v", err)
 	}
 	if string(got) != body {
-		f.t.Fatalf("canonical executable = %q, want %q", got, body)
+		f.t.Fatalf("canonical body = %q, want %q", got, body)
 	}
 }
 
@@ -434,7 +440,7 @@ func (f *fixture) wantCanonical(body string) {
 func (f *fixture) wantSuperseded(body string) {
 	f.t.Helper()
 	for _, path := range []string{f.deploy.layout.canonical, f.deploy.layout.prior} {
-		got, err := os.ReadFile(path + "/Contents/MacOS/example")
+		got, err := os.ReadFile(filepath.Join(path, bundleBodyRel))
 		if err == nil && string(got) == body {
 			return
 		}

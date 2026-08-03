@@ -653,22 +653,33 @@ func TestOwnedCloseFaultsOnAChildWhoseExitWasNeverProven(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OwnProcesses() = %v", err)
 	}
-	child, err := owned.Spawn(bounded(t, 20*time.Second), Cmd{
-		Path: "/bin/sleep",
-		Args: []string{"600"},
-		Exec: ServingSameUser(),
-	}, ChannelNone, nil)
-	if err != nil {
-		t.Fatalf("Spawn() = %v", err)
+	// The ladder can win the race against its own expired timer, so the
+	// unproven terminal is retried until it arises rather than assumed — the
+	// shape unprovenChild reaches the same way. A proven exit settles its child
+	// and drops it from the scope, so only an unproven one is left for Close.
+	unproven := false
+	for attempt := range 20 {
+		child, err := owned.Spawn(bounded(t, 20*time.Second), Cmd{
+			Path: "/bin/sleep",
+			Args: []string{"600"},
+			Exec: ServingSameUser(),
+		}, ChannelNone, nil)
+		if err != nil {
+			t.Fatalf("Spawn() attempt %d = %v", attempt, err)
+		}
+		spent, cancelSpent := context.WithTimeout(context.Background(), time.Nanosecond)
+		_, stopErr := child.Stop(spent)
+		cancelSpent()
+		if !errors.Is(stopErr, ErrUnsettled) {
+			t.Fatalf("Stop() = %v, want ErrUnsettled", stopErr)
+		}
+		if exit := <-child.Done(); exit.Reap == ReapUndetermined {
+			unproven = true
+			break
+		}
 	}
-
-	spent, cancelSpent := context.WithTimeout(context.Background(), time.Nanosecond)
-	defer cancelSpent()
-	if _, stopErr := child.Stop(spent); !errors.Is(stopErr, ErrUnsettled) {
-		t.Fatalf("Stop() = %v, want ErrUnsettled", stopErr)
-	}
-	if exit := <-child.Done(); exit.Reap != ReapUndetermined {
-		t.Skipf("Exit.Reap = %d: the ladder proved the exit inside a spent budget, so there is no unproven terminal to close over", exit.Reap)
+	if !unproven {
+		t.Fatal("20 settlements on a spent budget each proved their exit, so there is no unproven terminal to close over")
 	}
 
 	closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1322,7 +1333,7 @@ func TestARefusedVerbLeavesNoDurableRecord(t *testing.T) {
 		}
 	}
 	if refused == 0 {
-		t.Skipf("every one of %d concurrent Adopts landed inside its 60ms budget, so no refusal was exercised", burst)
+		t.Fatalf("every one of %d concurrent Adopts landed inside its 60ms budget; the burst is what saturates the store's one writer, and a run where none expires exercises no refusal at all", burst)
 	}
 	closeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	closeErr := owned.Close(closeCtx)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"testing"
 	"time"
 
@@ -40,76 +41,109 @@ func settleFixture(t *testing.T) (Daemon, proc.Owner) {
 	return d, owner
 }
 
+// liveOwnerFixture stands a real daemon child up and waits for the owner record
+// Serve writes before it binds. That is the only way a record names a live
+// process other than this one: a real store records only the process that opens
+// it, so the in-process fixture can never name anything but this one.
+func liveOwnerFixture(t *testing.T, label Label) (Daemon, *exec.Cmd, proc.Owner) {
+	t.Helper()
+	shortHome(t)
+	d := Daemon{Label: label, Schemas: []Schema{"test.v1"}, Shutdown: Grace(5 * time.Second)}
+	child := startControlChild(t, string(d.Label))
+	record := d.RecordPath()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		owner, ok, err := proc.ReadOwner(record)
+		if err != nil {
+			t.Fatalf("ReadOwner(%q) = %v", record, err)
+		}
+		if ok && owner.PID == child.Process.Pid {
+			return d, child, owner
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the daemon child never recorded itself at %q", record)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// departedOwnerFixture is liveOwnerFixture's incumbent reaped, so the record it
+// leaves behind names a process the kernel no longer answers for.
+func departedOwnerFixture(t *testing.T) (Daemon, proc.Owner) {
+	t.Helper()
+	d, child, owner := liveOwnerFixture(t, "dkgone")
+	if err := child.Process.Kill(); err != nil {
+		t.Fatalf("kill the recorded daemon: %v", err)
+	}
+	_ = child.Wait()
+	if _, err := proc.ProbeIdentity(owner.PID); !errors.Is(err, proc.ErrNoProcess) {
+		t.Fatalf("ProbeIdentity(%d) = %v after the child was reaped, want %v", owner.PID, err, proc.ErrNoProcess)
+	}
+	return d, owner
+}
+
 func TestClientSettle(t *testing.T) {
-	absent := func(proc.Identity) (proc.Reap, bool, error) { return proc.ReapAbsent, true, nil }
-	reused := func(proc.Identity) (proc.Reap, bool, error) { return proc.ReapReused, true, nil }
-	live := func(proc.Identity) (proc.Reap, bool, error) { return 0, false, nil }
 	tests := []struct {
-		name     string
-		missing  bool
-		expect   Expect
-		observe  func(proc.Identity) (proc.Reap, bool, error)
-		wantReap Reap
-		wantErr  error
+		name    string
+		missing bool
+		expect  Expect
+		wantErr error
 	}{
-		{name: "no owner record", missing: true, observe: absent, wantErr: ErrUnrecorded},
-		{name: "expect build mismatch", expect: Expect{Build: "b2"}, observe: absent, wantErr: ErrWrongIncumbent},
-		{name: "expect generation mismatch", expect: Expect{Generation: 1}, observe: absent, wantErr: ErrWrongIncumbent},
-		{name: "settles absent", observe: absent, wantReap: ReapAbsent},
-		{name: "settles reused", observe: reused, wantReap: ReapReused},
-		{name: "unsettled at ctx end", observe: live, wantErr: ErrUnsettled},
+		{name: "no owner record", missing: true, wantErr: ErrUnrecorded},
+		{name: "expect build mismatch", expect: Expect{Build: "b2"}, wantErr: ErrWrongIncumbent},
+		{name: "expect generation mismatch", expect: Expect{Generation: 1}, wantErr: ErrWrongIncumbent},
+		{name: "unsettled at ctx end", wantErr: ErrUnsettled},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			d, owner := settleFixture(t)
+			if owner.PID != os.Getpid() {
+				t.Fatalf("recorded owner PID = %d, want this process %d", owner.PID, os.Getpid())
+			}
 			if tt.missing {
 				d.Label = "com.example.settle.unrecorded"
 			}
-			expect := tt.expect
-			if expect == (Expect{}) && !tt.missing && tt.wantErr == nil {
-				expect = Expect{Build: owner.Build, Generation: owner.Generation}
-			}
-			client := &Client{
-				daemon: d,
-				observe: func(id proc.Identity) (proc.Reap, bool, error) {
-					if !tt.missing && id != owner.Identity() {
-						t.Fatalf("observed %+v, want the recorded owner core %+v", id, owner.Identity())
-					}
-					return tt.observe(id)
-				},
-				readOwner: proc.ReadOwner,
-			}
+			client := &Client{daemon: d}
 			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 			defer cancel()
-			stopped, err := client.Settle(ctx, expect)
-			if tt.wantErr != nil {
-				if !errors.Is(err, tt.wantErr) {
-					t.Fatalf("Settle() error = %v, want %v", err, tt.wantErr)
-				}
-				if errors.Is(tt.wantErr, ErrUnsettled) && !errors.Is(err, context.DeadlineExceeded) {
-					t.Fatalf("Settle() error = %v, want joined ctx.Err()", err)
-				}
-				return
+			_, err := client.Settle(ctx, tt.expect)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("Settle() error = %v, want %v", err, tt.wantErr)
 			}
-			if err != nil {
-				t.Fatalf("Settle() = %v", err)
-			}
-			if stopped.Reap != tt.wantReap {
-				t.Fatalf("Reap = %d, want %d", stopped.Reap, tt.wantReap)
-			}
-			before := stopped.Before
-			if before.PID != os.Getpid() || before.Generation != owner.Generation || before.Build != "b1" {
-				t.Fatalf("Before = %+v, want the synthesized owner core", before)
-			}
-			if before.Phase != phaseInvalid || before.Protocol != 0 || before.Detail != nil {
-				t.Fatalf("Before = %+v, want zero Phase, Protocol, and Detail", before)
+			if errors.Is(tt.wantErr, ErrUnsettled) && !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Settle() error = %v, want joined ctx.Err()", err)
 			}
 		})
 	}
 }
 
+// TestClientSettleSynthesizesTheRecordedCore pins what a settled proof carries.
+// The recorded incumbent has to be a process that departs, so it is a real
+// child that opened the store, recorded itself, and exited — the only way a
+// record names anything but the process reading it.
+func TestClientSettleSynthesizesTheRecordedCore(t *testing.T) {
+	d, owner := departedOwnerFixture(t)
+	client := &Client{daemon: d}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stopped, err := client.Settle(ctx, Expect{Build: owner.Build, Generation: owner.Generation})
+	if err != nil {
+		t.Fatalf("Settle() = %v", err)
+	}
+	if stopped.Reap != ReapAbsent {
+		t.Fatalf("Reap = %d, want ReapAbsent", stopped.Reap)
+	}
+	before := stopped.Before
+	if before.PID != owner.PID || before.Generation != owner.Generation || before.Build != owner.Build {
+		t.Fatalf("Before = %+v, want the synthesized owner core %+v", before, owner)
+	}
+	if before.Phase != phaseInvalid || before.Protocol != 0 || before.Detail != nil {
+		t.Fatalf("Before = %+v, want zero Phase, Protocol, and Detail", before)
+	}
+}
+
 func TestSettleRequiresDeadline(t *testing.T) {
-	client := &Client{readOwner: proc.ReadOwner}
+	client := &Client{}
 	if _, err := client.Settle(context.Background(), Expect{}); err == nil {
 		t.Fatal("Settle() without a deadline succeeded")
 	}

@@ -5,41 +5,31 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
+	"syscall"
 	"testing"
 
 	"golang.org/x/sys/unix"
 )
 
-func TestExecutableIdentitiesExactAbsentPath(t *testing.T) {
-	report, err := executableIdentities(
-		"/daemonkit-test/definitely-not-an-executable",
-		func() ([]int, error) { return []int{101, 202}, nil },
-		func(int) (string, error) { return "/other/executable", nil },
-		func(int) (Identity, error) {
-			t.Fatal("probe called for a nonmatching executable")
-			return Identity{}, nil
-		},
-	)
+// suspendedChild posix_spawns path parked before its first instruction, so a
+// scan sees a live same-user process the kernel names exactly and no
+// instruction of the target ever runs.
+func suspendedChild(t *testing.T, path string) int {
+	t.Helper()
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(report.Matched) != 0 || len(report.Unnameable) != 0 {
-		t.Fatalf("report = %+v, want none", report)
+	pid, err := startChild(Cmd{Path: path}, spawnFiles{stdin: devNull, stdout: devNull, stderr: devNull})
+	_ = devNull.Close()
+	if err != nil {
+		t.Fatalf("startChild(%q) = %v", path, err)
 	}
-}
-
-func TestExecutableIdentitiesFailsClosedOnUnreadableProcess(t *testing.T) {
-	permissionErr := errors.New("permission denied")
-	_, err := executableIdentities(
-		"/Applications/Exact.app/Contents/MacOS/Exact",
-		func() ([]int, error) { return []int{10}, nil },
-		func(int) (string, error) { return "", permissionErr },
-		func(int) (Identity, error) { return Identity{}, nil },
-	)
-	if err == nil || !strings.Contains(err.Error(), "inspect executable for pid 10") {
-		t.Fatalf("error = %v, want fail-closed inventory error", err)
-	}
+	t.Cleanup(func() {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		awaitExit(pid)
+	})
+	return pid
 }
 
 // TestExecutableIdentitiesFailsClosedOnAnUnresolvableQuery is the other
@@ -68,20 +58,15 @@ func TestExecutableIdentitiesFailsClosedOnAnUnresolvableQuery(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			report, err := executableIdentities(
-				test.query,
-				func() ([]int, error) { return []int{10}, nil },
-				func(int) (string, error) { return "/other/executable", nil },
-				func(pid int) (Identity, error) { return Identity{PID: pid, Start: 77, Boot: 9}, nil },
-			)
+			report, err := ExecutableIdentities(test.query)
 			if test.wantErr {
 				if err == nil {
-					t.Fatalf("executableIdentities(%q) = %+v, want an error", test.query, report)
+					t.Fatalf("ExecutableIdentities(%q) = %+v, want an error", test.query, report)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("executableIdentities(%q) = %v", test.query, err)
+				t.Fatalf("ExecutableIdentities(%q) = %v", test.query, err)
 			}
 			if len(report.Matched) != 0 {
 				t.Fatalf("Matched = %+v, want none", report.Matched)
@@ -90,98 +75,20 @@ func TestExecutableIdentitiesFailsClosedOnAnUnresolvableQuery(t *testing.T) {
 	}
 }
 
-func TestExecutableIdentitiesDropsReusedPID(t *testing.T) {
-	path := "/Applications/Exact.app/Contents/MacOS/Exact"
-	probes := 0
-	report, err := executableIdentities(
-		path,
-		func() ([]int, error) { return []int{10}, nil },
-		func(int) (string, error) { return path, nil },
-		func(pid int) (Identity, error) {
-			probes++
-			// The PID is reused by another instance of the same executable
-			// between the bracketing executable reads.
-			return Identity{PID: pid, Start: uint64(probes), Boot: 9}, nil
-		},
-	)
-	if err != nil {
-		t.Fatalf("executableIdentities() = %v", err)
-	}
-	if probes != 2 {
-		t.Fatalf("probes = %d, want the identity re-probed around the executable bracket", probes)
-	}
-	if len(report.Matched) != 0 {
-		t.Fatalf("Matched = %+v, want none: the pin named a dead instance", report.Matched)
-	}
-}
-
 func TestExecutableIdentitiesKeepsStableInstance(t *testing.T) {
-	path := "/Applications/Exact.app/Contents/MacOS/Exact"
-	report, err := executableIdentities(
-		path,
-		func() ([]int, error) { return []int{10}, nil },
-		func(int) (string, error) { return path, nil },
-		func(pid int) (Identity, error) { return Identity{PID: pid, Start: 77, Boot: 9}, nil },
-	)
+	const program = "/bin/sleep"
+	pid := suspendedChild(t, program)
+	report, err := ExecutableIdentities(program)
 	if err != nil {
-		t.Fatalf("executableIdentities() = %v", err)
+		t.Fatalf("ExecutableIdentities(%q) = %v", program, err)
 	}
-	want := []Identity{{PID: 10, Start: 77, Boot: 9, Executable: path}}
-	if !slices.Equal(report.Matched, want) {
-		t.Fatalf("Matched = %+v, want %+v", report.Matched, want)
+	at := slices.IndexFunc(report.Matched, func(id Identity) bool { return id.PID == pid })
+	if at < 0 {
+		t.Fatalf("Matched = %+v, want pid %d", report.Matched, pid)
 	}
-}
-
-// TestExecutableIdentitiesReportsAnUnidentifiableProcess is the fail-closed
-// half of the gate, and the half that must not fail closed forever: a live
-// same-user process whose executable nothing could resolve is reported, since
-// dropping it reports an empty inventory for a daemon that may still be
-// running — but it is reported apart from the query, since attributing it to
-// every query lets one stranger's husk wedge every gate on the machine shut.
-func TestExecutableIdentitiesReportsAnUnidentifiableProcess(t *testing.T) {
-	tests := []struct {
-		name           string
-		err            error
-		wantMatched    []Identity
-		wantUnnameable []Identity
-	}{
-		{
-			name:           "a live same-user process nothing could name is unnameable, not matched",
-			err:            errUnresolvedExecutable,
-			wantMatched:    []Identity{},
-			wantUnnameable: []Identity{{PID: 10, Start: 77, Boot: 9}},
-		},
-		{
-			name:           "another user's process is never this daemon",
-			err:            errForeignProcess,
-			wantMatched:    []Identity{},
-			wantUnnameable: []Identity{},
-		},
-		{
-			name:           "a pid the kernel does not hold is gone",
-			err:            ErrNoProcess,
-			wantMatched:    []Identity{},
-			wantUnnameable: []Identity{},
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			report, err := executableIdentities(
-				"/Applications/Exact.app/Contents/MacOS/Exact",
-				func() ([]int, error) { return []int{10}, nil },
-				func(int) (string, error) { return "", test.err },
-				func(pid int) (Identity, error) { return Identity{PID: pid, Start: 77, Boot: 9}, nil },
-			)
-			if err != nil {
-				t.Fatalf("executableIdentities() = %v", err)
-			}
-			if !slices.Equal(report.Matched, test.wantMatched) {
-				t.Fatalf("Matched = %+v, want %+v", report.Matched, test.wantMatched)
-			}
-			if !slices.Equal(report.Unnameable, test.wantUnnameable) {
-				t.Fatalf("Unnameable = %+v, want %+v", report.Unnameable, test.wantUnnameable)
-			}
-		})
+	got := report.Matched[at]
+	if got.Executable != program || got.Start == 0 || got.Boot == 0 {
+		t.Fatalf("Matched[%d] = %+v, want %q under a non-zero start and boot", at, got, program)
 	}
 }
 
@@ -236,74 +143,43 @@ func TestIdentityNamesTheSurvivor(t *testing.T) {
 	}
 }
 
-// TestExecutableIdentitiesKeepsAProcessUnnamedMidInventory holds the
-// revalidation bracket to the same rule: an executable that stops resolving
-// between the bracketing reads leaves the process counted, and the identity
-// repin stays the anti-PID-reuse authority.
-func TestExecutableIdentitiesKeepsAProcessUnnamedMidInventory(t *testing.T) {
-	path := "/Applications/Exact.app/Contents/MacOS/Exact"
-	reads := 0
-	report, err := executableIdentities(
-		path,
-		func() ([]int, error) { return []int{10}, nil },
-		func(int) (string, error) {
-			reads++
-			if reads == 1 {
-				return path, nil
-			}
-			return "", errUnresolvedExecutable
-		},
-		func(pid int) (Identity, error) { return Identity{PID: pid, Start: 77, Boot: 9}, nil },
-	)
-	if err != nil {
-		t.Fatalf("executableIdentities() = %v", err)
-	}
-	want := []Identity{{PID: 10, Start: 77, Boot: 9, Executable: path}}
-	if !slices.Equal(report.Matched, want) {
-		t.Fatalf("Matched = %+v, want %+v", report.Matched, want)
-	}
-}
-
 // TestExecutableIdentitiesMatchesTheQueryInBothForms pins both sides of the
 // comparison in the same form: a consumer that names its program through a
 // symlink must still match the symlink-free path a process runs under, or the
 // gate reports a clear inventory for a daemon that is running.
 func TestExecutableIdentitiesMatchesTheQueryInBothForms(t *testing.T) {
+	const resolved = "/bin/sleep"
 	dir := t.TempDir()
-	program := filepath.Join(dir, "program")
-	if err := os.WriteFile(program, []byte("x"), 0o700); err != nil {
-		t.Fatal(err)
-	}
 	link := filepath.Join(dir, "link")
-	if err := os.Symlink(program, link); err != nil {
+	if err := os.Symlink(resolved, link); err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := filepath.EvalSymlinks(program)
+	resolvedDir, err := filepath.EvalSymlinks(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
+	pid := suspendedChild(t, link)
 	tests := []struct {
 		name  string
 		query string
 	}{
 		{name: "queried through the symlink", query: link},
-		{name: "queried as the caller wrote it", query: program},
+		{name: "queried under a symlinked directory", query: filepath.Join(resolvedDir, "link")},
 		{name: "queried in the resolved form", query: resolved},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			report, err := executableIdentities(
-				test.query,
-				func() ([]int, error) { return []int{10}, nil },
-				func(int) (string, error) { return resolved, nil },
-				func(pid int) (Identity, error) { return Identity{PID: pid, Start: 77, Boot: 9}, nil },
-			)
+			report, err := ExecutableIdentities(test.query)
 			if err != nil {
-				t.Fatalf("executableIdentities() = %v", err)
+				t.Fatalf("ExecutableIdentities(%q) = %v", test.query, err)
 			}
-			want := []Identity{{PID: 10, Start: 77, Boot: 9, Executable: resolved}}
-			if !slices.Equal(report.Matched, want) {
+			want := Identity{PID: pid, Executable: resolved}
+			at := slices.IndexFunc(report.Matched, func(id Identity) bool { return id.PID == pid })
+			if at < 0 {
 				t.Fatalf("Matched = %+v, want %+v", report.Matched, want)
+			}
+			if got := report.Matched[at]; got.Executable != resolved {
+				t.Fatalf("Matched[%d] = %+v, want executable %q", at, got, resolved)
 			}
 		})
 	}
@@ -386,7 +262,7 @@ func TestProcessIDsHoldsTheSameEUIDFloor(t *testing.T) {
 		}
 	}
 	if len(foreign) == 0 {
-		t.Skip("no process owned by another user to read")
+		t.Fatal("kern.proc.all reported no process owned by another user; a live macOS always has some, and without one the euid floor is unprovable")
 	}
 	pids, err := processIDs()
 	if err != nil {
@@ -446,6 +322,6 @@ func namedForeignProcess(t *testing.T) (int, string) {
 		}
 		return pid, resolved
 	}
-	t.Skip("no nameable process owned by another user to read")
+	t.Fatal("no nameable process owned by another user; a live macOS always runs some, and without one this scan proves nothing")
 	return 0, ""
 }

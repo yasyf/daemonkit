@@ -64,39 +64,24 @@ type Report struct {
 // residual is why an irreversible action gates on a recorded identity as well
 // as on this scan.
 func ExecutableIdentities(path string) (Report, error) {
-	return executableIdentities(path, processIDs, ExecutablePath, ProbeIdentity)
-}
-
-// SameInstance reports whether two pins name one process instance. It is the
-// module's only identity comparison reached from outside proc, so a caller
-// correlating an unnameable process against an identity it recorded compares
-// the whole pin the way everything else does — never the PID alone.
-func SameInstance(a, b Identity) bool { return instance(a).matches(instance(b)) }
-
-func executableIdentities(
-	path string,
-	list func() ([]int, error),
-	executable func(int) (string, error),
-	probe func(int) (Identity, error),
-) (Report, error) {
 	matches, err := executableMatcher(path)
 	if err != nil {
 		return Report{}, err
 	}
-	pids, err := list()
+	pids, err := processIDs()
 	if err != nil {
 		return Report{}, err
 	}
 	report := Report{Matched: make([]Identity, 0), Unnameable: make([]Identity, 0)}
 	for _, pid := range pids {
-		before, err := readExecutable(executable, pid)
+		before, err := readExecutable(pid)
 		if err != nil {
 			return Report{}, fmt.Errorf("inspect executable for pid %d: %w", pid, err)
 		}
 		if before.state == execSkipped || (before.state == execResolved && !matches(before.path)) {
 			continue
 		}
-		identity, err := probe(pid)
+		identity, err := ProbeIdentity(pid)
 		if errors.Is(err, ErrNoProcess) {
 			continue
 		}
@@ -107,14 +92,14 @@ func executableIdentities(
 			report.Unnameable = append(report.Unnameable, identity)
 			continue
 		}
-		after, err := readExecutable(executable, pid)
+		after, err := readExecutable(pid)
 		if err != nil {
 			return Report{}, fmt.Errorf("revalidate executable for pid %d: %w", pid, err)
 		}
 		if after.state == execSkipped || (after.state == execResolved && after.path != before.path) {
 			continue
 		}
-		repinned, err := probe(pid)
+		repinned, err := ProbeIdentity(pid)
 		if errors.Is(err, ErrNoProcess) {
 			continue
 		}
@@ -131,6 +116,12 @@ func executableIdentities(
 	sort.Slice(report.Unnameable, func(i, j int) bool { return report.Unnameable[i].PID < report.Unnameable[j].PID })
 	return report, nil
 }
+
+// SameInstance reports whether two pins name one process instance. It is the
+// module's only identity comparison reached from outside proc, so a caller
+// correlating an unnameable process against an identity it recorded compares
+// the whole pin the way everything else does — never the PID alone.
+func SameInstance(a, b Identity) bool { return instance(a).matches(instance(b)) }
 
 // execState is what one executable read settled about a PID.
 type execState int
@@ -151,8 +142,8 @@ type execRead struct {
 	state execState
 }
 
-func readExecutable(executable func(int) (string, error), pid int) (execRead, error) {
-	path, err := executable(pid)
+func readExecutable(pid int) (execRead, error) {
+	path, err := ExecutablePath(pid)
 	switch {
 	case errors.Is(err, ErrNoProcess), errors.Is(err, errForeignProcess):
 		return execRead{state: execSkipped}, nil

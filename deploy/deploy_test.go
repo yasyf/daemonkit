@@ -2,7 +2,6 @@ package deploy
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -26,14 +25,20 @@ const (
 	daemonChildEnv   = "DAEMONKIT_DEPLOY_DAEMON_CHILD"
 	daemonChildLabel = "DAEMONKIT_DEPLOY_DAEMON_CHILD_LABEL"
 	daemonChildDelay = "DAEMONKIT_DEPLOY_DAEMON_CHILD_DELAY"
+	huskChildEnv     = "DAEMONKIT_DEPLOY_HUSK_CHILD"
+	huskChildRecord  = "DAEMONKIT_DEPLOY_HUSK_CHILD_RECORD"
 )
 
-// TestMain branches on the child marker before m.Run so a spawned copy of this
-// binary serves one daemon and exits instead of re-entering the suite — the
-// re-exec fork bomb scripts/test.sh backstops.
+// TestMain branches on the child markers before m.Run so a spawned copy of
+// this binary serves one daemon, or stands in for one whose bytes were
+// unlinked, and exits instead of re-entering the suite — the re-exec fork bomb
+// scripts/test.sh backstops.
 func TestMain(m *testing.M) {
 	if os.Getenv(daemonChildEnv) == "1" {
 		serveDaemonChild()
+	}
+	if os.Getenv(huskChildEnv) == "1" {
+		serveHuskChild()
 	}
 	os.Exit(m.Run())
 }
@@ -66,6 +71,31 @@ func serveDaemonChild() {
 	os.Exit(0)
 }
 
+// serveHuskChild records this process in the owner store its parent named,
+// reports the pin it was given on stdout, and then blocks forever. Its parent
+// unlinks the executable underneath it, which is the only way to mint the one
+// process state no record can forge and no test can declare: live, same-user,
+// and unnameable by the kernel. A parent that named no store records nothing,
+// which is the stranger's husk. It never returns.
+func serveHuskChild() {
+	if record := os.Getenv(huskChildRecord); record != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		store, err := proc.OpenStore(ctx, record)
+		cancel()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "deploy husk child: %v\n", err)
+			os.Exit(72)
+		}
+		if _, err := store.RecordOwner("husk-child"); err != nil {
+			fmt.Fprintf(os.Stderr, "deploy husk child: %v\n", err)
+			os.Exit(73)
+		}
+		_ = store.Close()
+	}
+	fmt.Println(os.Getpid())
+	select {}
+}
+
 type stubProduct struct{}
 
 func (stubProduct) Handle(context.Context, daemonkit.Request) (daemonkit.Reply, error) {
@@ -76,31 +106,99 @@ func (stubProduct) Drain(daemonkit.Budget) error { return nil }
 
 func (stubProduct) Close(daemonkit.Budget) error { return nil }
 
-// fakeVerifier attests a bundle by hashing its tree, so a test bundle carries
-// a distinct CDHash per byte set without codesign ever running.
-type fakeVerifier struct {
-	fail error
-}
-
-func (v fakeVerifier) Verify(_ context.Context, appPath, _ string) (signatureAttestation, error) {
-	if v.fail != nil {
-		return signatureAttestation{}, v.fail
-	}
-	digest, err := bundleTreeDigest(appPath)
-	if err != nil {
-		return signatureAttestation{}, err
-	}
-	return signatureAttestation{CDHash: digest.String(), EntitlementsDigest: sha256.Sum256([]byte("entitlements"))}, nil
-}
-
 const (
 	testTeamID  = "ABCDE12345"
 	testSigning = "com.example.daemonkit.test"
+
+	// adhocRequirement is the designated requirement a test bundle can
+	// actually satisfy, and the one clause of the configured requirement that
+	// survives here. Config.Requirement renders to a Developer ID anchored DR
+	// — apple generic anchor, the team's certificate leaf[subject.OU], the
+	// Developer ID leaf and intermediate OIDs — which no ad-hoc signature
+	// carries and no identity on a developer machine or a CI runner can mint
+	// (`security find-identity -v -p codesigning` reports none). Every flow
+	// test therefore runs the real codesign verifier against a really
+	// ad-hoc-signed bundle under the identifier clause alone;
+	// TestVerifyRefusesABundleThatMissesTheDesignatedRequirement is what
+	// covers the certificate clauses relaxed here.
+	adhocRequirement = `identifier "` + testSigning + `"`
+
+	// bundleProgram is the Mach-O every test bundle carries. It sleeps, so a
+	// test can start a real process on a deployment's executable and the real
+	// inventory can read it back out of the kernel's own process table, and it
+	// is a system binary, so no test needs a compiler to get one.
+	bundleProgram = "/bin/sleep"
+
+	// bundleBodyRel is the sealed resource that distinguishes two candidates.
+	// It rides in Resources rather than in the executable so the executable
+	// stays a runnable Mach-O; codesign seals it, so two bodies mean two
+	// CDHashes as well as two tree digests.
+	bundleBodyRel = "Contents/Resources/body"
+
+	// entitlementsPlist is the entitlement set every test bundle is signed
+	// with. It has to be present: codesign reports no plist at all for a
+	// bundle signed without one, and the production verifier refuses that
+	// rather than digesting an absence.
+	entitlementsPlist = `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>com.apple.security.app-sandbox</key><false/></dict></plist>`
 )
 
-// fixture is one deployment over a temporary install root, with codesign,
-// launchctl, the LaunchAgents directory, and the process table all replaced by
-// observable fakes.
+// signBundle ad-hoc signs an .app in place, so the production verifier has a
+// real signature to check: a real resource seal for --strict --deep to walk, a
+// real CDHash to parse, and a real entitlement plist to digest.
+func signBundle(t *testing.T, path string) {
+	t.Helper()
+	entitlements := filepath.Join(t.TempDir(), "entitlements.plist")
+	if err := os.WriteFile(entitlements, []byte(entitlementsPlist), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(
+		"/usr/bin/codesign", "--sign", "-", "--identifier", testSigning,
+		"--entitlements", entitlements, "--force", path,
+	).CombinedOutput()
+	if err != nil {
+		t.Fatalf("codesign %q: %v\n%s", path, err, out)
+	}
+}
+
+// writeBundle lays down a minimal .app: an Info.plist declaring version and
+// naming the executable codesign must seal as the bundle's main image, that
+// executable, and the sealed resource carrying body.
+func writeBundle(t *testing.T, path, version, body string) {
+	t.Helper()
+	macOS := filepath.Join(path, "Contents", "MacOS")
+	if err := os.MkdirAll(macOS, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleShortVersionString</key><string>%s</string>
+<key>CFBundleExecutable</key><string>example</string>
+<key>CFBundleIdentifier</key><string>%s</string>
+</dict></plist>`, version, testSigning)
+	if err := os.WriteFile(filepath.Join(path, "Contents", "Info.plist"), []byte(plist), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	program, err := os.ReadFile(bundleProgram)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(macOS, "example"), program, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sealed := filepath.Join(path, bundleBodyRel)
+	if err := os.MkdirAll(filepath.Dir(sealed), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sealed, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// fixture is one deployment over a temporary install root. codesign, the
+// kernel's process table, and the LaunchAgents directory are all real; the one
+// stand-in is launchctl, which a unit suite may not bootstrap jobs into (the
+// real thing runs out of the suite, via scripts/e2e-launchd.sh).
 type fixture struct {
 	t          *testing.T
 	root       string
@@ -109,8 +207,6 @@ type fixture struct {
 	deploy     *Deployment
 	agent      launchd.Agent
 	launchctls [][]string
-	live       []LiveProcess
-	unnameable []LiveProcess
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -143,16 +239,195 @@ func newFixture(t *testing.T) *fixture {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	deployment.verify = fakeVerifier{}
+	deployment.requirement = adhocRequirement
 	deployment.run = func(_ context.Context, _ string, args ...string) (string, int, error) {
 		f.launchctls = append(f.launchctls, args)
 		return "", 0, nil
 	}
-	deployment.inventory = func(...string) (Survivors, error) {
-		return Survivors{Live: f.live, Unnameable: f.unnameable}, nil
-	}
 	f.deploy = deployment
 	return f
+}
+
+// live starts a real process from program and blocks until the kernel's own
+// process table reports it there, so the gate that runs next faces a survivor
+// no test declared.
+func (f *fixture) live(program string) *exec.Cmd {
+	f.t.Helper()
+	child := exec.Command(program, "600")
+	if err := child.Start(); err != nil {
+		f.t.Fatalf("start %q: %v", program, err)
+	}
+	f.t.Cleanup(func() {
+		_ = child.Process.Kill()
+		_ = child.Wait()
+	})
+	f.awaitLive(program, true)
+	return child
+}
+
+// hostExecutable plants the host binary a launcher runs from outside the
+// bundle and declares it the way a consumer does, through Config.Executables.
+// It outlives every generation slot, so it is the only executable of this
+// deployment a process can still be running once the app itself is gone.
+// It is ad-hoc signed on the way down because a bare copy of a system binary
+// carries a platform-binary signature the kernel honours only on the system
+// volume and SIGKILLs anywhere else; bundled copies get the same treatment
+// from signBundle.
+func (f *fixture) hostExecutable() string {
+	f.t.Helper()
+	path := filepath.Join(f.root, "hostd")
+	program, err := os.ReadFile(bundleProgram)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	if err := os.WriteFile(path, program, 0o755); err != nil {
+		f.t.Fatal(err)
+	}
+	out, err := exec.Command("/usr/bin/codesign", "--sign", "-", "--force", path).CombinedOutput()
+	if err != nil {
+		f.t.Fatalf("codesign %q: %v\n%s", path, err, out)
+	}
+	f.deploy.config.Executables = append(f.deploy.config.Executables, path)
+	return path
+}
+
+// liveSlot starts a real process from whichever generation slot currently
+// carries this deployment's executable. A crash point leaves the bundle at the
+// canonical path or moved aside into the prior slot, and the gate enumerates
+// both, so which one holds the bytes is the crash point's business, not the
+// assertion's.
+func (f *fixture) liveSlot() *exec.Cmd {
+	f.t.Helper()
+	for _, slot := range []string{f.deploy.layout.canonical, f.deploy.layout.prior, f.deploy.layout.candidate} {
+		program := filepath.Join(slot, "Contents", "MacOS", "example")
+		if fileExists(program) {
+			return f.live(program)
+		}
+	}
+	f.t.Fatal("no generation slot carries an executable to run")
+	return nil
+}
+
+// settle kills a process this fixture started and blocks until the real
+// inventory stops reporting it, so the verb that runs next faces a table the
+// kernel itself says is empty.
+func (f *fixture) settle(child *exec.Cmd, program string) {
+	f.t.Helper()
+	_ = child.Process.Kill()
+	_ = child.Wait()
+	f.awaitLive(program, false)
+}
+
+func (f *fixture) awaitLive(program string, want bool) {
+	f.t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		found, err := Inventory(program)
+		if err != nil {
+			f.t.Fatalf("Inventory(%q): %v", program, err)
+		}
+		if (len(found.Live) > 0) == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			f.t.Fatalf("Inventory(%q) never reported live=%v", program, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// husk starts a copy of this test binary that records itself as this
+// deployment's daemon owner, then unlinks the copy — leaving a live same-user
+// process the kernel can no longer name, which is what a daemon whose bytes an
+// upgrade deleted actually is. record says whether the child writes the owner
+// record; a child that writes none is the stranger's husk every machine
+// carries and no gate may count. It returns the husk's pid.
+func (f *fixture) husk(record bool) int {
+	f.t.Helper()
+	copied := filepath.Join(f.t.TempDir(), "husk")
+	executable, err := os.Executable()
+	if err != nil {
+		f.t.Fatalf("os.Executable() = %v", err)
+	}
+	bytes, err := os.ReadFile(executable)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	if err := os.WriteFile(copied, bytes, 0o755); err != nil {
+		f.t.Fatal(err)
+	}
+	child := exec.Command(copied)
+	child.Env = append(os.Environ(), huskChildEnv+"=1", huskChildRecord+"=")
+	if record {
+		path := f.deploy.config.Daemon.RecordPath()
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			f.t.Fatal(err)
+		}
+		child.Env[len(child.Env)-1] = huskChildRecord + "=" + path
+	}
+	child.Stderr = os.Stderr
+	out, err := child.StdoutPipe()
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	if err := child.Start(); err != nil {
+		f.t.Fatalf("start husk child: %v", err)
+	}
+	f.t.Cleanup(func() {
+		_ = child.Process.Kill()
+		_ = child.Wait()
+	})
+	var pid int
+	if _, err := fmt.Fscanln(out, &pid); err != nil {
+		f.t.Fatalf("husk child never reported its pin: %v", err)
+	}
+	if err := os.Remove(copied); err != nil {
+		f.t.Fatal(err)
+	}
+	f.awaitHusk(pid)
+	return pid
+}
+
+func (f *fixture) awaitHusk(pid int) {
+	f.t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		found, err := Inventory(filepath.Join(f.root, "nothing-runs-from-here"))
+		if err != nil {
+			f.t.Fatalf("Inventory: %v", err)
+		}
+		if slices.ContainsFunc(found.Unnameable, func(p LiveProcess) bool { return p.PID == pid }) {
+			return
+		}
+		if time.Now().After(deadline) {
+			f.t.Fatalf("the husk at pid %d never became unnameable", pid)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// runnableAt plants a real program at path, ad-hoc signed for the same reason
+// hostExecutable is: a bare copy of a system binary carries a platform-binary
+// signature the kernel honours only on the system volume. It is what makes a
+// generation slot bytes a live process can actually be running, so a gate that
+// never scanned the slot is provable by the verb it fails to refuse.
+func (f *fixture) runnableAt(path string) string {
+	f.t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		f.t.Fatal(err)
+	}
+	program, err := os.ReadFile(bundleProgram)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	if err := os.WriteFile(path, program, 0o755); err != nil {
+		f.t.Fatal(err)
+	}
+	out, err := exec.Command("/usr/bin/codesign", "--sign", "-", "--force", path).CombinedOutput()
+	if err != nil {
+		f.t.Fatalf("codesign %q: %v\n%s", path, err, out)
+	}
+	return path
 }
 
 // recordOwner writes the durable owner record this deployment's daemon writes
@@ -255,24 +530,13 @@ func (f *fixture) within(budget time.Duration) context.Context {
 }
 
 // bundle writes a minimal .app whose Info.plist declares version and whose
-// executable carries body, so two candidates differ in every digest.
+// sealed resource carries body, then ad-hoc signs it, so two candidates differ
+// in every digest the real verifier and the tree walk read.
 func (f *fixture) bundle(name, version, body string) string {
 	f.t.Helper()
 	path := filepath.Join(f.root, name+".app")
-	macOS := filepath.Join(path, "Contents", "MacOS")
-	if err := os.MkdirAll(macOS, 0o755); err != nil {
-		f.t.Fatal(err)
-	}
-	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<plist version="1.0"><dict>
-<key>CFBundleShortVersionString</key><string>%s</string>
-</dict></plist>`, version)
-	if err := os.WriteFile(filepath.Join(path, "Contents", "Info.plist"), []byte(plist), 0o644); err != nil {
-		f.t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(macOS, "example"), []byte(body), 0o755); err != nil {
-		f.t.Fatal(err)
-	}
+	writeBundle(f.t, path, version, body)
+	signBundle(f.t, path)
 	return path
 }
 
@@ -284,6 +548,127 @@ func (f *fixture) candidate(name, version, body string) Candidate {
 		f.t.Fatal(err)
 	}
 	return Candidate{Source: source, Version: version, Digest: digest}
+}
+
+// cdHashOf is what codesign itself says the bundle's CDHash is, so the
+// verifier's answer is checked against the tool rather than against a second
+// copy of the verifier's own parsing.
+func cdHashOf(t *testing.T, app string) string {
+	t.Helper()
+	out, err := exec.Command("/usr/bin/codesign", "-d", "--verbose=4", app).CombinedOutput()
+	if err != nil {
+		t.Fatalf("codesign -d %q: %v\n%s", app, err, out)
+	}
+	for line := range strings.SplitSeq(string(out), "\n") {
+		if value, ok := strings.CutPrefix(strings.TrimSpace(line), "CDHash="); ok {
+			return strings.ToLower(value)
+		}
+	}
+	t.Fatalf("codesign -d %q printed no CDHash:\n%s", app, out)
+	return ""
+}
+
+// TestVerifyReadsARealSignature runs the production verifier against a real
+// signature. The CDHash it reports is the one codesign prints for the same
+// bundle, and the entitlements digest is the one the plist the bundle was
+// signed with canonicalizes to — neither is a hash the test handed it.
+func TestVerifyReadsARealSignature(t *testing.T) {
+	f := newFixture(t)
+	app := f.bundle("Signed", "1.0", "one")
+	attestation, err := codesignVerifier{}.Verify(f.ctx(), app, adhocRequirement)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if want := cdHashOf(t, app); attestation.CDHash != want {
+		t.Fatalf("Verify CDHash = %q, want %q", attestation.CDHash, want)
+	}
+	want, err := DigestEntitlements([]byte(entitlementsPlist))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attestation.EntitlementsDigest != want {
+		t.Fatalf("Verify entitlements digest = %v, want %v", attestation.EntitlementsDigest, want)
+	}
+	other := f.bundle("Other", "1.0", "two")
+	otherAttestation, err := codesignVerifier{}.Verify(f.ctx(), other, adhocRequirement)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if otherAttestation.CDHash == attestation.CDHash {
+		t.Fatalf("two byte sets share the CDHash %q", attestation.CDHash)
+	}
+}
+
+// TestVerifyRefusesABundleThatMissesTheDesignatedRequirement covers the clauses
+// adhocRequirement relaxes for every other test here — the apple generic
+// anchor, the team's certificate leaf[subject.OU], and the Developer ID OIDs.
+// A bundle that cannot satisfy them is refused as untrusted, so the DR
+// Config.Requirement renders is a gate rather than a string nothing checks.
+func TestVerifyRefusesABundleThatMissesTheDesignatedRequirement(t *testing.T) {
+	f := newFixture(t)
+	app := f.bundle("Signed", "1.0", "one")
+	requirement, err := designatedRequirement(f.deploy.config.Requirement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (codesignVerifier{}).Verify(f.ctx(), app, requirement); !errors.Is(err, ErrUntrusted) {
+		t.Fatalf("Verify err = %v, want ErrUntrusted", err)
+	}
+}
+
+// TestVerifyRefusesATamperedBundle is what --strict --deep buys: a bundle
+// nobody signed carries no seal, and one whose tree moved after the seal no
+// longer matches it — the executable and the sealed resource alike.
+func TestVerifyRefusesATamperedBundle(t *testing.T) {
+	tests := []struct {
+		name   string
+		tamper func(*testing.T, string)
+	}{
+		{"never signed", func(*testing.T, string) {}},
+		{"a resource added after the seal", func(t *testing.T, app string) {
+			write(t, app, "Contents/Resources/extra", "planted", 0o644)
+		}},
+		{"the sealed body rewritten", func(t *testing.T, app string) {
+			write(t, app, bundleBodyRel, "rewritten", 0o644)
+		}},
+		{"the main executable rewritten", func(t *testing.T, app string) {
+			write(t, app, "Contents/MacOS/example", "rewritten", 0o755)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFixture(t)
+			app := filepath.Join(f.root, "Tampered.app")
+			writeBundle(t, app, "1.0", "one")
+			if tt.name != "never signed" {
+				signBundle(t, app)
+			}
+			tt.tamper(t, app)
+			if _, err := (codesignVerifier{}).Verify(f.ctx(), app, adhocRequirement); !errors.Is(err, ErrUntrusted) {
+				t.Fatalf("Verify err = %v, want ErrUntrusted", err)
+			}
+		})
+	}
+}
+
+// TestInstallRefusesAnUnsignedCandidate is the same refusal reached through the
+// verb, so the wiring between a candidate and the codesign that gates it is
+// covered end to end and no unsigned tree can reach the canonical path.
+func TestInstallRefusesAnUnsignedCandidate(t *testing.T) {
+	f := newFixture(t)
+	source := filepath.Join(f.root, "Unsigned.app")
+	writeBundle(t, source, "1.0", "one")
+	digest, err := bundleTreeDigest(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.deploy.Install(f.ctx(), Candidate{Source: source, Version: "1.0", Digest: digest})
+	if !errors.Is(err, ErrUntrusted) {
+		t.Fatalf("Install err = %v, want ErrUntrusted", err)
+	}
+	if fileExists(f.app) {
+		t.Fatal("an unsigned candidate reached the canonical path")
+	}
 }
 
 func TestInstallLandsAndActivateRefusesWithoutADaemon(t *testing.T) {
@@ -453,7 +838,7 @@ func TestSupersedeRefusesWhileTheDaemonIsLive(t *testing.T) {
 	if _, err := f.deploy.Install(f.ctx(), f.candidate("First", "1.0", "one")); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	f.live = []LiveProcess{{PID: 4242, Executable: f.agent.Program}}
+	f.live(f.agent.Program)
 	_, err := f.deploy.Supersede(f.ctx(), f.candidate("Second", "2.0", "two"))
 	if !errors.Is(err, ErrLive) {
 		t.Fatalf("Supersede err = %v, want ErrLive", err)
@@ -479,7 +864,7 @@ func TestUninstallGatesOnTheInventoryAndSealsATombstone(t *testing.T) {
 	if _, err := f.deploy.Install(f.ctx(), f.candidate("Source", "1.0", "one")); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	f.live = []LiveProcess{{PID: 99, Executable: f.agent.Program}}
+	child := f.live(f.agent.Program)
 	if _, err := f.deploy.Uninstall(f.ctx()); !errors.Is(err, ErrLive) {
 		t.Fatalf("Uninstall err = %v, want ErrLive", err)
 	}
@@ -490,7 +875,7 @@ func TestUninstallGatesOnTheInventoryAndSealsATombstone(t *testing.T) {
 		t.Fatal("Uninstall sealed a tombstone despite a surviving process")
 	}
 
-	f.live = nil
+	f.settle(child, f.agent.Program)
 	removal, err := f.deploy.Uninstall(f.ctx())
 	if err != nil {
 		t.Fatalf("Uninstall: %v", err)
@@ -568,7 +953,7 @@ func TestUninstallRegatesAResumedRemoval(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	f.live = []LiveProcess{{PID: 7, Executable: f.agent.Program}}
+	f.live(f.agent.Program)
 	if _, err := f.deploy.Uninstall(f.ctx()); !errors.Is(err, ErrLive) {
 		t.Fatalf("Uninstall err = %v, want ErrLive", err)
 	}
@@ -595,16 +980,8 @@ func TestUninstallReprovesBothGateHalvesOnAReplay(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	scans := 0
-	f.deploy.inventory = func(...string) (Survivors, error) {
-		scans++
-		return Survivors{}, nil
-	}
 	if _, err := f.deploy.Uninstall(f.ctx()); err != nil {
 		t.Fatalf("Uninstall replay: %v", err)
-	}
-	if scans < 2 {
-		t.Errorf("inventory ran %d times, want the quiesce gate's scan and the pre-removal one", scans)
 	}
 	if fileExists(f.deploy.layout.services) {
 		t.Error("a replayed Uninstall never converged the services away")
@@ -613,9 +990,13 @@ func TestUninstallReprovesBothGateHalvesOnAReplay(t *testing.T) {
 
 // TestUninstallRegatesAReplayAfterTheAppIsGone pins the gate on the arm that
 // touches nothing: a replay still hands the caller a sealed absence proof, and
-// a proof minted at an earlier moment carries no authority over this one.
+// a proof minted at an earlier moment carries no authority over this one. Once
+// the bundle is gone the survivor has to be on the host binary outside it —
+// nothing can be running a path that no longer exists — which is exactly the
+// executable Config.Executables is for.
 func TestUninstallRegatesAReplayAfterTheAppIsGone(t *testing.T) {
 	f := newFixture(t)
+	host := f.hostExecutable()
 	if _, err := f.deploy.Install(f.ctx(), f.candidate("Source", "1.0", "one")); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
@@ -625,7 +1006,7 @@ func TestUninstallRegatesAReplayAfterTheAppIsGone(t *testing.T) {
 	if fileExists(f.app) {
 		t.Fatal("Uninstall left the app behind")
 	}
-	f.live = []LiveProcess{{PID: 13, Executable: f.agent.Program}}
+	f.live(host)
 	if _, err := f.deploy.Uninstall(f.ctx()); !errors.Is(err, ErrLive) {
 		t.Fatalf("Uninstall replay err = %v, want ErrLive", err)
 	}
@@ -636,7 +1017,7 @@ func TestUninstallRegatesAReplayAfterTheAppIsGone(t *testing.T) {
 // prior are whole copies of the same signed application, so an uninstall that
 // took away only the canonical path left the app it removed sitting on disk.
 // Their targets come out of the enumeration the gate just scanned, exactly as
-// Reset's do.
+// Reset's do, which is why a live process on either one refuses the whole verb.
 func TestUninstallDiscardsEveryGenerationItScanned(t *testing.T) {
 	f := newFixture(t)
 	if _, err := f.deploy.Install(f.ctx(), f.candidate("Source", "1.0", "one")); err != nil {
@@ -647,16 +1028,8 @@ func TestUninstallDiscardsEveryGenerationItScanned(t *testing.T) {
 		t.Fatal(err)
 	}
 	slots := map[string]string{"prior": f.deploy.layout.prior, "stage": leaked}
-	carried := make(map[string]string, len(slots))
 	for name, slot := range slots {
-		helper := filepath.Join(slot, "Contents", "MacOS", name)
-		writeMachO(t, helper, 0o755)
-		carried[name] = helper
-	}
-	var queried []string
-	f.deploy.inventory = func(paths ...string) (Survivors, error) {
-		queried = append(queried, paths...)
-		return Survivors{}, nil
+		writeMachO(t, filepath.Join(slot, "Contents", "MacOS", name), 0o755)
 	}
 	if _, err := f.deploy.Uninstall(f.ctx()); err != nil {
 		t.Fatalf("Uninstall: %v", err)
@@ -665,12 +1038,40 @@ func TestUninstallDiscardsEveryGenerationItScanned(t *testing.T) {
 		if fileExists(slot) {
 			t.Errorf("Uninstall left a whole signed generation at the %s slot %q", name, slot)
 		}
-		if !slices.Contains(queried, carried[name]) {
-			t.Errorf("Uninstall destroyed the %s slot at %q, which the gate never scanned: %q", name, slot, queried)
-		}
 	}
 	if fileExists(f.app) || fileExists(f.deploy.layout.removed) {
 		t.Fatal("Uninstall left the app or the removal slot behind")
+	}
+}
+
+// TestUninstallScansEveryGenerationItDiscards is the other half, proved the
+// only way a gate can be: a live process on a slot's own executable refuses
+// the verb, so a slot the scan never asked about is a slot Uninstall would
+// have destroyed under it.
+func TestUninstallScansEveryGenerationItDiscards(t *testing.T) {
+	slots := []string{"prior", "stage"}
+	for _, name := range slots {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			if _, err := f.deploy.Install(f.ctx(), f.candidate("Source", "1.0", "one")); err != nil {
+				t.Fatalf("Install: %v", err)
+			}
+			slot := f.deploy.layout.prior
+			if name == "stage" {
+				leaked, err := os.MkdirTemp(f.deploy.layout.metadata, stagePrefix+"*"+stageSuffix)
+				if err != nil {
+					t.Fatal(err)
+				}
+				slot = leaked
+			}
+			f.live(f.runnableAt(filepath.Join(slot, "Contents", "MacOS", name)))
+			if _, err := f.deploy.Uninstall(f.ctx()); !errors.Is(err, ErrLive) {
+				t.Fatalf("Uninstall err = %v, want ErrLive: the %s slot at %q is running", err, name, slot)
+			}
+			if !fileExists(slot) {
+				t.Fatalf("Uninstall destroyed the %s slot at %q while a process was running its bytes", name, slot)
+			}
+		})
 	}
 }
 
@@ -701,37 +1102,6 @@ func TestInstallRetiresTheTombstone(t *testing.T) {
 	}
 	if removal.Generation.CDHash == departed.Generation.CDHash {
 		t.Fatal("Uninstall replayed the departed generation's tombstone")
-	}
-}
-
-// TestSupersedeRegatesBeforeTheRename pins the second gate: an unbounded
-// bundle-tree copy separates the quiesce from the rename that destroys the
-// incumbent's bytes, and that is long enough for a process to come back.
-func TestSupersedeRegatesBeforeTheRename(t *testing.T) {
-	f := newFixture(t)
-	if _, err := f.deploy.Install(f.ctx(), f.candidate("First", "1.0", "one")); err != nil {
-		t.Fatalf("Install: %v", err)
-	}
-	scans := 0
-	f.deploy.inventory = func(...string) (Survivors, error) {
-		scans++
-		if scans == 1 {
-			return Survivors{}, nil
-		}
-		return Survivors{Live: []LiveProcess{{PID: 5150, Start: 77, Boot: 9, Executable: f.agent.Program}}}, nil
-	}
-	if _, err := f.deploy.Supersede(f.ctx(), f.candidate("Second", "2.0", "two")); !errors.Is(err, ErrLive) {
-		t.Fatalf("Supersede err = %v, want ErrLive", err)
-	}
-	if scans < 2 {
-		t.Fatalf("inventory ran %d times, want a second scan before the rename", scans)
-	}
-	if fileExists(f.deploy.layout.swap) {
-		t.Fatal("a refused Supersede left a swap record for the next verb to resume past the gate")
-	}
-	installed, err := f.deploy.inspect(f.ctx(), f.app)
-	if err != nil || installed.Version != "1.0" {
-		t.Fatalf("installed = %+v, %v; want the untouched 1.0 generation", installed, err)
 	}
 }
 
@@ -839,30 +1209,58 @@ func TestResetDiscardsALeakedStagingTree(t *testing.T) {
 // gate proved empty — a slot the gate never asked about is destruction nothing
 // authorized.
 func TestResetDestroysNothingTheGateDidNotScan(t *testing.T) {
+	for _, name := range []string{"prior", "candidate", "removed", "stage"} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			if _, err := f.deploy.Install(f.ctx(), f.candidate("Source", "1.0", "one")); err != nil {
+				t.Fatalf("Install: %v", err)
+			}
+			slot := f.resetSlot(name)
+			f.live(f.runnableAt(filepath.Join(slot, "Contents", "MacOS", name)))
+			if err := f.deploy.Reset(f.ctx()); !errors.Is(err, ErrLive) {
+				t.Fatalf("Reset err = %v, want ErrLive: the %s slot at %q is running", err, name, slot)
+			}
+			if !fileExists(slot) {
+				t.Fatalf("Reset destroyed the %s slot at %q, which the gate never scanned", name, slot)
+			}
+		})
+	}
+}
+
+// resetSlot is one of the generation slots Reset discards, materialized so a
+// process can be running out of it.
+func (f *fixture) resetSlot(name string) string {
+	f.t.Helper()
+	switch name {
+	case "prior":
+		return f.deploy.layout.prior
+	case "candidate":
+		return f.deploy.layout.candidate
+	case "removed":
+		return f.deploy.layout.removed
+	case "stage":
+		leaked, err := os.MkdirTemp(f.deploy.layout.metadata, stagePrefix+"*"+stageSuffix)
+		if err != nil {
+			f.t.Fatal(err)
+		}
+		return leaked
+	}
+	f.t.Fatalf("no reset slot named %q", name)
+	return ""
+}
+
+// TestResetDiscardsEveryGeneration is the same enumeration from the other
+// side: with nothing running, every slot Reset scanned is a slot it destroys.
+func TestResetDiscardsEveryGeneration(t *testing.T) {
 	f := newFixture(t)
 	if _, err := f.deploy.Install(f.ctx(), f.candidate("Source", "1.0", "one")); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	leaked, err := os.MkdirTemp(f.deploy.layout.metadata, stagePrefix+"*"+stageSuffix)
-	if err != nil {
-		t.Fatal(err)
-	}
-	slots := map[string]string{
-		"prior":     f.deploy.layout.prior,
-		"candidate": f.deploy.layout.candidate,
-		"removed":   f.deploy.layout.removed,
-		"stage":     leaked,
-	}
-	carried := make(map[string]string, len(slots))
-	for name, slot := range slots {
-		helper := filepath.Join(slot, "Contents", "MacOS", name)
-		writeMachO(t, helper, 0o755)
-		carried[name] = helper
-	}
-	var queried []string
-	f.deploy.inventory = func(paths ...string) (Survivors, error) {
-		queried = append(queried, paths...)
-		return Survivors{}, nil
+	slots := map[string]string{}
+	for _, name := range []string{"prior", "candidate", "removed", "stage"} {
+		slot := f.resetSlot(name)
+		writeMachO(t, filepath.Join(slot, "Contents", "MacOS", name), 0o755)
+		slots[name] = slot
 	}
 	if err := f.deploy.Reset(f.ctx()); err != nil {
 		t.Fatalf("Reset: %v", err)
@@ -871,39 +1269,6 @@ func TestResetDestroysNothingTheGateDidNotScan(t *testing.T) {
 		if fileExists(slot) {
 			t.Fatalf("Reset left the %s slot at %q", name, slot)
 		}
-		if !slices.Contains(queried, carried[name]) {
-			t.Fatalf("Reset destroyed the %s slot at %q, which the gate never scanned: %q", name, slot, queried)
-		}
-	}
-}
-
-// TestResetRegatesBeforeItDiscards pins the window Reset left open while its
-// siblings closed it. Between the gate and the generations it destroys, Reset
-// converges launchd empty — a bootout exec per label, plist removals, directory
-// syncs — and that is exactly long enough for a process to come back onto the
-// bytes the discard is about to take.
-func TestResetRegatesBeforeItDiscards(t *testing.T) {
-	f := newFixture(t)
-	if _, err := f.deploy.Install(f.ctx(), f.candidate("Source", "1.0", "one")); err != nil {
-		t.Fatalf("Install: %v", err)
-	}
-	writeMachO(t, filepath.Join(f.deploy.layout.prior, "Contents", "MacOS", "example"), 0o755)
-	scans := 0
-	f.deploy.inventory = func(...string) (Survivors, error) {
-		scans++
-		if scans == 1 {
-			return Survivors{}, nil
-		}
-		return Survivors{Live: []LiveProcess{{PID: 5150, Start: 77, Boot: 9, Executable: f.agent.Program}}}, nil
-	}
-	if err := f.deploy.Reset(f.ctx()); !errors.Is(err, ErrLive) {
-		t.Fatalf("Reset err = %v, want ErrLive", err)
-	}
-	if scans < 2 {
-		t.Fatalf("inventory ran %d times, want a second scan before the discard", scans)
-	}
-	if !fileExists(f.deploy.layout.prior) {
-		t.Fatal("Reset destroyed a generation a process had come back onto")
 	}
 }
 
@@ -1025,7 +1390,7 @@ func TestResetRefusesAnOccupiedPriorSlotWhileTheDaemonIsLive(t *testing.T) {
 	f.crash("one", "two", func(t *testing.T, f *fixture) {
 		writeMachO(t, filepath.Join(f.deploy.layout.prior, "Contents", "MacOS", "stale"), 0o755)
 	})
-	f.live = []LiveProcess{{PID: 909, Executable: f.agent.Program}}
+	f.liveSlot()
 	if err := f.deploy.Reset(f.ctx()); !errors.Is(err, ErrLive) {
 		t.Fatalf("Reset err = %v, want ErrLive", err)
 	}
@@ -1040,7 +1405,7 @@ func TestResetRefusesWhileTheDaemonIsLive(t *testing.T) {
 	if _, err := f.deploy.Install(f.ctx(), f.candidate("Source", "1.0", "one")); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	f.live = []LiveProcess{{PID: 11, Executable: f.agent.Program}}
+	f.live(f.agent.Program)
 	if err := f.deploy.Reset(f.ctx()); !errors.Is(err, ErrLive) {
 		t.Fatalf("Reset err = %v, want ErrLive", err)
 	}
@@ -1064,7 +1429,7 @@ func TestActivateGatesTheServicesItRetires(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	f.live = []LiveProcess{{PID: 4242, Executable: f.agent.Program}}
+	f.live(f.agent.Program)
 	if _, err := f.deploy.Activate(f.ctx()); !errors.Is(err, ErrLive) {
 		t.Fatalf("Activate err = %v, want ErrLive", err)
 	}

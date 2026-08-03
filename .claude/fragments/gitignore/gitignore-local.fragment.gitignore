@@ -1,4 +1,4 @@
-# signed trust E2E fixtures (regenerate: scripts/trust-fixtures.sh)
+# signed trust E2E fixtures (regenerate: scripts/e2e-trust.sh)
 .trust-fixtures/
 
 # stray binaries from `go build ./internal/<pkg>/` or `./ci/<pkg>/` at the root

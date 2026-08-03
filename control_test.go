@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -15,59 +17,45 @@ import (
 )
 
 func TestAssemblePin(t *testing.T) {
-	pinned := proc.Identity{PID: 4242, Start: 100, Boot: 200}
-	probeOK := func(pid int) (proc.Identity, error) {
-		if pid != 4242 {
-			t.Fatalf("probe pid = %d, want 4242", pid)
-		}
-		return pinned, nil
-	}
-	healthOK := func() (wire.HealthReport, error) {
-		return wire.HealthReport{PID: 4242, Generation: 7, Build: "b1"}, nil
-	}
-	probeFailure := errors.New("probe failed")
-	healthFailure := errors.New("health failed")
+	self := os.Getpid()
+	other := os.Getppid()
+	const unheld = 1 << 30
 	tests := []struct {
-		name    string
-		self    int
-		peerPID int
-		probe   func(int) (proc.Identity, error)
-		health  func() (wire.HealthReport, error)
-		wantErr string
+		name       string
+		self       int
+		peerPID    int
+		servingPID int
+		cancelled  bool
+		wantErr    string
 	}{
 		{
-			name: "refuses own pid", self: 4242, peerPID: 4242,
-			probe:   func(int) (proc.Identity, error) { t.Fatal("probed self"); return proc.Identity{}, nil },
-			health:  healthOK,
+			name: "refuses own pid", self: self, peerPID: self, servingPID: self,
 			wantErr: "refusing to pin own process",
 		},
 		{
-			name: "refuses probe failure", self: 1, peerPID: 4242,
-			probe:   func(int) (proc.Identity, error) { return proc.Identity{}, probeFailure },
-			health:  healthOK,
-			wantErr: "probe peer 4242",
+			name: "refuses probe failure", self: self, peerPID: unheld, servingPID: unheld,
+			wantErr: "probe peer " + strconv.Itoa(unheld),
 		},
 		{
-			name: "refuses health failure", self: 1, peerPID: 4242,
-			probe:   probeOK,
-			health:  func() (wire.HealthReport, error) { return wire.HealthReport{}, healthFailure },
+			name: "refuses health failure", self: other, peerPID: self, servingPID: self, cancelled: true,
 			wantErr: "health self-attestation",
 		},
 		{
-			name: "refuses self-attestation mismatch", self: 1, peerPID: 4242,
-			probe:   probeOK,
-			health:  func() (wire.HealthReport, error) { return wire.HealthReport{PID: 9999, Generation: 7}, nil },
-			wantErr: "peer self-attests pid 9999, socket observed 4242",
+			name: "refuses self-attestation mismatch", self: other, peerPID: self, servingPID: unheld,
+			wantErr: "peer self-attests pid " + strconv.Itoa(unheld) + ", socket observed " + strconv.Itoa(self),
 		},
-		{
-			name: "pins on agreement", self: 1, peerPID: 4242,
-			probe:  probeOK,
-			health: healthOK,
-		},
+		{name: "pins on agreement", self: other, peerPID: self, servingPID: self},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			id, report, err := assemblePin(tt.self, tt.peerPID, tt.probe, tt.health)
+			serving := wire.Serving{PID: tt.servingPID, Build: "b1", Generation: 7}
+			session := startControlServer(t, wiretest.NewStubRuntime(), serving)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if tt.cancelled {
+				cancel()
+			}
+			id, report, err := assemblePin(ctx, tt.self, tt.peerPID, session)
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 					t.Fatalf("assemblePin() error = %v, want %q", err, tt.wantErr)
@@ -77,8 +65,12 @@ func TestAssemblePin(t *testing.T) {
 			if err != nil {
 				t.Fatalf("assemblePin() = %v", err)
 			}
-			if id != pinned {
-				t.Fatalf("pinned = %+v, want %+v", id, pinned)
+			want, err := proc.ProbeIdentity(tt.peerPID)
+			if err != nil {
+				t.Fatalf("ProbeIdentity(%d) = %v", tt.peerPID, err)
+			}
+			if id != want {
+				t.Fatalf("pinned = %+v, want %+v", id, want)
 			}
 			if report.Generation != 7 {
 				t.Fatalf("generation = %d, want 7", report.Generation)
