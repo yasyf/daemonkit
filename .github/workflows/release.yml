@@ -52,13 +52,12 @@ jobs:
           require_workflow "Docs drift"
           require_workflow "Mixed era"
 
+  mixed-era-tag:
+    needs: verify-tag-on-main
+    uses: ./.github/workflows/mixed-era.yml
+
   release:
-    # TODO(phase 2): gate the tag on mixed-era's tag mode once the cut peer
-    # drives Control.Drain. verify-main-gates already requires the Mixed era
-    # workflow in branch mode; GITHUB_REF_TYPE=tag additionally refuses on
-    # drain-preamble-trust-gate UNPROVEN, which no release can redeem — root
-    # Control.Drain exists and is trust-gated, the cut peer is not yet on it.
-    needs: [verify-tag-on-main, verify-main-gates]
+    needs: [verify-tag-on-main, verify-main-gates, mixed-era-tag]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
