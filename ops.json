@@ -1,1 +1,1 @@
-{"v":1,"lamport":5,"session":"cfa0f537-f63b-4af9-844c-1efcf2ab6814","ops":[{"kind":"set_criterion_status","id":"72402f37ba9496c40f2f2c85d0ee0723","status":"met","note":"own_test.go:78-110: OwnProcesses(busy, d.RecordPath()) refused with durable.ErrLockBusy, not ErrBusy, children untouched"}]}
+{"v":1,"lamport":6,"session":"cfa0f537-f63b-4af9-844c-1efcf2ab6814","ops":[{"kind":"set_status","status":"done"},{"kind":"link_commit","sha":"16b92657b03b7e0db313bd0f6cf5da4d6bb433d0"}]}
