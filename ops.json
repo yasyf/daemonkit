@@ -1,1 +1,1 @@
-{"v":1,"lamport":4,"session":"cfa0f537-f63b-4af9-844c-1efcf2ab6814","ops":[{"kind":"set_criterion_status","id":"d6545a21f8ba52d61c6a8da0108c06b4","status":"met","note":"ci/mixedera/testdata/frozen/mechanisms.txt:165-182 claims drain-preamble for the cut era with live witnesses; 2026-08-03 tag-mode proving run shows drain-preamble PROVEN for cut"}]}
+{"v":1,"lamport":5,"session":"cfa0f537-f63b-4af9-844c-1efcf2ab6814","ops":[{"kind":"set_status","status":"done"},{"kind":"link_commit","sha":"16b92657b03b7e0db313bd0f6cf5da4d6bb433d0"}]}
