@@ -1,1 +1,1 @@
-{"v":1,"lamport":3,"session":"cfa0f537-f63b-4af9-844c-1efcf2ab6814","ops":[{"kind":"set_criterion_status","id":"c14295754fa1d90f9d7c51d7f89d1991","status":"met","note":"internal/wire/client.go:108 Authorize field; invoked between dial and hello at :232, before any write"}]}
+{"v":1,"lamport":4,"session":"cfa0f537-f63b-4af9-844c-1efcf2ab6814","ops":[{"kind":"set_criterion_status","id":"cc5c233abb34656356464ae6223a3530","status":"met","note":"TestAuthorizeIsRequired (internal/wire/hardening_internal_test.go:53); client.go:288-289 refuses nil Authorize"}]}
