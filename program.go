@@ -223,7 +223,7 @@ type bundled struct{ file string }
 // reports converged on a build the daemon does not execute — permanently, since
 // nothing on this policy ever disagrees. copied answers the same interleaving
 // with an eviction it can force; bundled cannot, because daemonkit does not
-// deploy those bytes. Closing it is serve.go's TODO.
+// deploy those bytes. Closing it is buildDigest's documented v0.22 residual.
 func (b bundled) build() (string, error) {
 	data, err := os.ReadFile(b.file)
 	if err != nil {

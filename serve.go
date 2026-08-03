@@ -406,18 +406,20 @@ func probeIncumbent(socket string) error {
 	return nil
 }
 
-// TODO: digest the image this process is executing — the cdhash csops already
-// reads in internal/trust — instead of re-reading the path it was executed
-// from. A replace landing between execve and this read has the daemon publish
-// and record the replacement's build while running the old code, and no
-// launcher can tell. Ensure's placement is serialized by the start lock and the
-// pass that made it evicts whatever is serving before it starts anything, so
-// what is left is a launcher that died between its own placement and that
-// eviction, and an out-of-band replace by a package manager. Against a bundled
-// Program the divergence is not merely undetected but silent forever:
-// bundled.build re-reads that same replaced path, agrees with the record, and
-// every later Ensure decides ActionNothing. Only digesting the running image
-// closes it — nothing reachable from the path can.
+// buildDigest re-reads the path this process was executed from, and carries a
+// documented residual: a replace landing between execve and this read has the
+// daemon publish and record the replacement's build while running the old
+// code. Ensure's placement is serialized by the start lock and evicts whatever
+// is serving first, so the triggering agent is an out-of-band replace — a
+// package manager bypassing deploy's sealed supersession — racing a launchd
+// restart, a window of microseconds at daemon start. Against a copied Program
+// the next Ensure evicts; against a bundled one bundled.build re-reads the
+// same replaced path, agrees with the record, and every later Ensure decides
+// ActionNothing — silent forever. Nothing reachable from the path can close
+// it. The fix is digesting the running image: a CS_OPS_CDHASH self-read
+// beside internal/trust's peer path, with the owner record carrying cdhash
+// alongside sha256 for one release cycle — build identity is
+// record-schema-visible, so that is a v0.22+ change riding the soak gate.
 func buildDigest() (string, error) {
 	exe, err := os.Executable()
 	if err != nil {
