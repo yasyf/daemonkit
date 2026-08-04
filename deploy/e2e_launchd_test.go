@@ -137,7 +137,7 @@ func (f *e2eFixture) e2eCandidate(name, version, variant string) Candidate {
 		f.t.Fatalf("build helper %q: %v\n%s", variant, err, out)
 	}
 	signBundle(f.t, source)
-	digest, err := bundleTreeDigest(source)
+	digest, err := BundleDigest(source)
 	if err != nil {
 		f.t.Fatal(err)
 	}

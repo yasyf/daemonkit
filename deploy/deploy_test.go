@@ -543,7 +543,7 @@ func (f *fixture) bundle(name, version, body string) string {
 func (f *fixture) candidate(name, version, body string) Candidate {
 	f.t.Helper()
 	source := f.bundle(name, version, body)
-	digest, err := bundleTreeDigest(source)
+	digest, err := BundleDigest(source)
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -658,7 +658,7 @@ func TestInstallRefusesAnUnsignedCandidate(t *testing.T) {
 	f := newFixture(t)
 	source := filepath.Join(f.root, "Unsigned.app")
 	writeBundle(t, source, "1.0", "one")
-	digest, err := bundleTreeDigest(source)
+	digest, err := BundleDigest(source)
 	if err != nil {
 		t.Fatal(err)
 	}

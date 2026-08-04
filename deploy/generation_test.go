@@ -6,13 +6,15 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
-// TestBundleTreeDigestSeparatesEveryHashedField asserts the digest moves for
+// TestBundleDigestSeparatesEveryHashedField asserts the digest moves for
 // every fact it claims to cover and for nothing else. Fields are
 // length-prefixed, so a name, a mode, a size, and a symlink target can never
 // be re-partitioned into each other to forge a match.
-func TestBundleTreeDigestSeparatesEveryHashedField(t *testing.T) {
+func TestBundleDigestSeparatesEveryHashedField(t *testing.T) {
 	tests := []struct {
 		name  string
 		build func(t *testing.T, root string)
@@ -57,18 +59,18 @@ func TestBundleTreeDigestSeparatesEveryHashedField(t *testing.T) {
 	base := t.TempDir()
 	baseline := filepath.Join(base, "Baseline.app")
 	write(t, baseline, "Contents/MacOS/x", "body", 0o755)
-	want, err := bundleTreeDigest(baseline)
+	want, err := BundleDigest(baseline)
 	if err != nil {
-		t.Fatalf("bundleTreeDigest: %v", err)
+		t.Fatalf("BundleDigest: %v", err)
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			root := filepath.Join(t.TempDir(), "Case.app")
 			tt.build(t, root)
-			got, err := bundleTreeDigest(root)
+			got, err := BundleDigest(root)
 			if err != nil {
-				t.Fatalf("bundleTreeDigest: %v", err)
+				t.Fatalf("BundleDigest: %v", err)
 			}
 			if (got == want) != tt.same {
 				t.Fatalf("digest == baseline is %v, want %v", got == want, tt.same)
@@ -77,20 +79,20 @@ func TestBundleTreeDigestSeparatesEveryHashedField(t *testing.T) {
 	}
 }
 
-// TestBundleTreeDigestLengthPrefixesItsFields splits the same bytes across a
+// TestBundleDigestLengthPrefixesItsFields splits the same bytes across a
 // name and a symlink target at two different offsets. Concatenated the two
 // trees are identical; length-prefixed they cannot be.
-func TestBundleTreeDigestLengthPrefixesItsFields(t *testing.T) {
+func TestBundleDigestLengthPrefixesItsFields(t *testing.T) {
 	root := t.TempDir()
 	left := filepath.Join(root, "Left.app")
 	symlink(t, left, "ab", "Contents/MacOS/c")
 	right := filepath.Join(root, "Right.app")
 	symlink(t, right, "a", "Contents/MacOS/bc")
-	leftDigest, err := bundleTreeDigest(left)
+	leftDigest, err := BundleDigest(left)
 	if err != nil {
 		t.Fatal(err)
 	}
-	rightDigest, err := bundleTreeDigest(right)
+	rightDigest, err := BundleDigest(right)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,15 +101,41 @@ func TestBundleTreeDigestLengthPrefixesItsFields(t *testing.T) {
 	}
 }
 
-func TestBundleTreeDigestRefusesAnUnsupportedEntry(t *testing.T) {
+func TestBundleDigestRefusesAnUnsupportedEntry(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "Case.app")
 	write(t, root, "Contents/MacOS/x", "body", 0o755)
 	if err := syscall.Mkfifo(filepath.Join(root, "Contents", "MacOS", "pipe"), 0o600); err != nil {
 		t.Skipf("mkfifo: %v", err)
 	}
-	_, err := bundleTreeDigest(root)
+	_, err := BundleDigest(root)
 	if err == nil || !strings.Contains(err.Error(), "unsupported entry") {
-		t.Fatalf("bundleTreeDigest err = %v, want an unsupported-entry refusal", err)
+		t.Fatalf("BundleDigest err = %v, want an unsupported-entry refusal", err)
+	}
+}
+
+// TestBundleDigestPinsOneExactTree pins the digest of one exact tree. The
+// value is a cross-repository contract: consumers compute it to fill
+// Candidate.Digest and store it in their own deployment records, so a change
+// to the field order or the encoding invalidates every stored record rather
+// than merely failing a build. Regenerating this constant to match new output
+// is the wrong fix.
+func TestBundleDigestPinsOneExactTree(t *testing.T) {
+	const want = "b6777d599dd2f9a28372ac4b860d0950cdf8a2cfd2ca90c8a36374d1f82715ae"
+	root := filepath.Join(t.TempDir(), "Pinned.app")
+	write(t, root, "Contents/Info.plist", "<plist/>", 0o644)
+	write(t, root, "Contents/MacOS/helper", "helper body", 0o755)
+	symlink(t, root, "MacOS/helper", "Contents/Current")
+	for _, dir := range []string{".", "Contents", "Contents/MacOS"} {
+		if err := os.Chmod(filepath.Join(root, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	digest, err := BundleDigest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digest.String() != want {
+		t.Fatalf("BundleDigest = %s, want %s", digest, want)
 	}
 }
 
@@ -216,6 +244,10 @@ func symlink(t *testing.T, root, target, rel string) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+	// os.Symlink applies the umask to the link's own mode, which the digest covers.
+	if err := unix.Fchmodat(unix.AT_FDCWD, path, 0o755, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 		t.Fatal(err)
 	}
 }

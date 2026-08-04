@@ -76,7 +76,7 @@ disappears cannot leave a stale row behind.
 |---|---|---|---|
 | `artifact` | resolves a version-exact executable from a declarative descriptor, for the cc-family's one central "give me the binary that matches my version" primitive. | 16 | 2227 |
 | `bundle` | reads a macOS .app's Info.plist and resolves the stable bundle paths a daemon installs to. | 5 | 198 |
-| `deploy` | owns sealed installation, activation, supersession, and removal of one fixed signed application. | 16 | 5895 |
+| `deploy` | owns sealed installation, activation, supersession, and removal of one fixed signed application. | 16 | 5932 |
 | `durable` | makes filesystem state survive crashes: atomic, fsynced publication of files and directory mutations, a strict validated JSON codec, and one bounded cross-process lock. | 9 | 1029 |
 | `ghrelease` | queries GitHub for a repository's latest published release. | 2 | 170 |
 | `launchd` | is the value-type model for one exact macOS user LaunchAgent and the stateless primitives that apply it. | 12 | 2675 |

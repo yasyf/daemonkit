@@ -105,7 +105,7 @@ func (d *Deployment) inspect(ctx context.Context, appPath string) (Generation, e
 	if err != nil {
 		return Generation{}, fmt.Errorf("deploy: read bundle version: %w", err)
 	}
-	tree, err := bundleTreeDigest(appPath)
+	tree, err := BundleDigest(appPath)
 	if err != nil {
 		return Generation{}, err
 	}
@@ -136,11 +136,16 @@ func (d *Deployment) attest(ctx context.Context, expected Generation) error {
 	return nil
 }
 
-// bundleTreeDigest hashes a bundle's whole tree under an os.Root scope, and
+// BundleDigest hashes a bundle's whole tree under an os.Root scope, and
 // refuses a file that moved beneath it: identity, size, mtime, and mode must
 // agree across the walk's stat, a stat before the read, and a stat after it.
 // Fields are length-prefixed so no two trees collide by concatenation.
-func bundleTreeDigest(root string) (SHA256, error) {
+//
+// It computes the value [Candidate.Digest] names. That digest is a caller's
+// claim, never an authority: every verb that takes a candidate re-derives the
+// digest from the bytes it is about to move and refuses with [ErrConflict] on
+// any disagreement.
+func BundleDigest(root string) (SHA256, error) {
 	h := sha256.New()
 	rootHandle, err := os.OpenRoot(root)
 	if err != nil {

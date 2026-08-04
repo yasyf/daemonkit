@@ -6,6 +6,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.4] - 2026-08-03
+
+### Added
+
+- `deploy.BundleDigest` — the bundle-tree digest `Candidate.Digest` requires,
+  now callable. Nothing may be installed without that field, and the only
+  implementation of it lived unexported inside the package, so every consumer
+  packaging its own application hand-copied the walk, the field order, and the
+  length-prefixed encoding out of daemonkit's source: captain-hook, fusekit's
+  holder, and cc-notes each carried one. Three transcriptions of a hash are
+  three chances to diverge from the value `Install` and `Supersede` re-derive
+  from the bytes themselves, and a divergence surfaces only as an
+  `ErrConflict` refusal at install time. The digest is byte-identical to what
+  the package has always computed — a candidate digested by a hand-copy and
+  one digested by the export are the same value, so records already stored
+  against a copy stay valid — and one fixture tree's digest is now pinned to a
+  constant, so the encoding cannot drift without a test saying so.
+
 ## [0.21.3] - 2026-08-03
 
 ### Added
@@ -1225,7 +1243,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.21.3...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.21.4...HEAD
+[0.21.4]: https://github.com/yasyf/daemonkit/compare/v0.21.3...v0.21.4
 [0.21.3]: https://github.com/yasyf/daemonkit/compare/v0.21.2...v0.21.3
 [0.21.2]: https://github.com/yasyf/daemonkit/compare/v0.21.1...v0.21.2
 [0.21.1]: https://github.com/yasyf/daemonkit/compare/v0.21.0...v0.21.1

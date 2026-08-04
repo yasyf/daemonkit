@@ -323,6 +323,7 @@ bundle	func	ShortVersion	all
 deploy	type	Activation	darwin
 deploy	field	Activation.Generation	darwin
 deploy	field	Activation.Readiness	darwin
+deploy	func	BundleDigest	darwin
 deploy	type	Candidate	darwin
 deploy	field	Candidate.Digest	darwin
 deploy	field	Candidate.Source	darwin
