@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
 
 concurrency:
   group: fleet-build-${{ github.ref }}
@@ -61,8 +62,8 @@ jobs:
           echo "ref=$ref" >>"$GITHUB_OUTPUT"
 
       # FLEET_TOKEN reaches private consumers; GITHUB_TOKEN covers the public
-      # ones. A denied checkout skips the leg with a loud warning instead of
-      # passing as though the consumer had built.
+      # ones. A denied checkout fails the leg: a release gates on this build,
+      # so a consumer that never compiled must not report green.
       - name: Check out ${{ matrix.repo }}
         id: consumer
         continue-on-error: true
@@ -77,9 +78,10 @@ jobs:
       - name: Report an unreachable consumer
         if: steps.consumer.outcome != 'success'
         run: |
-          echo "::warning title=fleet-build skipped ${{ matrix.repo }}::checkout of yasyf/${{ matrix.repo }} was denied — this consumer was NOT built against daemonkit. Grant a FLEET_TOKEN with read access to it."
-          echo "### :warning: fleet-build skipped \`${{ matrix.repo }}\`" >>"$GITHUB_STEP_SUMMARY"
+          echo "::warning title=fleet-build failed ${{ matrix.repo }}::checkout of yasyf/${{ matrix.repo }} was denied — this consumer was NOT built against daemonkit. Grant a FLEET_TOKEN with read access to it."
+          echo "### :warning: fleet-build failed \`${{ matrix.repo }}\`" >>"$GITHUB_STEP_SUMMARY"
           echo "Checkout was denied, so this consumer was not compiled against daemonkit." >>"$GITHUB_STEP_SUMMARY"
+          exit 1
 
       # A consumer that also sits on a migrating peer — cc-interact, cc-notes,
       # fusekit, synckit — otherwise resolves it from its published tag, so the
@@ -89,7 +91,6 @@ jobs:
       # go.work at that ref, and one the token cannot reach falls back to its
       # tag, loudly.
       - name: Check out the fleet substrate ${{ matrix.repo }} sits on
-        if: steps.consumer.outcome == 'success'
         working-directory: daemonkit
         env:
           FLEET_TOKEN: ${{ secrets.FLEET_TOKEN || secrets.GITHUB_TOKEN }}
@@ -109,7 +110,6 @@ jobs:
           done
 
       - uses: actions/setup-go@v6
-        if: steps.consumer.outcome == 'success'
         with:
           go-version-file: daemonkit/go.mod
           cache-dependency-path: |
@@ -117,6 +117,5 @@ jobs:
             ${{ matrix.repo }}/go.sum
 
       - name: Build ${{ matrix.repo }} against the daemonkit tree
-        if: steps.consumer.outcome == 'success'
         working-directory: daemonkit
         run: ./scripts/fleet-build.sh --only ${{ matrix.repo }}

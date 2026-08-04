@@ -51,13 +51,19 @@ jobs:
           require_workflow "Export census"
           require_workflow "Docs drift"
           require_workflow "Mixed era"
+          require_workflow "Fleet build"
 
   mixed-era-tag:
     needs: verify-tag-on-main
     uses: ./.github/workflows/mixed-era.yml
 
+  fleet-build-tag:
+    needs: verify-tag-on-main
+    uses: ./.github/workflows/fleet-build.yml
+    secrets: inherit
+
   release:
-    needs: [verify-tag-on-main, verify-main-gates, mixed-era-tag]
+    needs: [verify-tag-on-main, verify-main-gates, mixed-era-tag, fleet-build-tag]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

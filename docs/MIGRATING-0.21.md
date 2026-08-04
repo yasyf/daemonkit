@@ -252,8 +252,12 @@ requirement, because the control lane admits one session server-wide.
 
 - **State directory rename.** Deployment state moved to `.daemonkit-deploy/<name>/`. The old tree
   is archived on first open rather than decode-failed.
-- **Signed policy digests change.** Consumers that bake a requirement digest — captain-hook's
-  `RequireExactStopReceipt`, cc-notes' `RequireDaemonkitStopReceipt` and its golden hash — rev it.
+- **Signed policy digests: rev or retire.** A digest over the signing identity revs —
+  `Requirement.Digest()` replaces `ValidationDigest()` and `PolicyDigest` is now a hex string, so a
+  baked value like cc-pool's runtime digest changes and must be recomputed by a real compile. A
+  deployment-policy golden whose only reader was v0.20's `PolicyDigest` sink has no v0.21 consumer —
+  delete the policy struct, its hooks, and the golden test instead of re-deriving them, as
+  captain-hook and cc-notes did.
 - **Source-text contracts.** cc-notes' `internal/helperapp/release_contract_test.go` asserts on
   source text, so no compiler will find it for you.
 - **Substrate order.** Tag a substrate before its dependents pin it. MVS selects the max across the
