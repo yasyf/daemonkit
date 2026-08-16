@@ -71,8 +71,8 @@ func (c *Client) Health(ctx context.Context) (HealthReport, error) {
 	if rejection := result.Rejection(); rejection != nil {
 		return HealthReport{}, rejection
 	}
-	if result.Response.Err != "" {
-		return HealthReport{}, fmt.Errorf("wire: health verb: %s", result.Response.Err)
+	if terminal := result.Terminal(); terminal != nil {
+		return HealthReport{}, fmt.Errorf("wire: health verb: %w", terminal)
 	}
 	return decodeHealthReport(result.Response.Payload)
 }

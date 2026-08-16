@@ -114,6 +114,10 @@ func (e *callError) Unwrap() error { return e.err }
 // refused types a failure that provably never reached the wire.
 func refused(err error) error { return &callError{outcome: wire.PreSendFailure, err: err} }
 
+func remoteError(terminal *wire.TerminalError) *RemoteError {
+	return &RemoteError{Message: terminal.Message, Err: terminal.Unwrap()}
+}
+
 // Business prepares the lane and performs no I/O, so it exists before the
 // daemon does. The session is acquired on first Call and re-acquired after
 // any session failure; a typed rejection is the peer's own answer on a session
@@ -244,8 +248,10 @@ func authorizeCallerAuthenticated(net.Conn) error { return nil }
 // ErrNotReady (retryable; wait with Client.WaitReady), ErrDraining,
 // ErrUntrusted, ErrPeerGone, ErrNoVerifier, and ErrOversize are typed refusals
 // that provably never dispatched; *ProductError is the product's own delivered
-// failure; anything else is transport loss or the caller's own expired
-// context, with delivery unknown.
+// failure and *RemoteError the daemon session's, unwrapping to
+// context.DeadlineExceeded when the conveyed deadline ended on that side;
+// anything else is transport loss or the caller's own expired context, with
+// delivery unknown.
 func (b *Business) Call(ctx context.Context, op string, body []byte) (Reply, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		return Reply{}, errors.New("daemonkit: Call requires a context deadline")
@@ -267,10 +273,10 @@ func (b *Business) Call(ctx context.Context, op string, body []byte) (Reply, err
 	if err != nil {
 		return Reply{}, &callError{outcome: result.Outcome, err: err}
 	}
-	if result.Response.Err != "" {
+	if terminal := result.Terminal(); terminal != nil {
 		return Reply{}, &callError{
 			outcome: result.Outcome,
-			err:     fmt.Errorf("daemonkit: business session: %s", result.Response.Err),
+			err:     fmt.Errorf("daemonkit: business session: %w", remoteError(terminal)),
 		}
 	}
 	var envelope businessEnvelope

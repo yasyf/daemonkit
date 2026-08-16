@@ -77,6 +77,15 @@ func (r Result) Rejection() error {
 	return &RejectionError{Code: r.Response.Code, Reason: r.Response.Reason}
 }
 
+// Terminal returns the typed failure an admitted request answered with and nil
+// otherwise. A rejection reports through Rejection instead.
+func (r Result) Terminal() *TerminalError {
+	if r.Response.Err == "" {
+		return nil
+	}
+	return &TerminalError{Code: r.Response.Code, Message: r.Response.Err}
+}
+
 // OpenError reports whether a request frame was committed before Open failed.
 type OpenError struct {
 	Outcome Outcome

@@ -110,6 +110,12 @@ const (
 	ResponseCodePermissionDenied ResponseCode = "permission_denied"
 	// ResponseCodeHandoffReplay identifies a nonce already consumed by this session.
 	ResponseCodeHandoffReplay ResponseCode = "handoff_replay"
+	// ResponseCodeDeadlineExceeded identifies an admitted request whose
+	// conveyed deadline ended before the serving side answered it. It is the
+	// one code that is no rejection, and it does not say the runtime handler
+	// ever ran: a request still waiting on the concurrency semaphore is
+	// abandoned under the same code.
+	ResponseCodeDeadlineExceeded ResponseCode = "deadline_exceeded"
 )
 
 // Request is one admitted request on a persistent session.
@@ -156,6 +162,17 @@ func (e *RejectionError) Error() string { return e.Reason }
 
 func (e *RejectionError) Unwrap() error { return responseCodeCause(e.Code) }
 
+// TerminalError is an admitted request's own failure, as the serving session
+// reported it. Message is that session's text verbatim.
+type TerminalError struct {
+	Code    ResponseCode
+	Message string
+}
+
+func (e *TerminalError) Error() string { return e.Message }
+
+func (e *TerminalError) Unwrap() error { return responseCodeCause(e.Code) }
+
 func responseCodeCause(code ResponseCode) error {
 	switch code {
 	case ResponseCodeRuntimeStarting:
@@ -172,6 +189,8 @@ func responseCodeCause(code ResponseCode) error {
 		return ErrPermissionDenied
 	case ResponseCodeHandoffReplay:
 		return ErrHandoffReplay
+	case ResponseCodeDeadlineExceeded:
+		return context.DeadlineExceeded
 	default:
 		return nil
 	}

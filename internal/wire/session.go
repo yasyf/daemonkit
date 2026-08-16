@@ -488,6 +488,13 @@ func rejectionCode(err error) (ResponseCode, bool) {
 	}
 }
 
+func terminalCode(err error) ResponseCode {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return ResponseCodeDeadlineExceeded
+	}
+	return ""
+}
+
 func (s *session) sendValue(
 	requestCtx, responseCtx context.Context,
 	id uint64,
@@ -527,6 +534,7 @@ func (s *session) sendValue(
 	}
 	response := Response{Ack: true}
 	if handlerErr != nil {
+		response.Code = terminalCode(handlerErr)
 		response.Err = handlerErr.Error()
 	} else {
 		payload, err := json.Marshal(value)

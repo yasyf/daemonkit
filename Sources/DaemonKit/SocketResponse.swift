@@ -23,6 +23,7 @@ public struct SocketResponseCode: RawRepresentable, Equatable, Hashable, Sendabl
     public static let handoffPendingCapacity = SocketResponseCode(rawValue: "handoff_pending_capacity")
     public static let handoffReplay = SocketResponseCode(rawValue: "handoff_replay")
     public static let handoffSessionExhausted = SocketResponseCode(rawValue: "handoff_session_exhausted")
+    public static let deadlineExceeded = SocketResponseCode(rawValue: "deadline_exceeded")
 }
 
 /// An authenticated server's typed handshake rejection.

@@ -3,6 +3,7 @@ package wire_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -97,5 +98,36 @@ func TestHealthVerbAnswersBelowPhaseGate(t *testing.T) {
 	}
 	if _, err := client.Health(ctx); err != nil {
 		t.Fatalf("Health() during starting = %v, want an answer below the gate", err)
+	}
+}
+
+// pastConveyedDeadline advertises a deadline the serving side is already past
+// while the caller's own context stays live, so the verb answers with that
+// side's verdict rather than racing the caller's.
+type pastConveyedDeadline struct{ context.Context }
+
+func (pastConveyedDeadline) Deadline() (time.Time, bool) { return time.Now().Add(-time.Second), true }
+
+func TestHealthVerbCarriesTheServingSidesTerminalVerdict(t *testing.T) {
+	rt := wiretest.NewStubRuntime()
+	sock, _ := startServer(t, rt, wire.Config{Serving: wire.Serving{PID: 1, Generation: 1}})
+	client := dialControl(t, sock)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := client.Health(pastConveyedDeadline{Context: ctx})
+
+	var terminal *wire.TerminalError
+	if !errors.As(err, &terminal) {
+		t.Fatalf("Health() = %v, want a *wire.TerminalError", err)
+	}
+	if terminal.Code != wire.ResponseCodeDeadlineExceeded {
+		t.Errorf("TerminalError.Code = %q, want %q", terminal.Code, wire.ResponseCodeDeadlineExceeded)
+	}
+	if terminal.Message != "context deadline exceeded" {
+		t.Errorf("TerminalError.Message = %q, want %q", terminal.Message, "context deadline exceeded")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("errors.Is(%v, context.DeadlineExceeded) = false, want true", err)
 	}
 }

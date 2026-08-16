@@ -76,3 +76,19 @@ var (
 	// inventory question — deploy.Inventory over the daemon's executables.
 	ErrUnrecorded = errors.New("daemonkit: no owner record names an incumbent")
 )
+
+// RemoteError is the daemon session's own failure on a request it admitted,
+// not the product's *ProductError. Err is what the response code classified
+// Message as — context.DeadlineExceeded when the conveyed deadline ended on
+// the serving side. It proves the daemon answered; its absence proves
+// nothing, one conveyed deadline ending on both sides at once.
+type RemoteError struct {
+	Message string
+	Err     error
+}
+
+// Error returns the daemon's failure text verbatim.
+func (e *RemoteError) Error() string { return e.Message }
+
+// Unwrap returns Err, nil when the response code classified nothing.
+func (e *RemoteError) Unwrap() error { return e.Err }

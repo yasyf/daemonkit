@@ -233,6 +233,59 @@ func TestBusinessSurvivesACallersOwnDeadlineOnItsSingleSession(t *testing.T) {
 	}
 }
 
+// splitDeadline advertises the deadline Call conveys onto the wire while its
+// own cancellation runs on an unrelated one. A single deadline ends on both
+// sides at once and races which leg answers first; parking the other leg far
+// away is what leaves one of them alone to answer.
+type splitDeadline struct {
+	context.Context
+	conveyed time.Time
+}
+
+func (c splitDeadline) Deadline() (time.Time, bool) { return c.conveyed, true }
+
+// TestBusinessTellsADaemonSideDeadlineFromTheCallersOwn pins what Call
+// promises about one conveyed deadline: whichever leg of it answers reports
+// context.DeadlineExceeded, and only the daemon's carries a *RemoteError.
+func TestBusinessTellsADaemonSideDeadlineFromTheCallersOwn(t *testing.T) {
+	lane := dialBusiness(t, serveBusiness(t), Contract{Schema: businessSchema})
+	const soon, distant = 200 * time.Millisecond, 30 * time.Second
+	tests := []struct {
+		name        string
+		conveyed    time.Duration
+		callerOwn   time.Duration
+		wantRemote  bool
+		wantMessage string
+	}{
+		{
+			name: "the daemon's leg", conveyed: soon, callerOwn: distant,
+			wantRemote: true, wantMessage: "context deadline exceeded",
+		},
+		{name: "the caller's leg", conveyed: distant, callerOwn: soon},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			own, cancel := context.WithTimeout(context.Background(), tt.callerOwn)
+			defer cancel()
+			ctx := splitDeadline{Context: own, conveyed: time.Now().Add(tt.conveyed)}
+			_, err := lane.Call(ctx, blockOp, nil)
+			var remote *RemoteError
+			if got := errors.As(err, &remote); got != tt.wantRemote {
+				t.Fatalf("errors.As(%v, *RemoteError) = %t, want %t", err, got, tt.wantRemote)
+			}
+			if tt.wantRemote && remote.Message != tt.wantMessage {
+				t.Errorf("RemoteError.Message = %q, want %q", remote.Message, tt.wantMessage)
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("errors.Is(%v, context.DeadlineExceeded) = false, want true", err)
+			}
+			if Undispatched(err) {
+				t.Errorf("Undispatched(%v) = true for a request the daemon admitted", err)
+			}
+		})
+	}
+}
+
 // failingWrites passes the handshake through and then, once armed, fails
 // every write with EPIPE while reads stay healthy — a transport whose break
 // only the writer can observe.
