@@ -53,7 +53,7 @@ func (l Label) element() (element, error) {
 	return element{label: string(l)}, nil
 }
 
-func (e element) state() paths.Paths { return paths.Paths{App: e.label} }
+func (e element) state() paths.Paths { return paths.Agent(e.label) }
 
 func (e element) socket() (string, error) { return paths.Socket(e.label) }
 

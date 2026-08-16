@@ -1,6 +1,8 @@
 // Package paths owns the canonical state-directory layout under the user's home
 // directory, resolved through the passwd database — never the caller's HOME or
 // CLAUDE_CONFIG_DIR — so a sandboxed environment cannot relocate state.
+// Daemon-owned state is rooted at ~/.daemonkit/agents/<label> through Agent,
+// inside the hidden directory daemonkit already owns.
 package paths
 
 import (
@@ -13,10 +15,22 @@ import (
 	"github.com/yasyf/daemonkit/internal/realhome"
 )
 
+const (
+	daemonkitDir = ".daemonkit"
+	agentsDir    = "agents"
+)
+
 // Paths produces the state-directory layout for an application whose private
-// state lives at ~/<App>.
+// state lives at ~/<App>, where App is home-relative. A daemon's layout comes
+// from Agent rather than from a bare label.
 type Paths struct {
 	App string
+}
+
+// Agent is the layout for one daemon's private state, at
+// ~/.daemonkit/agents/<label>.
+func Agent(label string) Paths {
+	return Paths{App: filepath.Join(daemonkitDir, agentsDir, label)}
 }
 
 func mustHome() string {

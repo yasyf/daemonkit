@@ -6,6 +6,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking.** Every daemon's private state moved from `~/<Label>` to
+  `~/.daemonkit/agents/<Label>`. A daemon used to cut a non-hidden directory
+  straight into the user's home for its socket, owner record, and start lock —
+  one per label, thirteen of them on a fleet machine — beside the hidden
+  `~/.daemonkit` daemonkit already owns for `bin/`, `cache/`, `tools/`, and
+  `locks/`. `paths.Agent(label)` is the new constructor for that layout and
+  `paths.Socket` routes through it; `paths.Paths{App: …}` keeps its `~/<App>`
+  meaning for an application that owns its home directory outright. There is no
+  migration and no fallback read: old state is abandoned where it lies and a
+  daemon comes up fresh, so delete `~/<Label>` by hand once every consumer is
+  on this release. The socket path grows 18 bytes, which darwin's 104-byte
+  `sun_path` still fits — `paths.Socket` returns its `*SocketPathError` for the
+  combinations of long home and long label that no longer do.
+
 ## [0.21.4] - 2026-08-03
 
 ### Added

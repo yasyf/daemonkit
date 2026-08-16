@@ -1577,11 +1577,13 @@ func TestOpenRejectsInvalidConfig(t *testing.T) {
 // TestOpenRefusesALabelWhoseRecordPathEscapesTheStateRoot is the traversal a
 // "Label is required" check lets through. Daemon.RecordPath states the layout
 // without running the Label rule, and the inventory gate every quiesce arm ends
-// at reads that path — so a Label of "../../evil" reaches Install, Supersede,
-// Uninstall, Reset, and Quiesce as a file outside the state root entirely. Open
-// is the boundary that refuses it, and the owner record planted at the escaped
-// path is what proves the refusal is the only thing standing between a consumer
-// and that read.
+// at reads that path — so a Label of "../../../evil" reaches Install,
+// Supersede, Uninstall, Reset, and Quiesce as a file outside the state root
+// entirely. Open is the boundary that refuses it, and the owner record planted
+// at the escaped path is what proves the refusal is the only thing standing
+// between a consumer and that read. The traversal is as deep as
+// ~/.daemonkit/agents/<Label> is; a shallower one lands back inside the home
+// directory and proves nothing.
 func TestOpenRefusesALabelWhoseRecordPathEscapesTheStateRoot(t *testing.T) {
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -1593,7 +1595,7 @@ func TestOpenRefusesALabelWhoseRecordPathEscapesTheStateRoot(t *testing.T) {
 	}
 	t.Setenv(realhome.EnvOverride, home)
 
-	const label = daemonkit.Label("../../evil")
+	const label = daemonkit.Label("../../../evil")
 	escaped := daemonkit.Daemon{Label: label}.RecordPath()
 	if strings.HasPrefix(escaped, home+string(filepath.Separator)) {
 		t.Fatalf("record path %q is inside the state root %q; this label no longer escapes", escaped, home)

@@ -332,7 +332,7 @@ func TestDaemonAgent(t *testing.T) {
 			want: launchd.Agent{
 				Label:         "com.example.ensure",
 				Program:       program,
-				LogPath:       filepath.Join(home, "com.example.ensure", "daemon.log"),
+				LogPath:       filepath.Join(home, ".daemonkit", "agents", "com.example.ensure", "daemon.log"),
 				RestartPolicy: launchd.RestartOnFailure,
 				ExitTimeOut:   30 * time.Second,
 			},
@@ -899,7 +899,7 @@ func TestMovedNamesTheRacesEnsureReObserves(t *testing.T) {
 func TestEnsurePlacesTheProgramOnlyUnderTheStartLock(t *testing.T) {
 	ladderHome(t)
 	label := Label("com.example.race")
-	statePaths := paths.Paths{App: string(label)}
+	statePaths := paths.Agent(string(label))
 	if err := statePaths.EnsureLockDir(); err != nil {
 		t.Fatalf("create lock dir: %v", err)
 	}

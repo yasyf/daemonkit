@@ -2,10 +2,43 @@ package daemonkit
 
 import (
 	"math"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestDaemonStateRootsUnderTheHiddenDir(t *testing.T) {
+	home := shortHome(t)
+	d := Daemon{Label: "com.example.hidden"}
+	el, err := d.Label.element()
+	if err != nil {
+		t.Fatalf("element() error = %v", err)
+	}
+	socket, err := el.socket()
+	if err != nil {
+		t.Fatalf("socket() error = %v", err)
+	}
+	root := filepath.Join(home, ".daemonkit", "agents", string(d.Label))
+
+	tests := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{"state dir", el.state().StateDir(), root},
+		{"socket", socket, filepath.Join(root, "daemon.sock")},
+		{"record", d.RecordPath(), filepath.Join(root, "daemon.records")},
+		{"start lock", el.state().StartLockPath(), filepath.Join(root, "locks", "start.lock")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.got != tt.want {
+				t.Errorf("%s = %q, want %q", tt.name, tt.got, tt.want)
+			}
+		})
+	}
+}
 
 func TestDaemonValidateForServe(t *testing.T) {
 	tests := []struct {

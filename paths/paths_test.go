@@ -8,6 +8,31 @@ import (
 	"github.com/yasyf/daemonkit/internal/realhome"
 )
 
+func TestAgentRootsStateUnderTheHiddenDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv(realhome.EnvOverride, home)
+	root := filepath.Join(home, ".daemonkit", "agents", "com.example.daemon")
+	agent := Agent("com.example.daemon")
+
+	tests := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{"state dir", agent.StateDir(), root},
+		{"socket", agent.SocketPath(), filepath.Join(root, "daemon.sock")},
+		{"log", agent.LogPath(), filepath.Join(root, "daemon.log")},
+		{"start lock", agent.StartLockPath(), filepath.Join(root, "locks", "start.lock")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.got != tt.want {
+				t.Errorf("%s = %q, want %q", tt.name, tt.got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRepoTurnsDir(t *testing.T) {
 	t.Setenv(realhome.EnvOverride, t.TempDir())
 	p := Paths{App: ".cc-test"}

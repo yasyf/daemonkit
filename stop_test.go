@@ -144,7 +144,7 @@ func TestStopHoldsTheStartLock(t *testing.T) {
 	ladderHome(t)
 	label := Label("com.example.stoplock")
 	path := installedAgentPlist(t, label, true)
-	statePaths := paths.Paths{App: string(label)}
+	statePaths := paths.Agent(string(label))
 	if err := statePaths.EnsureLockDir(); err != nil {
 		t.Fatalf("create lock dir: %v", err)
 	}
