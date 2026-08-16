@@ -7,7 +7,7 @@ public func acquireReadyRuntime(
     deadline: Date
 ) async throws {
     let client = try ServiceSocketClient(
-        path: configuration.path,
+        connection: configuration.connection,
         schema: configuration.schema,
         lane: configuration.lane,
         configuration: configuration.socket,

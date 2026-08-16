@@ -88,6 +88,27 @@ private func reportBridgeFailure(_ message: String) {
 
 private let descriptorInheritanceLock = NSLock()
 
+enum BrokerDelegation: Sendable {
+    case wireOp(BrokerHandoffClient)
+    case channel(SpawnedChannel)
+
+    func handoff(descriptor: Int32, parentDeadline: Date) async throws {
+        switch self {
+        case let .wireOp(client):
+            try await client.handoff(descriptor: descriptor, parentDeadline: parentDeadline)
+        case let .channel(channel):
+            defer { Darwin.close(descriptor) }
+            try await channel.delegate(descriptor: descriptor, deadline: parentDeadline)
+        }
+    }
+
+    func close() async {
+        if case let .wireOp(client) = self {
+            await client.close()
+        }
+    }
+}
+
 actor BrokerHandoffClient {
     private struct Usage {
         var accepted = 0
@@ -273,7 +294,7 @@ public final class BrokerSocketBridge: @unchecked Sendable {
 
     private let path: String
     private let lifecycleClient: ServiceSocketClient
-    private let handoffClient: BrokerHandoffClient
+    private let delegation: BrokerDelegation
     private let acceptQueue = DispatchQueue(label: "com.yasyf.daemonkit.BrokerSocketBridge.accept")
     private let lock = NSLock()
     private var listener: Int32 = -1
@@ -299,16 +320,18 @@ public final class BrokerSocketBridge: @unchecked Sendable {
     ) throws {
         self.path = path
         lifecycleClient = try ServiceSocketClient(
-            path: lifecycle.path,
+            connection: lifecycle.connection,
             schema: lifecycle.schema,
             lane: lifecycle.lane,
             configuration: lifecycle.socket,
             onProgress: lifecycle.onProgress
         )
-        handoffClient = BrokerHandoffClient(
-            path: lifecycle.path,
-            configuration: lifecycle.socket
-        )
+        delegation = switch lifecycle.connection {
+        case let .path(daemonPath):
+            .wireOp(BrokerHandoffClient(path: daemonPath, configuration: lifecycle.socket))
+        case let .spawned(channel):
+            .channel(channel)
+        }
     }
 
     /// Runs one bounded listener until cancellation or ``shutdown()``.
@@ -340,7 +363,7 @@ public final class BrokerSocketBridge: @unchecked Sendable {
                         }
                         let accepted = try await acceptConnection(bound.descriptor)
                         pending += 1
-                        group.addTask { [lifecycleClient, handoffClient] in
+                        group.addTask { [lifecycleClient, delegation] in
                             var ownsDescriptor = true
                             defer {
                                 if ownsDescriptor {
@@ -351,7 +374,7 @@ public final class BrokerSocketBridge: @unchecked Sendable {
                                 let deadline = Date().addingTimeInterval(brokerHandoffMaximumDuration)
                                 try await lifecycleClient.waitReady(deadline: deadline)
                                 ownsDescriptor = false
-                                try await handoffClient.handoff(
+                                try await delegation.handoff(
                                     descriptor: accepted,
                                     parentDeadline: deadline
                                 )
@@ -373,7 +396,7 @@ public final class BrokerSocketBridge: @unchecked Sendable {
             let expectedStop = lock.withLock { stopped }
             closeListener(bound)
             await lifecycleClient.close()
-            await handoffClient.close()
+            await delegation.close()
             if expectedStop {
                 return
             }
@@ -381,7 +404,7 @@ public final class BrokerSocketBridge: @unchecked Sendable {
         }
         closeListener(bound)
         await lifecycleClient.close()
-        await handoffClient.close()
+        await delegation.close()
     }
 
     /// Stops admission and closes the authenticated outbound session.
@@ -403,7 +426,7 @@ public final class BrokerSocketBridge: @unchecked Sendable {
             release(owned)
         }
         await lifecycleClient.close()
-        await handoffClient.close()
+        await delegation.close()
     }
 
     private func bindListener() throws -> BoundListener {

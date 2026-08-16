@@ -10,7 +10,8 @@ import (
 
 const handoffFD = 3
 
-func socketpairFiles() (parent, child *os.File, err error) {
+// SocketpairFiles creates one pre-connected CLOEXEC unix stream socketpair.
+func SocketpairFiles() (parent, child *os.File, err error) {
 	syscall.ForkLock.Lock()
 	defer syscall.ForkLock.Unlock()
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)

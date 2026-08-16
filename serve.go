@@ -41,6 +41,11 @@ type Ctx struct {
 	// Serve and Owned.Ctx are the only things that set it, so the zero Ctx
 	// refuses the verbs loudly instead of spawning into a scope nothing owns.
 	owner *Owned
+
+	// adoptMinted and adoptHandoff are the serving wire server's admission
+	// entries, set only by Serve; ServeChannel refuses without them.
+	adoptMinted  func(*net.UnixConn, trust.Peer, []byte) error
+	adoptHandoff func(*net.UnixConn) error
 }
 
 // Product is the consumer's daemon. Handle owns dispatch — no route table,
@@ -241,11 +246,13 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 	activationCtx, cancelActivation := context.WithCancel(rt.stopped)
 	defer cancelActivation()
 	product, startErr := start(Ctx{
-		Context:   activationCtx,
-		Reclaimed: owned.Reclaimed(),
-		Report:    rt.report,
-		Stop:      func(error) { rt.Drain() },
-		owner:     owned,
+		Context:      activationCtx,
+		Reclaimed:    owned.Reclaimed(),
+		Report:       rt.report,
+		Stop:         func(error) { rt.Drain() },
+		owner:        owned,
+		adoptMinted:  server.AdoptMinted,
+		adoptHandoff: server.AdoptHandoff,
 	})
 	var serveErr error
 	serveReturned := false

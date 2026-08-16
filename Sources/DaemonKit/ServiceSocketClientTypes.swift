@@ -15,7 +15,7 @@ public enum ServiceSocketReplayPolicy: Equatable, Sendable {
 
 /// RuntimeClientConfiguration configures one private connect-through-ready operation.
 public struct RuntimeClientConfiguration: Sendable {
-    public let path: String
+    public let connection: SocketConnection
     public let schema: String
     public let lane: SessionLane
     public let socket: SocketClient.Configuration
@@ -28,7 +28,23 @@ public struct RuntimeClientConfiguration: Sendable {
         socket: SocketClient.Configuration = .init(),
         onProgress: (@Sendable (PhaseSnapshot) -> Void)? = nil
     ) {
-        self.path = path
+        self.init(
+            connection: .path(path),
+            schema: schema,
+            lane: lane,
+            socket: socket,
+            onProgress: onProgress
+        )
+    }
+
+    public init(
+        connection: SocketConnection,
+        schema: String,
+        lane: SessionLane = .business,
+        socket: SocketClient.Configuration = .init(),
+        onProgress: (@Sendable (PhaseSnapshot) -> Void)? = nil
+    ) {
+        self.connection = connection
         self.schema = schema
         self.lane = lane
         self.socket = socket

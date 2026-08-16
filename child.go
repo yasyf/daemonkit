@@ -29,6 +29,10 @@ type Child struct {
 	// plumbing.
 	nonce  []byte
 	limits Limits
+	// token is the child's audit token, read while the spawn held it
+	// suspended — before release, where the PID provably cannot have been
+	// reaped — so later uses cannot race PID reuse.
+	token proc.AuditToken
 }
 
 // PID returns the child's process id.

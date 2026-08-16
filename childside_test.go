@@ -48,6 +48,10 @@ func runChildRole(role string) int {
 		return childServeSpawnedDisconnect()
 	case "claim-then-serve":
 		return childClaimThenServe()
+	case "spawn-channel-client":
+		return childSpawnChannelClient()
+	case "exit-clean":
+		return 0
 	}
 	fmt.Fprintf(os.Stderr, "child: unknown role %q\n", role)
 	return 64

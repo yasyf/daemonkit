@@ -137,7 +137,7 @@ public actor ServiceSocketClient {
         case reconnect
     }
 
-    private let path: String
+    private let connection: SocketConnection
     private let schema: String
     private let lane: SessionLane
     private let configuration: SocketClient.Configuration
@@ -170,13 +170,30 @@ public actor ServiceSocketClient {
         configuration: SocketClient.Configuration = .init(),
         onProgress: (@Sendable (PhaseSnapshot) -> Void)? = nil
     ) throws {
+        try self.init(
+            connection: .path(path),
+            schema: schema,
+            lane: lane,
+            configuration: configuration,
+            onProgress: onProgress
+        )
+    }
+
+    /// Creates a lazy schema-pinned service client over the given connection.
+    public init(
+        connection: SocketConnection,
+        schema: String,
+        lane: SessionLane = .business,
+        configuration: SocketClient.Configuration = .init(),
+        onProgress: (@Sendable (PhaseSnapshot) -> Void)? = nil
+    ) throws {
         switch lane {
         case .business:
             guard !schema.isEmpty else { throw SessionTransportError.handshake("empty schema") }
         case .control:
             guard schema.isEmpty else { throw SessionTransportError.handshake("control lane carries no schema") }
         }
-        self.path = path
+        self.connection = connection
         self.schema = schema
         self.lane = lane
         self.configuration = configuration
@@ -303,13 +320,13 @@ private extension ServiceSocketClient {
             attemptConfiguration.handshakeTimeout = min(attemptConfiguration.handshakeTimeout, remaining)
             let id = nextGeneration
             nextGeneration += 1
-            let path = path
+            let connection = connection
             let schema = schema
             let lane = lane
             let onPhase = progressHandler
             let task = Task {
                 try await SocketClient(
-                    path: path,
+                    connection: connection,
                     schema: schema,
                     lane: lane,
                     configuration: attemptConfiguration,

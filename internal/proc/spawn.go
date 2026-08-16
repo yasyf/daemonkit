@@ -207,7 +207,7 @@ func (s *Store) plumb(c Cmd, childOut, childErr *os.File) (spawnFiles, net.Conn,
 	var parentEnd net.Conn
 	switch c.Channel {
 	case ChannelHandoff:
-		parent, child, err := socketpairFiles()
+		parent, child, err := SocketpairFiles()
 		if err != nil {
 			return fail(err)
 		}

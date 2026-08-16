@@ -97,15 +97,31 @@ public final class SocketCall: @unchecked Sendable {
 public final class SocketClient: @unchecked Sendable {
     let core: SocketClientCore
 
-    public init(
+    public convenience init(
         path: String,
         schema: String,
         lane: SessionLane,
         configuration: Configuration = .init(),
         onPhase: (@Sendable (PhaseSnapshot) -> Void)? = nil
     ) async throws {
+        try await self.init(
+            connection: .path(path),
+            schema: schema,
+            lane: lane,
+            configuration: configuration,
+            onPhase: onPhase
+        )
+    }
+
+    public init(
+        connection: SocketConnection,
+        schema: String,
+        lane: SessionLane,
+        configuration: Configuration = .init(),
+        onPhase: (@Sendable (PhaseSnapshot) -> Void)? = nil
+    ) async throws {
         core = try await SocketClientCore(
-            path: path,
+            connection: connection,
             schema: schema,
             lane: lane,
             configuration: configuration,
@@ -264,7 +280,7 @@ final class SocketClientCore: @unchecked Sendable {
     var cancellationTimeoutResultHook: (@Sendable (Bool) async -> Void)?
 
     init(
-        path: String,
+        connection: SocketConnection,
         schema: String,
         lane: SessionLane,
         configuration: SocketClient.Configuration,
@@ -275,6 +291,9 @@ final class SocketClientCore: @unchecked Sendable {
             guard !schema.isEmpty else { throw SessionTransportError.handshake("empty schema") }
         case .control:
             guard schema.isEmpty else { throw SessionTransportError.handshake("control lane carries no schema") }
+            if case .spawned = connection {
+                throw SessionTransportError.handshake("minted session requires the business lane")
+            }
         }
         guard configuration.maximumFrameBytes > 0,
               (1 ... Int(UInt32.max)).contains(configuration.streamQueueDepth),
@@ -287,7 +306,7 @@ final class SocketClientCore: @unchecked Sendable {
               configuration.cancellationSettlementTimeout >= 0
         else { throw SessionTransportError.invalidFrame("timeout") }
         let bootstrap = try await Self.bootstrap(
-            path: path,
+            connection: connection,
             schema: schema,
             lane: lane,
             configuration: configuration
@@ -613,12 +632,14 @@ extension SocketClientCore {
         codec: SessionFrameCodec,
         schema: String,
         lane: SessionLane,
+        nonce: Data? = nil,
         timeout: TimeInterval
     ) throws -> SessionWireIdentity {
         let payload = try JSONEncoder().encode(SessionHelloIdentity(
             protocolVersion: daemonKitSessionProtocolVersion,
             lane: lane,
-            schema: schema.isEmpty ? nil : schema
+            schema: schema.isEmpty ? nil : schema,
+            nonce: nonce
         ))
         let writeFailure: Error?
         do {
@@ -708,7 +729,7 @@ extension SocketClientCore {
 
 private extension SocketClientCore {
     private static func bootstrap(
-        path: String,
+        connection: SocketConnection,
         schema: String,
         lane: SessionLane,
         configuration: SocketClient.Configuration
@@ -718,8 +739,20 @@ private extension SocketClientCore {
         return try await withTaskCancellationHandler {
             var writer: SessionWriter?
             do {
-                let descriptor = try await readQueue.performIO {
-                    try connect(path: path, timeout: configuration.handshakeTimeout, owner: owner)
+                var nonce: Data?
+                let descriptor: Int32
+                switch connection {
+                case let .path(path):
+                    descriptor = try await readQueue.performIO {
+                        try connect(path: path, timeout: configuration.handshakeTimeout, owner: owner)
+                    }
+                case let .spawned(channel):
+                    let minted = try await channel.mint(
+                        deadline: Date().addingTimeInterval(configuration.handshakeTimeout)
+                    )
+                    try owner.install(minted.descriptor)
+                    descriptor = minted.descriptor
+                    nonce = minted.nonce
                 }
                 try await readQueue.performIO {
                     try configureNonblocking(descriptor)
@@ -735,11 +768,13 @@ private extension SocketClientCore {
                     label: "com.yasyf.daemonkit.SocketClient.write"
                 )
                 writer = sessionWriter
+                let helloNonce = nonce
                 let identity = try await readQueue.performIO {
                     try handshake(
                         codec: codec,
                         schema: schema,
                         lane: lane,
+                        nonce: helloNonce,
                         timeout: configuration.handshakeTimeout
                     )
                 }

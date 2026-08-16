@@ -6,7 +6,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Ctx.ServeChannel` serves the fd-3 channel a `ChannelHandoff` child inherits,
+  over two verbs. `mint` hands the child a fresh pre-connected session end;
+  `adopt` takes a connection the child accepted and admits it through the same
+  full-trust path an accepted connection already takes. A child that takes its
+  sessions this way never learns or dials a socket path, so there is no path a
+  same-UID process can bind first and no constant for a consumer to drift from
+  — the failure mode that a socket path in a child's argv invites. A minted
+  session is business-lane only, carries a per-mint nonce compared in constant
+  time, and refuses the drain preamble outright, because a spawned peer must
+  never inherit authority to drain the daemon that spawned it.
+
+- `Spawn` pins its child's code identity while the child is still suspended,
+  before `Verify` releases it, and `Child` carries that audit token. A
+  suspended child cannot exit, be reaped, or surrender its PID, so the pin
+  names the execution that was spawned rather than whoever holds that PID by
+  the time anyone asks — the same guarantee `Control` assembles at attach, in
+  the one place where a spawn makes it free.
+
+- `RemoteError` carries the daemon's own terminal failure to the caller, so a
+  failure the daemon reported can be recovered with `errors.As` instead of
+  matched by its text.
+
 ### Changed
+
+- A business session's terminal failure is a typed error rather than a
+  flattened string. `Response.Err` crossed the wire as text and was rendered
+  with `%s`, so a caller could not tell a deadline the daemon hit from its own
+  expired context — the same words for two different facts, and nothing but
+  string matching to separate them. The serving side now stamps a response
+  code that the client resolves through the one classification table
+  `RejectionError` already used, so `errors.Is(err, context.DeadlineExceeded)`
+  answers for the daemon's own deadline. `Client.Health` takes the same
+  treatment.
 
 - **Breaking.** Every daemon's private state moved from `~/<Label>` to
   `~/.daemonkit/agents/<Label>`. A daemon used to cut a non-hidden directory

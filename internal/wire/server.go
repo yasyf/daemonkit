@@ -3,6 +3,7 @@ package wire
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -202,6 +203,95 @@ func (s *Server) AdoptHandoff(conn *net.UnixConn) error {
 	return s.startConnection(ctx, conn)
 }
 
+// AdoptMinted admits a parent-minted socketpair end as one business session
+// whose peer identity is pinned to the spawn-proven child: a socketpair's
+// kernel peer names its creator — this daemon — so the socket read that
+// identifies an accepted peer would lie here. The hello must present the
+// business lane and echo the per-mint nonce; the pinned peer still walks the
+// business trust gate.
+func (s *Server) AdoptMinted(conn *net.UnixConn, peer trust.Peer, nonce []byte) error {
+	if len(nonce) != spawnedNonceBytes {
+		_ = conn.Close()
+		return fmt.Errorf("wire: minted nonce must be %d bytes", spawnedNonceBytes)
+	}
+	s.mu.Lock()
+	ctx := s.serveCtx
+	closed := s.intakeClosed || ctx == nil
+	s.mu.Unlock()
+	if closed || ctx.Err() != nil {
+		_ = conn.Close()
+		return ErrDraining
+	}
+	select {
+	case s.pendingSlots <- struct{}{}:
+	default:
+		_ = conn.Close()
+		return ErrSessionCapacity
+	}
+	s.pendingWG.Add(1)
+	defer func() { <-s.pendingSlots; s.pendingWG.Done() }()
+	return s.startMinted(ctx, conn, peer, nonce)
+}
+
+// startMinted is AdoptMinted's gate walk. It refuses the drain preamble
+// outright — a spawned peer holds no drain authority — and takes the pinned
+// peer where startConnection reads the socket.
+func (s *Server) startMinted(ctx context.Context, conn *net.UnixConn, peer trust.Peer, nonce []byte) error {
+	start := time.Now()
+	codec := NewCodec(conn)
+	codec.MaxFrame = s.maxFrame()
+	if err := codec.SetDeadline(earlierDeadline(ctx, start.Add(s.handshakeReadTimeout()))); err != nil {
+		_ = conn.Close()
+		return err
+	}
+	drain, err := codec.PeekPreamble()
+	if err != nil {
+		_ = conn.Close()
+		return err
+	}
+	if drain {
+		_ = conn.Close()
+		return fmt.Errorf("%w: drain preamble on a minted session", ErrHandshake)
+	}
+	hello, err := readClientHello(codec)
+	if err != nil {
+		s.rejectHandshake(conn, codec, ResponseCodePeerUntrusted, err)
+		return err
+	}
+	if hello.Lane != LaneBusiness {
+		err := fmt.Errorf("%w: minted session requires the business lane", ErrHandshake)
+		s.rejectHandshake(conn, codec, ResponseCodePeerUntrusted, err)
+		return err
+	}
+	if subtle.ConstantTimeCompare(hello.Nonce, nonce) != 1 {
+		err := fmt.Errorf("%w: minted session nonce", ErrHandshake)
+		s.rejectHandshake(conn, codec, ResponseCodePeerUntrusted, err)
+		return err
+	}
+	if err := codec.SetDeadline(earlierDeadline(ctx, start.Add(s.handshakeTimeout()))); err != nil {
+		_ = conn.Close()
+		return err
+	}
+	if s.draining() {
+		_, _ = conn.Write(drainPreamble[:])
+		_ = conn.Close()
+		return ErrDraining
+	}
+	if verified := trust.VerifyAny(peer, s.cfg.Trust.Business); verified != nil {
+		s.rejectHandshake(conn, codec, ResponseCodePeerUntrusted, ErrUntrustedPeer)
+		err := fmt.Errorf("wire: verify minted peer: %w", verified)
+		if !errors.Is(err, trust.ErrUntrustedPeer) && !errors.Is(err, trust.ErrPeerGone) {
+			s.log.Error("wire: peer verification infrastructure failure", "err", err)
+		}
+		return err
+	}
+	if !s.cfg.Schemas.Accepts(hello.Schema) {
+		s.rejectHandshake(conn, codec, ResponseCodeBuildMismatch, ErrBuildMismatch)
+		return ErrBuildMismatch
+	}
+	return s.admitSession(ctx, conn, codec, hello, peer)
+}
+
 // startConnection walks the admission gate stack in order: the inbound drain
 // preamble peek, hello read under the short pre-verification deadline, drain
 // preamble, trust, schema, lane capacity — capacity strictly after
@@ -269,6 +359,18 @@ func (s *Server) startConnection(ctx context.Context, conn *net.UnixConn) error 
 		s.rejectHandshake(conn, codec, ResponseCodeBuildMismatch, ErrBuildMismatch)
 		return ErrBuildMismatch
 	}
+	return s.admitSession(ctx, conn, codec, hello, peer)
+}
+
+// admitSession is the verified tail both admission paths share: lane
+// capacity strictly after verification, then the phase-carrying ack.
+func (s *Server) admitSession(
+	ctx context.Context,
+	conn *net.UnixConn,
+	codec *Codec,
+	hello helloIdentity,
+	peer trust.Peer,
+) error {
 	s.mu.Lock()
 	if s.intakeClosed {
 		s.mu.Unlock()
