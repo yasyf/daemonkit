@@ -66,6 +66,7 @@
 .	field	Ctx.Reclaimed	darwin
 .	field	Ctx.Report	darwin
 .	method	Ctx.Run	darwin
+.	method	Ctx.ServeChannel	darwin
 .	method	Ctx.Spawn	darwin
 .	field	Ctx.Stop	darwin
 .	type	Daemon	darwin
@@ -479,6 +480,7 @@ launchd	const	SessionTypeStandardIO	darwin
 launchd	const	SessionTypeSystem	darwin
 launchd	func	ValidateLabel	darwin
 launchd	func	Verify	darwin
+paths	func	Agent	all
 paths	type	Paths	all
 paths	field	Paths.App	all
 paths	method	Paths.ChannelSetupMarkerPath	all
