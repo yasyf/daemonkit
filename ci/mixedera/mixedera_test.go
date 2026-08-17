@@ -45,6 +45,7 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/ci/mixedera/coverage"
+	"github.com/yasyf/daemonkit/paths"
 	"github.com/yasyf/daemonkit/version"
 )
 
@@ -517,7 +518,7 @@ func probeDeadline(err error) (bool, string) {
 func startCut(t *testing.T, p peer, args ...string) *daemonProc {
 	t.Helper()
 	home := socketDir(t)
-	daemon := startDaemon(t, p, filepath.Join(home, cutLabel, "daemon.sock"),
+	daemon := startDaemon(t, p, filepath.Join(home, paths.Agent(cutLabel).App, "daemon.sock"),
 		append([]string{"serve", "-home", home}, args...)...)
 	daemon.home = home
 	return daemon
