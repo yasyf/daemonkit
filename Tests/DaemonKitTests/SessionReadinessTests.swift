@@ -9,6 +9,17 @@ private func setNonblocking(_ descriptor: Int32) throws {
     try #require(fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0)
 }
 
+/// The counterpart I/O runs on a thread of its own rather than a delayed block
+/// on the global queue: these tests gate a readiness deadline on it arriving,
+/// and a saturated dispatch pool defers such a block past the deadline.
+private func afterDelay(milliseconds: Int, _ body: @escaping @Sendable () -> Void) {
+    let thread = Thread {
+        Thread.sleep(forTimeInterval: Double(milliseconds) / 1000)
+        body()
+    }
+    thread.start()
+}
+
 private final class SocketFrameResult: @unchecked Sendable {
     private let lock = NSLock()
     private var result: Result<SessionFrame, Error>?
@@ -40,7 +51,7 @@ struct SessionReadinessTests {
         let writer = SessionFrameCodec(descriptor: descriptors[1])
         let expected = SessionFrame(kind: .event, flags: .end, operation: "ready")
         let finished = DispatchSemaphore(value: 0)
-        DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(50)) {
+        afterDelay(milliseconds: 50) {
             try? writer.write(expected)
             finished.signal()
         }
@@ -72,7 +83,7 @@ struct SessionReadinessTests {
         let payload = Data(repeating: 0x5A, count: 2 * 1024 * 1024)
         let received = SocketFrameResult()
         let finished = DispatchSemaphore(value: 0)
-        DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(50)) {
+        afterDelay(milliseconds: 50) {
             received.store(Result { try reader.read(timeout: 2) })
             finished.signal()
         }
