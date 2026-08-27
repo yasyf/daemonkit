@@ -4,8 +4,9 @@
 #   scripts/gen-package-table.sh            # rewrite every target in place
 #   scripts/gen-package-table.sh --check    # exits non-zero on any drift
 #
-# AGENTS.md is a cc-guides render of .claude/fragments/AGENTS.md/, so the
-# fragment carries the table too and the next render stays byte-identical.
+# AGENTS.md is a cc-guides render of .claude/fragments/AGENTS.md/ and is not a
+# target: cc-guides fails any pull request that hand-edits a rendered artifact.
+# Rendering the fragment is what puts the table there.
 
 set -euo pipefail
 
@@ -19,7 +20,6 @@ export GOOS=darwin
 
 targets=(
   "README.md"
-  "AGENTS.md"
   ".claude/fragments/AGENTS.md/daemonkit-development-guide.fragment.md"
 )
 
