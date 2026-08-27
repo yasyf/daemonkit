@@ -23,8 +23,10 @@ daemonkit/
 
 The Go packages sit beside `doc.go` at the module root. Read them out of the
 tree, never out of a list someone typed — `scripts/gen-package-table.sh` writes
-the table below and `--check` gates it in CI, so an edit made here by hand is
-reverted rather than trusted.
+the table below and `--check` gates it in CI, so an edit made by hand is
+reverted rather than trusted. This file is a cc-guides render, so the gate
+holds the fragment it renders from; a hand edit to this copy is discarded by
+the next render.
 
 <!-- BEGIN GENERATED: package table (scripts/gen-package-table.sh) -->
 | Package | Owns | Files | Lines |
