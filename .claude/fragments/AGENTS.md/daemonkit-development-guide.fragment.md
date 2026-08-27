@@ -35,7 +35,7 @@ reverted rather than trusted.
 | `durable` | makes filesystem state survive crashes: atomic, fsynced publication of files and directory mutations, a strict validated JSON codec, and one bounded cross-process lock. | 9 | 1029 |
 | `ghrelease` | queries GitHub for a repository's latest published release. | 2 | 170 |
 | `launchd` | is the value-type model for one exact macOS user LaunchAgent and the stateless primitives that apply it. | 12 | 2675 |
-| `paths` | owns the canonical state-directory layout under the user's home directory, resolved through the passwd database — never the caller's HOME or CLAUDE_CONFIG_DIR — so a sandboxed environment cannot relocate state. | 4 | 248 |
+| `paths` | owns the canonical state-directory layout under the user's home directory, resolved through the passwd database — never the caller's HOME or CLAUDE_CONFIG_DIR — so a sandboxed environment cannot relocate state. | 4 | 251 |
 | `templates` | — | 2 | 218 |
 | `version` | classifies and compares release and development builds for launcher-owned runtime settlement and release ordering. | 2 | 302 |
 <!-- END GENERATED: package table -->
