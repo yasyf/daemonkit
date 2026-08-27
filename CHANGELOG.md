@@ -4,6 +4,34 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.0] - 2026-08-26
+
+### Added
+
+- `AgentPaths` — the Swift half of `paths.Agent`. The Swift package shipped no
+  label-to-socket derivation at all, so captain-hook's helper hand-wrote the
+  formula in its own `HelperPaths.hostSocket` and pinned an older daemonkit to
+  keep that copy agreeing with the Go half. Under that arrangement a path move
+  on the Go side breaks the Swift side silently, at runtime, on a socket
+  nothing can dial. `AgentPaths(label:).socket()` derives it once and refuses a
+  path past `sun_path` the way `paths.Socket` does, and
+  `paths/testdata/agent-layout.json` is one golden both halves assert against,
+  so the two cannot drift without a test saying so.
+
+### Changed
+
+- **Breaking.** Daemon state moved again, from `~/.daemonkit/agents/<Label>` to
+  `~/.daemonkit/a/<Label>`. v0.22.0 spent 18 bytes of the 103 darwin's
+  `sun_path` leaves a socket path, and cc-orchestrate's pty daemons landed on
+  104 — one byte over, `paths.Socket` refusing every spawn under a long account
+  name. Their label already carries 64 bits of a nonce hash and nothing else,
+  precisely so the socket clears the limit, so the byte had to come out of the
+  root. The directory is one letter because every byte it spends comes out of
+  the label budget every consumer shares. As in v0.22.0 there is no migration
+  and no fallback read: old state is abandoned where it lies and a daemon comes
+  up fresh, so delete `~/.daemonkit/agents` by hand once every consumer is on
+  this release.
+
 ## [0.22.0] - 2026-08-17
 
 ### Added
@@ -1293,7 +1321,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.23.0...HEAD
+[0.23.0]: https://github.com/yasyf/daemonkit/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/yasyf/daemonkit/compare/v0.21.4...v0.22.0
 [0.21.4]: https://github.com/yasyf/daemonkit/compare/v0.21.3...v0.21.4
 [0.21.3]: https://github.com/yasyf/daemonkit/compare/v0.21.2...v0.21.3

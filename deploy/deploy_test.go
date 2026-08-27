@@ -1582,7 +1582,7 @@ func TestOpenRejectsInvalidConfig(t *testing.T) {
 // entirely. Open is the boundary that refuses it, and the owner record planted
 // at the escaped path is what proves the refusal is the only thing standing
 // between a consumer and that read. The traversal is as deep as
-// ~/.daemonkit/agents/<Label> is; a shallower one lands back inside the home
+// ~/.daemonkit/a/<Label> is; a shallower one lands back inside the home
 // directory and proves nothing.
 func TestOpenRefusesALabelWhoseRecordPathEscapesTheStateRoot(t *testing.T) {
 	root, err := filepath.EvalSymlinks(t.TempDir())

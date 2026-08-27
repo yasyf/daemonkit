@@ -1,0 +1,6 @@
+{
+  "home": "/Users/example",
+  "label": "com.example.daemon",
+  "stateDir": "/Users/example/.daemonkit/a/com.example.daemon",
+  "socket": "/Users/example/.daemonkit/a/com.example.daemon/daemon.sock"
+}

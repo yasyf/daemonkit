@@ -1,6 +1,8 @@
 package paths
 
 import (
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"regexp"
 	"testing"
@@ -8,21 +10,47 @@ import (
 	"github.com/yasyf/daemonkit/internal/realhome"
 )
 
-func TestAgentRootsStateUnderTheHiddenDir(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv(realhome.EnvOverride, home)
-	root := filepath.Join(home, ".daemonkit", "agents", "com.example.daemon")
-	agent := Agent("com.example.daemon")
+// agentLayout is the golden the Swift half is pinned to as well, so the two
+// derivations of ~/.daemonkit/a/<label> cannot drift.
+type agentLayout struct {
+	Home     string `json:"home"`
+	Label    string `json:"label"`
+	StateDir string `json:"stateDir"`
+	Socket   string `json:"socket"`
+}
+
+func readAgentLayout(t *testing.T) agentLayout {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("testdata", "agent-layout.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var golden agentLayout
+	if err := json.Unmarshal(raw, &golden); err != nil {
+		t.Fatal(err)
+	}
+	return golden
+}
+
+func TestAgentMatchesTheSharedSwiftGolden(t *testing.T) {
+	golden := readAgentLayout(t)
+	t.Setenv(realhome.EnvOverride, golden.Home)
+	agent := Agent(golden.Label)
+	socket, err := Socket(golden.Label)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	tests := []struct {
 		name string
 		got  string
 		want string
 	}{
-		{"state dir", agent.StateDir(), root},
-		{"socket", agent.SocketPath(), filepath.Join(root, "daemon.sock")},
-		{"log", agent.LogPath(), filepath.Join(root, "daemon.log")},
-		{"start lock", agent.StartLockPath(), filepath.Join(root, "locks", "start.lock")},
+		{"state dir", agent.StateDir(), golden.StateDir},
+		{"socket", agent.SocketPath(), golden.Socket},
+		{"Socket", socket, golden.Socket},
+		{"log", agent.LogPath(), filepath.Join(golden.StateDir, "daemon.log")},
+		{"start lock", agent.StartLockPath(), filepath.Join(golden.StateDir, "locks", "start.lock")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

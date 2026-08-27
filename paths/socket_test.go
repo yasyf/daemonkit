@@ -16,13 +16,13 @@ func TestSocket(t *testing.T) {
 		wantLong bool
 	}{
 		{"short", ".cc-test", false},
-		{"at the 103-byte limit", strings.Repeat("a", 68), false},
-		{"one past the limit", strings.Repeat("a", 69), true},
+		{"at the 103-byte limit", strings.Repeat("a", 73), false},
+		{"one past the limit", strings.Repeat("a", 74), true},
 		{"far past the limit", strings.Repeat("a", 200), true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			path := "/tmp/.daemonkit/agents/" + tt.app + "/daemon.sock"
+			path := "/tmp/.daemonkit/a/" + tt.app + "/daemon.sock"
 			got, err := Socket(tt.app)
 			if tt.wantLong {
 				var overlong *SocketPathError
