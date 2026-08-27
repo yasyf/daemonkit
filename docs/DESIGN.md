@@ -612,7 +612,9 @@ The client half and the fd bridge, never the server half: the v1 frame byte-exac
 schema, one shared golden, a CI no-op gate — restoring what `7ec51bc` deleted), the
 non-optional floor (already landed, verified), `{Protocol, Lane}` and the phase-carrying ack,
 the frozen Drain preamble, `Outcome` semantics (`Delivered` never replays), FrameAck, and the
-SCM_RIGHTS handoff with its single-use nonce. Swift does not mirror `Serve`, `launchd`, child
+SCM_RIGHTS handoff with its single-use nonce, plus the `~/.daemonkit/a/<label>` state layout a
+client needs to find the socket it dials (`AgentPaths`, pinned to `paths.Agent` by one shared
+golden). Swift does not mirror `Serve`, `launchd`, child
 ownership, or server-side budgets — it has no daemon to host.
 
 ---

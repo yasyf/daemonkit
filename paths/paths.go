@@ -1,7 +1,7 @@
 // Package paths owns the canonical state-directory layout under the user's home
 // directory, resolved through the passwd database — never the caller's HOME or
 // CLAUDE_CONFIG_DIR — so a sandboxed environment cannot relocate state.
-// Daemon-owned state is rooted at ~/.daemonkit/agents/<label> through Agent,
+// Daemon-owned state is rooted at ~/.daemonkit/a/<label> through Agent,
 // inside the hidden directory daemonkit already owns.
 package paths
 
@@ -17,7 +17,9 @@ import (
 
 const (
 	daemonkitDir = ".daemonkit"
-	agentsDir    = "agents"
+	// agentsDir is one letter because every byte it spends comes out of the
+	// label budget darwin's 104-byte sun_path leaves a daemon socket.
+	agentsDir = "a"
 )
 
 // Paths produces the state-directory layout for an application whose private
@@ -28,7 +30,7 @@ type Paths struct {
 }
 
 // Agent is the layout for one daemon's private state, at
-// ~/.daemonkit/agents/<label>.
+// ~/.daemonkit/a/<label>.
 func Agent(label string) Paths {
 	return Paths{App: filepath.Join(daemonkitDir, agentsDir, label)}
 }
