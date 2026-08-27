@@ -4,6 +4,34 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Swift `AgentPaths` derives one daemon's state directory and control socket
+  from its launchd label, the counterpart to Go `paths.Agent`. The Swift half
+  of a mixed-language consumer had nothing to call, so it transcribed the
+  formula instead — captain-hook's helper carried `~/<label>/daemon.sock` in
+  Swift with a comment naming the Go rule it copied, and a layout change on the
+  Go side left the two halves dialing different paths with no compile error
+  between them. `socket(label:)` throws `AgentPathError.socketPathTooLong`
+  on the same 104-byte `sun_path` bound Go's `paths.Socket` refuses at.
+
+### Changed
+
+- **Breaking.** The agent root is `~/.daemonkit/a/<label>`, not
+  `~/.daemonkit/agents/<label>`. Every byte in that segment comes out of the
+  label budget a daemon's socket has left under darwin's 104-byte `sun_path`,
+  and 0.22.0's move spent enough of it to push real consumers over: with a long
+  account name, cc-orchestrate's per-incarnation pty label derived a 104-byte
+  socket path, one past the limit, and its own guard test caught it. Shortening
+  the segment reclaims 5 bytes for every consumer and leaves that budget where
+  the label can spend it — cc-orchestrate keeps the full 64 bits of spawn nonce
+  its collision property rests on. There is still no migration and no fallback
+  read: old state is abandoned where it lies, so a consumer repinning straight
+  from 0.21.x moves once rather than twice. Delete `~/<label>` and, on a machine
+  that ran a 0.22.0 build, `~/.daemonkit/agents/` by hand.
+
 ## [0.22.0] - 2026-08-17
 
 ### Added

@@ -5,7 +5,7 @@ import "fmt"
 const sunPathBytes = 104
 
 // Socket returns the daemon socket path for name's state directory
-// (~/.daemonkit/agents/<name>/daemon.sock). A path that cannot fit darwin's
+// (~/.daemonkit/a/<name>/daemon.sock). A path that cannot fit darwin's
 // sun_path with its terminating NUL returns a *SocketPathError instead of
 // surviving to a truncated bind.
 func Socket(name string) (string, error) {

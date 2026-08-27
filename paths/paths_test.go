@@ -11,7 +11,7 @@ import (
 func TestAgentRootsStateUnderTheHiddenDir(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv(realhome.EnvOverride, home)
-	root := filepath.Join(home, ".daemonkit", "agents", "com.example.daemon")
+	root := filepath.Join(home, ".daemonkit", "a", "com.example.daemon")
 	agent := Agent("com.example.daemon")
 
 	tests := []struct {
