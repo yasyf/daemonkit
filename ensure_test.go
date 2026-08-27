@@ -332,7 +332,7 @@ func TestDaemonAgent(t *testing.T) {
 			want: launchd.Agent{
 				Label:         "com.example.ensure",
 				Program:       program,
-				LogPath:       filepath.Join(home, ".daemonkit", "agents", "com.example.ensure", "daemon.log"),
+				LogPath:       filepath.Join(home, ".daemonkit", "a", "com.example.ensure", "daemon.log"),
 				RestartPolicy: launchd.RestartOnFailure,
 				ExitTimeOut:   30 * time.Second,
 			},

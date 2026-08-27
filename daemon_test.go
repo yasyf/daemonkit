@@ -19,7 +19,7 @@ func TestDaemonStateRootsUnderTheHiddenDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("socket() error = %v", err)
 	}
-	root := filepath.Join(home, ".daemonkit", "agents", string(d.Label))
+	root := filepath.Join(home, ".daemonkit", "a", string(d.Label))
 
 	tests := []struct {
 		name string
