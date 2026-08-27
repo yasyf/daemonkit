@@ -4,8 +4,9 @@
 #   scripts/gen-package-table.sh            # rewrite every target in place
 #   scripts/gen-package-table.sh --check    # exits non-zero on any drift
 #
-# AGENTS.md is a cc-guides render of .claude/fragments/AGENTS.md/, so the
-# fragment carries the table too and the next render stays byte-identical.
+# AGENTS.md is not a target: cc-guides owns it, nothing renders it until the
+# merge, and its pr-check refuses a branch that edits one. The fragment carries
+# the table instead and the next render is byte-identical.
 
 set -euo pipefail
 
@@ -19,7 +20,6 @@ export GOOS=darwin
 
 targets=(
   "README.md"
-  "AGENTS.md"
   ".claude/fragments/AGENTS.md/daemonkit-development-guide.fragment.md"
 )
 
