@@ -17,28 +17,32 @@ permissions:
 # a breaking surface change goes red before a release exists. One leg per
 # consumer: a break names its own consumer in the checks list.
 jobs:
+  # The matrix is ci/fleet-refs.txt read through the script, so the fleet set is
+  # declared once: a consumer added there gets a leg without an edit here.
+  fleet-set:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      repos: ${{ steps.repos.outputs.repos }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: List the fleet set
+        id: repos
+        run: |
+          set -euo pipefail
+          repos="$(./scripts/fleet-build.sh --list | jq -Rsc 'split("\n") | map(select(length > 0))')"
+          echo "repos=$repos" >>"$GITHUB_OUTPUT"
+
   fleet-build:
     name: fleet-build (${{ matrix.repo }})
+    needs: fleet-set
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        repo:
-          - synckit
-          - fusekit
-          - reposync
-          - captain-hook
-          - cc-notes
-          - cc-patch
-          - cc-orchestrate
-          - cc-interact
-          - binrun
-          - cc-present
-          - cc-review
-          - cc-pool
-          - cookiesync
-          - cc-skills
+        repo: ${{ fromJSON(needs.fleet-set.outputs.repos) }}
     # daemonkit is macOS-only, so its consumers cross-compile here rather than
     # billing macOS minutes across every leg of the fleet. Which platforms a leg
     # cross-compiles for is the consumer's own declaration in ci/fleet-refs.txt,

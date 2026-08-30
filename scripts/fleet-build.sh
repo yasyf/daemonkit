@@ -58,6 +58,7 @@
 #   scripts/fleet-build.sh --only cc-notes [--only binrun]
 #   scripts/fleet-build.sh --ref binrun   # print binrun's declared ref
 #   scripts/fleet-build.sh --cone cc-orchestrate  # print its fleet substrate
+#   scripts/fleet-build.sh --list         # every consumer, one bare repo a line
 #   FLEET_REPOS="binrun synckit" scripts/fleet-build.sh
 #
 # Environment:
@@ -83,6 +84,7 @@ fail() {
 only=""
 ref_query=""
 cone_query=""
+list=""
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     --only)
@@ -100,12 +102,16 @@ while [[ "$#" -gt 0 ]]; do
       cone_query="$2"
       shift 2
       ;;
+    --list)
+      list=1
+      shift
+      ;;
     -h | --help)
       awk 'NR > 1 && /^#/ { print substr($0, 3); next } NR > 1 { exit }' "${BASH_SOURCE[0]}"
       exit 0
       ;;
     *)
-      fail "unknown argument $1 (usage: fleet-build.sh [--only REPO]... | --ref REPO | --cone REPO)"
+      fail "unknown argument $1 (usage: fleet-build.sh [--only REPO]... | --ref REPO | --cone REPO | --list)"
       ;;
   esac
 done
@@ -118,6 +124,15 @@ declared() {
     /^[[:space:]]*(#|$)/ { next }
     { split($1, id, ":") }
     id[1] == repo { print $col; exit }
+  ' "$refs_file"
+}
+
+# Every repo ci/fleet-refs.txt declares, bare: a module subdirectory is no part
+# of the name that addresses a leg.
+list_repos() {
+  awk '
+    /^[[:space:]]*(#|$)/ { next }
+    { split($1, id, ":"); print id[1] }
   ' "$refs_file"
 }
 
@@ -368,6 +383,11 @@ if [[ -n "$cone_query" ]]; then
   cone_dir="$(checkout_of "$cone_module")" ||
     fail "no checkout of $cone_module under $src_dir"
   cone_of "$cone_dir"
+  exit 0
+fi
+
+if [[ -n "$list" ]]; then
+  list_repos
   exit 0
 fi
 
