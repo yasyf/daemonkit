@@ -22,6 +22,16 @@
 # with no such checkout fails its leg instead of being cloned from remote main,
 # which during a migration is the unmigrated tree and a false green.
 #
+# A consumer's module need not sit at its checkout root — cc-skills builds
+# plugins/codex — so ci/fleet-refs.txt spells the subdirectory as
+# `<repo>:<module-dir>` and every go.mod read, the go.work `use` line, and the
+# build's working directory address the module directory rather than the
+# checkout. That string is also the module path minus the owner prefix, so the
+# checkout a module resolves to and the module a checkout must declare derive
+# from each other: the identity rule above covers the subdirectory too, not just
+# the repository it sits in. Everything that names a leg — --only, --ref,
+# --cone, a cone peer — still takes the bare repo.
+#
 # ci/fleet-refs.txt declares each leg's ref and GOOS set; `--ref REPO` prints
 # that ref and `--cone REPO` the substrate it needs, so the workflow checks out
 # exactly the trees this script expects to build. A checkout that is not the
@@ -61,7 +71,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 owner="yasyf"
-default_repos="synckit fusekit reposync captain-hook cc-notes cc-patch cc-orchestrate cc-interact binrun cc-present cc-review cc-pool cookiesync"
+default_repos="synckit fusekit reposync captain-hook cc-notes cc-patch cc-orchestrate cc-interact binrun cc-present cc-review cc-pool cookiesync cc-skills"
 refs_file="$root/ci/fleet-refs.txt"
 default_goos="darwin"
 
@@ -101,20 +111,89 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 # Prints column $2 of $1's ci/fleet-refs.txt line; empty when it declares none.
+# The repo column may carry a module subdirectory after a colon, so the line is
+# found by the repo name alone.
 declared() {
   awk -v repo="$1" -v col="$2" '
     /^[[:space:]]*(#|$)/ { next }
-    $1 == repo { print $col; exit }
+    { split($1, id, ":") }
+    id[1] == repo { print $col; exit }
   ' "$refs_file"
 }
 
+# The subdirectory of $1's checkout holding its Go module, `.` when the module
+# sits at the checkout root. printf, since echo reads a `-n` directory as its
+# own option and returns nothing.
+module_dir() {
+  local dir
+  dir="$(awk -v repo="$1" '
+    /^[[:space:]]*(#|$)/ { next }
+    { n = split($1, id, ":") }
+    id[1] == repo { print (n > 1 ? id[2] : "."); exit }
+  ' "$refs_file")"
+  printf '%s\n' "${dir:-.}"
+}
+
+# The module path repo $1's leg builds. Its declared module directory appended
+# to the owner prefix is exactly what that module's go.mod must declare, which
+# is what makes checkout_of's identity check reach into the subdirectory.
+module_path() {
+  local dir
+  dir="$(module_dir "$1")"
+  [[ "$dir" != "." ]] || {
+    echo "github.com/$owner/$1"
+    return
+  }
+  echo "github.com/$owner/$1/$dir"
+}
+
+# The fleet repo module $1 lives in: the first path segment after the owner
+# prefix. A module nested in a subdirectory names the repository holding it
+# rather than the directory it happens to end in — cc-skills, not codex.
+repo_of() {
+  local rest="${1#github.com/"$owner"/}"
+  printf '%s\n' "${rest%%/*}"
+}
+
 check_refs() {
-  local repo ref rest seen=""
-  while read -r repo ref _ rest; do
+  local entry repo dir ref goos os rest seen=""
+  while read -r entry ref goos rest; do
+    repo="${entry%%:*}"
     case " $default_repos " in
       *" $repo "*) ;;
       *) fail "ci/fleet-refs.txt declares $repo, which is no fleet consumer" ;;
     esac
+    if [[ "$entry" == *:* ]]; then
+      dir="${entry#*:}"
+      [[ -n "$dir" ]] ||
+        fail "ci/fleet-refs.txt gives $repo an empty module directory; drop the colon when the module sits at the checkout root"
+      [[ "$dir" != *:* ]] ||
+        fail "ci/fleet-refs.txt gives $repo the module directory $dir; the repo column holds one colon, separating the repo from its module directory"
+      [[ "$dir" != /* ]] ||
+        fail "ci/fleet-refs.txt gives $repo the absolute module directory $dir; it names a path inside the checkout, which the workflow clones wherever it likes"
+      # A `.` or an empty segment survives as-is into the module path the leg's
+      # go.mod must declare, and `cc-skills:.` in particular would name the
+      # repository root — a module the file's own grammar spells by dropping the
+      # colon, and one whose build silently walks past the nested module the leg
+      # exists to compile.
+      case "/$dir/" in
+        */../*) fail "ci/fleet-refs.txt gives $repo the module directory $dir, which escapes the checkout" ;;
+        */./*) fail "ci/fleet-refs.txt gives $repo the module directory $dir; a root module is spelled $repo, without the colon" ;;
+        *//*) fail "ci/fleet-refs.txt gives $repo the module directory $dir, which holds an empty path segment" ;;
+      esac
+    fi
+    # The GOOS column is optional, so an unusable one must not read as an absent
+    # one: `,` names no platform at all, and the build loop it feeds would run no
+    # build and leave the leg's verdict at the PASS it starts from.
+    if [[ -n "$goos" ]]; then
+      case ",$goos," in
+        *,,*) fail "ci/fleet-refs.txt gives $repo the GOOS set $goos, which holds an empty entry" ;;
+      esac
+      for os in ${goos//,/ }; do
+        [[ "$os" =~ ^[a-z0-9]+$ ]] ||
+          fail "ci/fleet-refs.txt gives $repo the GOOS $os, which is no platform name"
+      done
+    fi
     case " $seen " in
       *" $repo "*) fail "ci/fleet-refs.txt declares $repo twice" ;;
     esac
@@ -122,7 +201,7 @@ check_refs() {
     [[ -n "$ref" ]] || fail "ci/fleet-refs.txt leaves $repo without a ref"
     [[ ! "$ref" =~ ^[0-9a-fA-F]{7,40}$ ]] ||
       fail "ci/fleet-refs.txt gives $repo the commit $ref; a ref must name a branch or tag, because a leg that needs $repo in its cone clones it with git clone --branch"
-    [[ -z "$rest" ]] || fail "ci/fleet-refs.txt gives $repo more than \"<repo> <ref> [goos,...]\""
+    [[ -z "$rest" ]] || fail "ci/fleet-refs.txt gives $repo more than \"<repo>[:<module-dir>] <ref> [goos,...]\""
   done < <(grep -Ev '^[[:space:]]*(#|$)' "$refs_file")
   for repo in $default_repos; do
     case " $seen " in
@@ -133,7 +212,13 @@ check_refs() {
 }
 
 repos="${only:-${FLEET_REPOS:-$default_repos}}"
+# Resolved before any path derives from it: a checkout path is $src_dir plus a
+# module's own path and a manifest backup is the temp tree plus that checkout
+# path, so a relative FLEET_SRC would carry `..` segments all the way into the
+# backup destination and land the copy on a real file outside the temp tree.
 src_dir="${FLEET_SRC:-$(dirname "$root")}"
+[[ -d "$src_dir" ]] || fail "FLEET_SRC names $src_dir, which is not a directory"
+src_dir="$(cd "$src_dir" && pwd)"
 
 go_directive() {
   awk '$1 == "go" {print $2; exit}' "$1/go.mod"
@@ -159,10 +244,13 @@ module_of() {
   awk '$1 == "module" {print $2; exit}' "$1/go.mod"
 }
 
-# Prints $src_dir's checkout of module $1, and only when that checkout's own
-# go.mod declares it: a directory carrying the name is not evidence of identity.
+# Prints $src_dir's directory for module $1, and only when the go.mod there
+# declares it: a directory carrying the name is not evidence of identity. The
+# path is the module path minus the owner prefix, so a module in a subdirectory
+# resolves into that subdirectory and has to declare itself there — the repo's
+# root go.mod, or none at all, cannot stand in for it.
 checkout_of() {
-  local module="$1" named="$src_dir/${1##*/}"
+  local module="$1" named="$src_dir/${1#github.com/"$owner"/}"
   [[ "$(module_of "$named")" == "$module" ]] || return 1
   echo "$named"
 }
@@ -184,16 +272,19 @@ fleet_requires() {
 
 # The fleet substrate the consumer checked out at $1 sits on, named by repo:
 # every module it requires under the owner's prefix but itself and daemonkit,
-# and only those the fleet set carries a declared ref for.
+# and only those a leg declares as its exact module. A second module out of a
+# repository whose leg declares another — cc-skills/plugins/shared beside the
+# declared cc-skills/plugins/codex — keeps the published version it resolved,
+# like any peer outside the set; projecting it onto its repository would overlay
+# a module nobody asked for, and list a leg's own module twice.
 cone_of() {
-  local self required peer
+  local self required
   self="$(module_of "$1")"
   for required in $(fleet_requires "$1"); do
     [[ "$required" != "github.com/$owner/daemonkit" ]] || continue
     [[ "$required" != "$self" ]] || continue
-    peer="${required##*/}"
-    case " $default_repos " in
-      *" $peer "*) echo "$peer" ;;
+    case " $fleet_modules " in
+      *" $required "*) repo_of "$required" ;;
     esac
   done
 }
@@ -231,28 +322,41 @@ record_off_ref() {
 
 # A workspace build treats every `use` member as a main module, so the go
 # command may add missing hashes to their go.sum. The gate must leave every
-# checkout it overlays byte-identical.
+# checkout it overlays byte-identical. The backup mirrors the module directory's
+# whole path rather than keying on its basename, which two module directories can
+# share — every repo's plugins/codex ends in `codex` — and a shared key would
+# restore one module's manifest over another's.
 snapshot_manifest() {
   local dir="$1" work="$2" file
-  mkdir -p "$work/orig/$(basename "$dir")"
+  # Asserted rather than assumed: a destination that leaves the temp tree
+  # overwrites a real file, and the EXIT trap would not even clean it up.
+  [[ "$dir" == /* && "$dir" != *"/../"* ]] ||
+    fail "refusing to back up $dir, whose copy would land outside $work/orig"
+  mkdir -p "$work/orig$dir"
   for file in go.mod go.sum; do
-    [[ -f "$dir/$file" ]] && cp "$dir/$file" "$work/orig/$(basename "$dir")/$file"
+    [[ -f "$dir/$file" ]] && cp "$dir/$file" "$work/orig$dir/$file"
   done
   return 0
 }
 
 restore_manifest() {
-  local dir="$1" work="$2" name file
-  name="$(basename "$dir")"
+  local dir="$1" work="$2" file
   for file in go.mod go.sum; do
-    [[ -f "$work/orig/$name/$file" ]] || continue
-    cmp -s "$work/orig/$name/$file" "$dir/$file" && continue
-    cp "$work/orig/$name/$file" "$dir/$file"
-    echo "  note: $name/$file was rewritten by the build; restored"
+    [[ -f "$work/orig$dir/$file" ]] || continue
+    cmp -s "$work/orig$dir/$file" "$dir/$file" && continue
+    cp "$work/orig$dir/$file" "$dir/$file"
+    echo "  note: ${dir#"$src_dir"/}/$file was rewritten by the build; restored"
   done
 }
 
 check_refs
+
+# Every module the gate can overlay, spelled the way a go.mod requires it, which
+# is what cone_of intersects against.
+fleet_modules=""
+for repo in $default_repos; do
+  fleet_modules="$fleet_modules $(module_path "$repo")"
+done
 
 if [[ -n "$ref_query" ]]; then
   declared "$ref_query" 2
@@ -260,8 +364,9 @@ if [[ -n "$ref_query" ]]; then
 fi
 
 if [[ -n "$cone_query" ]]; then
-  cone_dir="$(checkout_of "github.com/$owner/$cone_query")" ||
-    fail "no checkout of github.com/$owner/$cone_query under $src_dir"
+  cone_module="$(module_path "$cone_query")"
+  cone_dir="$(checkout_of "$cone_module")" ||
+    fail "no checkout of $cone_module under $src_dir"
   cone_of "$cone_dir"
   exit 0
 fi
@@ -282,17 +387,17 @@ echo "fleet-build: consumer checkouts under $src_dir"
 echo
 
 for repo in $repos; do
-  module="github.com/$owner/$repo"
+  module="$(module_path "$repo")"
   if ! source_dir="$(checkout_of "$module")"; then
     printf '  %-6s %-15s %s\n' "FAIL" "$repo" "no checkout of $module under $src_dir"
-    echo "no checkout of $module under $src_dir: $src_dir/$repo does not declare it" >"$tmp/$repo.log"
+    echo "no checkout of $module under $src_dir: $src_dir/${module#github.com/"$owner"/} does not declare it" >"$tmp/$repo.log"
     failed_repos="$failed_repos $repo"
     continue
   fi
 
   cone=""
   for peer in $(cone_of "$source_dir"); do
-    peer_dir="$(checkout_of "github.com/$owner/$peer")" || {
+    peer_dir="$(checkout_of "$(module_path "$peer")")" || {
       echo "  note: no checkout of $peer under $src_dir; $repo builds its published pin"
       continue
     }
@@ -312,14 +417,30 @@ for repo in $repos; do
   goos_set="$(declared "$repo" 3)"
   goos_set="${goos_set:-$default_goos}"
   verdict="PASS"
+  runs=0
   : >"$tmp/$repo.log"
   for goos in ${goos_set//,/ }; do
     echo "---- $repo GOOS=$goos ----" >>"$tmp/$repo.log"
+    runs=$((runs + 1))
     if ! (cd "$source_dir" && GOWORK="$work/go.work" CGO_ENABLED=0 GOOS="$goos" go build ./...) \
       >>"$tmp/$repo.log" 2>&1; then
       verdict="FAIL"
+      continue
     fi
+    # go build ./... exits 0 when ./... matches no package, so its green can
+    # stand over nothing — every file behind a build tag this GOOS drops.
+    packages="$(cd "$source_dir" && GOWORK="$work/go.work" CGO_ENABLED=0 GOOS="$goos" go list ./... 2>>"$tmp/$repo.log")"
+    [[ -n "$packages" ]] || {
+      echo "./... matches no package for GOOS=$goos" >>"$tmp/$repo.log"
+      verdict="FAIL"
+    }
   done
+  # The GOOS set is validated to name a platform, so this cannot fire from the
+  # refs file; a PASS no build stands behind is asserted against anyway.
+  if [[ "$runs" -eq 0 ]]; then
+    echo "the GOOS set \"$goos_set\" ran no build" >>"$tmp/$repo.log"
+    verdict="FAIL"
+  fi
   [[ "$verdict" == PASS ]] || failed_repos="$failed_repos $repo"
 
   for dir in "$root" "$source_dir" $cone; do restore_manifest "$dir" "$work"; done
@@ -330,7 +451,7 @@ for repo in $repos; do
     "$verdict$mark" "$repo" "$goos_set" "$(declared "$repo" 2)" \
     "$(pinned_daemonkit "$source_dir")" "$source_dir" "$(describe_checkout "$source_dir")"
   for dir in $cone; do
-    peer="$(basename "$dir")"
+    peer="$(repo_of "$(module_of "$dir")")"
     peer_mark="$(ref_mark "$dir" "$peer")"
     [[ -z "$peer_mark" ]] || record_off_ref "$peer"
     printf '         %-5s %s (%s)\n' "cone$peer_mark" "$peer" "$(describe_checkout "$dir")"

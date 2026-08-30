@@ -1,6 +1,6 @@
 # The ref each fleet-build leg builds, and the GOOS set it builds it for.
 #
-#   <repo> <ref> [goos[,goos]...]
+#   <repo>[:<module-dir>] <ref> [goos[,goos]...]
 #
 # The ref points a leg at the branch carrying that consumer's migration while it
 # is still in flight, so the gate measures the tree that is about to merge
@@ -15,19 +15,36 @@
 # another leg's cone peer, and a cone peer is fetched with git clone --branch,
 # which no commit satisfies. The script refuses a commit-shaped ref outright.
 #
+# A consumer whose Go module does not sit at its checkout root spells the
+# subdirectory on the repo column after a colon. The colon rather than a fourth
+# column because the GOOS column is optional, so a bare trailing field could not
+# be told apart from it; and on the repo column rather than a column of its own
+# because "<repo>:<module-dir>" is exactly the module path minus the
+# github.com/<owner>/ prefix — the script derives both the checkout path and the
+# identity a leg's go.mod must declare from that one string instead of guessing
+# either. Everything that addresses a leg by name — --ref, --cone, the
+# workflow's matrix.repo, a cone peer — still takes the bare repo, because that
+# is what the repository is called and what actions/checkout clones it to. The
+# subdirectory is relative to the checkout and spelled as plain path segments:
+# the script refuses an absolute one, one that escapes upward, and `.`, which
+# would name the repository root that dropping the colon already names.
+#
 # GOOS defaults to darwin: daemonkit is macOS-only and its consumers ship there.
 # binrun also ships linux and is the fleet's linux canary for the portable
 # subset, so its leg builds both and a linux-only break stops being invisible.
-synckit         main
-fusekit         main
-reposync        main
-captain-hook    main
-cc-notes        main
-cc-patch        main
-cc-orchestrate  main
-cc-interact     main
-binrun          main    darwin,linux
-cc-present      main
-cc-review       main
-cc-pool         main
-cookiesync      main
+# Every entry in the set names a platform: the script refuses an empty one,
+# which would leave a leg building nothing and reporting the pass it starts at.
+synckit                 main
+fusekit                 main
+reposync                main
+captain-hook            main
+cc-notes                main
+cc-patch                main
+cc-orchestrate          main
+cc-interact             main
+binrun                  main    darwin,linux
+cc-present              main
+cc-review               main
+cc-pool                 main
+cookiesync              main
+cc-skills:plugins/codex main

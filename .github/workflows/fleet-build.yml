@@ -38,6 +38,7 @@ jobs:
           - cc-review
           - cc-pool
           - cookiesync
+          - cc-skills
     # daemonkit is macOS-only, so its consumers cross-compile here rather than
     # billing macOS minutes across every leg of the fleet. Which platforms a leg
     # cross-compiles for is the consumer's own declaration in ci/fleet-refs.txt,
@@ -112,9 +113,12 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: daemonkit/go.mod
+          # A consumer whose module sits in a subdirectory — cc-skills builds
+          # plugins/codex — keeps its go.sum there, and `**` matches zero path
+          # segments, so one pattern covers both layouts.
           cache-dependency-path: |
             daemonkit/go.sum
-            ${{ matrix.repo }}/go.sum
+            ${{ matrix.repo }}/**/go.sum
 
       - name: Build ${{ matrix.repo }} against the daemonkit tree
         working-directory: daemonkit
