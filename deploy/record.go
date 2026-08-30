@@ -21,8 +21,7 @@ const (
 	serviceIdentity    = "daemonkit.deploy.services.v1"
 	recordSchema       = 1
 
-	metadataDir       = ".daemonkit-deploy"
-	legacyMetadataDir = ".daemonkit-deployment"
+	metadataDir = ".daemonkit-deploy"
 )
 
 // swapRecord names the one fact a resume cannot recompute: which generation
@@ -168,7 +167,6 @@ type layout struct {
 	candidate  string
 	prior      string
 	removed    string
-	legacy     string
 }
 
 func layoutFor(appPath string) layout {
@@ -186,7 +184,6 @@ func layoutFor(appPath string) layout {
 		candidate:  filepath.Join(root, "."+name+".daemonkit-candidate.app"),
 		prior:      filepath.Join(metadata, "prior.app"),
 		removed:    filepath.Join(metadata, "removed.app"),
-		legacy:     filepath.Join(root, legacyMetadataDir, name),
 	}
 }
 
@@ -195,9 +192,6 @@ func (l layout) ensureMetadata() error {
 	resolved, err := filepath.EvalSymlinks(root)
 	if err != nil || resolved != root {
 		return fmt.Errorf("%w: install directory is not a canonical real path", ErrConflict)
-	}
-	if err := l.archiveLegacy(); err != nil {
-		return err
 	}
 	for _, dir := range []string{filepath.Dir(l.metadata), l.metadata} {
 		if err := durable.Mkdir(dir, 0o700); err != nil {
@@ -208,33 +202,4 @@ func (l layout) ensureMetadata() error {
 		}
 	}
 	return nil
-}
-
-// archiveLegacy moves this deployment's pre-rename metadata tree aside. Every
-// record in it names fields this package no longer has, and readRecord refuses
-// an unknown field, so the first read on an installed machine would fail hard
-// rather than converge; a rename turns that into a clean re-install and keeps
-// the old tree as evidence instead of destroying it. The legacy directory is
-// shared by every product installed beside this one, so only this deployment's
-// own subtree moves — a sibling an older binary still manages keeps the lock
-// file path that binary opens by name.
-//
-// The name rotates because a downgrade to a pre-cut release recreates the tree,
-// and nothing on either side of that downgrade removes an archive: an occupied
-// name has to yield the next one rather than fail, or the re-upgrade wedges the
-// deployment for good. os.Rename never replaces a directory, so the attempt is
-// itself both the occupancy test and the one-shot — no stat precedes it, and
-// two openers racing the same tree still produce one archive, the loser seeing
-// the source gone rather than a free name.
-func (l layout) archiveLegacy() error {
-	archive := l.legacy + ".bak"
-	for n := 2; ; n++ {
-		switch err := durable.Rename(l.legacy, archive); {
-		case err == nil, errors.Is(err, os.ErrNotExist):
-			return nil
-		case !errors.Is(err, os.ErrExist):
-			return fmt.Errorf("deploy: archive legacy metadata %q: %w", l.legacy, err)
-		}
-		archive = fmt.Sprintf("%s.bak.%d", l.legacy, n)
-	}
 }

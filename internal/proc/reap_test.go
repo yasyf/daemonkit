@@ -128,7 +128,7 @@ func TestReapProbeErrorFailsClosedAndKeepsRecord(t *testing.T) {
 	signaler := &funcSignaler{}
 	s.prober, s.signaler = prober, signaler
 
-	reclaimed, _, err := s.Recover(ladderContext(t, time.Second), nil)
+	reclaimed, _, err := s.Recover(ladderContext(t, time.Second))
 	if err == nil {
 		t.Fatal("Recover() succeeded despite an undetermined probe")
 	}
@@ -228,7 +228,7 @@ func TestReapRemovesRecordOnlyAfterPostKillAbsence(t *testing.T) {
 	}}
 	s.prober, s.signaler = prober, signaler
 
-	reclaimed, _, err := s.Recover(ladderContext(t, time.Second), nil)
+	reclaimed, _, err := s.Recover(ladderContext(t, time.Second))
 	if err != nil {
 		t.Fatalf("Recover() error = %v", err)
 	}
@@ -258,7 +258,7 @@ func TestReapRetainsRecordWhenKilledProcessNeverSettles(t *testing.T) {
 	signaler := &funcSignaler{}
 	s.prober, s.signaler = prober, signaler
 
-	reclaimed, _, err := s.Recover(ladderContext(t, 400*time.Millisecond), nil)
+	reclaimed, _, err := s.Recover(ladderContext(t, 400*time.Millisecond))
 	if err == nil {
 		t.Fatal("Recover() succeeded although the killed process never settled")
 	}

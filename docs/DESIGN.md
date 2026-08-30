@@ -571,7 +571,7 @@ ladder from parts that are not exported.
 |---|---|---|
 | 1 | **arm** — SIGINT/SIGTERM/SIGHUP, before anything can block. SIGHUP → `Reload` if the product implements `Reloader`, else a graceful drain. | captain-hook gains signal handling it has nowhere today (`command.go:75-83`); ptyhost's SIGHUP-terminates becomes SIGHUP-drains-in-5s. |
 | 2 | **own** — flock by inode (polled, ctx-observing, never unlinked). `ErrBusy` on a live incumbent — no takeover exists here. | Recovery cannot race a healthy incumbent: ownership precedes it. |
-| 3 | **recover** — open the record file; extract identity cores (frozen envelope, any era); for each prior-generation record: probe → TERM → grace (a `Share`) → probe → KILL → retire on observed absence. Undetermined keeps the record. Collect `[]Reclaimed`; archive an unknown-schema remainder aside. | The legacy-bbolt sweep (§8) runs here for exactly one release cycle. |
+| 3 | **recover** — open the record file; extract identity cores (frozen envelope, any era); for each prior-generation record: probe → TERM → grace (a `Share`) → probe → KILL → retire on observed absence. Undetermined keeps the record. Collect `[]Reclaimed`; archive an unknown-schema remainder aside. | |
 | 4 | **bind** — unlink the stale socket file under the flock, listen. Health and phase answer immediately (`PhaseStarting`). | |
 | 5 | **start** — the consumer's `Start(Ctx)`. An error tears down through steps 7–9 with business never opened. | |
 | 6 | **ready** — `PhaseReady`; business admission opens; every handshake ack carries the phase; the phase stream wakes every `WaitReady`. | |
@@ -730,11 +730,11 @@ produced three incompatible schema epochs in two days. Hence the gates below, no
    unmigrated consumer, and it joins the release gate once the last leg turns green. An API
    mistake found mid-migration is fixed forward as `v0.21.1`, never by re-cutting the tag. The
    in-repo suite and `task build`/`task lint` stay green per commit, as they did throughout.
-2. **The legacy record sweep survives the decision** — it answers durable state crossing an
-   upgrade, not a module path. For one release cycle, the recover step also reads a legacy bbolt
-   file if present, reaps its recorded children, and archives it, so a machine crashing
-   mid-upgrade still settles its previous generation. The crash window failure-first refused and
-   consumer-first hand-waved, answered head-on. Its deletion release is named in its own TODO.
+2. **The legacy record sweep survived the decision** — it answered durable state crossing an
+   upgrade, not a module path. For one release cycle the recover step also read a legacy bbolt
+   file if present, reaped its recorded children, and archived it, so a machine crashing
+   mid-upgrade still settled its previous generation. The crash window failure-first refused and
+   consumer-first hand-waved, answered head-on. That cycle is over and the sweep is deleted.
 3. **The rename ledger is a build artifact, not a memory.** Before the cut, `scripts/export-census.sh`
    emits every deleted and renamed exported symbol; each consumer PR is checked against it. A
    symbol that moved without appearing there is a bug in the ledger, found before the tag rather

@@ -174,7 +174,7 @@ func TestZeroOutcomesAreUnpublishable(t *testing.T) {
 
 func TestRecoverRequiresDeadline(t *testing.T) {
 	s, _ := newTestStore(t)
-	if _, _, err := s.Recover(context.Background(), nil); err == nil {
+	if _, _, err := s.Recover(context.Background()); err == nil {
 		t.Fatal("Recover() accepted a context without a deadline")
 	}
 }

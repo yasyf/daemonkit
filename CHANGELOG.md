@@ -4,6 +4,28 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Removed
+
+- The legacy bbolt sweep in `internal/proc`, and the `go.etcd.io/bbolt`
+  dependency with it. `Store.Recover` no longer takes a `legacy []string`
+  parameter: both call sites already passed `nil`, so every machine the fleet
+  runs settled its prior generation from the JSON record alone. The dependency
+  cone loses bbolt entirely, which is what DESIGN §8 said the cut was for.
+- The pre-rename deployment-metadata migration in `deploy`. A `.daemonkit-deploy`
+  tree is the only shape any install has, so `archiveLegacy` had no
+  `.daemonkit-deployment` tree left to move aside and `layout` no longer carries
+  a path to one.
+- `Client.Stop`'s markerless-plist fallback. Every plist daemonkit writes has
+  carried the ownership marker since v0.21, so `removeAgent` is
+  `launchd.Remove` and nothing else — a plist that fails its ownership proof is
+  now refused rather than deleted through the escape.
+  `launchd.RemoveUnmarked` and `launchd.ErrMarked` stay exported: captain-hook
+  calls the verb directly to sweep its own pre-v0.21 labels.
+- `docs/MIGRATING-0.21.md`, the v0.20.x repin guide. The migration it describes
+  closed with v0.21, and nothing referenced the file.
+
 ## [0.23.0] - 2026-08-26
 
 ### Added

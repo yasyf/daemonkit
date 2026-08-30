@@ -34,7 +34,7 @@ func OwnProcesses(ctx context.Context, recordPath string) (*Owned, error) {
 	if err != nil {
 		return nil, err
 	}
-	reclaimed, _, recoverErr := store.Recover(ctx, nil)
+	reclaimed, _, recoverErr := store.Recover(ctx)
 	if recoverErr != nil {
 		slog.Warn("daemonkit: reclaim incomplete; undetermined records kept", "err", recoverErr)
 	}

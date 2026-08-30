@@ -192,7 +192,7 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 		return Drained{}, fmt.Errorf("daemonkit: record owner: %w", err)
 	}
 	recoverCtx, cancelRecover := d.shutdownGrace().mint("recover").Context(ctx)
-	reclaimed, archived, recoverErr := store.Recover(recoverCtx, nil)
+	reclaimed, archived, recoverErr := store.Recover(recoverCtx)
 	cancelRecover()
 	if recoverErr != nil {
 		slog.Warn("daemonkit: recovery incomplete; undetermined records kept", "err", recoverErr)

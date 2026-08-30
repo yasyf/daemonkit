@@ -108,7 +108,7 @@ func TestOpenStoreArchivesUnknownSchemaAndRecoverReapsItsCores(t *testing.T) {
 	}}
 	s.prober = prober
 
-	reclaimed, archived, err := s.Recover(ladderContext(t, time.Second), nil)
+	reclaimed, archived, err := s.Recover(ladderContext(t, time.Second))
 	if err != nil {
 		t.Fatalf("Recover() error = %v", err)
 	}
@@ -145,7 +145,7 @@ func TestReopenBeforeRecoverStillReclaimsArchivedCores(t *testing.T) {
 	second := openTestStore(t, path)
 	second.prober = &funcProber{probeFn: func(int) (procInfo, error) { return procInfo{}, errNoProc }}
 
-	reclaimed, _, err := second.Recover(ladderContext(t, time.Second), nil)
+	reclaimed, _, err := second.Recover(ladderContext(t, time.Second))
 	if err != nil {
 		t.Fatalf("Recover() error = %v", err)
 	}
@@ -173,7 +173,7 @@ func TestArchivedSessionCoreRecoversItsSessionMembers(t *testing.T) {
 		membersFn: func(int) ([]groupMember, error) { enumerated = true; return nil, nil },
 	}
 
-	if _, _, err := s.Recover(ladderContext(t, time.Second), nil); err != nil {
+	if _, _, err := s.Recover(ladderContext(t, time.Second)); err != nil {
 		t.Fatalf("Recover() error = %v", err)
 	}
 	if !enumerated {

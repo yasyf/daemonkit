@@ -40,12 +40,9 @@ import (
 //
 // The LaunchAgent goes last, after departure is proven, so launchd never
 // relaunches what was just drained — and a relaunch that races the removal is
-// booted out by the removal itself. A markerless plist at the label, the shape
-// every pre-marker install left behind, is removed through
-// [launchd.RemoveUnmarked]: this client's Daemon.Label is the caller's
-// assertion that the label is its own, which is the only ownership proof a
-// markerless plist admits. A marked plist travels [launchd.Remove]'s ordinary
-// ownership rules.
+// booted out by the removal itself. The plist travels [launchd.Remove]'s
+// ordinary ownership rules, so a file daemonkit did not write is refused
+// rather than deleted.
 //
 // Stop takes down the daemon and its LaunchAgent and nothing else: the state
 // directory and the owner record stay, and sealed removal remains
@@ -134,18 +131,10 @@ func (c *Client) observeRuntime(ctx context.Context) (converge.World, error) {
 	})
 }
 
-// removeAgent takes the label's LaunchAgent down once departure is proven,
-// falling back to the markerless escape when the plist predates the marker.
+// removeAgent takes the label's LaunchAgent down once departure is proven.
 func (c *Client) removeAgent(ctx context.Context, label string) error {
-	err := launchd.Remove(ctx, c.launchctl, label)
-	if err == nil {
-		return nil
-	}
-	if !errors.Is(err, launchd.ErrNotOwned) {
+	if err := launchd.Remove(ctx, c.launchctl, label); err != nil {
 		return fmt.Errorf("daemonkit: remove agent %q: %w", label, err)
-	}
-	if err := launchd.RemoveUnmarked(ctx, c.launchctl, label); err != nil {
-		return fmt.Errorf("daemonkit: remove legacy agent %q: %w", label, err)
 	}
 	return nil
 }

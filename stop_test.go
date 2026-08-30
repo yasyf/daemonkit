@@ -36,11 +36,10 @@ func unrunProgram(t *testing.T) Program {
 	return Program{policy: bundled{file: file}}
 }
 
-// installedAgentPlist stands a plist up at the label's own LaunchAgents path:
-// the rendered marker-carrying shape when marked, and the pre-marker shape a
-// v0.20 install left behind otherwise. Neither is byte-exact with the test
-// Daemon's own agent, so an observation never reaches launchctl print.
-func installedAgentPlist(t *testing.T, label Label, marked bool) string {
+// installedAgentPlist stands the rendered marker-carrying plist up at the
+// label's own LaunchAgents path. It is not byte-exact with the test Daemon's
+// own agent, so an observation never reaches launchctl print.
+func installedAgentPlist(t *testing.T, label Label) string {
 	t.Helper()
 	agent := launchd.Agent{
 		Label:         string(label),
@@ -52,11 +51,9 @@ func installedAgentPlist(t *testing.T, label Label, marked bool) string {
 	if err != nil {
 		t.Fatalf("PlistPath() error = %v", err)
 	}
-	body := []byte("<?xml version=\"1.0\"?>\n<plist><dict><key>Label</key><string>" + string(label) + "</string></dict></plist>\n")
-	if marked {
-		if body, err = agent.Plist(); err != nil {
-			t.Fatalf("Plist() error = %v", err)
-		}
+	body, err := agent.Plist()
+	if err != nil {
+		t.Fatalf("Plist() error = %v", err)
 	}
 	if err := os.WriteFile(path, body, 0o600); err != nil {
 		t.Fatalf("write plist: %v", err)
@@ -70,7 +67,7 @@ func installedAgentPlist(t *testing.T, label Label, marked bool) string {
 func TestStopRemovesTheMarkedAgentOfAStoppedDaemon(t *testing.T) {
 	ladderHome(t)
 	label := Label("com.example.stopmarked")
-	path := installedAgentPlist(t, label, true)
+	path := installedAgentPlist(t, label)
 	client := openClient(t, Daemon{Label: label, Program: unrunProgram(t)})
 	rec := &launchctlRecorder{}
 	client.launchctl = rec.run
@@ -91,31 +88,6 @@ func TestStopRemovesTheMarkedAgentOfAStoppedDaemon(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("plist survived Stop: %v", err)
-	}
-}
-
-// TestStopFallsBackToTheMarkerlessEscape is the v0.20 upgrade arm: the plist
-// at the label predates the marker, Remove refuses it with ErrNotOwned, and
-// Stop's own Label is the assertion RemoveUnmarked acts on.
-func TestStopFallsBackToTheMarkerlessEscape(t *testing.T) {
-	ladderHome(t)
-	label := Label("com.example.stoplegacy")
-	path := installedAgentPlist(t, label, false)
-	client := openClient(t, Daemon{Label: label, Program: unrunProgram(t)})
-	rec := &launchctlRecorder{}
-	client.launchctl = rec.run
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-	defer cancel()
-
-	if err := client.Stop(ctx); err != nil {
-		t.Fatalf("Stop() = %v", err)
-	}
-
-	if want := []string{"bootout"}; !slices.Equal(rec.verbs, want) {
-		t.Fatalf("verbs = %v, want %v", rec.verbs, want)
-	}
-	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("legacy plist survived Stop: %v", err)
 	}
 }
 
@@ -143,7 +115,7 @@ func TestStopIsSuccessWithNothingInstalled(t *testing.T) {
 func TestStopHoldsTheStartLock(t *testing.T) {
 	ladderHome(t)
 	label := Label("com.example.stoplock")
-	path := installedAgentPlist(t, label, true)
+	path := installedAgentPlist(t, label)
 	statePaths := paths.Agent(string(label))
 	if err := statePaths.EnsureLockDir(); err != nil {
 		t.Fatalf("create lock dir: %v", err)
@@ -182,7 +154,7 @@ func TestStopDrainsTheLiveIncumbentAndRemovesItsAgent(t *testing.T) {
 	ladderHome(t)
 	d := Daemon{Label: "dkstop", Schemas: []Schema{"test.v1"}, Shutdown: Grace(5 * time.Second), Program: unrunProgram(t)}
 	child := startControlChild(t, string(d.Label))
-	path := installedAgentPlist(t, d.Label, true)
+	path := installedAgentPlist(t, d.Label)
 	client := openClient(t, d)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
@@ -210,15 +182,14 @@ func TestStopDrainsTheLiveIncumbentAndRemovesItsAgent(t *testing.T) {
 }
 
 // TestStopWorksWithoutAProgram is the launcher shape: a Daemon declaring only
-// its Label — no Program to render or scan — on a machine upgraded from the
-// pre-marker era, where a markerless plist sits at the label with no owner
-// record and no listener. Stop proceeds without an inventory to consult and
-// the removal's own bootout is what takes down anything launchd still runs
+// its Label — no Program to render or scan — with a plist at the label but no
+// owner record and no listener. Stop proceeds without an inventory to consult
+// and the removal's own bootout is what takes down anything launchd still runs
 // under the label.
 func TestStopWorksWithoutAProgram(t *testing.T) {
 	ladderHome(t)
 	label := Label("com.example.stopnoprog")
-	path := installedAgentPlist(t, label, false)
+	path := installedAgentPlist(t, label)
 	client := openClient(t, Daemon{Label: label})
 	rec := &launchctlRecorder{}
 	client.launchctl = rec.run
@@ -233,7 +204,7 @@ func TestStopWorksWithoutAProgram(t *testing.T) {
 		t.Fatalf("verbs = %v, want %v", rec.verbs, want)
 	}
 	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("legacy plist survived Stop: %v", err)
+		t.Fatalf("plist survived Stop: %v", err)
 	}
 }
 
@@ -265,7 +236,7 @@ func TestStopPropagatesAnUntrustedSocketHolder(t *testing.T) {
 	ladderHome(t)
 	d := Daemon{Label: "dkstoptrust", Schemas: []Schema{"test.v1"}, Shutdown: Grace(5 * time.Second), Program: unrunProgram(t)}
 	startControlChild(t, string(d.Label))
-	path := installedAgentPlist(t, d.Label, true)
+	path := installedAgentPlist(t, d.Label)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()

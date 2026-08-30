@@ -100,7 +100,7 @@ func TestRecoverSettlesSuspendedChildWithDurableRecord(t *testing.T) {
 	}
 
 	next := openTestStore(t, path)
-	reclaimed, _, err := next.Recover(ladderContext(t, 1500*time.Millisecond), nil)
+	reclaimed, _, err := next.Recover(ladderContext(t, 1500*time.Millisecond))
 	if err != nil {
 		t.Fatalf("Recover() error = %v", err)
 	}

@@ -60,8 +60,8 @@ fleet-build still green (nothing has been deleted).
 **Lands (proc):** `internal/proc` — unexported comparable identity, the one comparison site,
 suspended spawn (record fsynced before SIGCONT), the driver goroutine with closure-local
 authority, the single-writer record store with the frozen identity core, flock-by-inode, the reap
-ladder, the one-release legacy bbolt sweep (reads a pre-cut file, reaps, archives — its deletion
-release named in the code's TODO). **Deletes:** public `proc`, `worker`.
+ladder, and the one-release legacy bbolt sweep (since deleted). **Deletes:** public `proc`,
+`worker`.
 
 **Lands (trust):** `internal/trust` — the unconditional floor, plus one kernel-only verifier:
 five `csops_audittoken` reads against the audit token (status → `csposture.Check(…,
@@ -145,6 +145,5 @@ section. A stalled repo is an **open migration, not a slow one** — fleet-build
 release gate only when its last leg turns green, and `v0.21.1` is the fix path for an API
 mistake the migration surfaces.
 
-**After the cut:** the legacy bbolt sweep deletes at its named release. The mixed-era gate
-narrows to protocol-bump coverage and stays forever — it is the one check that reproduces the
+**After the cut:** the mixed-era gate narrows to protocol-bump coverage and stays forever — it is the one check that reproduces the
 class that motivated the redesign.

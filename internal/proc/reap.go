@@ -5,44 +5,28 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"strings"
 	"syscall"
 	"time"
 )
 
 const settlementPollInterval = 10 * time.Millisecond
 
-// Recover settles every prior-generation record through the reap ladder,
-// sweeps any legacy bbolt files, and reports what it reclaimed and where an
-// unreadable record file was archived. ctx must carry a deadline; every
-// ladder bound derives from it.
-func (s *Store) Recover(ctx context.Context, legacy []string) ([]Reclaimed, string, error) {
+// Recover settles every prior-generation record through the reap ladder and
+// reports what it reclaimed and where an unreadable record file was archived.
+// ctx must carry a deadline; every ladder bound derives from it.
+func (s *Store) Recover(ctx context.Context) ([]Reclaimed, string, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		return nil, "", errors.New("proc: recover requires a context deadline")
 	}
 	var reclaimed []Reclaimed
 	var errs []error
-	var archives []string
-	if s.archived != "" {
-		archives = append(archives, s.archived)
-	}
 	for _, rec := range s.snapshot() {
 		if rec.Generation == s.generation {
 			continue
 		}
 		reclaimed, errs = s.recoverOne(ctx, rec.id(), rec.Session, reclaimed, errs)
 	}
-	for _, path := range legacy {
-		archived, swept, err := s.sweepLegacy(ctx, path)
-		reclaimed = append(reclaimed, swept...)
-		if err != nil {
-			errs = append(errs, err)
-		}
-		if archived != "" {
-			archives = append(archives, archived)
-		}
-	}
-	return reclaimed, strings.Join(archives, ", "), errors.Join(errs...)
+	return reclaimed, s.archived, errors.Join(errs...)
 }
 
 func (s *Store) recoverOne(

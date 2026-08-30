@@ -3,7 +3,6 @@ package proc
 import (
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"syscall"
 
@@ -128,27 +127,4 @@ func bootSession() (uint64, error) {
 
 func microStamp(sec, usec int64) uint64 {
 	return uint64(sec)*1_000_000 + uint64(usec) //nolint:gosec // kernel stamps are non-negative
-}
-
-// parseLegacyStart maps v1's darwin "%d.%06d" start stamp onto the frozen
-// seconds×1e6+microseconds numeric encoding.
-func parseLegacyStart(stamp string) (uint64, error) { return parseMicroStamp(stamp) }
-
-// parseLegacyBoot maps v1's darwin kern.boottime stamp identically.
-func parseLegacyBoot(stamp string) (uint64, error) { return parseMicroStamp(stamp) }
-
-func parseMicroStamp(stamp string) (uint64, error) {
-	secText, usecText, ok := strings.Cut(stamp, ".")
-	if !ok || len(usecText) != 6 {
-		return 0, fmt.Errorf("proc: malformed legacy stamp %q", stamp)
-	}
-	sec, err := strconv.ParseUint(secText, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("proc: malformed legacy stamp %q: %w", stamp, err)
-	}
-	usec, err := strconv.ParseUint(usecText, 10, 64)
-	if err != nil || usec >= 1_000_000 {
-		return 0, fmt.Errorf("proc: malformed legacy stamp %q", stamp)
-	}
-	return sec*1_000_000 + usec, nil
 }
