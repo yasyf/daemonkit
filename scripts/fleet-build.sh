@@ -435,8 +435,8 @@ for repo in $repos; do
       verdict="FAIL"
     }
   done
-  # The GOOS set is validated to name a platform, so this cannot fire from the
-  # refs file; a PASS no build stands behind is asserted against anyway.
+  # Backstop, not duplication: check_refs refuses a GOOS set naming no platform;
+  # this refuses a PASS no build stands behind, whatever put it there.
   if [[ "$runs" -eq 0 ]]; then
     echo "the GOOS set \"$goos_set\" ran no build" >>"$tmp/$repo.log"
     verdict="FAIL"
