@@ -53,6 +53,12 @@
 #   moves what those generators emit breaks fusekit's codegen drift check, not
 #   any compile run here.
 #
+#   A ref of 7 to 40 hex characters is refused as a commit, so a branch or tag
+#   whose name happens to be all hex is unusable here. Nothing distinguishes the
+#   two without asking the remote, and a pasted abbreviated SHA is the mistake
+#   worth catching: `git clone --branch` cannot take one, so a cone peer named by
+#   a commit fails at clone time with nothing pointing back at this file.
+#
 # Usage:
 #   scripts/fleet-build.sh                # every consumer
 #   scripts/fleet-build.sh --only cc-notes [--only binrun]
@@ -275,7 +281,7 @@ checkout_of() {
 # so the whole block is skipped, not just the line opening it.
 fleet_requires() {
   awk -v prefix="github.com/$owner/" '
-    $1 == "replace" || $1 == "exclude" { directive = ($NF == "("); next }
+    $1 == "replace" || $1 == "exclude" { directive = ($2 == "("); next }
     directive { directive = ($1 != ")"); next }
     {
       for (i = 1; i < NF; i++) {
