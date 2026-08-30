@@ -48,3 +48,5 @@ cc-review               main
 cc-pool                 main
 cookiesync              main
 cc-skills:plugins/codex main
+cc-runtime              main
+cc-squash:go            main

@@ -72,7 +72,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 owner="yasyf"
-default_repos="synckit fusekit reposync captain-hook cc-notes cc-patch cc-orchestrate cc-interact binrun cc-present cc-review cc-pool cookiesync cc-skills"
+default_repos="synckit fusekit reposync captain-hook cc-notes cc-patch cc-orchestrate cc-interact binrun cc-present cc-review cc-pool cookiesync cc-skills cc-runtime cc-squash"
 refs_file="$root/ci/fleet-refs.txt"
 default_goos="darwin"
 
