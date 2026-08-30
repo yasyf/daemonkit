@@ -25,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   calls the verb directly to sweep its own pre-v0.21 labels.
 - `docs/MIGRATING-0.21.md`, the v0.20.x repin guide. The migration it describes
   closed with v0.21, and nothing referenced the file.
+- `launchd.SessionType`, its five constants, `launchd.ParseSessionType`, and
+  `launchd.Agent.LimitLoadToSessionType`. v0.21.0 deprecated them and named a
+  future breaking release as where they go; this is it. The field had been
+  accepted and zeroed ever since — never rendered into the plist, never stored
+  with the agent, cleared from every agent daemonkit canonicalized — and no
+  fleet consumer set it. `acceptIgnoredSessionType` goes with them, so
+  `canonicalAgent` and `canonicalPlanAgents` now only copy reference-typed
+  fields. The export census drops eight symbols, 522 → 514.
 
 ## [0.23.0] - 2026-08-26
 

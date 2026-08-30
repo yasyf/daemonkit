@@ -139,17 +139,6 @@ type Agent struct {
 	// ProcessType declares launchd's resource policy. The zero value omits the
 	// launchd key.
 	ProcessType ProcessType
-	// LimitLoadToSessionType is accepted and dropped: never rendered into the
-	// plist, never stored with the agent, and cleared from every agent daemonkit
-	// canonicalizes, so a Plan reads it back as the zero value.
-	//
-	// Deprecated: launchd refuses any job whose session type names a domain
-	// other than the bootstrap domain's own (error 134, "Service cannot load in
-	// requested session"), and daemonkit bootstraps only into gui/<uid> — so
-	// SessionTypeAqua was always a no-op and every other value was a guaranteed
-	// permanent refusal. Setting anything but SessionTypeAqua logs a warning.
-	// Removed in a future breaking release.
-	LimitLoadToSessionType SessionType `json:"-"`
 }
 
 // PlistPath is the LaunchAgent plist location (~/Library/LaunchAgents/<Label>.plist),

@@ -384,7 +384,6 @@ func canonicalAgent(agent Agent) (Agent, error) {
 	if err := validateProgramTree(agent); err != nil {
 		return Agent{}, fmt.Errorf("launchd: validate agent %q: %w", agent.Label, err)
 	}
-	acceptIgnoredSessionType(&agent)
 	agent.Args = append([]string(nil), agent.Args...)
 	agent.Env = cloneStrings(agent.Env)
 	agent.AssociatedBundleIdentifiers, _ = canonicalAssociatedBundleIdentifiers(

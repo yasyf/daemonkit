@@ -79,7 +79,7 @@ disappears cannot leave a stale row behind.
 | `deploy` | owns sealed installation, activation, supersession, and removal of one fixed signed application. | 15 | 5586 |
 | `durable` | makes filesystem state survive crashes: atomic, fsynced publication of files and directory mutations, a strict validated JSON codec, and one bounded cross-process lock. | 9 | 1029 |
 | `ghrelease` | queries GitHub for a repository's latest published release. | 2 | 170 |
-| `launchd` | is the value-type model for one exact macOS user LaunchAgent and the stateless primitives that apply it. | 12 | 2675 |
+| `launchd` | is the value-type model for one exact macOS user LaunchAgent and the stateless primitives that apply it. | 12 | 2571 |
 | `paths` | owns the canonical state-directory layout under the user's home directory, resolved through the passwd database — never the caller's HOME or CLAUDE_CONFIG_DIR — so a sandboxed environment cannot relocate state. | 4 | 278 |
 | `templates` | — | 2 | 218 |
 | `version` | classifies and compares release and development builds for launcher-owned runtime settlement and release ordering. | 2 | 302 |
