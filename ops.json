@@ -1,0 +1,1 @@
+{"v":1,"lamport":1,"session":"0a63ac1e-6d69-45a8-9706-5891cf8b9dd4","ops":[{"kind":"create_log","nonce":"d8c18bea2cbc65bb053e396ed0b72b4e","title":"2026-08-30 fleet session: wedge fix, install-path fix, gate closure, and what was deliberately not built","tags":["fleet","release","session-record"],"anchors":[]}]}
