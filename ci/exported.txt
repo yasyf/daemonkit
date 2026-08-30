@@ -448,7 +448,6 @@ launchd	field	CalendarInterval.Minute	darwin
 launchd	field	CalendarInterval.Month	darwin
 launchd	field	CalendarInterval.Weekday	darwin
 launchd	func	Daily	darwin
-launchd	var	ErrMarked	darwin
 launchd	var	ErrNotOwned	darwin
 launchd	func	NewPlan	darwin
 launchd	const	NoRestart	darwin
@@ -464,7 +463,6 @@ launchd	const	ProcessTypeBackground	darwin
 launchd	const	ProcessTypeInteractive	darwin
 launchd	const	ProcessTypeStandard	darwin
 launchd	func	Remove	darwin
-launchd	func	RemoveUnmarked	darwin
 launchd	const	RestartAlways	darwin
 launchd	const	RestartOnFailure	darwin
 launchd	type	RestartPolicy	darwin

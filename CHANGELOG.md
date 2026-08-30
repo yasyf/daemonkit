@@ -21,8 +21,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carried the ownership marker since v0.21, so `removeAgent` is
   `launchd.Remove` and nothing else — a plist that fails its ownership proof is
   now refused rather than deleted through the escape.
-  `launchd.RemoveUnmarked` and `launchd.ErrMarked` stay exported: captain-hook
-  calls the verb directly to sweep its own pre-v0.21 labels.
 - `docs/MIGRATING-0.21.md`, the v0.20.x repin guide. The migration it describes
   closed with v0.21, and nothing referenced the file.
 - `launchd.SessionType`, its five constants, `launchd.ParseSessionType`, and
@@ -33,6 +31,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fleet consumer set it. `acceptIgnoredSessionType` goes with them, so
   `canonicalAgent` and `canonicalPlanAgents` now only copy reference-typed
   fields. The export census drops eight symbols, 522 → 514.
+- **Breaking.** `launchd.RemoveUnmarked` and `launchd.ErrMarked` — the
+  pre-marker era's named waiver of the ownership gate, and the sentinel that
+  kept it from reaching a marked plist. The waiver outlived what it waived:
+  `Client.Stop` gave up its markerless fallback above, captain-hook dropped its
+  own pre-v0.21 LaunchAgent sweep, and cc-pool's cross-era migration was the
+  last caller anywhere in the fleet. `Remove` is now the only verb that takes a
+  plist down, so the applier's `removeWhen` goes too — with one plist shape
+  left to accept, `remove` reads the marker itself rather than through a
+  predicate. The export census drops two more symbols, 514 → 512.
 
 ## [0.23.0] - 2026-08-26
 

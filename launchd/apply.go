@@ -36,11 +36,6 @@ var ownerMarkerKey = []byte("<key>" + OwnerEnvKey + "</key>")
 // holds there is a third party's to stop.
 var ErrNotOwned = errors.New("launchd: agent plist carries no " + OwnerEnvKey + " ownership marker")
 
-// ErrMarked means the plist sitting at daemonkit's path for a label carries
-// the ownership marker, so it is not the pre-marker shape RemoveUnmarked
-// exists to clear. RemoveUnmarked refuses it untouched; Remove owns it.
-var ErrMarked = errors.New("launchd: agent plist carries the " + OwnerEnvKey + " ownership marker; Remove owns marked plists")
-
 // Runner runs one command to completion and returns its combined stdout and
 // stderr, its exit code, and any error that prevented it from running. Apply and
 // Remove drive /bin/launchctl through a Runner so the process boundary stays
@@ -111,29 +106,6 @@ func Remove(ctx context.Context, run Runner, label string) error {
 	return c.remove(ctx, label)
 }
 
-// RemoveUnmarked boots out and deletes the one plist at the named label only
-// when that plist carries no ownership marker — the shape every pre-marker
-// install left behind, which [Remove] refuses with [ErrNotOwned]. Nothing in a
-// markerless plist can prove whose it is, so naming the label is the caller's
-// own assertion of ownership: call it only for a label your product registered.
-//
-// The verb is the marker gate's named waiver and nothing more. A plist
-// carrying the marker is refused untouched with [ErrMarked] — it is not legacy,
-// and Remove's ordinary ownership proof governs it — so the two verbs partition
-// plist shapes exactly and neither bypasses the other. A label with no plist at
-// daemonkit's path, or one launchd does not know, is success, so a repeated
-// RemoveUnmarked is a no-op.
-func RemoveUnmarked(ctx context.Context, run Runner, label string) error {
-	if run == nil {
-		return errors.New("launchd: remove runner is required")
-	}
-	if err := ValidateLabel(label); err != nil {
-		return err
-	}
-	c := applier{run: run, wait: waitRetry}
-	return c.removeUnmarked(ctx, label)
-}
-
 type applier struct {
 	run  Runner
 	wait func(context.Context, time.Duration) error
@@ -157,27 +129,6 @@ func (c applier) apply(ctx context.Context, agent Agent) error {
 }
 
 func (c applier) remove(ctx context.Context, label string) error {
-	return c.removeWhen(ctx, label, func(data []byte, path string) error {
-		if !plistHasOwnerMarker(data) {
-			return fmt.Errorf("%w: %q", ErrNotOwned, path)
-		}
-		return nil
-	})
-}
-
-func (c applier) removeUnmarked(ctx context.Context, label string) error {
-	return c.removeWhen(ctx, label, func(data []byte, path string) error {
-		if plistHasOwnerMarker(data) {
-			return fmt.Errorf("%w: %q", ErrMarked, path)
-		}
-		return nil
-	})
-}
-
-// removeWhen boots the label out and deletes its plist once owns accepts the
-// plist bytes actually on disk; a refusal leaves both the file and the job
-// untouched.
-func (c applier) removeWhen(ctx context.Context, label string, owns func(data []byte, path string) error) error {
 	path, err := plistPath(label)
 	if err != nil {
 		return err
@@ -189,8 +140,8 @@ func (c applier) removeWhen(ctx context.Context, label string, owns func(data []
 	if err != nil {
 		return fmt.Errorf("launchd: inspect agent plist %q: %w", path, err)
 	}
-	if err := owns(data, path); err != nil {
-		return err
+	if !plistHasOwnerMarker(data) {
+		return fmt.Errorf("%w: %q", ErrNotOwned, path)
 	}
 	if bootout := c.launchctl(ctx, "bootout", serviceTarget(label)); !bootout.settled() {
 		return fmt.Errorf("launchd: remove agent %q: %w", label, bootout.fail())
