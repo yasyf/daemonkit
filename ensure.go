@@ -495,6 +495,15 @@ func (c *Client) inventoryClear(observed proc.Identity) error {
 	return fmt.Errorf("%w: live process(es) remain: %s", ErrUnsettled, strings.Join(names, ", "))
 }
 
+// AgentPath is the PATH every daemonkit LaunchAgent runs under. launchd's own
+// default omits the Homebrew prefixes, so a daemon that execs `git` reaches the
+// Xcode shim at /usr/bin/git, which re-execs Xcode's binary and pays a second
+// endpoint-security exec check on every call; a per-machine `launchctl config
+// user path` only applies after a reboot, and a job started before it keeps the
+// bare default. Rendering the value into the plist makes the daemon's PATH a
+// fact of the spec rather than of when the job was bootstrapped.
+const AgentPath = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
 // agent is the LaunchAgent that runs this daemon. Every field is already on
 // the Daemon, so nothing about the job is declared twice; an unset Log sinks
 // to the state directory's daemon.log.
@@ -520,6 +529,7 @@ func (d Daemon) agent() (launchd.Agent, error) {
 		Program:       program,
 		Args:          d.Args,
 		LogPath:       log,
+		Env:           map[string]string{"PATH": AgentPath},
 		RestartPolicy: restart,
 		ExitTimeOut:   d.exitTimeOut(),
 	}, nil

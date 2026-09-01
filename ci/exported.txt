@@ -4,6 +4,7 @@
 .	const	ActionRestarted	darwin
 .	const	ActionStarted	darwin
 .	const	ActionUpgraded	darwin
+.	const	AgentPath	darwin
 .	type	Budget	darwin
 .	method	Budget.Context	darwin
 .	method	Budget.Left	darwin

@@ -379,6 +379,9 @@ func TestDaemonAgent(t *testing.T) {
 				agent.ExitTimeOut != tt.want.ExitTimeOut {
 				t.Fatalf("agent() = %+v, want %+v", agent, tt.want)
 			}
+			if len(agent.Env) != 1 || agent.Env["PATH"] != AgentPath {
+				t.Fatalf("agent() env = %q, want PATH=%q alone", agent.Env, AgentPath)
+			}
 			if len(agent.Args) != len(tt.want.Args) {
 				t.Fatalf("agent() args = %q, want %q", agent.Args, tt.want.Args)
 			}

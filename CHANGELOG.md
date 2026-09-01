@@ -41,6 +41,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   left to accept, `remove` reads the marker itself rather than through a
   predicate. The export census drops two more symbols, 514 → 512.
 
+### Fixed
+
+- Every rendered LaunchAgent now carries `PATH` (`AgentPath`, Homebrew-first).
+  launchd's default PATH has no Homebrew prefix, so a daemon execing `git`
+  reached the Xcode shim at `/usr/bin/git`, which re-execs Xcode's binary and
+  pays a second endpoint-security exec check per call — enough to push
+  cc-review's `turn-start` hook past Claude Code's 10 s budget on a loaded
+  machine. `launchctl config user path` only applies after a reboot and never
+  reaches a job bootstrapped before it, so the value now rides the plist.
+
 ## [0.23.0] - 2026-08-26
 
 ### Added
