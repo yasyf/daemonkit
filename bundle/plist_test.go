@@ -26,22 +26,25 @@ func writePlist(t *testing.T, content string) string {
 	return path
 }
 
-func TestReadShortVersion(t *testing.T) {
+func TestStringValue(t *testing.T) {
 	cases := []struct {
 		name    string
 		content string
+		key     string
 		want    string
 		wantErr bool
 	}{
-		{name: "release format", content: releasePlist, want: "0.38.0"},
-		{name: "key after other strings", content: `<plist><dict><key>A</key><string>x</string><key>CFBundleShortVersionString</key><string>1.2.3</string></dict></plist>`, want: "1.2.3"},
-		{name: "missing key", content: `<plist><dict><key>A</key><string>x</string></dict></plist>`, wantErr: true},
-		{name: "non-string value after key", content: `<plist><dict><key>CFBundleShortVersionString</key><true/><key>B</key><string>x</string></dict></plist>`, wantErr: true},
-		{name: "binary junk", content: "bplist00\x00\x01\x02", wantErr: true},
+		{name: "release format", content: releasePlist, key: "CFBundleShortVersionString", want: "0.38.0"},
+		{name: "any key, not just the version", content: releasePlist, key: "CFBundleIdentifier", want: "com.yasyf.fusekit-holder"},
+		{name: "key after other strings", content: `<plist><dict><key>A</key><string>x</string><key>CFBundleShortVersionString</key><string>1.2.3</string></dict></plist>`, key: "CFBundleShortVersionString", want: "1.2.3"},
+		{name: "missing key", content: `<plist><dict><key>A</key><string>x</string></dict></plist>`, key: "CFBundleShortVersionString", wantErr: true},
+		{name: "non-string value after key", content: `<plist><dict><key>CFBundleShortVersionString</key><true/><key>B</key><string>x</string></dict></plist>`, key: "CFBundleShortVersionString", wantErr: true},
+		{name: "empty value", content: `<plist><dict><key>A</key><string></string></dict></plist>`, key: "A", wantErr: true},
+		{name: "binary junk", content: "bplist00\x00\x01\x02", key: "A", wantErr: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := readShortVersion(writePlist(t, tc.content))
+			got, err := StringValue(writePlist(t, tc.content), tc.key)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("got %q, want error", got)
@@ -52,11 +55,11 @@ func TestReadShortVersion(t *testing.T) {
 				t.Fatal(err)
 			}
 			if got != tc.want {
-				t.Fatalf("version = %q, want %q", got, tc.want)
+				t.Fatalf("value = %q, want %q", got, tc.want)
 			}
 		})
 	}
-	if _, err := readShortVersion(filepath.Join(t.TempDir(), "missing.plist")); err == nil {
+	if _, err := StringValue(filepath.Join(t.TempDir(), "missing.plist"), "A"); err == nil {
 		t.Fatal("missing plist read without error")
 	}
 }

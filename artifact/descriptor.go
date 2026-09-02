@@ -8,8 +8,13 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
+
+	"github.com/yasyf/daemonkit/bundle"
+	"github.com/yasyf/daemonkit/internal/realhome"
 )
 
 const versionCommandTimeout = 10 * time.Second
@@ -54,17 +59,21 @@ type Descriptor struct {
 	App       *AppSpec                   `json:"app,omitempty"`
 }
 
-// VersionSource is a baked Static version or a dynamic host-authority Command.
-// Exactly one is set. Command's stdout is JSON; JSONField names the field the
-// version is read from.
+// VersionSource is a baked Static version, a host File, or a host-authority
+// Command. Exactly one is set. File is an absolute or "~/"-relative path, read
+// for the string at PlistKey (an XML or binary plist) or at JSONField (a JSON
+// document); Command's stdout is JSON, read at JSONField the same way.
 type VersionSource struct {
 	Static    string   `json:"static,omitempty"`
 	Command   []string `json:"command,omitempty"`
+	File      string   `json:"file,omitempty"`
+	PlistKey  string   `json:"plist_key,omitempty"`
 	JSONField string   `json:"json_field,omitempty"`
 }
 
-// Dynamic reports whether the version is resolved from a host command.
-func (v VersionSource) Dynamic() bool { return len(v.Command) > 0 }
+// Dynamic reports whether the version comes from the host rather than from a
+// value baked into the descriptor.
+func (v VersionSource) Dynamic() bool { return len(v.Command) > 0 || v.File != "" }
 
 // PlatformEntry is one platform's baked artifact for a release-binary or a
 // static signed-app. Digest is empty only for a dynamic template.
@@ -210,13 +219,25 @@ func (d *Descriptor) Validate() error {
 }
 
 func (v VersionSource) validate() error {
+	sources := 0
+	for _, set := range []bool{v.Static != "", len(v.Command) > 0, v.File != ""} {
+		if set {
+			sources++
+		}
+	}
 	switch {
-	case v.Static != "" && len(v.Command) > 0:
-		return fmt.Errorf("%w: version has both static and command", ErrInvalidDescriptor)
-	case v.Static == "" && len(v.Command) == 0:
-		return fmt.Errorf("%w: version has neither static nor command", ErrInvalidDescriptor)
+	case sources == 0:
+		return fmt.Errorf("%w: version has none of static, file, and command", ErrInvalidDescriptor)
+	case sources > 1:
+		return fmt.Errorf("%w: version has more than one of static, file, and command", ErrInvalidDescriptor)
 	case len(v.Command) > 0 && v.JSONField == "":
 		return fmt.Errorf("%w: dynamic version missing json_field", ErrInvalidDescriptor)
+	case len(v.Command) > 0 && v.PlistKey != "":
+		return fmt.Errorf("%w: plist_key reads a file, not a command", ErrInvalidDescriptor)
+	case v.File != "" && (v.PlistKey == "") == (v.JSONField == ""):
+		return fmt.Errorf("%w: file version needs exactly one of plist_key and json_field", ErrInvalidDescriptor)
+	case v.File != "" && !homeRelative(v.File) && !filepath.IsAbs(v.File):
+		return fmt.Errorf("%w: version file %q is neither absolute nor ~/-relative", ErrInvalidDescriptor, v.File)
 	}
 	return nil
 }
@@ -269,13 +290,37 @@ func (p Provider) validate() error {
 	return nil
 }
 
-// ResolveVersion returns the concrete version: the Static value, or the JSON
-// field read from the dynamic command's stdout, bounded by ctx.
+// ResolveVersion returns the concrete version: the Static value, the string read
+// from the host File, or the JSON field read from the dynamic command's stdout,
+// bounded by ctx.
 func (d *Descriptor) ResolveVersion(ctx context.Context) (string, error) {
-	if !d.Version.Dynamic() {
-		return d.Version.Static, nil
+	switch v := d.Version; {
+	case v.File != "":
+		return v.resolveFile()
+	case len(v.Command) > 0:
+		return v.resolveCommand(ctx)
+	default:
+		return v.Static, nil
 	}
-	return d.Version.resolveCommand(ctx)
+}
+
+func (v VersionSource) resolveFile() (string, error) {
+	path, err := expandHome(v.File)
+	if err != nil {
+		return "", err
+	}
+	if v.PlistKey != "" {
+		version, err := bundle.StringValue(path, v.PlistKey)
+		if err != nil {
+			return "", fmt.Errorf("artifact: read version file: %w", err)
+		}
+		return version, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("artifact: read version file: %w", err)
+	}
+	return v.versionFromJSON(data)
 }
 
 func (v VersionSource) resolveCommand(ctx context.Context) (string, error) {
@@ -287,13 +332,17 @@ func (v VersionSource) resolveCommand(ctx context.Context) (string, error) {
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("artifact: run version command: %w", err)
 	}
+	return v.versionFromJSON(stdout.Bytes())
+}
+
+func (v VersionSource) versionFromJSON(data []byte) (string, error) {
 	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(stdout.Bytes(), &fields); err != nil {
-		return "", fmt.Errorf("artifact: parse version command output: %w", err)
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return "", fmt.Errorf("artifact: parse version JSON: %w", err)
 	}
 	raw, ok := fields[v.JSONField]
 	if !ok {
-		return "", fmt.Errorf("artifact: version command output has no field %q", v.JSONField)
+		return "", fmt.Errorf("artifact: version JSON has no field %q", v.JSONField)
 	}
 	var version string
 	if err := json.Unmarshal(raw, &version); err != nil {
@@ -303,4 +352,20 @@ func (v VersionSource) resolveCommand(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("artifact: version field %q is empty", v.JSONField)
 	}
 	return version, nil
+}
+
+func homeRelative(path string) bool { return strings.HasPrefix(path, "~/") }
+
+// expandHome resolves a leading "~/" through the passwd database rather than
+// HOME, so a descriptor read under a sandboxed environment names the same file
+// the store root does.
+func expandHome(path string) (string, error) {
+	if !homeRelative(path) {
+		return path, nil
+	}
+	home, err := realhome.Dir()
+	if err != nil {
+		return "", fmt.Errorf("artifact: resolve home directory: %w", err)
+	}
+	return filepath.Join(home, path[len("~/"):]), nil
 }

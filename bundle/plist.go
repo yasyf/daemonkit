@@ -10,23 +10,30 @@ import (
 
 // ShortVersion reads CFBundleShortVersionString from an XML or binary Info.plist.
 func ShortVersion(appPath string) (string, error) {
-	return readShortVersion(filepath.Join(appPath, "Contents", "Info.plist"))
+	return StringValue(filepath.Join(appPath, "Contents", "Info.plist"), "CFBundleShortVersionString")
 }
 
-func readShortVersion(path string) (string, error) {
+// StringValue reads a non-empty string-valued key from an XML or binary plist.
+func StringValue(path, key string) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	defer file.Close()
-	var info struct {
-		ShortVersion string `plist:"CFBundleShortVersionString"`
-	}
-	if err := plist.NewDecoder(file).Decode(&info); err != nil {
+	var values map[string]any
+	if err := plist.NewDecoder(file).Decode(&values); err != nil {
 		return "", fmt.Errorf("parse %s: %w", path, err)
 	}
-	if info.ShortVersion == "" {
-		return "", fmt.Errorf("no CFBundleShortVersionString in %s", path)
+	raw, ok := values[key]
+	if !ok {
+		return "", fmt.Errorf("no %s in %s", key, path)
 	}
-	return info.ShortVersion, nil
+	value, ok := raw.(string)
+	if !ok {
+		return "", fmt.Errorf("%s in %s is not a string", key, path)
+	}
+	if value == "" {
+		return "", fmt.Errorf("%s in %s is empty", key, path)
+	}
+	return value, nil
 }
