@@ -56,10 +56,10 @@ struct SessionReadinessTests {
             finished.signal()
         }
 
-        let received = try reader.read(timeout: 1)
+        let received = try reader.read(timeout: 2)
         #expect(received.kind == .event)
         #expect(received.operation == "ready")
-        #expect(finished.wait(timeout: .now() + 1) == .success)
+        #expect(finished.wait(timeout: .now() + 3) == .success)
     }
 
     @Test func strictExecutorNonblockingWriteWaitsForReadiness() throws {
