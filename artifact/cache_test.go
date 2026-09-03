@@ -193,3 +193,139 @@ func TestCacheEntriesReadsMaterializedMeta(t *testing.T) {
 		t.Fatalf("entries after remove = %d, want 0", len(left))
 	}
 }
+
+func seedToolEntry(t *testing.T, store Store, dist, version string, installedAt time.Time) ToolEntry {
+	t.Helper()
+	dir := filepath.Join(store.ToolsDir(), dist, version)
+	if err := os.MkdirAll(filepath.Join(dir, "bin"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dir, installedMarker)
+	if err := os.WriteFile(marker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(marker, installedAt, installedAt); err != nil {
+		t.Fatal(err)
+	}
+	return ToolEntry{Dist: dist, Version: version, Dir: dir, InstalledAt: installedAt}
+}
+
+func toolEntriesByVersion(t *testing.T, store Store) map[string]ToolEntry {
+	t.Helper()
+	entries, err := store.ToolEntries()
+	if err != nil {
+		t.Fatalf("ToolEntries() = %v", err)
+	}
+	byVersion := make(map[string]ToolEntry, len(entries))
+	for _, e := range entries {
+		byVersion[e.Dist+"@"+e.Version] = e
+	}
+	return byVersion
+}
+
+func TestToolEntriesWalk(t *testing.T) {
+	store := Store{Root: t.TempDir()}
+	installed := time.Now().Add(-time.Hour).Truncate(time.Second)
+	old := seedToolEntry(t, store, "capt-hook", "12.21.3", installed)
+	current := seedToolEntry(t, store, "capt-hook", "12.22.5", installed.Add(time.Hour))
+	other := seedToolEntry(t, store, "other-tool", "1.0.0", installed)
+
+	byVersion := toolEntriesByVersion(t, store)
+	if len(byVersion) != 3 {
+		t.Fatalf("entries = %d, want 3", len(byVersion))
+	}
+	for _, want := range []ToolEntry{old, current, other} {
+		got := byVersion[want.Dist+"@"+want.Version]
+		if got.Dir != want.Dir || got.Dist != want.Dist || got.Version != want.Version {
+			t.Fatalf("entry = %+v, want %+v", got, want)
+		}
+		if !got.InstalledAt.Equal(want.InstalledAt) {
+			t.Fatalf("entry %s InstalledAt = %v, want %v", want.Version, got.InstalledAt, want.InstalledAt)
+		}
+	}
+}
+
+func TestToolEntriesEmpty(t *testing.T) {
+	entries, err := (Store{Root: t.TempDir()}).ToolEntries()
+	if err != nil || entries != nil {
+		t.Fatalf("ToolEntries() on an empty store = %v, %v; want nil, nil", entries, err)
+	}
+}
+
+func TestToolEntriesPartialInstallStillPrunable(t *testing.T) {
+	store := Store{Root: t.TempDir()}
+	dir := filepath.Join(store.ToolsDir(), "capt-hook", "12.22.0")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	entry, ok := toolEntriesByVersion(t, store)["capt-hook@12.22.0"]
+	if !ok {
+		t.Fatal("env without an install marker not returned")
+	}
+	if !entry.InstalledAt.IsZero() {
+		t.Fatalf("unmarked env carries a timestamp: %+v", entry)
+	}
+	if err := store.RemoveToolEntry(entry); err != nil {
+		t.Fatalf("RemoveToolEntry() = %v", err)
+	}
+}
+
+func TestRemoveToolEntry(t *testing.T) {
+	store := Store{Root: t.TempDir()}
+	entry := seedToolEntry(t, store, "capt-hook", "12.21.3", time.Now())
+
+	if err := store.RemoveToolEntry(entry); err != nil {
+		t.Fatalf("RemoveToolEntry() = %v", err)
+	}
+	if _, err := os.Stat(entry.Dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("tool entry dir not removed: %v", err)
+	}
+	if err := store.RemoveToolEntry(entry); err != nil {
+		t.Fatalf("second RemoveToolEntry() = %v (want idempotent)", err)
+	}
+}
+
+func TestRemoveToolEntryRejectsDirOutsideToolStore(t *testing.T) {
+	store := Store{Root: t.TempDir()}
+	if err := store.RemoveToolEntry(ToolEntry{Dist: "x", Version: "1", Dir: t.TempDir()}); err == nil {
+		t.Fatal("RemoveToolEntry accepted a dir outside the tool store")
+	}
+	if err := store.RemoveToolEntry(ToolEntry{Dist: "x", Version: "1", Dir: store.ToolsDir()}); err == nil {
+		t.Fatal("RemoveToolEntry accepted the tool store root itself")
+	}
+	if err := store.RemoveToolEntry(ToolEntry{Dist: "x", Version: "1", Dir: store.CacheDir()}); err == nil {
+		t.Fatal("RemoveToolEntry accepted the content cache")
+	}
+}
+
+func TestRemoveToolEntryWaitsForConcurrentInstall(t *testing.T) {
+	store := Store{Root: t.TempDir()}
+	entry := seedToolEntry(t, store, "capt-hook", "12.22.5", time.Now())
+
+	acquired := make(chan struct{})
+	release := make(chan struct{})
+	go func() {
+		_ = store.withLock(context.Background(), toolLockKey(entry.Dist, entry.Version), func() error {
+			close(acquired)
+			<-release
+			return nil
+		})
+	}()
+	<-acquired
+
+	done := make(chan error, 1)
+	go func() { done <- store.RemoveToolEntry(entry) }()
+	select {
+	case <-done:
+		t.Fatal("RemoveToolEntry did not wait for the held install lock")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("RemoveToolEntry after release = %v", err)
+	}
+	if _, err := os.Stat(entry.Dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("tool entry dir not removed after lock release: %v", err)
+	}
+}

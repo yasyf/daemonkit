@@ -78,6 +78,87 @@ func readCacheEntry(dir, digest string) CacheEntry {
 	return entry
 }
 
+// ToolEntry is one materialized python-tool environment in the version-addressed
+// tool store, as enumerated for garbage collection. Dist, Version, and Dir are
+// always set; InstalledAt comes from the environment's install marker and is
+// zero when that marker is missing, so the partial env an interrupted install
+// left behind sorts oldest and is reclaimed first.
+type ToolEntry struct {
+	Dist        string
+	Version     string
+	Dir         string
+	InstalledAt time.Time
+}
+
+// ToolEntries walks the tool store and returns one entry per <dist>/<version>
+// environment, reading each install marker for its timestamp.
+func (s Store) ToolEntries() ([]ToolEntry, error) {
+	if err := s.validate(); err != nil {
+		return nil, err
+	}
+	dists, err := os.ReadDir(s.ToolsDir())
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("artifact: read tools directory: %w", err)
+	}
+	var entries []ToolEntry
+	for _, dist := range dists {
+		if !dist.IsDir() {
+			continue
+		}
+		distDir := filepath.Join(s.ToolsDir(), dist.Name())
+		versions, err := os.ReadDir(distDir)
+		if err != nil {
+			return nil, fmt.Errorf("artifact: read tool dist %q: %w", dist.Name(), err)
+		}
+		for _, version := range versions {
+			if version.IsDir() {
+				entries = append(entries, readToolEntry(filepath.Join(distDir, version.Name()), dist.Name(), version.Name()))
+			}
+		}
+	}
+	return entries, nil
+}
+
+func readToolEntry(dir, dist, version string) ToolEntry {
+	entry := ToolEntry{Dist: dist, Version: version, Dir: dir}
+	info, err := os.Stat(filepath.Join(dir, installedMarker))
+	if err != nil {
+		slog.Warn("artifact: tool env has no install marker", "dir", dir, "error", err)
+		return entry
+	}
+	entry.InstalledAt = info.ModTime()
+	return entry
+}
+
+// RemoveToolEntry removes a tool environment under the same per-artifact lock
+// installation holds, so a concurrent install of the same version completes
+// whole before the removal begins.
+func (s Store) RemoveToolEntry(entry ToolEntry) error {
+	if err := s.validate(); err != nil {
+		return err
+	}
+	if err := within(s.ToolsDir(), entry.Dir); err != nil {
+		return err
+	}
+	return s.withLock(context.Background(), toolLockKey(entry.Dist, entry.Version), func() error {
+		if err := durable.RemoveTree(entry.Dir); err != nil {
+			return fmt.Errorf("artifact: remove tool entry: %w", err)
+		}
+		return nil
+	})
+}
+
+func within(root, dir string) error {
+	rel, err := filepath.Rel(root, dir)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return fmt.Errorf("artifact: entry dir %q is not within %q", dir, root)
+	}
+	return nil
+}
+
 // RemoveCacheEntry removes a cache entry's digest directory under the same
 // per-artifact lock materialization holds, so a concurrent resolve of the same
 // digest completes whole before the removal begins and never observes a
@@ -86,9 +167,8 @@ func (s Store) RemoveCacheEntry(entry CacheEntry) error {
 	if err := s.validate(); err != nil {
 		return err
 	}
-	rel, err := filepath.Rel(s.CacheDir(), entry.Dir)
-	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-		return fmt.Errorf("artifact: cache entry dir %q is not within the cache", entry.Dir)
+	if err := within(s.CacheDir(), entry.Dir); err != nil {
+		return err
 	}
 	return s.withLock(context.Background(), "release:"+entry.Digest, func() error {
 		if err := durable.RemoveTree(entry.Dir); err != nil {

@@ -12,6 +12,13 @@ import (
 	"github.com/yasyf/daemonkit/durable"
 )
 
+// installedMarker names the receipt written last, after a tool env's files are
+// on disk and fsynced, so its presence means the env is whole and its timestamp
+// dates the install.
+const installedMarker = ".installed"
+
+func toolLockKey(dist, version string) string { return "tool:" + dist + "@" + version }
+
 func (s Store) resolvePythonTool(ctx context.Context, desc *Descriptor, version string, o options) (string, error) {
 	entrypoint := desc.Tool.Entrypoint
 	if entrypoint == "" {
@@ -29,12 +36,12 @@ func (s Store) resolvePythonTool(ctx context.Context, desc *Descriptor, version 
 	if err != nil {
 		return "", err
 	}
-	marker := filepath.Join(toolDir, ".installed")
+	marker := filepath.Join(toolDir, installedMarker)
 
 	if regular(marker) {
 		return realEntrypoint(link)
 	}
-	if err := s.withLock(ctx, "tool:"+desc.Tool.Dist+"@"+version, func() error {
+	if err := s.withLock(ctx, toolLockKey(desc.Tool.Dist, version), func() error {
 		if regular(marker) {
 			return nil
 		}

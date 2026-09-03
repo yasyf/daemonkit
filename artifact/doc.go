@@ -24,7 +24,9 @@
 // UV_TOOL_DIR and UV_TOOL_BIN_DIR, then returns the real console-script
 // entrypoint inside the environment. uv enforces PyPI hashes, so no descriptor
 // digest is carried. A second resolution returns the existing environment
-// offline.
+// offline. Store.ToolEntries and Store.RemoveToolEntry enumerate and prune that
+// store the way their cache counterparts do, so a host that has tracked a
+// fast-moving tool through many versions can reclaim the old environments.
 //
 // SignedApp is attest-only. It verifies the app exists and — for a static
 // descriptor — that its version matches, and otherwise returns a
@@ -33,13 +35,21 @@
 //
 // # Version source and the supply-chain rule
 //
-// A VersionSource is either a baked Static version (rendered at descriptor build
-// time, with full commit-time platform digests) or a dynamic Command whose JSON
-// stdout carries the version under JSONField (host authority; no baked digest).
-// A dynamic version is valid only for PythonTool and SignedApp, where an
-// independent integrity gate exists — uv's PyPI hashes and codesign's designated
-// requirement respectively. A dynamic ReleaseBinary is rejected by Validate with
-// ErrDynamicIntegrity, because no such gate exists for a bare downloaded binary.
+// A VersionSource is a baked Static version (rendered at descriptor build time,
+// with full commit-time platform digests) or one of two host-authoritative
+// sources carrying no baked digest: a File the runner reads — a plist key or a
+// JSON field — or a Command whose JSON stdout carries the version under
+// JSONField. A dynamic version is valid only for PythonTool and SignedApp, where
+// an independent integrity gate exists — uv's PyPI hashes and codesign's
+// designated requirement respectively. A dynamic ReleaseBinary is rejected by
+// Validate with ErrDynamicIntegrity, because no such gate exists for a bare
+// downloaded binary.
+//
+// Prefer File over Command wherever the host already publishes its version in a
+// file, such as an installed app's Info.plist. A file read is exact, spawns no
+// process, and cannot go stale between resolutions the way a cached probe would;
+// a Command costs a process spawn on every single resolution, which dominates
+// the warm path for a consumer that resolves per invocation.
 //
 // # Resolution is exact
 //
