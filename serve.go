@@ -131,6 +131,15 @@ const (
 
 const requestSettleTick = 10 * time.Millisecond
 
+const defaultIdle = Grace(15 * time.Minute)
+
+func idleOrDefault(idle Grace) time.Duration {
+	if idle <= 0 {
+		return time.Duration(defaultIdle)
+	}
+	return time.Duration(idle)
+}
+
 const (
 	requestsShare = 0.40 / 0.95
 	drainShare    = 0.30 / 0.55
@@ -217,6 +226,7 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 		Concurrency: d.Concurrency,
 		MaxFrame:    int(d.MaxFrame),
 		Handshake:   time.Duration(d.Handshake),
+		Idle:        idleOrDefault(d.Idle),
 		Serving:     wire.Serving{PID: os.Getpid(), Build: build, Generation: store.Generation(), Detail: rt.reportDetail},
 	})
 	if err != nil {

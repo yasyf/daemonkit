@@ -214,7 +214,7 @@ func classifyWire(err error) error {
 		return err
 	case errors.Is(err, wire.ErrUntrustedPeer), errors.Is(err, trust.ErrUntrustedPeer):
 		return fmt.Errorf("%w: %w", ErrUntrusted, err)
-	case errors.Is(err, ErrNoVerifier), errors.Is(err, ErrPeerGone):
+	case errors.Is(err, ErrNoVerifier), errors.Is(err, ErrPeerGone), errors.Is(err, ErrSessionCapacity):
 		return err
 	case errors.Is(err, syscall.ENOENT), errors.Is(err, os.ErrNotExist), errors.Is(err, syscall.ECONNREFUSED):
 		return fmt.Errorf("%w: %w", ErrAbsent, err)

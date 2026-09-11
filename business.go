@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/yasyf/daemonkit/internal/wire"
 )
@@ -85,10 +86,14 @@ func (e *ProductError) Error() string {
 	return e.Code + ": " + e.Message
 }
 
-// peerGoneAttempts bounds the daemon-restart race: a serving peer whose
-// execution generation ends mid-attach is re-attached this many times before
-// ErrPeerGone surfaces.
-const peerGoneAttempts = 3
+// attachAttempts bounds two transient refusals: a serving peer whose execution
+// generation ends mid-attach, and a momentarily full slot table. Capacity waits
+// capacityBackoff between tries; a peer freeing a slot is what ends the wait,
+// so a caller starved past the bound is told rather than held.
+const (
+	attachAttempts  = 3
+	capacityBackoff = 25 * time.Millisecond
+)
 
 // businessEnvelope is one terminal on the business lane. A product failure is
 // delivered data rather than a session error, so the wire's own Err field
@@ -326,18 +331,35 @@ func (b *Business) acquire(ctx context.Context) (*wire.Client, error) {
 		return nil, err
 	}
 	var denial error
-	for range peerGoneAttempts {
+	for attempt := range attachAttempts {
 		session, err := b.attach(ctx)
 		if err == nil {
 			b.session = session
 			return session, nil
 		}
 		denial = classifyWire(err)
+		if errors.Is(denial, ErrSessionCapacity) {
+			if attempt == attachAttempts-1 || !sleepUntil(ctx, capacityBackoff) {
+				return nil, denial
+			}
+			continue
+		}
 		if !errors.Is(denial, ErrPeerGone) {
 			return nil, denial
 		}
 	}
 	return nil, denial
+}
+
+func sleepUntil(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // retiring asks the transport whether it is broken instead of reading it off

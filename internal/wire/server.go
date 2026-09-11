@@ -52,6 +52,10 @@ type Config struct {
 	HandshakeRead time.Duration
 	// Write bounds each frame write; 10s when zero.
 	Write time.Duration
+	// Idle reclaims a session's lane slot after this long with no frame and
+	// no request in flight; never when zero. A quiet peer whose socket the
+	// kernel never tears down holds its slot until the daemon restarts.
+	Idle time.Duration
 	// Serving is the process identity the daemon.health verb reports.
 	Serving Serving
 	// Log receives accept and session diagnostics.
@@ -484,6 +488,7 @@ func (s *Server) runSession(
 		done:         make(chan struct{}),
 		active:       make(map[uint64]*requestState),
 		seen:         make(map[uint64]struct{}),
+		idle:         s.cfg.Idle,
 	}
 	sess.accepted = &AcceptedSession{s: sess}
 	s.addSession(sess)
