@@ -57,6 +57,8 @@ func TestDaemonValidateForServe(t *testing.T) {
 		{"overlong shutdown", Daemon{Label: "x", Shutdown: Grace(24*time.Hour + 1)}, "Shutdown"},
 		{"saturated handshake", Daemon{Label: "x", Handshake: Grace(math.MaxInt64)}, "Handshake"},
 		{"negative handshake", Daemon{Label: "x", Handshake: Grace(-1)}, "Handshake"},
+		{"saturated idle", Daemon{Label: "x", Idle: Grace(math.MaxInt64)}, "Idle"},
+		{"negative idle", Daemon{Label: "x", Idle: Grace(-1)}, "Idle"},
 		{"nil business set", Daemon{Label: "x"}, ""},
 		{
 			"business set naming two bundles",

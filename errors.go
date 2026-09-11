@@ -4,6 +4,7 @@ import (
 	"errors"
 
 	"github.com/yasyf/daemonkit/internal/trust"
+	"github.com/yasyf/daemonkit/internal/wire"
 )
 
 // Sentinel identity is load-bearing: consumers alias these and match with
@@ -30,6 +31,10 @@ var (
 
 	// ErrUntrusted means the peer failed a lane's trust requirement.
 	ErrUntrusted = errors.New("daemonkit: peer failed trust verification")
+
+	// ErrSessionCapacity means the lane had no free session slot. It is
+	// transient and says nothing about whether the daemon is installed.
+	ErrSessionCapacity = wire.ErrSessionCapacity
 
 	// ErrPeerGone means the process accepting on the socket ended its
 	// execution generation before verification could finish: the ordinary

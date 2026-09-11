@@ -24,6 +24,7 @@ type Daemon struct {
 	Restart     Restart
 	Shutdown    Grace  // the whole drain budget AND the plist's ExitTimeOut; 30s when zero
 	Handshake   Grace  // the whole admission budget; 10s when zero
+	Idle        Grace  // reclaims a session slot after this long quiet and unoccupied; 15m when zero
 	Log         string // launchd's stderr sink
 	MaxFrame    Bytes  // 4 MiB when zero
 	Concurrency int    // in-flight requests; every queue depth derives; 8 when zero
@@ -130,6 +131,9 @@ func (d Daemon) ValidateForServe() error {
 		return err
 	}
 	if err := d.Handshake.validate("Handshake"); err != nil {
+		return err
+	}
+	if err := d.Idle.validate("Idle"); err != nil {
 		return err
 	}
 	if d.Trust.Business != nil && len(d.Trust.Business) == 0 {

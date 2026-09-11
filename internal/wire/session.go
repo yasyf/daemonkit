@@ -67,10 +67,13 @@ type session struct {
 	done         chan struct{}
 	writerErr    error
 
+	idle time.Duration
+
 	mu        sync.Mutex
 	active    map[uint64]*requestState
 	seen      map[uint64]struct{}
 	watermark uint64
+	idleTimer *time.Timer
 
 	requestWG      sync.WaitGroup
 	writerWG       sync.WaitGroup
@@ -166,6 +169,51 @@ func (s *session) run(ctx context.Context) error {
 
 func (s *session) disconnect() {
 	s.disconnectOnce.Do(func() { close(s.disconnected) })
+}
+
+// touchIdle re-arms idle reclaim. The timer runs only between requests, so a
+// slow request is never idle; expiry closes the transport, and that close is
+// what releases the lane slot a quiet peer would otherwise hold forever.
+func (s *session) touchIdle() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.touchIdleLocked()
+}
+
+func (s *session) touchIdleLocked() {
+	if s.idle <= 0 {
+		return
+	}
+	if len(s.active) > 0 {
+		if s.idleTimer != nil {
+			s.idleTimer.Stop()
+		}
+		return
+	}
+	if s.idleTimer == nil {
+		s.idleTimer = time.AfterFunc(s.idle, s.reclaimIdle)
+		return
+	}
+	s.idleTimer.Reset(s.idle)
+}
+
+func (s *session) reclaimIdle() {
+	s.mu.Lock()
+	busy := len(s.active) > 0
+	s.mu.Unlock()
+	if busy {
+		s.touchIdle()
+		return
+	}
+	s.close()
+}
+
+func (s *session) stopIdle() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.idleTimer != nil {
+		s.idleTimer.Stop()
+	}
 }
 
 func (s *session) close() {
@@ -271,11 +319,14 @@ func (s *session) cancelRequests() {
 }
 
 func (s *session) readLoop(ctx context.Context) error {
+	s.touchIdle()
+	defer s.stopIdle()
 	for {
 		frame, sidecar, err := s.codec.readFrameWithSidecar()
 		if err != nil {
 			return err
 		}
+		s.touchIdle()
 		switch frame.Kind {
 		case FrameRequest:
 			if err := s.receiveRequest(ctx, frame, sidecar); err != nil {
@@ -382,6 +433,7 @@ func (s *session) receiveRequest(ctx context.Context, frame Frame, sidecar frame
 	}
 	s.server.admitted.Add(1)
 	s.active[frame.ID] = state
+	s.touchIdleLocked()
 	s.mu.Unlock()
 
 	s.requestWG.Add(2)
@@ -674,6 +726,7 @@ func (s *session) deliverRequestChunks(state *requestState) {
 func (s *session) removeRequest(id uint64) {
 	s.mu.Lock()
 	delete(s.active, id)
+	s.touchIdleLocked()
 	s.mu.Unlock()
 }
 
