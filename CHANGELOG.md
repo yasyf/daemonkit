@@ -6,6 +6,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-09-11
+
+### Added
+
+- `Daemon.Idle` reclaims a session's lane slot after that long with no frame and
+  no request in flight; 15m when zero. A peer that neither sends another frame
+  nor closes its socket — suspended, asleep, or partitioned behind a connection
+  the kernel never tears down — held its slot until the daemon restarted, so a
+  machine running enough concurrent clients exhausted the lane and every later
+  attach was refused. The timer runs only between requests, so a slow request is
+  never idle; expiry closes the transport, and that close is what frees the slot.
+- `ErrSessionCapacity`, the public identity for a lane with no free session slot.
+  `classifyWire` preserves it rather than passing it through unclassified, so a
+  consumer can tell transient saturation from a daemon that is not installed —
+  captain-hook reported the former as the latter and sent operators to reinstall
+  a healthy host.
+
+### Fixed
+
+- A business lane attaching into a momentarily full slot table retries inside its
+  existing bounded attempt budget with a short backoff, instead of surfacing the
+  refusal on the first attempt. The backoff stays short deliberately: the slot is
+  freed by another peer finishing, not by waiting, so a caller starved past the
+  bound is told rather than held.
+
 ### Removed
 
 - The legacy bbolt sweep in `internal/proc`, and the `go.etcd.io/bbolt`
@@ -1368,7 +1393,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.23.0...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.24.0...HEAD
+[0.24.0]: https://github.com/yasyf/daemonkit/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/yasyf/daemonkit/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/yasyf/daemonkit/compare/v0.21.4...v0.22.0
 [0.21.4]: https://github.com/yasyf/daemonkit/compare/v0.21.3...v0.21.4
