@@ -110,7 +110,29 @@ func startServing(t *testing.T, server *Server) string {
 			t.Errorf("Serve() = %v", err)
 		}
 	})
+	awaitServing(t, server)
 	return sock
+}
+
+// awaitServing blocks until Serve has installed serveCtx. Serve does that on
+// the goroutine startServing just launched, and an adopt racing ahead of it
+// reads the nil serveCtx as a draining server, so a loaded machine fails the
+// refusal a test was asserting.
+func awaitServing(t *testing.T, server *Server) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		server.mu.Lock()
+		serving := server.serveCtx != nil
+		server.mu.Unlock()
+		if serving {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Serve() never installed serveCtx")
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func writeHello(t *testing.T, codec *Codec, hello helloIdentity) {
