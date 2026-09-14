@@ -40,15 +40,22 @@ type ManualUpgradeError struct {
 	Name    string
 	Cask    string
 	Formula string
-	Want    string // descriptor version ("" when the version is host-authoritative)
+	Want    string // descriptor version or minimum ("" when the version is host-authoritative and no minimum applies)
 	Got     string // installed version ("" when the app is absent)
+	// AtLeast reports that Want is the descriptor's app.min_version, a floor
+	// rather than the exact version.
+	AtLeast bool
 }
 
 func (e *ManualUpgradeError) Error() string {
 	if e.Got == "" {
 		return fmt.Sprintf("artifact: signed app %q is not installed; run: %s", e.Name, e.upgradeCommand())
 	}
-	return fmt.Sprintf("artifact: signed app %q is version %s, want %s; run: %s", e.Name, e.Got, e.Want, e.upgradeCommand())
+	want := e.Want
+	if e.AtLeast {
+		want = "at least " + e.Want
+	}
+	return fmt.Sprintf("artifact: signed app %q is version %s, want %s; run: %s", e.Name, e.Got, want, e.upgradeCommand())
 }
 
 func (e *ManualUpgradeError) upgradeCommand() string {

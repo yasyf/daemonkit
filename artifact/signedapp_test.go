@@ -99,6 +99,57 @@ func TestResolveSignedAppFormulaUpgradeHint(t *testing.T) {
 	}
 }
 
+func minVersionDescriptor(dir, minVersion string) *Descriptor {
+	return &Descriptor{
+		Schema: 1, Name: "capt-hook", Kind: SignedApp,
+		Version: VersionSource{File: filepath.Join(dir, "Captain Hook.app", "Contents", "Info.plist"), PlistKey: "CFBundleShortVersionString"},
+		App:     &AppSpec{Dir: dir, AppName: "Captain Hook", Exec: "Contents/Helpers/capt-hookd", Formula: "yasyf/tap/captain-hook", MinVersion: minVersion},
+	}
+}
+
+func TestResolveSignedAppBelowMinVersion(t *testing.T) {
+	dir := t.TempDir()
+	writeApp(t, dir, "Captain Hook", "12.27.4", "Contents/Helpers/capt-hookd")
+
+	_, err := (Store{Root: t.TempDir()}).Resolve(context.Background(), minVersionDescriptor(dir, "12.28.0"))
+	if !errors.Is(err, ErrManualUpgrade) {
+		t.Fatalf("Resolve() = %v, want ErrManualUpgrade", err)
+	}
+	var upgrade *ManualUpgradeError
+	if !errors.As(err, &upgrade) || !upgrade.AtLeast || upgrade.Want != "12.28.0" || upgrade.Got != "12.27.4" || upgrade.Formula != "yasyf/tap/captain-hook" {
+		t.Fatalf("ManualUpgradeError = %+v", upgrade)
+	}
+	want := `artifact: signed app "capt-hook" is version 12.27.4, want at least 12.28.0; run: brew upgrade yasyf/tap/captain-hook`
+	if err.Error() != want {
+		t.Fatalf("Error() = %q, want %q", err.Error(), want)
+	}
+}
+
+func TestResolveSignedAppMeetsMinVersion(t *testing.T) {
+	tests := []struct {
+		name      string
+		installed string
+	}{
+		{"equal", "12.28.0"},
+		{"above", "12.29.1"},
+		{"dev build", "9999.1757840000000000000.0-dev"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeApp(t, dir, "Captain Hook", tt.installed, "Contents/Helpers/capt-hookd")
+
+			path, err := (Store{Root: t.TempDir()}).Resolve(context.Background(), minVersionDescriptor(dir, "12.28.0"))
+			if err != nil {
+				t.Fatalf("Resolve() = %v, want nil", err)
+			}
+			if want := filepath.Join(dir, "Captain Hook.app", "Contents", "Helpers", "capt-hookd"); path != want {
+				t.Fatalf("path = %q, want %q", path, want)
+			}
+		})
+	}
+}
+
 func TestManualUpgradeErrorRendersBrewCommand(t *testing.T) {
 	tests := []struct {
 		name string
@@ -109,6 +160,7 @@ func TestManualUpgradeErrorRendersBrewCommand(t *testing.T) {
 		{"cask stale", &ManualUpgradeError{Name: "cap", Cask: "captain-hook", Want: "1.2.0", Got: "1.1.0"}, `artifact: signed app "cap" is version 1.1.0, want 1.2.0; run: brew upgrade --cask captain-hook`},
 		{"formula absent", &ManualUpgradeError{Name: "cap", Formula: "yasyf/tap/captain-hook"}, `artifact: signed app "cap" is not installed; run: brew upgrade yasyf/tap/captain-hook`},
 		{"formula stale", &ManualUpgradeError{Name: "cap", Formula: "yasyf/tap/captain-hook", Want: "1.2.0", Got: "1.1.0"}, `artifact: signed app "cap" is version 1.1.0, want 1.2.0; run: brew upgrade yasyf/tap/captain-hook`},
+		{"formula below minimum", &ManualUpgradeError{Name: "cap", Formula: "yasyf/tap/captain-hook", Want: "1.2.0", Got: "1.1.0", AtLeast: true}, `artifact: signed app "cap" is version 1.1.0, want at least 1.2.0; run: brew upgrade yasyf/tap/captain-hook`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
