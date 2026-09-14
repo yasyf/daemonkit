@@ -6,6 +6,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Daemon.ShutdownGrace` names the budget a daemon's shutdown ladder runs on:
+  `Shutdown`, or 30s when unset.
+
+### Changed
+
+- `deploy.Quiesce` escalates once the incumbent's own shutdown grace, plus a
+  quarter of it, has passed without an exit, or after half the quiesce budget,
+  whichever ends first. It used to wait out half the budget unconditionally,
+  which on a three-minute package install left a parked incumbent holding its
+  flock for 90s before the first SIGTERM; a 30s-grace daemon is now signalled at
+  37.5s. The grace is the one the deployment's own `Daemon` declares, so an
+  incumbent that drains on a longer one is SIGTERMed mid-drain — one more drain
+  trigger to a daemon that is draining — and SIGKILLed only after the ladder's
+  own grace share on top.
+
 ## [0.27.0] - 2026-09-14
 
 ### Added

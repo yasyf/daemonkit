@@ -84,6 +84,7 @@
 .	field	Daemon.Restart	darwin
 .	field	Daemon.Schemas	darwin
 .	field	Daemon.Shutdown	darwin
+.	method	Daemon.ShutdownGrace	darwin
 .	field	Daemon.Trust	darwin
 .	method	Daemon.ValidateForClient	darwin
 .	method	Daemon.ValidateForServe	darwin

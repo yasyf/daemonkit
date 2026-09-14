@@ -75,7 +75,10 @@ func (e element) record() string { return filepath.Join(e.state().StateDir(), "d
 // unchecked join here, and the file it names is not one to read.
 func (d Daemon) RecordPath() string { return element{label: string(d.Label)}.record() }
 
-func (d Daemon) shutdownGrace() Grace {
+// ShutdownGrace is the budget this daemon's shutdown ladder runs on: Shutdown,
+// or 30s when unset. A drain that has not exited past it has abandoned a stage
+// and parked, which is the moment a deploy escalates.
+func (d Daemon) ShutdownGrace() Grace {
 	if d.Shutdown == 0 {
 		return Grace(30 * time.Second)
 	}

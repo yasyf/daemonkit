@@ -65,7 +65,7 @@ func serveDaemonChild() {
 		daemonkit.Daemon{
 			Label:    daemonkit.Label(os.Getenv(daemonChildLabel)),
 			Schemas:  []daemonkit.Schema{"deploy.test.v1"},
-			Shutdown: daemonkit.Grace(2 * time.Second),
+			Shutdown: daemonChildShutdown,
 		},
 		func(daemonkit.Ctx) (daemonkit.Product, error) {
 			time.Sleep(delay)
@@ -113,6 +113,11 @@ func (stubProduct) Handle(context.Context, daemonkit.Request) (daemonkit.Reply, 
 func (stubProduct) Drain(daemonkit.Budget) error { return nil }
 
 func (stubProduct) Close(daemonkit.Budget) error { return nil }
+
+// daemonChildShutdown is the grace every daemon child drains on, and the one
+// the fixture's deployment names, so a quiesce escalates against the grace the
+// incumbent really has.
+const daemonChildShutdown = daemonkit.Grace(2 * time.Second)
 
 type parkedProduct struct{ stubProduct }
 
@@ -245,8 +250,9 @@ func newFixture(t *testing.T) *fixture {
 		App:         app,
 		Requirement: daemonkit.Requirement{TeamID: testTeamID, SigningIdentifier: testSigning},
 		Daemon: daemonkit.Daemon{
-			Label: daemonkit.Label("daemonkit-deploy-test-" + filepath.Base(root)),
-			Trust: daemonkit.Trust{Serving: daemonkit.ServingSameUser()},
+			Label:    daemonkit.Label("daemonkit-deploy-test-" + filepath.Base(root)),
+			Trust:    daemonkit.Trust{Serving: daemonkit.ServingSameUser()},
+			Shutdown: daemonChildShutdown,
 		},
 		Agents: []launchd.Agent{agent},
 	})
@@ -985,7 +991,8 @@ func TestSupersedeInvalidCandidateLeavesServingIncumbent(t *testing.T) {
 // drain, whatever daemonkit built it. The first arm drains it through a live
 // session and escalates when the exit is never observed; the second finds it
 // already parked and socketless, with only the owner record to pin it by. Both
-// end it inside the deploy's own budget and land the swap.
+// end it once the incumbent's own shutdown grace is past — not after a share of
+// a deploy budget that dwarfs it — and land the swap.
 func TestSupersedeEscalatesAParkedIncumbent(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1022,9 +1029,14 @@ func TestSupersedeEscalatesAParkedIncumbent(t *testing.T) {
 			child := f.startParkedDaemonChild()
 			incumbent := f.serving(20 * time.Second)
 			tt.park(t, f)
-			landed, err := f.deploy.Supersede(f.within(12*time.Second), f.candidate("Second", "2.0", "two"))
+			start := time.Now()
+			landed, err := f.deploy.Supersede(f.within(60*time.Second), f.candidate("Second", "2.0", "two"))
+			took := time.Since(start)
 			if err != nil {
 				t.Fatalf("Supersede: %v", err)
+			}
+			if bound := 4 * time.Duration(daemonChildShutdown); took > bound {
+				t.Fatalf("Supersede took %v over a parked incumbent, want escalation inside %v of its %v grace", took, bound, time.Duration(daemonChildShutdown))
 			}
 			if err := child.Wait(); err != nil {
 				t.Fatalf("parked incumbent %d exit = %v, want the clean exit a signalled park leaves", incumbent, err)
