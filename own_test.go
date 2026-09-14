@@ -938,6 +938,71 @@ func TestOwnedCloseFaultsOverALiveSessionSurvivor(t *testing.T) {
 	}
 }
 
+// slowCloseProduct spends the whole work window in Close, so the children
+// stage runs on its reserved tail alone, as it does under a host whose worker
+// stops fill the close share.
+type slowCloseProduct struct{ stubProduct }
+
+func (*slowCloseProduct) Close(b Budget) error {
+	time.Sleep(b.Left() - 100*time.Millisecond)
+	return nil
+}
+
+// TestServeProvesATermResistantSessionInsideItsChildrenTail is a session leader
+// that ignores SIGTERM over a grandchild that inherited the ignore, under the
+// 30s grace a real host declares with its work window spent: the children tail
+// must kill and prove both on its own clock rather than let the session ladder
+// run past it.
+func TestServeProvesATermResistantSessionInsideItsChildrenTail(t *testing.T) {
+	shortHome(t)
+	guard := make(chan os.Signal, 1)
+	signal.Notify(guard, syscall.SIGTERM)
+	defer signal.Stop(guard)
+
+	dir := t.TempDir()
+	d := Daemon{Label: "dkresist", Schemas: []Schema{"test.v1"}, Shutdown: Grace(30 * time.Second)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	staged := make(chan int, 1)
+	done := serveInBackground(ctx, t, d, func(x Ctx) (Product, error) {
+		c, _, holderFile := sessionHolderCmd(dir, 0)
+		if _, err := x.Spawn(bounded(t, 20*time.Second), c, ChannelNone, nil); err != nil {
+			return nil, err
+		}
+		holder, err := readPID(holderFile)
+		if err != nil {
+			return nil, err
+		}
+		staged <- holder
+		return &slowCloseProduct{}, nil
+	})
+
+	var holder int
+	select {
+	case holder = <-staged:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the product never staged its session")
+	}
+	t.Cleanup(func() { _ = syscall.Kill(holder, syscall.SIGKILL) })
+	cancel()
+
+	select {
+	case out := <-done:
+		if out.err != nil {
+			t.Fatalf("Serve() = %v", out.err)
+		}
+		if len(out.drained.Abandoned) != 0 {
+			t.Fatalf("Abandoned = %v, want none for a session the tail could kill", out.drained.Abandoned)
+		}
+	case <-time.After(45 * time.Second):
+		_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+		t.Fatal("Serve parked over a TERM-resistant session its children tail should have killed")
+	}
+	if alive(holder) {
+		t.Fatalf("the session survivor %d outlived the drain", holder)
+	}
+}
+
 // TestServeAbandonsChildrenItCouldNotProveGone is the same shape one layer up.
 // StageChildren's error IS the "did everything drain" answer, so a ladder that
 // classified it by budget alone published every stage settled — and released

@@ -141,9 +141,11 @@ func idleOrDefault(idle Grace) time.Duration {
 }
 
 const (
-	requestsShare = 0.40 / 0.95
-	drainShare    = 0.30 / 0.55
-	closeShare    = 1.0
+	childrenShare   = 0.15
+	childrenCeiling = 0.5
+	requestsShare   = 0.40 / 0.95
+	drainShare      = 0.30 / 0.55
+	closeShare      = 1.0
 
 	// requestsCancelReserve is the tail of the requests share held back to
 	// join the handlers cancelled when the rest of it ran out.
@@ -333,7 +335,7 @@ func runShutdownLadder(
 	cancelActivation context.CancelFunc,
 ) Drained {
 	budget := shutdown.mint("shutdown")
-	work, children := budget.Reserve("children", 0.15)
+	work, children := budget.Reserve("children", childrenReserve(budget))
 	var drained Drained
 	stage := func(s Stage, settled bool) {
 		if settled {
@@ -355,6 +357,14 @@ func runShutdownLadder(
 		return errors.Join(owned.settle(settleCtx), server.Settle(settleCtx))
 	}))
 	return drained
+}
+
+// childrenReserve is the tail's share of the shutdown budget: its locked share,
+// raised to one proc.SettleGrace where the budget affords it, since a demanded
+// session ladder — leader, then survivors — proves nothing on less, and never
+// past half, so a short grace keeps a work window at all.
+func childrenReserve(budget Budget) float64 {
+	return max(childrenShare, min(float64(proc.SettleGrace)/float64(budget.Left()), childrenCeiling))
 }
 
 // provenStage is runStage for the one stage whose error IS the verdict: the

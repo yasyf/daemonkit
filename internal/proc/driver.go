@@ -186,7 +186,7 @@ func (s *Store) drive(c *Child, id identity, session int) {
 	settled := reap != reapUndetermined
 	sessionSettled := true
 	if settled && session != 0 {
-		outcome, ok := s.settleSessionSurvivors(session, id.boot, clk)
+		outcome, ok := s.settleSessionSurvivors(session, id.boot, sessionDeadline(c.demanded, clk))
 		sessionSettled = ok
 		switch {
 		case !ok:
@@ -244,12 +244,23 @@ func (s *Store) terminateChild(pid int, deadline time.Time, exited <-chan status
 	}
 }
 
+// sessionDeadline bounds the session settlement that follows a leader's exit:
+// SettleGrace, which no caller deadline covers, cut to the demand's own
+// deadline when the settlement was demanded.
+func sessionDeadline(demanded time.Time, clk clock) time.Time {
+	grace := clk.Now().Add(SettleGrace)
+	if demanded.IsZero() || grace.Before(demanded) {
+		return grace
+	}
+	return demanded
+}
+
 // settleSessionSurvivors settles the dedicated session after its leader's
 // exit: the leader's exit is not the group's, so a false return publishes an
 // undetermined terminal and keeps the record for the next open to reclaim —
 // a leader proven gone over survivors that were not is not a proof.
-func (s *Store) settleSessionSurvivors(session int, boot uint64, clk clock) (Reap, bool) {
-	ctx, cancel := context.WithDeadline(context.Background(), clk.Now().Add(SettleGrace))
+func (s *Store) settleSessionSurvivors(session int, boot uint64, deadline time.Time) (Reap, bool) {
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 	outcome, err := s.settleSession(ctx, session, boot)
 	if err != nil {
