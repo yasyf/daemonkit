@@ -22,7 +22,9 @@
 // PythonTool materializes a PyPI distribution into a version-addressed store
 // under Store.ToolsDir via "uv tool install <dist>==<version>" with a redirected
 // UV_TOOL_DIR and UV_TOOL_BIN_DIR, then returns the real console-script
-// entrypoint inside the environment. uv enforces PyPI hashes, so no descriptor
+// entrypoint inside the environment. The install refreshes uv's cached index
+// entry for the dist, so a version published after that cache was written
+// still resolves. uv enforces PyPI hashes, so no descriptor
 // digest is carried. A second resolution returns the existing environment
 // offline. Store.ToolEntries and Store.RemoveToolEntry enumerate and prune that
 // store the way their cache counterparts do, so a host that has tracked a

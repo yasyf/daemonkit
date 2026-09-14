@@ -96,7 +96,7 @@ func installTool(ctx context.Context, uv, dist, version, toolDir, binDir string)
 	if err := os.MkdirAll(binDir, 0o700); err != nil {
 		return fmt.Errorf("artifact: create tool directory: %w", err)
 	}
-	cmd := exec.CommandContext(ctx, uv, "tool", "install", "--force", dist+"=="+version)
+	cmd := exec.CommandContext(ctx, uv, "tool", "install", "--force", "--refresh-package", dist, dist+"=="+version)
 	cmd.Env = append(os.Environ(), "UV_TOOL_DIR="+toolDir, "UV_TOOL_BIN_DIR="+binDir)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

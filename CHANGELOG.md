@@ -29,6 +29,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   abandon the stage the instant the cancel went out, so a product that
   returned on cancel still parked the daemon over its flock.
 
+### Fixed
+
+- A `python-tool` install passes `--refresh-package <dist>` to
+  `uv tool install`. uv answered from its cached PyPI index, so a host that
+  resolved a version published after that cache was written failed with
+  "no version of <dist>==<version>" until someone refreshed it by hand. That
+  took capt-hook's hooks down on 12.28.0. uv has no flag to refresh only when
+  the pinned version is missing from the cache, so every install refreshes the
+  dist's index entry. Installs run once per version, so the cost is one index
+  request each.
+
 ## [0.27.0] - 2026-09-14
 
 ### Added
