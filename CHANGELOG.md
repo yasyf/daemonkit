@@ -6,6 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A signed-app descriptor's `app.dir` now expands a leading `~/` through the
+  passwd home, as `version.file` already did. `"dir": "~/Applications"` looked
+  for a literal `~` directory relative to the working directory, so an installed
+  app read as missing and the resolver asked for a manual upgrade.
+
 ## [0.25.0] - 2026-09-11
 
 ### Added

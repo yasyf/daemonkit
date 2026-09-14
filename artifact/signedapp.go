@@ -20,7 +20,11 @@ func (s Store) resolveSignedApp(_ context.Context, desc *Descriptor, version str
 }
 
 func attestSignedApp(desc *Descriptor, version, exec string) (string, error) {
-	appPath, err := safeJoin(desc.App.Dir, desc.App.AppName+".app")
+	dir, err := expandHome(desc.App.Dir)
+	if err != nil {
+		return "", err
+	}
+	appPath, err := safeJoin(dir, desc.App.AppName+".app")
 	if err != nil {
 		return "", err
 	}
