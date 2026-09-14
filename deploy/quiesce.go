@@ -20,11 +20,16 @@ import (
 // daemon that is really there and reports it absent.
 const readinessReserve = 4
 
-// escalationReserve is the share of the quiesce budget the drain gives up to
-// the ladder that ends an incumbent which did not leave on its own: half, so a
-// TERM-resistant incumbent still has a grace, a SIGKILL, and an observed
-// absence inside the transaction's deadline.
+// escalationReserve is the most of the quiesce budget the drain may spend
+// before the ladder that ends an incumbent which did not leave on its own:
+// half, so a TERM-resistant incumbent still has a grace, a SIGKILL, and an
+// observed absence inside the transaction's deadline.
 const escalationReserve = 2
+
+// drainMargin is the share of the incumbent's shutdown grace the drain waits
+// past it. The ladder abandons its last stage at the grace and parks; the
+// margin is the process leaving after a ladder that settled at the wire.
+const drainMargin = 4
 
 // RuntimeProof is deploy's absence evidence: the daemon this deployment owns
 // was proved gone, and every executable it runs was proved to have no live
@@ -133,13 +138,17 @@ func absenceProof(reap daemonkit.Reap) bool {
 		reap == daemonkit.ReapReused || reap == daemonkit.ReapTerminated
 }
 
-// stop drains the incumbent inside the drain's share of the budget and hands
-// one that is still there to the escalation ladder with the rest. The pin the
-// drain observed is what the ladder is addressed to, so an incumbent that was
-// replaced in between is refused rather than signalled.
+// stop drains the incumbent for its own shutdown grace plus a margin — the
+// point past which one still in the table has parked over an abandoned stage —
+// or the drain's share of the budget, whichever ends first, and hands one that
+// is still there to the escalation ladder with the rest. A SIGTERM that lands
+// on an incumbent still inside a longer grace of its own is one more drain
+// trigger, not a kill. The pin the drain observed is what the ladder is
+// addressed to, so an incumbent that was replaced in between is refused rather
+// than signalled.
 func (d *Deployment) stop(ctx context.Context) (daemonkit.Stopped, error) {
-	deadline, _ := ctx.Deadline()
-	drainCtx, cancel := context.WithDeadline(ctx, deadline.Add(-time.Until(deadline)/escalationReserve))
+	grace := time.Duration(d.config.Daemon.ShutdownGrace())
+	drainCtx, cancel := context.WithTimeout(ctx, min(left(ctx)/escalationReserve, grace+grace/drainMargin))
 	defer cancel()
 	expect, stopped, err := d.drain(drainCtx)
 	switch {
@@ -343,6 +352,11 @@ func unanswered(err error) bool {
 // deadline, or the transport's own — a dial or a handshake that outlives its
 // deadline reports os.ErrDeadlineExceeded and never the context error behind
 // it.
+func left(ctx context.Context) time.Duration {
+	deadline, _ := ctx.Deadline()
+	return time.Until(deadline)
+}
+
 func timedOut(err error) bool {
 	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded)
 }

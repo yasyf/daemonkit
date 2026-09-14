@@ -187,7 +187,7 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 	if err := probeIncumbent(socket); err != nil {
 		return Drained{}, err
 	}
-	ownCtx, cancelOwn := d.shutdownGrace().mint("own").Context(ctx)
+	ownCtx, cancelOwn := d.ShutdownGrace().mint("own").Context(ctx)
 	store, err := proc.OpenStore(ownCtx, el.record())
 	cancelOwn()
 	if err != nil {
@@ -200,7 +200,7 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 		_ = store.Close()
 		return Drained{}, fmt.Errorf("daemonkit: record owner: %w", err)
 	}
-	recoverCtx, cancelRecover := d.shutdownGrace().mint("recover").Context(ctx)
+	recoverCtx, cancelRecover := d.ShutdownGrace().mint("recover").Context(ctx)
 	reclaimed, archived, recoverErr := store.Recover(recoverCtx)
 	cancelRecover()
 	if recoverErr != nil {
@@ -279,7 +279,7 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 		}
 	}
 
-	drained := runShutdownLadder(d.shutdownGrace(), server, product, owned, cancelActivation) //nolint:contextcheck // the ladder runs after the caller's ctx is cancelled by design: its own budget is the only deadline
+	drained := runShutdownLadder(d.ShutdownGrace(), server, product, owned, cancelActivation) //nolint:contextcheck // the ladder runs after the caller's ctx is cancelled by design: its own budget is the only deadline
 	drained.Archived = archived
 	cancelServe()
 	if !serveReturned {

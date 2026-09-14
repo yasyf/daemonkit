@@ -543,7 +543,7 @@ func (d Daemon) agent() (launchd.Agent, error) {
 // sub-second remainder rounds up — truncating it would fire the backstop on the
 // very grace it exists to protect.
 func (d Daemon) exitTimeOut() time.Duration {
-	grace := time.Duration(d.shutdownGrace())
+	grace := time.Duration(d.ShutdownGrace())
 	if remainder := grace % time.Second; remainder != 0 {
 		return grace + time.Second - remainder
 	}
