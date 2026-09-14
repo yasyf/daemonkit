@@ -15,6 +15,7 @@ import (
 
 	"github.com/yasyf/daemonkit/bundle"
 	"github.com/yasyf/daemonkit/internal/realhome"
+	dkversion "github.com/yasyf/daemonkit/version"
 )
 
 const versionCommandTimeout = 10 * time.Second
@@ -101,13 +102,16 @@ type ToolSpec struct {
 }
 
 // AppSpec is the signed-app payload. Exactly one of Cask and Formula names the
-// Homebrew package a ManualUpgradeError tells the user to upgrade.
+// Homebrew package a ManualUpgradeError tells the user to upgrade. MinVersion,
+// valid only with a host-authoritative version, is the oldest release triple
+// the installed app may report; a dev build always satisfies it.
 type AppSpec struct {
-	Dir     string `json:"dir"`
-	AppName string `json:"app_name"`
-	Exec    string `json:"exec,omitempty"`
-	Cask    string `json:"cask,omitempty"`
-	Formula string `json:"formula,omitempty"`
+	Dir        string `json:"dir"`
+	AppName    string `json:"app_name"`
+	Exec       string `json:"exec,omitempty"`
+	Cask       string `json:"cask,omitempty"`
+	Formula    string `json:"formula,omitempty"`
+	MinVersion string `json:"min_version,omitempty"`
 }
 
 // CurrentPlatform returns the dotslash platform key for the running host.
@@ -211,6 +215,14 @@ func (d *Descriptor) Validate() error {
 		}
 		if (d.App.Cask == "") == (d.App.Formula == "") {
 			return fmt.Errorf("%w: signed-app %q needs exactly one of app.cask or app.formula", ErrInvalidDescriptor, d.Name)
+		}
+		if d.App.MinVersion != "" {
+			if !d.Version.Dynamic() {
+				return fmt.Errorf("%w: signed-app %q sets app.min_version with a static version", ErrInvalidDescriptor, d.Name)
+			}
+			if _, ok := dkversion.Parse(d.App.MinVersion).(dkversion.Release); !ok {
+				return fmt.Errorf("%w: signed-app %q app.min_version %q is not a release triple", ErrInvalidDescriptor, d.Name, d.App.MinVersion)
+			}
 		}
 		for platform, entry := range d.Platforms {
 			if err := entry.validate(platform, d.Version.Dynamic()); err != nil {

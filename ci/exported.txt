@@ -249,6 +249,7 @@ artifact	field	AppSpec.Cask	all
 artifact	field	AppSpec.Dir	all
 artifact	field	AppSpec.Exec	all
 artifact	field	AppSpec.Formula	all
+artifact	field	AppSpec.MinVersion	all
 artifact	type	CacheEntry	all
 artifact	field	CacheEntry.Digest	all
 artifact	field	CacheEntry.Dir	all
@@ -280,6 +281,7 @@ artifact	type	Format	all
 artifact	const	GitHubRelease	all
 artifact	type	Kind	all
 artifact	type	ManualUpgradeError	all
+artifact	field	ManualUpgradeError.AtLeast	all
 artifact	field	ManualUpgradeError.Cask	all
 artifact	method	ManualUpgradeError.Error	all
 artifact	field	ManualUpgradeError.Formula	all

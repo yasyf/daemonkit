@@ -38,13 +38,22 @@ func attestSignedApp(desc *Descriptor, version, exec string) (string, error) {
 		}
 		return "", fmt.Errorf("artifact: inspect installed app: %w", err)
 	}
-	if want != "" {
-		installed, err := bundle.ShortVersion(appPath)
+	switch {
+	case want != "":
+		installed, err := installedVersion(appPath)
 		if err != nil {
-			return "", fmt.Errorf("artifact: read installed app version: %w", err)
+			return "", err
 		}
 		if !dkversion.Equal(installed, want) {
 			return "", &ManualUpgradeError{Name: desc.Name, Cask: desc.App.Cask, Formula: desc.App.Formula, Want: want, Got: installed}
+		}
+	case desc.App.MinVersion != "":
+		installed, err := installedVersion(appPath)
+		if err != nil {
+			return "", err
+		}
+		if dkversion.Newer(desc.App.MinVersion, installed) {
+			return "", &ManualUpgradeError{Name: desc.Name, Cask: desc.App.Cask, Formula: desc.App.Formula, Want: desc.App.MinVersion, Got: installed, AtLeast: true}
 		}
 	}
 	entrypoint, err := safeJoin(appPath, exec)
@@ -55,4 +64,12 @@ func attestSignedApp(desc *Descriptor, version, exec string) (string, error) {
 		return "", fmt.Errorf("%w: installed app entrypoint %q missing", ErrInvalidDescriptor, exec)
 	}
 	return entrypoint, nil
+}
+
+func installedVersion(appPath string) (string, error) {
+	installed, err := bundle.ShortVersion(appPath)
+	if err != nil {
+		return "", fmt.Errorf("artifact: read installed app version: %w", err)
+	}
+	return installed, nil
 }

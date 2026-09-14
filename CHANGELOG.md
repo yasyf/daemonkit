@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A signed-app descriptor with a host-authoritative version can set
+  `app.min_version`, the oldest release the installed app may report. An older
+  app fails attestation with a `ManualUpgradeError` whose new `AtLeast` field
+  is set, and the handoff reads `is version X, want at least Y; run: brew
+  upgrade <formula>`. A dev build (the `9999.` sentinel) always satisfies the
+  floor. `Validate` refuses a `min_version` that is not a release triple, and
+  one paired with a static version, which already pins the exact build.
+
 ## [0.27.1] - 2026-09-14
 
 ### Added

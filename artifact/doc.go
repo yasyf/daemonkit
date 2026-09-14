@@ -31,9 +31,10 @@
 // fast-moving tool through many versions can reclaim the old environments.
 //
 // SignedApp is attest-only. It verifies the app exists and — for a static
-// descriptor — that its version matches, and otherwise returns a
-// ManualUpgradeError the caller renders as a "brew upgrade" handoff naming the
-// descriptor's cask or formula.
+// descriptor — that its version matches, or — for a host-authoritative one
+// with app.min_version — that it is no older than that release, and otherwise
+// returns a ManualUpgradeError the caller renders as a "brew upgrade" handoff
+// naming the descriptor's cask or formula.
 // Packaging and deployment activation are explicit consumer operations.
 //
 // # Version source and the supply-chain rule
