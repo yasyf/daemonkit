@@ -87,6 +87,38 @@ func TestResolveSignedAppAttestMissingApp(t *testing.T) {
 	}
 }
 
+func TestResolveSignedAppFormulaUpgradeHint(t *testing.T) {
+	desc := signedAppDescriptor(t.TempDir(), "12.15.3")
+	desc.App.Cask = ""
+	desc.App.Formula = "yasyf/tap/captain-hook"
+
+	_, err := (Store{Root: t.TempDir()}).Resolve(context.Background(), desc)
+	var upgrade *ManualUpgradeError
+	if !errors.As(err, &upgrade) || upgrade.Formula != "yasyf/tap/captain-hook" || upgrade.Cask != "" {
+		t.Fatalf("Resolve() = %v, want ManualUpgradeError naming the formula", err)
+	}
+}
+
+func TestManualUpgradeErrorRendersBrewCommand(t *testing.T) {
+	tests := []struct {
+		name string
+		err  *ManualUpgradeError
+		want string
+	}{
+		{"cask absent", &ManualUpgradeError{Name: "cap", Cask: "captain-hook"}, `artifact: signed app "cap" is not installed; run: brew upgrade --cask captain-hook`},
+		{"cask stale", &ManualUpgradeError{Name: "cap", Cask: "captain-hook", Want: "1.2.0", Got: "1.1.0"}, `artifact: signed app "cap" is version 1.1.0, want 1.2.0; run: brew upgrade --cask captain-hook`},
+		{"formula absent", &ManualUpgradeError{Name: "cap", Formula: "yasyf/tap/captain-hook"}, `artifact: signed app "cap" is not installed; run: brew upgrade yasyf/tap/captain-hook`},
+		{"formula stale", &ManualUpgradeError{Name: "cap", Formula: "yasyf/tap/captain-hook", Want: "1.2.0", Got: "1.1.0"}, `artifact: signed app "cap" is version 1.1.0, want 1.2.0; run: brew upgrade yasyf/tap/captain-hook`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.err.Error(); got != tt.want {
+				t.Fatalf("Error() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSignedAppExpandsHomeInDir(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv(realhome.EnvOverride, home)
