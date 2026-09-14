@@ -47,8 +47,8 @@ func TestResolvePythonToolInstallsAndIsIdempotent(t *testing.T) {
 	if info, err := os.Lstat(path); err != nil || info.Mode()&os.ModeSymlink != 0 {
 		t.Fatalf("Resolve returned a symlink, want the real entrypoint (%v)", info.Mode())
 	}
-	if calls, _ := os.ReadFile(marker); !strings.Contains(string(calls), "tool install --force capt-hook==1.2.3") {
-		t.Fatalf("uv args = %q, want the pinned install spec", calls)
+	if calls, _ := os.ReadFile(marker); string(calls) != "tool install --force --refresh-package capt-hook capt-hook==1.2.3\n" {
+		t.Fatalf("uv args = %q, want the pinned install spec with a refreshed index for its dist", calls)
 	}
 
 	path2, err := store.Resolve(context.Background(), desc, WithUV(uv))
