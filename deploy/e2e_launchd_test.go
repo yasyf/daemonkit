@@ -374,6 +374,62 @@ func TestE2EDeployResetReturnsTheMachineToClean(t *testing.T) {
 		"and the installed bytes are intact", e2eAgentLabel, len(executables))
 }
 
+// TestE2EDeploySupersedeEscalatesAParkedIncumbent is the incumbent an upgrade
+// found alive, socketless, and childless: its product drain outlives the
+// Shutdown grace, the ladder abandons that stage, and Serve parks the process
+// over its flock. Supersede's drain observes no exit inside its share and
+// escalates through Terminate; the events log has to show the park entered
+// and no drain.exit, and the swap has to land on the new generation.
+func TestE2EDeploySupersedeEscalatesAParkedIncumbent(t *testing.T) {
+	f := newE2EFixture(t)
+	first := f.e2eCandidate("Source1", "1.0.0", "one")
+	if _, err := f.deploy.Install(f.e2eCtx(120*time.Second), first); err != nil {
+		t.Fatalf("Install = %v", err)
+	}
+	f.behave(`{"drain":"1h"}`)
+	activation, err := f.deploy.Activate(f.e2eCtx(180 * time.Second))
+	if err != nil {
+		t.Fatalf("Activate = %v\nevents:%s", err, f.events())
+	}
+	f.behave(`{}`)
+
+	second := f.e2eCandidate("Source2", "2.0.0", "two")
+	supersedeStart := time.Now()
+	replaced, err := f.deploy.Supersede(f.e2eCtx(40*time.Second), second)
+	supersedeTook := time.Since(supersedeStart)
+	if err != nil {
+		t.Fatalf("Supersede = %v\nevents:%s", err, f.events())
+	}
+	t.Logf("Supersede over a parked incumbent: version=%s took=%s", replaced.Version, supersedeTook.Round(time.Millisecond))
+	if replaced.Version != "2.0.0" {
+		t.Errorf("Supersede generation = %s, want 2.0.0", replaced.Version)
+	}
+	events := f.events()
+	if !strings.Contains(events, "drain.enter") || strings.Contains(events, "drain.exit") {
+		t.Errorf("the incumbent was not parked in its drain:%s", events)
+	}
+
+	reactivation, err := f.deploy.Activate(f.e2eCtx(180 * time.Second))
+	if err != nil {
+		t.Fatalf("Activate after Supersede = %v\nevents:%s", err, f.events())
+	}
+	if reactivation.Readiness.Build() == activation.Readiness.Build() {
+		t.Errorf("Activate #2 proved the same build; the superseded generation is a different binary")
+	}
+	if _, err := f.deploy.Uninstall(f.e2eCtx(180 * time.Second)); err != nil {
+		t.Fatalf("Uninstall = %v\nevents:%s", err, f.events())
+	}
+	t.Logf("events:%s", f.events())
+}
+
+// behave writes the helper's per-run knob file, which it reads at every start.
+func (f *e2eFixture) behave(body string) {
+	f.t.Helper()
+	if err := os.WriteFile(filepath.Join(f.home, "behavior.json"), []byte(body), 0o600); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
 func e2eField(out, key string) string {
 	for _, line := range strings.Split(out, "\n") {
 		name, value, ok := strings.Cut(strings.TrimSpace(line), " = ")

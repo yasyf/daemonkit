@@ -11,6 +11,31 @@ import (
 
 const settlementPollInterval = 10 * time.Millisecond
 
+// ladder binds the reap ladder's boundaries once, so a Store and a
+// session-less Terminate run one identity-checked TERM→KILL→absence sequence.
+type ladder struct {
+	prober   prober
+	signaler signaler
+	clock    clock
+}
+
+func sysLadder() ladder {
+	return ladder{prober: sysProber{}, signaler: sysSignaler{}, clock: realClock{}}
+}
+
+// Terminate ends the exact process instance id names and proves it gone:
+// SIGTERM, a grace share of re-verified polls, SIGKILL, then observed absence,
+// each signal addressed to the {pid, start, boot} pin. A reused PID is
+// answered ReapReused and never signalled; a cross-boot pin is never probed;
+// this process and PID 1 are refused. ctx must carry a deadline.
+func Terminate(ctx context.Context, id Identity) (Reap, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		return reapUndetermined, errors.New("proc: terminate requires a context deadline")
+	}
+	ladder := sysLadder()
+	return ladder.reapIdentity(ctx, instance(id), 0)
+}
+
 // Recover settles every prior-generation record through the reap ladder and
 // reports what it reclaimed and where an unreadable record file was archived.
 // ctx must carry a deadline; every ladder bound derives from it.
@@ -50,7 +75,7 @@ func (s *Store) recoverOne(
 
 // An undecided outcome always keeps the record, so a probe failure can never
 // read as dead.
-func (s *Store) reapIdentity(ctx context.Context, id identity, session int) (Reap, error) {
+func (s *ladder) reapIdentity(ctx context.Context, id identity, session int) (Reap, error) {
 	boot, err := s.prober.boot()
 	if err != nil {
 		return reapUndetermined, fmt.Errorf("load current boot identity: %w", err)
@@ -81,7 +106,7 @@ func (s *Store) reapIdentity(ctx context.Context, id identity, session int) (Rea
 // reapOrphan delivers SIGTERM, re-verifies identity through every poll of the
 // grace share, then SIGKILLs and settles on observed absence. ESRCH anywhere
 // is success; a PID reused during grace is never SIGKILLed.
-func (s *Store) reapOrphan(ctx context.Context, id identity, boot uint64) (Reap, error) {
+func (s *ladder) reapOrphan(ctx context.Context, id identity, boot uint64) (Reap, error) {
 	gone, err := s.signalGone(id.pid, syscall.SIGTERM)
 	if err != nil {
 		return reapUndetermined, err
@@ -122,7 +147,7 @@ func (s *Store) reapOrphan(ctx context.Context, id identity, boot uint64) (Reap,
 	return s.awaitSettlement(ctx, id, boot)
 }
 
-func (s *Store) awaitSettlement(ctx context.Context, id identity, boot uint64) (Reap, error) {
+func (s *ladder) awaitSettlement(ctx context.Context, id identity, boot uint64) (Reap, error) {
 	clk := clockOrReal(s.clock)
 	deadline, _ := ctx.Deadline()
 	for {
@@ -148,7 +173,7 @@ func (s *Store) awaitSettlement(ctx context.Context, id identity, boot uint64) (
 // reapSession settles a dedicated-session record. A reaped leader PID can be
 // reused within the same start-time tick; that mismatched process is never
 // signaled — only members still in the durably recorded session settle.
-func (s *Store) reapSession(
+func (s *ladder) reapSession(
 	ctx context.Context,
 	id identity,
 	session int,
@@ -171,7 +196,7 @@ func (s *Store) reapSession(
 // settleSession terminates every verified member of the dedicated session:
 // SIGTERM per process group, a grace share of re-verified polls, then SIGKILL
 // to the ctx deadline.
-func (s *Store) settleSession(ctx context.Context, session int, boot uint64) (Reap, error) {
+func (s *ladder) settleSession(ctx context.Context, session int, boot uint64) (Reap, error) {
 	members, err := s.verifiedMembers(session, boot)
 	if err != nil {
 		return reapUndetermined, err
@@ -208,7 +233,7 @@ func (s *Store) settleSession(ctx context.Context, session int, boot uint64) (Re
 	return s.awaitSessionSettlement(ctx, session, boot)
 }
 
-func (s *Store) awaitSessionSettlement(ctx context.Context, session int, boot uint64) (Reap, error) {
+func (s *ladder) awaitSessionSettlement(ctx context.Context, session int, boot uint64) (Reap, error) {
 	clk := clockOrReal(s.clock)
 	deadline, _ := ctx.Deadline()
 	for {
@@ -240,7 +265,7 @@ func (s *Store) awaitSessionSettlement(ctx context.Context, session int, boot ui
 // verifiedMembers re-verifies every enumerated member immediately before it
 // can be signaled: identity re-probed through matches, session membership
 // still the recorded one, zombies excluded.
-func (s *Store) verifiedMembers(session int, boot uint64) ([]groupMember, error) {
+func (s *ladder) verifiedMembers(session int, boot uint64) ([]groupMember, error) {
 	members, err := s.prober.groupMembers(session)
 	if err != nil {
 		return nil, fmt.Errorf("enumerate dedicated session %d: %w", session, err)
@@ -266,7 +291,7 @@ func (s *Store) verifiedMembers(session int, boot uint64) ([]groupMember, error)
 // signalSessionGroups signals each distinct process group of the verified
 // members. Darwin may deny killpg after the verified group exits; only a
 // fresh exact absence proof settles that denial.
-func (s *Store) signalSessionGroups(
+func (s *ladder) signalSessionGroups(
 	session int,
 	members []groupMember,
 	sig syscall.Signal,
@@ -307,7 +332,7 @@ func (s *Store) signalSessionGroups(
 }
 
 // signalGone delivers sig to pid, mapping ESRCH (already gone) to gone=true.
-func (s *Store) signalGone(pid int, sig syscall.Signal) (bool, error) {
+func (s *ladder) signalGone(pid int, sig syscall.Signal) (bool, error) {
 	if err := s.signaler.signal(pid, sig); err != nil {
 		if errors.Is(err, syscall.ESRCH) {
 			return true, nil

@@ -412,3 +412,65 @@ func TestReapDeniedGroupSignalRetainsLiveSessionAuthority(t *testing.T) {
 		t.Fatalf("reapIdentity() error = %v, want the denied signal", err)
 	}
 }
+
+// TestTerminateRunsTheReapLadderWithoutAStore drives the exported entry every
+// deploy verb escalates through: the identity gates, the SIGTERM grace with
+// re-verified polls, and the SIGKILL that follows a process which ignored it.
+func TestTerminateRunsTheReapLadderWithoutAStore(t *testing.T) {
+	boot, err := bootSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name string
+		id   Identity
+		want Reap
+	}{
+		{"cross-boot pin is never probed", Identity{PID: 4242, Start: 1, Boot: boot + 1}, ReapCrossBoot},
+		{"this process is refused", Identity{PID: syscall.Getpid(), Start: 1, Boot: boot}, reapUndetermined},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := Terminate(ladderContext(t, time.Second), tt.id)
+			if (err != nil) != (tt.want == reapUndetermined) {
+				t.Fatalf("Terminate() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("Terminate() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+	if _, err := Terminate(context.Background(), Identity{PID: 4242, Start: 1, Boot: boot}); err == nil {
+		t.Fatal("Terminate() accepted a context without a deadline")
+	}
+}
+
+func TestReapEscalatesToSIGKILLWhenSIGTERMIsIgnored(t *testing.T) {
+	s, _ := newTestStore(t)
+	killed := false
+	prober := &funcProber{probeFn: func(int) (procInfo, error) {
+		if killed {
+			return procInfo{}, errNoProc
+		}
+		return procInfo{start: 1}, nil
+	}}
+	signaler := &funcSignaler{fn: func(_ int, sig syscall.Signal) error {
+		if sig == syscall.SIGKILL {
+			killed = true
+		}
+		return nil
+	}}
+	s.prober, s.signaler = prober, signaler
+
+	got, err := s.reapIdentity(ladderContext(t, 300*time.Millisecond), identity{pid: 4242, start: 1, boot: testBoot}, 0)
+	if err != nil {
+		t.Fatalf("reapIdentity() error = %v", err)
+	}
+	if got != ReapTerminated {
+		t.Fatalf("reapIdentity() = %d, want ReapTerminated", got)
+	}
+	sent := signaler.signals()
+	if len(sent) != 2 || sent[0].sig != syscall.SIGTERM || sent[1].sig != syscall.SIGKILL {
+		t.Fatalf("signals = %v, want SIGTERM then SIGKILL at pid 4242", sent)
+	}
+}

@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"slices"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/yasyf/daemonkit/internal/converge"
@@ -362,8 +361,8 @@ func (c *Client) proveRecorded(ctx context.Context, world converge.World) error 
 // prove settles target out of the process table without a session. A record
 // that no longer names target refuses with ErrWrongIncumbent and Ensure
 // re-observes; a record still naming it and still live is a wedged daemon, and
-// the one signal daemonkit ever sends goes out addressed to the recorded
-// identity before departure is observed again. No record at all leaves absence
+// Terminate's ladder goes out addressed to the recorded identity until
+// departure is observed. No record at all leaves absence
 // to the executable-scoped inventory, which reads the kernel and no
 // same-UID-writable record file can forge.
 //
@@ -384,54 +383,57 @@ func (c *Client) prove(ctx context.Context, target incumbent, observed proc.Iden
 	case errors.Is(err, ErrUnrecorded):
 		return c.inventoryClear(observed)
 	case errors.Is(err, ErrUnsettled):
-		record, recordErr := c.record()
-		if recordErr != nil {
-			return recordErr
-		}
-		if err := repairWedged(record, target); err != nil {
-			return err
-		}
 		reproofCtx, cancelReproof := proving.Share("reproof", proveReproofShare).Context(ctx)
 		defer cancelReproof()
-		_, err = c.Settle(reproofCtx, target.expect())
+		_, err = c.Terminate(reproofCtx, target.expect())
 		return err
 	default:
 		return err
 	}
 }
 
-// repairWedged terminates a recorded incumbent that will not leave. Two
-// cross-checks stand between the record and the signal: the record must still
-// name target — build and generation both — so a runtime the caller never
-// observed is never signalled on a record it can write itself, and the recorded
-// {pid, start, boot} must still be live and match, so a PID the kernel has
-// since handed to a stranger is never signalled either. The identity, not the
-// number, is the address.
-func repairWedged(recordPath string, target incumbent) error {
-	owner, ok, err := proc.ReadOwner(recordPath)
+// Terminate ends a recorded incumbent that will not leave and proves it gone:
+// SIGTERM at the recorded identity, a grace share of re-verified observation,
+// SIGKILL, then observed absence, all inside ctx's deadline. It is the one
+// escalation daemonkit has, shared by Ensure, Stop, and deploy's quiesce.
+//
+// Two cross-checks stand between the record and every signal. expect must be
+// complete — build and generation both — and the record must still name it, so
+// a runtime the caller never observed is never signalled on a record it can
+// write itself; and the recorded {pid, start, boot} must still be the kernel's
+// answer for that PID, so a PID handed to a stranger is never signalled either.
+// The identity, not the number, is the address. No owner record is
+// ErrUnrecorded; a record naming another incumbent is ErrWrongIncumbent.
+func (c *Client) Terminate(ctx context.Context, expect Expect) (Stopped, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		return Stopped{}, errors.New("daemonkit: Terminate requires a context deadline")
+	}
+	target, err := pin(expect.Build, expect.Generation)
 	if err != nil {
-		return err
+		return Stopped{}, err
+	}
+	record, err := c.record()
+	if err != nil {
+		return Stopped{}, err
+	}
+	owner, ok, err := proc.ReadOwner(record)
+	if err != nil {
+		return Stopped{}, err
 	}
 	if !ok {
-		return ErrUnrecorded
+		return Stopped{}, ErrUnrecorded
 	}
 	if target.expect().mismatch(owner.Build, owner.Generation) {
-		return ErrWrongIncumbent
+		return Stopped{}, ErrWrongIncumbent
 	}
-	live, err := proc.ProbeIdentity(owner.PID)
-	if errors.Is(err, proc.ErrNoProcess) {
-		return nil
-	}
+	reap, err := proc.Terminate(ctx, owner.Identity())
 	if err != nil {
-		return fmt.Errorf("daemonkit: probe recorded incumbent %d: %w", owner.PID, err)
+		return Stopped{}, fmt.Errorf("daemonkit: terminate recorded incumbent %d: %w", owner.PID, err)
 	}
-	if live.Start != owner.Start || live.Boot != owner.Boot {
-		return nil
-	}
-	if err := syscall.Kill(owner.PID, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return fmt.Errorf("daemonkit: terminate wedged incumbent %d: %w", owner.PID, err)
-	}
-	return nil
+	return Stopped{
+		Before: Health{Generation: owner.Generation, PID: owner.PID, Build: owner.Build},
+		Reap:   Reap(reap),
+	}, nil
 }
 
 // inventoryClear proves absence the one way a record file cannot forge: the

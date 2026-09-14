@@ -64,8 +64,9 @@ const (
 	ReapCrossBoot
 	// ReapReused means the PID now names a different process instance.
 	ReapReused
-	// ReapTerminated is reached only by owned-child settlement ladders that
-	// delivered signals; Drain and Settle never signal and never return it.
+	// ReapTerminated is reached only by a ladder that delivered signals and then
+	// observed the exact instance leave — owned-child settlement and Terminate.
+	// Drain and Settle never signal and never return it.
 	ReapTerminated
 )
 

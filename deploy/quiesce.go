@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit"
+	"github.com/yasyf/daemonkit/internal/proc"
 )
 
 // readinessReserve is the share of the readiness budget the wait gives up to
@@ -18,6 +19,12 @@ import (
 // daemon that may be busy starting — a sliver of the budget times out on a
 // daemon that is really there and reports it absent.
 const readinessReserve = 4
+
+// escalationReserve is the share of the quiesce budget the drain gives up to
+// the ladder that ends an incumbent which did not leave on its own: half, so a
+// TERM-resistant incumbent still has a grace, a SIGKILL, and an observed
+// absence inside the transaction's deadline.
+const escalationReserve = 2
 
 // RuntimeProof is deploy's absence evidence: the daemon this deployment owns
 // was proved gone, and every executable it runs was proved to have no live
@@ -70,11 +77,21 @@ func (p ReadinessProof) Digest() SHA256 { return p.digest }
 // durable owner record instead. A daemon that never recorded itself
 // (ErrUnrecorded) is the already-absent arm.
 //
-// Every arm ends at the same gate: the executable-scoped inventory over every
-// program this deployment runs — at every declared host binary, and inside a
-// bundle at every location a whole generation can occupy — must be empty. That
-// gate is not a belt-and-braces check, it is what closes the hole — see
-// [Inventory] and [Deployment.generationSlots].
+// An incumbent that does not leave inside the drain's share of the budget is
+// escalated through [daemonkit.Client.Terminate]: SIGTERM at the pinned
+// identity, SIGKILL, then observed absence. That reaches a daemon parked over
+// abandoned shutdown stages holding its flock, whatever daemonkit it was built
+// on, because the ladder runs in the process doing the deploy.
+//
+// Every arm then terminates what still runs from the bundle's own executables
+// — an app extension the system launched, an orphaned helper — through the
+// same identity-checked ladder, and ends at the same gate: the executable-
+// scoped inventory over every program this deployment runs — at every declared
+// host binary, and inside a bundle at every location a whole generation can
+// occupy — must be empty. That gate is not a belt-and-braces check, it is what
+// closes the hole — see [Inventory] and [Deployment.generationSlots]. A process
+// on a declared host binary is refused rather than terminated: it lives outside
+// the bundle, and may be the launcher driving this very deploy.
 //
 // A live process nothing could name counts against that gate when the daemon's
 // owner record names its exact pin, so this deployment's own husk refuses while
@@ -98,48 +115,104 @@ func (d *Deployment) Quiesce(ctx context.Context) (RuntimeProof, error) {
 	if !absenceProof(stopped.Reap) {
 		return RuntimeProof{}, fmt.Errorf("%w: settlement returned reap %d, not an absence proof", ErrConflict, stopped.Reap)
 	}
+	if err := d.terminateSurvivors(ctx); err != nil {
+		return RuntimeProof{}, err
+	}
 	if err := d.requireEmpty(); err != nil {
 		return RuntimeProof{}, err
 	}
 	return runtimeProof(stopped), nil
 }
 
-// absenceProof names the three reaps that were reached by observing the
-// process table. ReapTerminated belongs to signal-delivering child ladders and
-// ReapUndetermined to a settlement that timed out; neither proves absence.
+// absenceProof names the reaps that were reached by observing the process
+// table: the three Drain and Settle answer, and ReapTerminated, which the
+// escalation ladder answers only after observing the instance it signalled
+// leave. ReapUndetermined is a settlement that timed out and proves nothing.
 func absenceProof(reap daemonkit.Reap) bool {
-	return reap == daemonkit.ReapAbsent || reap == daemonkit.ReapCrossBoot || reap == daemonkit.ReapReused
+	return reap == daemonkit.ReapAbsent || reap == daemonkit.ReapCrossBoot ||
+		reap == daemonkit.ReapReused || reap == daemonkit.ReapTerminated
 }
 
+// stop drains the incumbent inside the drain's share of the budget and hands
+// one that is still there to the escalation ladder with the rest. The pin the
+// drain observed is what the ladder is addressed to, so an incumbent that was
+// replaced in between is refused rather than signalled.
 func (d *Deployment) stop(ctx context.Context) (daemonkit.Stopped, error) {
+	deadline, _ := ctx.Deadline()
+	drainCtx, cancel := context.WithDeadline(ctx, deadline.Add(-time.Until(deadline)/escalationReserve))
+	defer cancel()
+	expect, stopped, err := d.drain(drainCtx)
+	switch {
+	case err == nil:
+		return stopped, nil
+	case errors.Is(err, daemonkit.ErrUnsettled), timedOut(err):
+		return d.client.Terminate(ctx, expect)
+	default:
+		return daemonkit.Stopped{}, err
+	}
+}
+
+func (d *Deployment) drain(ctx context.Context) (daemonkit.Expect, daemonkit.Stopped, error) {
 	control, err := d.client.Control(ctx)
 	switch {
 	case errors.Is(err, daemonkit.ErrDraining), errors.Is(err, daemonkit.ErrAbsent):
 		return d.settle(ctx)
 	case err != nil:
-		return daemonkit.Stopped{}, err
+		return daemonkit.Expect{}, daemonkit.Stopped{}, err
 	}
 	defer func() { _ = control.Close(ctx) }()
 	health, err := control.Health(ctx)
 	if err != nil {
-		return daemonkit.Stopped{}, err
+		return daemonkit.Expect{}, daemonkit.Stopped{}, err
 	}
-	return control.Drain(ctx, daemonkit.Expect{Build: health.Build, Generation: health.Generation})
+	expect := daemonkit.Expect{Build: health.Build, Generation: health.Generation}
+	stopped, err := control.Drain(ctx, expect)
+	return expect, stopped, err
 }
 
-// settle is the session-less arm. An unrecorded incumbent is the already-
-// absent case: nothing of this daemon ever named itself here, so there is no
-// identity to observe out of the table and absence rests entirely on the
-// inventory gate Quiesce runs next.
-func (d *Deployment) settle(ctx context.Context) (daemonkit.Stopped, error) {
-	stopped, err := d.client.Settle(ctx, daemonkit.Expect{})
-	if errors.Is(err, daemonkit.ErrUnrecorded) {
-		return daemonkit.Stopped{Reap: daemonkit.ReapAbsent}, nil
-	}
+// settle is the session-less arm. The owner record is what pins it: the build
+// and generation read here are what a later escalation must find the record
+// still naming. An unrecorded incumbent is the already-absent case: nothing of
+// this daemon ever named itself here, so there is no identity to observe out of
+// the table and absence rests entirely on the inventory gate Quiesce runs next.
+func (d *Deployment) settle(ctx context.Context) (daemonkit.Expect, daemonkit.Stopped, error) {
+	owner, recorded, err := proc.ReadOwner(d.config.Daemon.RecordPath())
 	if err != nil {
-		return daemonkit.Stopped{}, err
+		return daemonkit.Expect{}, daemonkit.Stopped{}, fmt.Errorf("deploy: read owner record: %w", err)
 	}
-	return stopped, nil
+	if !recorded {
+		return daemonkit.Expect{}, daemonkit.Stopped{Reap: daemonkit.ReapAbsent}, nil
+	}
+	expect := daemonkit.Expect{Build: owner.Build, Generation: owner.Generation}
+	stopped, err := d.client.Settle(ctx, expect)
+	return expect, stopped, err
+}
+
+// terminateSurvivors ends every live process still running one of the bundle's
+// own executables, and this deployment's own recorded husk, through the same
+// identity-checked ladder the daemon is escalated with. Each is re-pinned
+// before every signal, so a PID reused by a stranger is never signalled, and
+// each gets an equal share of what is left, so one that ignores SIGTERM cannot
+// spend the next one's SIGKILL.
+func (d *Deployment) terminateSurvivors(ctx context.Context) error {
+	owned, err := d.ownedExecutables()
+	if err != nil {
+		return err
+	}
+	survivors, err := d.survivors(owned)
+	if err != nil {
+		return err
+	}
+	for i, survivor := range survivors {
+		deadline, _ := ctx.Deadline()
+		shareCtx, cancel := context.WithTimeout(ctx, time.Until(deadline)/time.Duration(len(survivors)-i))
+		_, err := proc.Terminate(shareCtx, survivor.identity())
+		cancel()
+		if err != nil {
+			return fmt.Errorf("deploy: terminate %s: %w", survivor, err)
+		}
+	}
+	return nil
 }
 
 func runtimeProof(stopped daemonkit.Stopped) RuntimeProof {
