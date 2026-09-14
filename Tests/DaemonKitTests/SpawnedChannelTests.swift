@@ -76,17 +76,17 @@ struct SpawnedChannelTests {
         }
     }
 
+    /// Runs in an exit test: repointing fd 3 in the test process drops the
+    /// poll registration of whichever parallel suite's socket holds fd 3.
     @Test
-    func claimRefusesADescriptorWhoseCreatorIsNotTheParent() throws {
-        let nonce = String(repeating: "ab", count: 32)
-        try withConveyance(nonce: nonce, limits: "0,0") {
-            let pair = try stagedPair()
-            defer {
-                Darwin.close(pair.local)
-                Darwin.close(pair.remote)
-            }
+    func claimRefusesADescriptorWhoseCreatorIsNotTheParent() async {
+        await #expect(processExitsWith: .success) {
+            setenv(SpawnedChannelTests.nonceEnvironment, String(repeating: "ab", count: 32), 1)
+            setenv(SpawnedChannelTests.limitsEnvironment, "0,0", 1)
+            var descriptors: [Int32] = [0, 0]
+            try #require(socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0)
             let saved = fcntl(3, F_DUPFD_CLOEXEC, 10)
-            try #require(dup2(pair.local, 3) == 3)
+            try #require(dup2(descriptors[0], 3) == 3)
             defer {
                 if saved >= 0 {
                     _ = dup2(saved, 3)
