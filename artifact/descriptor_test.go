@@ -38,7 +38,10 @@ func TestValidate(t *testing.T) {
 	}{
 		{"release-binary static", Descriptor{Schema: 1, Name: "t", Kind: ReleaseBinary, Version: VersionSource{Static: "1"}, Platforms: rbEntry}, nil},
 		{"python-tool dynamic ok", Descriptor{Schema: 1, Name: "t", Kind: PythonTool, Version: VersionSource{Command: []string{"host"}, JSONField: "build"}, Tool: &ToolSpec{Dist: "t"}}, nil},
-		{"signed-app dynamic ok", Descriptor{Schema: 1, Name: "t", Kind: SignedApp, Version: VersionSource{Command: []string{"host"}, JSONField: "build"}, App: &AppSpec{Dir: "/Applications", AppName: "T"}}, nil},
+		{"signed-app dynamic ok", Descriptor{Schema: 1, Name: "t", Kind: SignedApp, Version: VersionSource{Command: []string{"host"}, JSONField: "build"}, App: &AppSpec{Dir: "/Applications", AppName: "T", Cask: "t"}}, nil},
+		{"signed-app formula ok", Descriptor{Schema: 1, Name: "t", Kind: SignedApp, Version: VersionSource{Static: "1"}, App: &AppSpec{Dir: "/Applications", AppName: "T", Formula: "o/tap/t"}}, nil},
+		{"signed-app missing upgrade hint", Descriptor{Schema: 1, Name: "t", Kind: SignedApp, Version: VersionSource{Static: "1"}, App: &AppSpec{Dir: "/Applications", AppName: "T"}}, ErrInvalidDescriptor},
+		{"signed-app both cask and formula", Descriptor{Schema: 1, Name: "t", Kind: SignedApp, Version: VersionSource{Static: "1"}, App: &AppSpec{Dir: "/Applications", AppName: "T", Cask: "t", Formula: "o/tap/t"}}, ErrInvalidDescriptor},
 		{"wrong schema", Descriptor{Schema: 2, Name: "t", Kind: PythonTool, Version: VersionSource{Static: "1"}, Tool: &ToolSpec{Dist: "t"}}, ErrSchemaVersion},
 		{"dynamic release-binary refused", Descriptor{Schema: 1, Name: "t", Kind: ReleaseBinary, Version: VersionSource{Command: []string{"host"}, JSONField: "build"}, Platforms: rbEntry}, ErrDynamicIntegrity},
 		{"missing name", Descriptor{Schema: 1, Kind: PythonTool, Version: VersionSource{Static: "1"}, Tool: &ToolSpec{Dist: "t"}}, ErrInvalidDescriptor},

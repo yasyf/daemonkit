@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A signed-app descriptor can name a Homebrew formula instead of a cask:
+  `app.formula` sits beside `app.cask`, and `ManualUpgradeError.Formula`
+  carries it. The upgrade handoff then reads `brew upgrade <formula>`, for an
+  app that ships inside a formula rather than as a cask.
+
+### Changed
+
+- `Validate` requires a signed-app descriptor to set exactly one of
+  `app.cask` and `app.formula`. A descriptor with neither used to pass and
+  then render `brew upgrade --cask` with no package name.
+
 ## [0.26.0] - 2026-09-14
 
 ### Added

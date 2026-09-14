@@ -34,19 +34,28 @@ var (
 )
 
 // ManualUpgradeError is the typed attest failure a caller renders as a
-// "brew upgrade --cask <cask>" handoff. It matches ErrManualUpgrade via errors.Is.
+// "brew upgrade --cask <cask>" or "brew upgrade <formula>" handoff, whichever
+// the descriptor names. It matches ErrManualUpgrade via errors.Is.
 type ManualUpgradeError struct {
-	Name string
-	Cask string
-	Want string // descriptor version ("" when the version is host-authoritative)
-	Got  string // installed version ("" when the app is absent)
+	Name    string
+	Cask    string
+	Formula string
+	Want    string // descriptor version ("" when the version is host-authoritative)
+	Got     string // installed version ("" when the app is absent)
 }
 
 func (e *ManualUpgradeError) Error() string {
 	if e.Got == "" {
-		return fmt.Sprintf("artifact: signed app %q is not installed; run: brew upgrade --cask %s", e.Name, e.Cask)
+		return fmt.Sprintf("artifact: signed app %q is not installed; run: %s", e.Name, e.upgradeCommand())
 	}
-	return fmt.Sprintf("artifact: signed app %q is version %s, want %s; run: brew upgrade --cask %s", e.Name, e.Got, e.Want, e.Cask)
+	return fmt.Sprintf("artifact: signed app %q is version %s, want %s; run: %s", e.Name, e.Got, e.Want, e.upgradeCommand())
+}
+
+func (e *ManualUpgradeError) upgradeCommand() string {
+	if e.Formula != "" {
+		return "brew upgrade " + e.Formula
+	}
+	return "brew upgrade --cask " + e.Cask
 }
 
 // Is reports whether target is ErrManualUpgrade.

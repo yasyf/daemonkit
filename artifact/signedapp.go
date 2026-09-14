@@ -34,7 +34,7 @@ func attestSignedApp(desc *Descriptor, version, exec string) (string, error) {
 	}
 	if _, err := os.Stat(appPath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return "", &ManualUpgradeError{Name: desc.Name, Cask: desc.App.Cask, Want: want}
+			return "", &ManualUpgradeError{Name: desc.Name, Cask: desc.App.Cask, Formula: desc.App.Formula, Want: want}
 		}
 		return "", fmt.Errorf("artifact: inspect installed app: %w", err)
 	}
@@ -44,7 +44,7 @@ func attestSignedApp(desc *Descriptor, version, exec string) (string, error) {
 			return "", fmt.Errorf("artifact: read installed app version: %w", err)
 		}
 		if !dkversion.Equal(installed, want) {
-			return "", &ManualUpgradeError{Name: desc.Name, Cask: desc.App.Cask, Want: want, Got: installed}
+			return "", &ManualUpgradeError{Name: desc.Name, Cask: desc.App.Cask, Formula: desc.App.Formula, Want: want, Got: installed}
 		}
 	}
 	entrypoint, err := safeJoin(appPath, exec)

@@ -247,6 +247,7 @@ artifact	field	AppSpec.AppName	all
 artifact	field	AppSpec.Cask	all
 artifact	field	AppSpec.Dir	all
 artifact	field	AppSpec.Exec	all
+artifact	field	AppSpec.Formula	all
 artifact	type	CacheEntry	all
 artifact	field	CacheEntry.Digest	all
 artifact	field	CacheEntry.Dir	all
@@ -280,6 +281,7 @@ artifact	type	Kind	all
 artifact	type	ManualUpgradeError	all
 artifact	field	ManualUpgradeError.Cask	all
 artifact	method	ManualUpgradeError.Error	all
+artifact	field	ManualUpgradeError.Formula	all
 artifact	field	ManualUpgradeError.Got	all
 artifact	method	ManualUpgradeError.Is	all
 artifact	field	ManualUpgradeError.Name	all

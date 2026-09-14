@@ -30,7 +30,8 @@
 //
 // SignedApp is attest-only. It verifies the app exists and — for a static
 // descriptor — that its version matches, and otherwise returns a
-// ManualUpgradeError the caller renders as a "brew upgrade --cask" handoff.
+// ManualUpgradeError the caller renders as a "brew upgrade" handoff naming the
+// descriptor's cask or formula.
 // Packaging and deployment activation are explicit consumer operations.
 //
 // # Version source and the supply-chain rule

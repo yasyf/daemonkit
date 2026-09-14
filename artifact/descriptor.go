@@ -100,12 +100,14 @@ type ToolSpec struct {
 	Entrypoint string `json:"entrypoint,omitempty"`
 }
 
-// AppSpec is the signed-app payload.
+// AppSpec is the signed-app payload. Exactly one of Cask and Formula names the
+// Homebrew package a ManualUpgradeError tells the user to upgrade.
 type AppSpec struct {
 	Dir     string `json:"dir"`
 	AppName string `json:"app_name"`
 	Exec    string `json:"exec,omitempty"`
 	Cask    string `json:"cask,omitempty"`
+	Formula string `json:"formula,omitempty"`
 }
 
 // CurrentPlatform returns the dotslash platform key for the running host.
@@ -206,6 +208,9 @@ func (d *Descriptor) Validate() error {
 	case SignedApp:
 		if d.App == nil || d.App.Dir == "" || d.App.AppName == "" {
 			return fmt.Errorf("%w: signed-app %q missing app.dir or app.app_name", ErrInvalidDescriptor, d.Name)
+		}
+		if (d.App.Cask == "") == (d.App.Formula == "") {
+			return fmt.Errorf("%w: signed-app %q needs exactly one of app.cask or app.formula", ErrInvalidDescriptor, d.Name)
 		}
 		for platform, entry := range d.Platforms {
 			if err := entry.validate(platform, d.Version.Dynamic()); err != nil {
