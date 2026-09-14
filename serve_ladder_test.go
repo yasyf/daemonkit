@@ -30,6 +30,17 @@ func (p *wedgedProduct) Drain(Budget) error {
 	return nil
 }
 
+type cancelledProduct struct {
+	stubProduct
+	admitted chan struct{}
+}
+
+func (p *cancelledProduct) Handle(ctx context.Context, _ Request) (Reply, error) {
+	close(p.admitted)
+	<-ctx.Done()
+	return Reply{}, ctx.Err()
+}
+
 type bigReplyProduct struct {
 	stubProduct
 	body []byte
@@ -140,6 +151,48 @@ func TestServeSettlesLargeReplyBeforeExit(t *testing.T) {
 		}
 	case <-time.After(20 * time.Second):
 		t.Fatal("Serve did not return after the product-initiated drain")
+	}
+}
+
+// TestServeJoinsRequestsCancelledAtTheShare is a request still in flight when
+// the requests share runs out, on a product that returns the moment its
+// context is cancelled: the stage cancels it, joins it, and settles, so the
+// daemon exits instead of parking over a handler that had already returned.
+func TestServeJoinsRequestsCancelledAtTheShare(t *testing.T) {
+	shortHome(t)
+	guard := make(chan os.Signal, 1)
+	signal.Notify(guard, syscall.SIGTERM)
+	defer signal.Stop(guard)
+
+	d := Daemon{Label: "dkcancel", Schemas: []Schema{"test.v1"}, Shutdown: Grace(2 * time.Second)}
+	product := &cancelledProduct{admitted: make(chan struct{})}
+	done := serveInBackground(context.Background(), t, d, func(Ctx) (Product, error) { return product, nil })
+
+	socket, err := paths.Socket("dkcancel")
+	if err != nil {
+		t.Fatalf("Socket: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	business := awaitBusinessSession(t, socket, int(d.MaxFrame))
+	if err := business.WaitReady(ctx); err != nil {
+		t.Fatalf("WaitReady() = %v", err)
+	}
+	go func() { _, _ = business.Call(ctx, "product.block.v1", nil) }()
+	<-product.admitted
+	control := awaitControlSession(t, socket)
+	if _, err := control.Drain(ctx); err != nil {
+		t.Fatalf("Drain() = %v", err)
+	}
+
+	select {
+	case out := <-done:
+		if len(out.drained.Abandoned) != 0 {
+			t.Fatalf("Abandoned = %v, want none for a handler that returned on cancel", out.drained.Abandoned)
+		}
+	case <-time.After(10 * time.Second):
+		_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+		t.Fatal("Serve parked over a request it had cancelled and whose handler had returned")
 	}
 }
 

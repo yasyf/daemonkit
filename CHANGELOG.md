@@ -22,6 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   incumbent that drains on a longer one is SIGTERMed mid-drain — one more drain
   trigger to a daemon that is draining — and SIGKILLed only after the ladder's
   own grace share on top.
+- Serve's requests stage joins the handlers it cancels. The share now reserves
+  a tail: admitted dispatch drains within the rest, what is still in flight is
+  cancelled, and the stage settles once those handlers return and every
+  terminal is acknowledged. A request in flight at the share's end used to
+  abandon the stage the instant the cancel went out, so a product that
+  returned on cancel still parked the daemon over its flock.
 
 ## [0.27.0] - 2026-09-14
 
