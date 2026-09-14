@@ -144,6 +144,10 @@ const (
 	requestsShare = 0.40 / 0.95
 	drainShare    = 0.30 / 0.55
 	closeShare    = 1.0
+
+	// requestsCancelReserve is the tail of the requests share held back to
+	// join the handlers cancelled when the rest of it ran out.
+	requestsCancelReserve = 1.0 / 3
 )
 
 var drainSignals = []os.Signal{syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP}
@@ -368,14 +372,27 @@ func provenStage(budget Budget, run func(Budget) error) bool {
 	return inTime && <-proven
 }
 
-// settleRequests joins admitted dispatch and waits every written terminal's
-// acknowledgment within the share; at expiry it cancels what remains and the
-// stage is abandoned.
+// settleRequests joins admitted dispatch within the share's work window,
+// cancels what is still in flight when that runs out, joins the cancelled
+// handlers within the reserved tail, and then waits every written terminal's
+// acknowledgment. Only a handler that outlives its cancellation abandons the
+// stage: one that returns on cancel is joined work, not half-done work.
 func settleRequests(budget Budget, server *wire.Server) bool {
+	work, tail := budget.Reserve("cancel", requestsCancelReserve)
+	if !awaitInFlight(work, server) {
+		server.CancelRequests()
+		if !awaitInFlight(tail, server) {
+			return false
+		}
+	}
+	ctx, cancel := tail.Context(context.Background())
+	defer cancel()
+	return server.Settle(ctx) == nil
+}
+
+func awaitInFlight(budget Budget, server *wire.Server) bool {
 	ctx, cancel := budget.Context(context.Background())
 	defer cancel()
-	stop := context.AfterFunc(ctx, server.CancelRequests)
-	defer stop()
 	for server.InFlight() > 0 {
 		select {
 		case <-ctx.Done():
@@ -383,7 +400,7 @@ func settleRequests(budget Budget, server *wire.Server) bool {
 		case <-time.After(requestSettleTick):
 		}
 	}
-	return server.Settle(ctx) == nil
+	return true
 }
 
 // runStage refuses to start a stage whose share is already spent, and
