@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/yasyf/daemonkit/internal/realhome"
 )
 
 func writeApp(t *testing.T, dir, name, version, exec string) {
@@ -82,5 +84,51 @@ func TestResolveSignedAppAttestMissingApp(t *testing.T) {
 	var upgrade *ManualUpgradeError
 	if !errors.As(err, &upgrade) || upgrade.Got != "" {
 		t.Fatalf("Resolve() = %v, want ManualUpgradeError with empty Got", err)
+	}
+}
+
+func TestSignedAppExpandsHomeInDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv(realhome.EnvOverride, home)
+	t.Setenv("HOME", t.TempDir())
+	dir := filepath.Join(home, "Applications")
+	writeApp(t, dir, "Captain Hook", "12.15.3", "Contents/Helpers/capt-hookd")
+	desc := signedAppDescriptor("~/Applications", "12.15.3")
+
+	path, err := (Store{Root: t.TempDir()}).Resolve(context.Background(), desc)
+	if err != nil {
+		t.Fatalf("Resolve() = %v", err)
+	}
+	want := filepath.Join(dir, "Captain Hook.app", "Contents", "Helpers", "capt-hookd")
+	if path != want {
+		t.Fatalf("path = %q, want %q", path, want)
+	}
+}
+
+func TestSignedAppAbsoluteDirIgnoresHome(t *testing.T) {
+	t.Setenv(realhome.EnvOverride, t.TempDir())
+	dir := t.TempDir()
+	writeApp(t, dir, "Captain Hook", "12.15.3", "Contents/Helpers/capt-hookd")
+	desc := signedAppDescriptor(dir, "12.15.3")
+
+	path, err := (Store{Root: t.TempDir()}).Resolve(context.Background(), desc)
+	if err != nil {
+		t.Fatalf("Resolve() = %v", err)
+	}
+	want := filepath.Join(dir, "Captain Hook.app", "Contents", "Helpers", "capt-hookd")
+	if path != want {
+		t.Fatalf("path = %q, want %q", path, want)
+	}
+}
+
+func TestSignedAppHomeDirRefusesEscape(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv(realhome.EnvOverride, home)
+	writeApp(t, home, "Captain Hook", "12.15.3", "Contents/Helpers/capt-hookd")
+	desc := signedAppDescriptor("~/Applications", "12.15.3")
+	desc.App.AppName = "../Captain Hook"
+
+	if _, err := (Store{Root: t.TempDir()}).Resolve(context.Background(), desc); !errors.Is(err, ErrUnsafeArchive) {
+		t.Fatalf("Resolve() = %v, want ErrUnsafeArchive", err)
 	}
 }
