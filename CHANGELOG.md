@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Serve's children stage runs its whole session ladder on its own clock. A
+  demanded settlement now proves the dedicated session — survivors as well as
+  the leader — inside the demand's deadline, where it used to give the
+  survivors a 5s clock of their own after the leader left, so a session that
+  settled at 5.7s under a 4.5s tail was reported unproven and parked the
+  daemon. The tail is also floored at one settlement grace where the budget
+  affords it, never past half of it, so a TERM-resistant leader over a
+  TERM-resistant grandchild is killed and proven inside a 30s grace with the
+  work window spent.
+
 ## [0.28.0] - 2026-09-14
 
 ### Added
