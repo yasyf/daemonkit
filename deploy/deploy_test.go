@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -25,6 +26,7 @@ const (
 	daemonChildEnv   = "DAEMONKIT_DEPLOY_DAEMON_CHILD"
 	daemonChildLabel = "DAEMONKIT_DEPLOY_DAEMON_CHILD_LABEL"
 	daemonChildDelay = "DAEMONKIT_DEPLOY_DAEMON_CHILD_DELAY"
+	daemonChildPark  = "DAEMONKIT_DEPLOY_DAEMON_CHILD_PARK"
 	huskChildEnv     = "DAEMONKIT_DEPLOY_HUSK_CHILD"
 	huskChildRecord  = "DAEMONKIT_DEPLOY_HUSK_CHILD_RECORD"
 )
@@ -45,23 +47,29 @@ func TestMain(m *testing.M) {
 
 // serveDaemonChild serves one daemon at the label its parent named and
 // publishes readiness only after the named delay, so the parent's wait faces
-// the daemon launchd has only just been asked to start. It never returns.
+// the daemon launchd has only just been asked to start. A parked child serves
+// a product whose Drain never returns, so its shutdown ladder abandons that
+// stage and Serve parks the process over its flock. It never returns.
 func serveDaemonChild() {
 	delay, err := time.ParseDuration(os.Getenv(daemonChildDelay))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "deploy daemon child: %v\n", err)
 		os.Exit(70)
 	}
+	var product daemonkit.Product = stubProduct{}
+	if os.Getenv(daemonChildPark) == "1" {
+		product = parkedProduct{}
+	}
 	_, err = daemonkit.Serve(
 		context.Background(),
 		daemonkit.Daemon{
 			Label:    daemonkit.Label(os.Getenv(daemonChildLabel)),
 			Schemas:  []daemonkit.Schema{"deploy.test.v1"},
-			Shutdown: daemonkit.Grace(5 * time.Second),
+			Shutdown: daemonkit.Grace(2 * time.Second),
 		},
 		func(daemonkit.Ctx) (daemonkit.Product, error) {
 			time.Sleep(delay)
-			return stubProduct{}, nil
+			return product, nil
 		},
 	)
 	if err != nil {
@@ -105,6 +113,12 @@ func (stubProduct) Handle(context.Context, daemonkit.Request) (daemonkit.Reply, 
 func (stubProduct) Drain(daemonkit.Budget) error { return nil }
 
 func (stubProduct) Close(daemonkit.Budget) error { return nil }
+
+type parkedProduct struct{ stubProduct }
+
+func (parkedProduct) Drain(daemonkit.Budget) error {
+	select {}
+}
 
 const (
 	testTeamID  = "ABCDE12345"
@@ -318,6 +332,27 @@ func (f *fixture) settle(child *exec.Cmd, program string) {
 	f.awaitLive(program, false)
 }
 
+// terminated proves the gate found a process the fixture started: the verb
+// ended it rather than refusing it, and by the signal the ladder sends first.
+func (f *fixture) terminated(child *exec.Cmd) {
+	f.t.Helper()
+	exited := make(chan error, 1)
+	go func() { exited <- child.Wait() }()
+	var err error
+	select {
+	case err = <-exited:
+	case <-time.After(10 * time.Second):
+		f.t.Fatalf("pid %d is still running: the verb terminated nobody", child.Process.Pid)
+	}
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) {
+		f.t.Fatalf("pid %d exit = %v, want the exit a signal leaves", child.Process.Pid, err)
+	}
+	if status, ok := exit.Sys().(syscall.WaitStatus); !ok || !status.Signaled() || status.Signal() != syscall.SIGTERM {
+		f.t.Fatalf("pid %d exit = %v, want SIGTERM", child.Process.Pid, err)
+	}
+}
+
 func (f *fixture) awaitLive(program string, want bool) {
 	f.t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
@@ -457,6 +492,19 @@ func (f *fixture) recordOwner(t *testing.T) proc.Identity {
 // process is one no client here can ever attach to.
 func (f *fixture) startDaemonChild(delay time.Duration) *exec.Cmd {
 	f.t.Helper()
+	return f.startDaemonChildEnv(delay, daemonChildPark+"=0")
+}
+
+// startParkedDaemonChild spawns a daemon whose drain never completes, so the
+// first drain parks it over its flock — the incumbent an upgrade found live,
+// socketless, and childless, and could not prove gone.
+func (f *fixture) startParkedDaemonChild() *exec.Cmd {
+	f.t.Helper()
+	return f.startDaemonChildEnv(0, daemonChildPark+"=1")
+}
+
+func (f *fixture) startDaemonChildEnv(delay time.Duration, env string) *exec.Cmd {
+	f.t.Helper()
 	executable, err := os.Executable()
 	if err != nil {
 		f.t.Fatalf("os.Executable() = %v", err)
@@ -467,6 +515,7 @@ func (f *fixture) startDaemonChild(delay time.Duration) *exec.Cmd {
 		daemonChildEnv+"=1",
 		daemonChildLabel+"="+string(f.deploy.config.Daemon.Label),
 		daemonChildDelay+"="+delay.String(),
+		env,
 	)
 	child.Stderr = os.Stderr
 	if err := child.Start(); err != nil {
@@ -477,6 +526,17 @@ func (f *fixture) startDaemonChild(delay time.Duration) *exec.Cmd {
 		_ = child.Wait()
 	})
 	return child
+}
+
+// serving waits for the deployment's daemon to publish readiness and returns
+// the pid that did, so a test can tell one instance from its successor.
+func (f *fixture) serving(budget time.Duration) int {
+	f.t.Helper()
+	health, err := f.deploy.client.WaitReady(f.within(budget))
+	if err != nil {
+		f.t.Fatalf("WaitReady: %v", err)
+	}
+	return health.PID
 }
 
 // squatSocket binds this deployment's socket path to a listener that accepts
@@ -833,22 +893,212 @@ func TestSupersedeReplacesTheInstalledGeneration(t *testing.T) {
 	}
 }
 
-func TestSupersedeRefusesWhileTheDaemonIsLive(t *testing.T) {
+// TestSupersedeTerminatesAStrayOnItsExecutables is the app extension the
+// system launched out of the installed bundle: not the daemon, so no drain
+// reaches it, and running bytes the swap is about to destroy. The quiesce ends
+// it at its pin, and the inventory gate then proves the bundle empty.
+func TestSupersedeTerminatesAStrayOnItsExecutables(t *testing.T) {
 	f := newFixture(t)
 	if _, err := f.deploy.Install(f.ctx(), f.candidate("First", "1.0", "one")); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	f.live(f.agent.Program)
-	_, err := f.deploy.Supersede(f.ctx(), f.candidate("Second", "2.0", "two"))
-	if !errors.Is(err, ErrLive) {
+	stray := f.live(f.agent.Program)
+	landed, err := f.deploy.Supersede(f.ctx(), f.candidate("Second", "2.0", "two"))
+	if err != nil {
+		t.Fatalf("Supersede: %v", err)
+	}
+	f.terminated(stray)
+	if landed.Version != "2.0" {
+		t.Fatalf("Supersede = %+v, want version 2.0", landed)
+	}
+	f.wantCanonical("two")
+}
+
+// TestSupersedeRefusesAStrayOnADeclaredHostExecutable is the line the
+// termination stops at: a process on a host binary outside the bundle may be
+// the launcher driving this very deploy, so it is refused, never signalled.
+func TestSupersedeRefusesAStrayOnADeclaredHostExecutable(t *testing.T) {
+	f := newFixture(t)
+	host := f.hostExecutable()
+	if _, err := f.deploy.Install(f.ctx(), f.candidate("First", "1.0", "one")); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	stray := f.live(host)
+	if _, err := f.deploy.Supersede(f.ctx(), f.candidate("Second", "2.0", "two")); !errors.Is(err, ErrLive) {
 		t.Fatalf("Supersede err = %v, want ErrLive", err)
 	}
-	if fileExists(f.deploy.layout.swap) || fileExists(f.deploy.layout.candidate) {
-		t.Fatal("Supersede staged a candidate despite a live process")
+	if _, err := proc.ProbeIdentity(stray.Process.Pid); err != nil {
+		t.Fatalf("the host process %d is gone: the gate signalled outside the bundle", stray.Process.Pid)
 	}
-	installed, err := f.deploy.inspect(f.ctx(), f.app)
-	if err != nil || installed.Version != "1.0" {
-		t.Fatalf("installed = %+v, %v; want the untouched 1.0 generation", installed, err)
+	if fileExists(f.deploy.layout.swap) {
+		t.Fatal("Supersede committed a swap despite a live process")
+	}
+	f.wantCanonical("one")
+}
+
+// TestSupersedeInvalidCandidateLeavesServingIncumbent pins the order the
+// transaction runs in: the candidate is staged and held to the request before
+// anything touches the incumbent, so a bundle that is the wrong version, the
+// wrong bytes, or unsigned is refused while the same daemon instance keeps
+// serving.
+func TestSupersedeInvalidCandidateLeavesServingIncumbent(t *testing.T) {
+	f := newFixture(t)
+	if _, err := f.deploy.Install(f.ctx(), f.candidate("First", "1.0", "one")); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	good := f.candidate("Second", "2.0", "two")
+	unsigned := filepath.Join(f.root, "Unsigned.app")
+	writeBundle(t, unsigned, "2.0", "two")
+	unsignedDigest, err := BundleDigest(unsigned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.startDaemonChild(0)
+	incumbent := f.serving(20 * time.Second)
+	tests := []struct {
+		name      string
+		candidate Candidate
+		want      error
+	}{
+		{"wrong version", Candidate{Source: good.Source, Version: "9.9", Digest: good.Digest}, ErrVersion},
+		{"wrong digest", Candidate{Source: good.Source, Version: "2.0", Digest: SHA256{1}}, ErrConflict},
+		{"unsigned", Candidate{Source: unsigned, Version: "2.0", Digest: unsignedDigest}, ErrUntrusted},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := f.deploy.Supersede(f.ctx(), tt.candidate); !errors.Is(err, tt.want) {
+				t.Fatalf("Supersede err = %v, want %v", err, tt.want)
+			}
+			if pid := f.serving(5 * time.Second); pid != incumbent {
+				t.Fatalf("pid %d is serving, want the untouched incumbent %d", pid, incumbent)
+			}
+			if fileExists(f.deploy.layout.swap) || fileExists(f.deploy.layout.candidate) {
+				t.Fatal("a refused candidate left a swap record or a staged tree behind")
+			}
+			f.wantCanonical("one")
+		})
+	}
+}
+
+// TestSupersedeEscalatesAParkedIncumbent is the incumbent that abandoned a
+// shutdown stage and parked holding its flock: alive, childless, and past any
+// drain, whatever daemonkit built it. The first arm drains it through a live
+// session and escalates when the exit is never observed; the second finds it
+// already parked and socketless, with only the owner record to pin it by. Both
+// end it inside the deploy's own budget and land the swap.
+func TestSupersedeEscalatesAParkedIncumbent(t *testing.T) {
+	tests := []struct {
+		name string
+		park func(t *testing.T, f *fixture)
+	}{
+		{"drained into the park by the deploy", func(*testing.T, *fixture) {}},
+		{"already parked and socketless", func(t *testing.T, f *fixture) {
+			control, err := f.deploy.client.Control(f.within(5 * time.Second))
+			if err != nil {
+				t.Fatalf("Control: %v", err)
+			}
+			if _, err := control.Drain(f.within(time.Second), daemonkit.Expect{}); !errors.Is(err, daemonkit.ErrUnsettled) {
+				t.Fatalf("Drain err = %v, want ErrUnsettled from a product that never drains", err)
+			}
+			deadline := time.Now().Add(20 * time.Second)
+			for {
+				_, err := f.deploy.client.Control(f.within(time.Second))
+				if errors.Is(err, daemonkit.ErrAbsent) {
+					return
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("Control err = %v, want ErrAbsent once the parked incumbent closed its listener", err)
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFixture(t)
+			if _, err := f.deploy.Install(f.ctx(), f.candidate("First", "1.0", "one")); err != nil {
+				t.Fatalf("Install: %v", err)
+			}
+			child := f.startParkedDaemonChild()
+			incumbent := f.serving(20 * time.Second)
+			tt.park(t, f)
+			landed, err := f.deploy.Supersede(f.within(12*time.Second), f.candidate("Second", "2.0", "two"))
+			if err != nil {
+				t.Fatalf("Supersede: %v", err)
+			}
+			if err := child.Wait(); err != nil {
+				t.Fatalf("parked incumbent %d exit = %v, want the clean exit a signalled park leaves", incumbent, err)
+			}
+			if landed.Version != "2.0" {
+				t.Fatalf("Supersede = %+v, want version 2.0", landed)
+			}
+			f.wantCanonical("two")
+		})
+	}
+}
+
+// TestSupersedeAbortRestoresRunningServices injects the abort between the
+// quiesce and the swap record — launchd refusing the bootout, and the
+// transaction's own deadline running out under it — and holds the verb to
+// leaving the machine as it found it: the original error reported, no swap
+// committed, the incumbent's services recorded and applied again, and its
+// daemon proved ready, on the restore's own clock.
+func TestSupersedeAbortRestoresRunningServices(t *testing.T) {
+	injected := errors.New("launchd refused the bootout")
+	tests := []struct {
+		name    string
+		budget  time.Duration
+		bootout func(ctx context.Context) (string, int, error)
+		want    error
+	}{
+		{"launchd refused", 20 * time.Second, func(context.Context) (string, int, error) {
+			return "", -1, injected
+		}, injected},
+		{"the deadline ran out", 6 * time.Second, func(ctx context.Context) (string, int, error) {
+			<-ctx.Done()
+			return "", -1, ctx.Err()
+		}, context.DeadlineExceeded},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFixture(t)
+			if _, err := f.deploy.Install(f.ctx(), f.candidate("First", "1.0", "one")); err != nil {
+				t.Fatalf("Install: %v", err)
+			}
+			f.startDaemonChild(0)
+			if _, err := f.deploy.Activate(f.ctx()); err != nil {
+				t.Fatalf("Activate: %v", err)
+			}
+			incumbent := f.serving(5 * time.Second)
+			f.deploy.run = func(ctx context.Context, _ string, args ...string) (string, int, error) {
+				f.launchctls = append(f.launchctls, args)
+				switch args[0] {
+				case "bootout":
+					return tt.bootout(ctx)
+				case "kickstart", "bootstrap":
+					f.startDaemonChild(0)
+				}
+				return "", 0, nil
+			}
+			_, err := f.deploy.Supersede(f.within(tt.budget), f.candidate("Second", "2.0", "two"))
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("Supersede err = %v, want the abort %v reported", err, tt.want)
+			}
+			if fileExists(f.deploy.layout.swap) {
+				t.Fatal("an aborted supersede committed the swap")
+			}
+			f.wantCanonical("one")
+			applied, err := f.deploy.appliedServices()
+			if err != nil || !slices.Equal(applied, []string{f.agent.Label}) {
+				t.Fatalf("applied services = %v, %v; want the incumbent's %q recorded again", applied, err, f.agent.Label)
+			}
+			if restored := f.serving(5 * time.Second); restored == incumbent {
+				t.Fatalf("pid %d is serving, which the quiesce drained; want a restored instance", restored)
+			}
+			if fileExists(f.deploy.layout.activation) {
+				t.Fatal("the restore kept the activation sealed for the instance it drained")
+			}
+		})
 	}
 }
 
@@ -864,22 +1114,12 @@ func TestUninstallGatesOnTheInventoryAndSealsATombstone(t *testing.T) {
 	if _, err := f.deploy.Install(f.ctx(), f.candidate("Source", "1.0", "one")); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	child := f.live(f.agent.Program)
-	if _, err := f.deploy.Uninstall(f.ctx()); !errors.Is(err, ErrLive) {
-		t.Fatalf("Uninstall err = %v, want ErrLive", err)
-	}
-	if !fileExists(f.app) {
-		t.Fatal("Uninstall removed the app despite a surviving process")
-	}
-	if fileExists(f.deploy.layout.removal) {
-		t.Fatal("Uninstall sealed a tombstone despite a surviving process")
-	}
-
-	f.settle(child, f.agent.Program)
+	stray := f.live(f.agent.Program)
 	removal, err := f.deploy.Uninstall(f.ctx())
 	if err != nil {
 		t.Fatalf("Uninstall: %v", err)
 	}
+	f.terminated(stray)
 	if !removal.Runtime.Absent() || removal.Runtime.Digest() == (SHA256{}) {
 		t.Fatalf("Removal runtime = %+v, want an absent proof with a digest", removal.Runtime)
 	}
@@ -936,7 +1176,8 @@ func TestUninstallHandsBackThisMomentsAbsenceProof(t *testing.T) {
 
 // TestUninstallRegatesAResumedRemoval covers the app being restored under a
 // sealed tombstone: the proof was minted at an earlier moment and carries no
-// authority over this one, so the inventory gate runs again.
+// authority over this one, so the quiesce runs again — and a process on the
+// restored app is ended by it, not left under the removal.
 func TestUninstallRegatesAResumedRemoval(t *testing.T) {
 	f := newFixture(t)
 	if _, err := f.deploy.Install(f.ctx(), f.candidate("Source", "1.0", "one")); err != nil {
@@ -953,12 +1194,13 @@ func TestUninstallRegatesAResumedRemoval(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	f.live(f.agent.Program)
-	if _, err := f.deploy.Uninstall(f.ctx()); !errors.Is(err, ErrLive) {
-		t.Fatalf("Uninstall err = %v, want ErrLive", err)
+	stray := f.live(f.agent.Program)
+	if _, err := f.deploy.Uninstall(f.ctx()); err != nil {
+		t.Fatalf("Uninstall: %v", err)
 	}
-	if !fileExists(f.app) {
-		t.Fatal("a resumed uninstall removed the app despite a surviving process")
+	f.terminated(stray)
+	if fileExists(f.app) {
+		t.Fatal("a resumed uninstall left the app behind")
 	}
 }
 
@@ -1045,9 +1287,9 @@ func TestUninstallDiscardsEveryGenerationItScanned(t *testing.T) {
 }
 
 // TestUninstallScansEveryGenerationItDiscards is the other half, proved the
-// only way a gate can be: a live process on a slot's own executable refuses
-// the verb, so a slot the scan never asked about is a slot Uninstall would
-// have destroyed under it.
+// only way a gate can be: a live process on a slot's own executable is ended
+// by the quiesce before the slot goes, so a slot the scan never asked about is
+// a slot Uninstall would have destroyed under a process still running it.
 func TestUninstallScansEveryGenerationItDiscards(t *testing.T) {
 	slots := []string{"prior", "stage"}
 	for _, name := range slots {
@@ -1064,12 +1306,13 @@ func TestUninstallScansEveryGenerationItDiscards(t *testing.T) {
 				}
 				slot = leaked
 			}
-			f.live(f.runnableAt(filepath.Join(slot, "Contents", "MacOS", name)))
-			if _, err := f.deploy.Uninstall(f.ctx()); !errors.Is(err, ErrLive) {
-				t.Fatalf("Uninstall err = %v, want ErrLive: the %s slot at %q is running", err, name, slot)
+			stray := f.live(f.runnableAt(filepath.Join(slot, "Contents", "MacOS", name)))
+			if _, err := f.deploy.Uninstall(f.ctx()); err != nil {
+				t.Fatalf("Uninstall: %v", err)
 			}
-			if !fileExists(slot) {
-				t.Fatalf("Uninstall destroyed the %s slot at %q while a process was running its bytes", name, slot)
+			f.terminated(stray)
+			if fileExists(slot) {
+				t.Fatalf("Uninstall left the %s slot at %q behind", name, slot)
 			}
 		})
 	}
@@ -1206,8 +1449,8 @@ func TestResetDiscardsALeakedStagingTree(t *testing.T) {
 // TestResetDestroysNothingTheGateDidNotScan holds Reset to the enumeration the
 // inventory gate scans. Every slot it destroys can be the bytes a live process
 // is running, so each one has to carry its executables into the query set the
-// gate proved empty — a slot the gate never asked about is destruction nothing
-// authorized.
+// quiesce ends survivors on and the gate proves empty — a slot the gate never
+// asked about is one Reset destroys under a process still running it.
 func TestResetDestroysNothingTheGateDidNotScan(t *testing.T) {
 	for _, name := range []string{"prior", "candidate", "removed", "stage"} {
 		t.Run(name, func(t *testing.T) {
@@ -1216,12 +1459,13 @@ func TestResetDestroysNothingTheGateDidNotScan(t *testing.T) {
 				t.Fatalf("Install: %v", err)
 			}
 			slot := f.resetSlot(name)
-			f.live(f.runnableAt(filepath.Join(slot, "Contents", "MacOS", name)))
-			if err := f.deploy.Reset(f.ctx()); !errors.Is(err, ErrLive) {
-				t.Fatalf("Reset err = %v, want ErrLive: the %s slot at %q is running", err, name, slot)
+			stray := f.live(f.runnableAt(filepath.Join(slot, "Contents", "MacOS", name)))
+			if err := f.deploy.Reset(f.ctx()); err != nil {
+				t.Fatalf("Reset: %v", err)
 			}
-			if !fileExists(slot) {
-				t.Fatalf("Reset destroyed the %s slot at %q, which the gate never scanned", name, slot)
+			f.terminated(stray)
+			if fileExists(slot) {
+				t.Fatalf("Reset left the %s slot at %q behind", name, slot)
 			}
 		})
 	}
@@ -1382,33 +1626,36 @@ func TestResetClearsAnOutstandingSwapWhosePriorSlotIsOccupied(t *testing.T) {
 	}
 }
 
-// TestResetRefusesAnOccupiedPriorSlotWhileTheDaemonIsLive is the other half:
-// clearing that slot destroys bytes a process can be running, so it is gated
-// exactly as every other generation slot's destruction is.
-func TestResetRefusesAnOccupiedPriorSlotWhileTheDaemonIsLive(t *testing.T) {
+// TestResetEndsTheProcessOnAnOccupiedPriorSlot is the other half: clearing
+// that slot destroys bytes a process can be running, so it is gated exactly as
+// every other generation slot's destruction is — the process is ended before
+// the slot goes.
+func TestResetEndsTheProcessOnAnOccupiedPriorSlot(t *testing.T) {
 	f := newFixture(t)
 	f.crash("one", "two", func(t *testing.T, f *fixture) {
 		writeMachO(t, filepath.Join(f.deploy.layout.prior, "Contents", "MacOS", "stale"), 0o755)
 	})
-	f.liveSlot()
-	if err := f.deploy.Reset(f.ctx()); !errors.Is(err, ErrLive) {
-		t.Fatalf("Reset err = %v, want ErrLive", err)
+	stray := f.liveSlot()
+	if err := f.deploy.Reset(f.ctx()); err != nil {
+		t.Fatalf("Reset: %v", err)
 	}
-	if !fileExists(filepath.Join(f.deploy.layout.prior, "Contents", "MacOS", "stale")) {
-		t.Fatal("Reset cleared the prior slot with no absence proof behind it")
+	f.terminated(stray)
+	if fileExists(f.deploy.layout.prior) {
+		t.Fatal("Reset left the occupied prior slot behind")
 	}
-	f.wantCanonical("one")
+	f.wantCanonical("two")
 }
 
-func TestResetRefusesWhileTheDaemonIsLive(t *testing.T) {
+func TestResetTerminatesAStrayOnItsExecutables(t *testing.T) {
 	f := newFixture(t)
 	if _, err := f.deploy.Install(f.ctx(), f.candidate("Source", "1.0", "one")); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	f.live(f.agent.Program)
-	if err := f.deploy.Reset(f.ctx()); !errors.Is(err, ErrLive) {
-		t.Fatalf("Reset err = %v, want ErrLive", err)
+	stray := f.live(f.agent.Program)
+	if err := f.deploy.Reset(f.ctx()); err != nil {
+		t.Fatalf("Reset: %v", err)
 	}
+	f.terminated(stray)
 }
 
 // TestActivateGatesTheServicesItRetires pins the gate Activate's own converge
@@ -1429,17 +1676,28 @@ func TestActivateGatesTheServicesItRetires(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	f.live(f.agent.Program)
-	if _, err := f.deploy.Activate(f.ctx()); !errors.Is(err, ErrLive) {
-		t.Fatalf("Activate err = %v, want ErrLive", err)
-	}
-	if !fileExists(retired) {
-		t.Fatal("Activate booted a label out of launchd with no absence proof behind it")
-	}
-	for _, args := range f.launchctls {
+	stray := f.live(f.agent.Program)
+	bootedOutOver := 0
+	f.deploy.run = func(_ context.Context, _ string, args ...string) (string, int, error) {
+		f.launchctls = append(f.launchctls, args)
 		if slices.Contains(args, "bootout") {
-			t.Fatalf("launchctl %q booted a job out before the daemon was proved gone", args)
+			found, err := Inventory(f.agent.Program)
+			if err != nil {
+				t.Errorf("Inventory: %v", err)
+			}
+			bootedOutOver += len(found.Live)
 		}
+		return "", 0, nil
+	}
+	if _, err := f.deploy.Activate(f.within(5 * time.Second)); !errors.Is(err, daemonkit.ErrAbsent) {
+		t.Fatalf("Activate err = %v, want ErrAbsent once the gate ended the stray and nothing served", err)
+	}
+	f.terminated(stray)
+	if bootedOutOver != 0 {
+		t.Fatalf("launchctl booted a job out over %d live process(es) before the runtime was proved gone", bootedOutOver)
+	}
+	if fileExists(retired) {
+		t.Fatal("Activate left the retired label's plist behind after proving the runtime gone")
 	}
 }
 

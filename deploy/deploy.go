@@ -55,7 +55,15 @@ var (
 	ErrState = errors.New("deploy: durable deployment state is invalid")
 )
 
-const lockGrace = 30 * time.Second
+const (
+	lockGrace = 30 * time.Second
+
+	// restoreGrace is the budget an aborted supersede spends putting the
+	// incumbent's services back and proving the daemon ready again. It is a
+	// clock of its own: the abort it compensates is as likely as not the
+	// transaction's deadline running out.
+	restoreGrace = 30 * time.Second
+)
 
 // Config names the one signed application a Deployment owns.
 type Config struct {
@@ -204,17 +212,25 @@ func (d *Deployment) Install(ctx context.Context, candidate Candidate) (Generati
 	return d.land(ctx, candidate, false)
 }
 
-// Supersede replaces the installed generation with candidate. It quiesces the
-// incumbent first — proved gone and its executables proved empty — then moves
-// the incumbent aside and the candidate into place as one recorded rename
-// pair, so a crash anywhere in the middle resumes to the same end.
+// Supersede replaces the installed generation with candidate. It stages and
+// validates the candidate while the incumbent still serves, so a bundle that
+// is unsigned, the wrong version, or the wrong bytes is refused with nothing
+// stopped. Only then is the incumbent quiesced — proved gone and its
+// executables proved empty — and moved aside with the candidate into place as
+// one recorded rename pair, so a crash anywhere in the middle resumes to the
+// same end.
 //
-// A whole bundle tree is copied between the quiesce and the rename, so the
-// inventory half runs again immediately before it: an unbounded copy is exactly
-// long enough for a process to come back, and the rename destroys the bytes it
-// would be running from. That gate precedes the swap record, so a refusal is
-// durable — with no record outstanding there is no swap for the next verb's
-// resume to drive past it.
+// Converging launchd empty is a bootout exec per label, long enough for a
+// process to come back onto the bytes the rename destroys, so the inventory
+// half runs again immediately before the swap record. That gate precedes the
+// record, so a refusal is durable — with no record outstanding there is no
+// swap for the next verb's resume to drive past it.
+//
+// Every abort between the quiesce and the swap record puts the incumbent back:
+// its services are re-applied from the labels the durable record named and
+// its daemon is proved ready again, on a budget of the restore's own, and the
+// restore's outcome is reported joined with the abort's. Once the record is
+// written the swap is committed and only forward recovery drives it.
 func (d *Deployment) Supersede(ctx context.Context, candidate Candidate) (Generation, error) {
 	return d.land(ctx, candidate, true)
 }
@@ -242,9 +258,6 @@ func (d *Deployment) land(ctx context.Context, candidate Candidate, supersede bo
 		if err != nil {
 			return Generation{}, err
 		}
-		if _, err := d.quiesceAndConverge(ctx, nil); err != nil {
-			return Generation{}, err
-		}
 		prior = &incumbent
 	}
 	staged, err := d.stage(ctx, candidate)
@@ -261,11 +274,11 @@ func (d *Deployment) land(ctx context.Context, candidate Candidate, supersede bo
 		return Generation{}, err
 	}
 	if prior != nil {
-		if err := d.requireEmpty(); err != nil {
-			return Generation{}, err
-		}
+		err = d.commitSupersede(ctx, record)
+	} else {
+		err = writeRecord(d.layout.swap, record)
 	}
-	if err := writeRecord(d.layout.swap, record); err != nil {
+	if err != nil {
 		return Generation{}, err
 	}
 	if err := d.settleSwap(ctx, record); err != nil {
@@ -275,6 +288,77 @@ func (d *Deployment) land(ctx context.Context, candidate Candidate, supersede bo
 		return Generation{}, err
 	}
 	return d.inspect(ctx, d.layout.canonical)
+}
+
+// commitSupersede quiesces the incumbent, converges its services away, and
+// writes the swap record that commits the rename pair. An abort anywhere
+// before that record restores the incumbent, and both outcomes are reported.
+func (d *Deployment) commitSupersede(ctx context.Context, record swapRecord) error {
+	applied, err := d.appliedServices()
+	if err != nil {
+		return err
+	}
+	if _, err := d.quiesceAndConverge(ctx, nil); err != nil {
+		return errors.Join(err, d.restore(ctx, *record.Prior, applied))
+	}
+	if err := d.requireEmpty(); err != nil {
+		return errors.Join(err, d.restore(ctx, *record.Prior, applied))
+	}
+	if err := writeRecord(d.layout.swap, record); err != nil {
+		return errors.Join(err, d.restore(ctx, *record.Prior, applied))
+	}
+	return nil
+}
+
+// restore puts the incumbent an aborted supersede stopped back into service:
+// the agents whose labels the services record named before the quiesce are
+// re-applied — launchd.Apply kickstarts a loaded-but-dead job and re-bootstraps
+// a removed one — and the daemon is proved ready again. It inspects before it
+// acts: a swap record on disk means the commit landed and forward recovery
+// owns it; a canonical path no longer holding prior is nothing this can put
+// back; and a daemon still answering ready — a quiesce that failed before it
+// stopped anything — is left exactly as it is, since an Apply over a drifted
+// plist would boot it out with no absence proof behind it. The sealed
+// activation described the instance the quiesce ended, so it is discarded
+// rather than left to refuse the next Activate.
+func (d *Deployment) restore(ctx context.Context, prior Generation, labels []string) error {
+	if fileExists(d.layout.swap) {
+		return nil
+	}
+	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), restoreGrace)
+	defer cancel()
+	installed, err := d.inspect(restoreCtx, d.layout.canonical)
+	if err != nil {
+		return fmt.Errorf("deploy: restore incumbent: %w", err)
+	}
+	if !installed.sameTree(prior) {
+		return fmt.Errorf("%w: restore refused, the canonical app is no longer the incumbent", ErrConflict)
+	}
+	probeCtx, cancelProbe := context.WithTimeout(restoreCtx, restoreGrace/readinessReserve)
+	health, err := d.client.WaitReady(probeCtx)
+	cancelProbe()
+	if err == nil && health.Phase == daemonkit.PhaseReady {
+		return nil
+	}
+	if err := durable.Remove(d.layout.activation); err != nil {
+		return fmt.Errorf("deploy: restore incumbent: %w", err)
+	}
+	if err := d.recordServices(labels); err != nil {
+		return fmt.Errorf("deploy: restore incumbent: %w", err)
+	}
+	for _, label := range labels {
+		index := slices.IndexFunc(d.config.Agents, func(agent launchd.Agent) bool { return agent.Label == label })
+		if index < 0 {
+			return fmt.Errorf("%w: restore has no agent for the recorded label %q", ErrConfig, label)
+		}
+		if err := launchd.Apply(restoreCtx, d.run, d.config.Agents[index]); err != nil {
+			return fmt.Errorf("deploy: restore agent %q: %w", label, err)
+		}
+	}
+	if _, err := d.prove(restoreCtx); err != nil {
+		return fmt.Errorf("deploy: restore incumbent: %w", err)
+	}
+	return nil
 }
 
 // Activate converges launchd to the deployment's exact agent set and seals

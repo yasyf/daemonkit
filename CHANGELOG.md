@@ -6,6 +6,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Client.Terminate` ends a recorded incumbent that will not leave and proves
+  it gone: SIGTERM at the recorded identity, a grace share of re-verified
+  observation, SIGKILL, then observed absence, inside the caller's deadline.
+  Every signal is addressed to the `{pid, start, boot}` pin under a complete
+  build-and-generation expectation, so a reused PID or a record naming another
+  incumbent is never signalled. It is the one escalation daemonkit has: Ensure
+  and Stop's wedged-incumbent repair now runs through it, and so does
+  `deploy.Quiesce`.
+
+### Changed
+
+- `deploy.Quiesce` escalates. An incumbent that does not leave inside the
+  drain's share of the budget is ended through `Client.Terminate`, whichever
+  daemonkit it was built on, since the ladder runs in the process doing the
+  deploy. A daemon parked over abandoned shutdown stages, holding its flock
+  with no socket and no children, used to wait out the whole transaction
+  deadline and then fail it with "process did not provably exit"; now it is
+  SIGTERMed out of the park and the swap lands.
+- `deploy.Quiesce` ends what still runs from the bundle's own executables — an
+  app extension the system launched, an orphaned helper — through the same
+  identity-checked ladder, then proves the inventory empty as before. A live
+  process on the installed bundle refused Supersede, Uninstall, Reset, and a
+  resumed swap outright; every one of them now terminates it at its pin. A
+  process on a declared host executable outside the bundle is still refused,
+  never signalled: it may be the launcher driving the deploy.
+- `Supersede` stages and validates the candidate before it quiesces the
+  incumbent, so a bundle that is the wrong version, the wrong bytes, or
+  unsigned is refused with the incumbent still serving.
+- `Supersede` restores the incumbent on every abort between the quiesce and
+  the swap record: the services the durable record named are recorded and
+  applied again, the sealed activation for the drained instance is discarded,
+  and the daemon is proved ready, on a 30s clock of the restore's own so a
+  transaction whose deadline ran out still puts the machine back. The abort
+  and the restore's outcome are reported joined. A live process on the old
+  bundle used to abort the deploy after the daemon was stopped and its agent
+  exited, leaving nothing serving until a hand kickstart.
+
 ### Fixed
 
 - A signed-app descriptor's `app.dir` now expands a leading `~/` through the

@@ -394,69 +394,68 @@ func TestDaemonAgent(t *testing.T) {
 	}
 }
 
-func TestRepairWedgedAddressesTheRecordedIdentity(t *testing.T) {
+func TestTerminateAddressesTheRecordedIdentity(t *testing.T) {
 	recorded, owner := settleFixture(t)
-	path := recorded.RecordPath()
-	noRecord := filepath.Join(t.TempDir(), "absent.records")
-	unreadable := filepath.Join(t.TempDir(), "unreadable.records")
-	if err := os.MkdirAll(unreadable, 0o700); err != nil {
+	unreadable := Daemon{Label: "com.example.unreadable"}
+	if err := os.MkdirAll(unreadable.RecordPath(), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	sigterm := make(chan os.Signal, 1)
-	signal.Notify(sigterm, syscall.SIGTERM)
-	t.Cleanup(func() { signal.Stop(sigterm) })
+	sigterm := notifySIGTERM(t)
 	tests := []struct {
 		name       string
-		recordPath string
-		target     incumbent
+		daemon     Daemon
+		expect     Expect
 		wantErr    error
 		wantAnyErr bool
 	}{
 		{
-			name:       "a record naming another build is not signalled",
-			recordPath: path,
-			target:     incumbent{build: "b2", generation: owner.Generation},
-			wantErr:    ErrWrongIncumbent,
+			name:    "a record naming another build is not signalled",
+			daemon:  recorded,
+			expect:  Expect{Build: "b2", Generation: owner.Generation},
+			wantErr: ErrWrongIncumbent,
 		},
 		{
-			name:       "a record naming another instance is not signalled",
-			recordPath: path,
-			target:     incumbent{build: owner.Build, generation: owner.Generation + 1},
-			wantErr:    ErrWrongIncumbent,
+			name:    "a record naming another instance is not signalled",
+			daemon:  recorded,
+			expect:  Expect{Build: owner.Build, Generation: owner.Generation + 1},
+			wantErr: ErrWrongIncumbent,
 		},
 		{
-			name:       "no owner record names nobody to signal",
-			recordPath: noRecord,
-			wantErr:    ErrUnrecorded,
+			name:    "an incomplete expectation names nobody to signal",
+			daemon:  recorded,
+			expect:  Expect{Build: owner.Build},
+			wantErr: nil,
+		},
+		{
+			name:    "no owner record names nobody to signal",
+			daemon:  Daemon{Label: "com.example.absent"},
+			expect:  Expect{Build: owner.Build, Generation: owner.Generation},
+			wantErr: ErrUnrecorded,
 		},
 		{
 			name:       "an unreadable record propagates",
-			recordPath: unreadable,
+			daemon:     unreadable,
+			expect:     Expect{Build: owner.Build, Generation: owner.Generation},
 			wantAnyErr: true,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			target := tt.target
-			if target == (incumbent{}) {
-				target = incumbent{build: owner.Build, generation: owner.Generation}
-			}
-			err := repairWedged(tt.recordPath, target)
+			client := openClient(t, tt.daemon)
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			_, err := client.Terminate(ctx, tt.expect)
 			switch {
-			case tt.wantAnyErr:
+			case tt.wantAnyErr || tt.wantErr == nil:
 				if err == nil || errors.Is(err, ErrUnrecorded) || errors.Is(err, ErrWrongIncumbent) {
-					t.Fatalf("repairWedged() error = %v, want the record read propagated", err)
+					t.Fatalf("Terminate() error = %v, want a refusal of its own", err)
 				}
 			default:
 				if !errors.Is(err, tt.wantErr) {
-					t.Fatalf("repairWedged() error = %v, want %v", err, tt.wantErr)
+					t.Fatalf("Terminate() error = %v, want %v", err, tt.wantErr)
 				}
 			}
-			select {
-			case sig := <-sigterm:
-				t.Fatalf("repairWedged delivered %v to pid %d, which the record does not name as the target", sig, owner.PID)
-			default:
-			}
+			selfSpared(t, sigterm)
 		})
 	}
 }
@@ -478,24 +477,32 @@ func selfSpared(t *testing.T, sigterm <-chan os.Signal) {
 	t.Helper()
 	select {
 	case sig := <-sigterm:
-		t.Fatalf("repairWedged delivered %v to this process %d, which no record under test names", sig, os.Getpid())
+		t.Fatalf("Terminate delivered %v to this process %d, which no record under test names", sig, os.Getpid())
 	case <-time.After(200 * time.Millisecond):
 	}
 }
 
-// TestRepairWedgedTerminatesTheLiveRecordedIncumbent is the arm the refusals
-// are refusals of: a record that still names the target and still names a live
-// process is the wedged daemon repairWedged exists to end. The incumbent is a
-// real daemon child that recorded itself, so the address under test is the
-// kernel's answer for that child and the departure is its actual exit.
-func TestRepairWedgedTerminatesTheLiveRecordedIncumbent(t *testing.T) {
+// TestTerminateEndsTheLiveRecordedIncumbent is the arm the refusals are
+// refusals of: a record that still names the target and still names a live
+// process is the wedged daemon Terminate exists to end. The incumbent is a real
+// daemon child that recorded itself, so the address under test is the kernel's
+// answer for that child, the departure is its actual exit, and the reap is the
+// ladder's own observation of it.
+func TestTerminateEndsTheLiveRecordedIncumbent(t *testing.T) {
 	d, child, owner := liveOwnerFixture(t, "dkwedged")
 	if want := ownerAt(probed(t, child.Process.Pid), owner.Build, owner.Generation); owner != want {
 		t.Fatalf("the record names %+v, want the live child's identity %+v", owner, want)
 	}
+	client := openClient(t, d)
 	sigterm := notifySIGTERM(t)
-	if err := repairWedged(d.RecordPath(), incumbent{build: owner.Build, generation: owner.Generation}); err != nil {
-		t.Fatalf("repairWedged() error = %v", err)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	stopped, err := client.Terminate(ctx, Expect{Build: owner.Build, Generation: owner.Generation})
+	if err != nil {
+		t.Fatalf("Terminate() error = %v", err)
+	}
+	if stopped.Reap != ReapTerminated || stopped.Before.PID != owner.PID {
+		t.Fatalf("Terminate() = %+v, want ReapTerminated for pid %d", stopped, owner.PID)
 	}
 	exited := make(chan error, 1)
 	go func() { exited <- child.Wait() }()
@@ -507,40 +514,59 @@ func TestRepairWedgedTerminatesTheLiveRecordedIncumbent(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		_ = child.Process.Kill()
 		<-exited
-		t.Fatalf("the recorded incumbent %d is still running: repairWedged addressed nobody", owner.PID)
+		t.Fatalf("the recorded incumbent %d is still running: Terminate addressed nobody", owner.PID)
 	}
 	selfSpared(t, sigterm)
 }
 
-// TestRepairWedgedHoldsTheRecordedPinAgainstTheKernel drives the two gates that
-// stand between a record naming the target and the signal: the recorded pid
-// must still be live, and the {start, boot} riding with it must still be the
-// kernel's answer for that pid. Every case names a pid this process may not
-// signal away — its own, or a real reaped one — so a gate that stopped holding
-// is a SIGTERM at the test binary.
-func TestRepairWedgedHoldsTheRecordedPinAgainstTheKernel(t *testing.T) {
-	self := probed(t, os.Getpid())
-	reused := self
+// TestTerminateHoldsTheRecordedPinAgainstTheKernel drives the gates that stand
+// between a record naming the target and the signal: the recorded pid must
+// still be live, the {start, boot} riding with it must still be the kernel's
+// answer for that pid, and this process is never an address. Every case names
+// a pid the ladder may not signal — a live child under another start stamp,
+// this process, or a real reaped one — so a gate that stopped holding is a
+// SIGTERM at the test binary or at a child still running afterwards.
+func TestTerminateHoldsTheRecordedPinAgainstTheKernel(t *testing.T) {
+	_, child, live := liveOwnerFixture(t, "dkpinned")
+	reused := live.Identity()
 	reused.Start++
+	self := probed(t, os.Getpid())
 	crossBoot := self
 	crossBoot.Boot++
 	sigterm := notifySIGTERM(t)
 	tests := []struct {
-		name  string
-		owner proc.Owner
+		name    string
+		owner   proc.Owner
+		want    Reap
+		refused bool
 	}{
-		{"a departed incumbent is not signalled", ownerAt(departedIdentity(t), "b1", 7)},
-		{"a reused pid is not signalled", ownerAt(reused, "b1", 7)},
-		{"a cross-boot pid is not signalled", ownerAt(crossBoot, "b1", 7)},
+		{name: "a departed incumbent is not signalled", owner: ownerAt(departedIdentity(t), "b1", 7), want: ReapAbsent},
+		{name: "a reused pid is not signalled", owner: ownerAt(reused, "b1", 7), want: ReapReused},
+		{name: "a cross-boot pid is not signalled", owner: ownerAt(crossBoot, "b1", 7), want: ReapCrossBoot},
+		{name: "this process is refused", owner: ownerAt(self, "b1", 7), refused: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			record := forgeOwnerRecord(t, tt.owner)
-			target := incumbent{build: tt.owner.Build, generation: tt.owner.Generation}
-			if err := repairWedged(record, target); err != nil {
-				t.Fatalf("repairWedged() error = %v", err)
+			d := Daemon{Label: "com.example.pinned"}
+			forgeOwnerRecordAt(t, d.RecordPath(), tt.owner)
+			client := openClient(t, d)
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			stopped, err := client.Terminate(ctx, Expect{Build: tt.owner.Build, Generation: tt.owner.Generation})
+			switch {
+			case tt.refused:
+				if err == nil {
+					t.Fatalf("Terminate() = %+v, want a refusal to address this process", stopped)
+				}
+			case err != nil:
+				t.Fatalf("Terminate() error = %v", err)
+			case stopped.Reap != tt.want:
+				t.Fatalf("Terminate() reap = %d, want %d", stopped.Reap, tt.want)
 			}
 			selfSpared(t, sigterm)
+			if _, err := proc.ProbeIdentity(child.Process.Pid); err != nil {
+				t.Fatalf("the live child %d is gone: Terminate signalled a pin the record did not name", child.Process.Pid)
+			}
 		})
 	}
 }
@@ -559,9 +585,11 @@ func (forgedOwner) Cores() []state.Core { return nil }
 // is same-UID writable input — that is the whole reason an eviction re-probes
 // what it names — and a store only ever records the process that opens it, so a
 // record naming any other identity has to be written here.
-func forgeOwnerRecord(t *testing.T, owner proc.Owner) string {
+func forgeOwnerRecordAt(t *testing.T, record string, owner proc.Owner) string {
 	t.Helper()
-	record := filepath.Join(t.TempDir(), "records.dkstate")
+	if err := os.MkdirAll(filepath.Dir(record), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := state.New[forgedOwner](record, ownerRecordSchema).Store(forgedOwner{Owner: owner}); err != nil {
 		t.Fatalf("forge an owner record at %q: %v", record, err)
 	}

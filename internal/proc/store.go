@@ -86,9 +86,7 @@ type Store struct {
 	closed    chan struct{}
 	done      chan struct{}
 
-	prober   prober
-	signaler signaler
-	clock    clock
+	ladder
 }
 
 // LockPath is the exclusive lock one record store's owner holds for its whole
@@ -140,9 +138,7 @@ func openLocked(path string, lock *durable.Lock) (*Store, error) {
 		ops:        make(chan func(*records)),
 		closed:     make(chan struct{}),
 		done:       make(chan struct{}),
-		prober:     sysProber{},
-		signaler:   sysSignaler{},
-		clock:      realClock{},
+		ladder:     sysLadder(),
 	}
 	go s.writer(value)
 	return s, nil

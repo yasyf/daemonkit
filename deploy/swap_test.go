@@ -178,8 +178,8 @@ func TestRecoverRefusesATornRenamePair(t *testing.T) {
 // TestRecoverGatesTheResumedDestruction pins the gate on the resume path. The
 // record a crash leaves behind drives the rename pair to its end and then
 // destroys the generation it superseded, and every verb starts by resuming it
-// — so a resume that skipped the gate would hand each of them the destruction
-// the first pass refuses while a process of the deployment is still live.
+// — so a resume that skipped the gate would hand each of them a destruction
+// under a process of the deployment still running, where the gate ends it.
 func TestRecoverGatesTheResumedDestruction(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -207,13 +207,14 @@ func TestRecoverGatesTheResumedDestruction(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			f := newFixture(t)
 			f.crash("one", "two", tt.place)
-			f.liveSlot()
-			if err := f.deploy.recover(f.ctx()); !errors.Is(err, ErrLive) {
-				t.Fatalf("recover err = %v, want ErrLive", err)
+			stray := f.liveSlot()
+			if err := f.deploy.recover(f.ctx()); err != nil {
+				t.Fatalf("recover: %v", err)
 			}
-			f.wantSuperseded("one")
-			if !fileExists(f.deploy.layout.swap) {
-				t.Error("a refused resume retired the swap record")
+			f.terminated(stray)
+			f.wantCanonical("two")
+			if fileExists(f.deploy.layout.swap) || fileExists(f.deploy.layout.prior) {
+				t.Error("a gated resume left the swap record or the prior tree behind")
 			}
 		})
 	}
@@ -352,12 +353,13 @@ func TestResetScansTheStrandedPriorItReclaims(t *testing.T) {
 	if _, err := f.deploy.Install(f.ctx(), f.candidate("Source", "1.0", "one")); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	f.live(stranded)
-	if err := f.deploy.Reset(f.ctx()); !errors.Is(err, ErrLive) {
-		t.Fatalf("Reset err = %v, want ErrLive: the stranded prior tree at %q is running", err, stranded)
+	stray := f.live(stranded)
+	if err := f.deploy.Reset(f.ctx()); err != nil {
+		t.Fatalf("Reset: %v", err)
 	}
-	if !fileExists(stranded) {
-		t.Fatal("Reset destroyed a stranded prior tree a live process was running")
+	f.terminated(stray)
+	if fileExists(stranded) {
+		t.Fatal("Reset left the stranded prior tree behind")
 	}
 }
 
@@ -433,19 +435,6 @@ func (f *fixture) wantCanonical(body string) {
 	if string(got) != body {
 		f.t.Fatalf("canonical body = %q, want %q", got, body)
 	}
-}
-
-// wantSuperseded asserts the generation the swap replaces is still on disk, at
-// whichever of the two slots the crash point left it in.
-func (f *fixture) wantSuperseded(body string) {
-	f.t.Helper()
-	for _, path := range []string{f.deploy.layout.canonical, f.deploy.layout.prior} {
-		got, err := os.ReadFile(filepath.Join(path, bundleBodyRel))
-		if err == nil && string(got) == body {
-			return
-		}
-	}
-	f.t.Fatalf("the superseded generation %q survives at neither the canonical path nor the prior slot", body)
 }
 
 func rename(t *testing.T, from, to string) {
