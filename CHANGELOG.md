@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-09-15
+
 ### Changed
 
 - A supersede runs every codesign before it quiesces the incumbent. The swap
@@ -1574,7 +1576,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.29.0...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.30.0...HEAD
+[0.30.0]: https://github.com/yasyf/daemonkit/compare/v0.29.0...v0.30.0
 [0.29.0]: https://github.com/yasyf/daemonkit/compare/v0.28.1...v0.29.0
 [0.28.1]: https://github.com/yasyf/daemonkit/compare/v0.28.0...v0.28.1
 [0.28.0]: https://github.com/yasyf/daemonkit/compare/v0.27.1...v0.28.0
