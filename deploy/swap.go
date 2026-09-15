@@ -19,32 +19,8 @@ const (
 	stageSuffix = ".app"
 )
 
-// swap runs the rename pair record commits on the attestations made before
-// the quiesce; both generations are held to their attested inode and digest
-// before either rename, so a change is refused with the incumbent in place.
-func (d *Deployment) swap(record swapRecord) error {
-	staged := record.Candidate
-	staged.Path = d.layout.candidate
-	if err := staged.unchanged(); err != nil {
-		return err
-	}
-	if record.Prior != nil {
-		if err := record.Prior.unchanged(); err != nil {
-			return err
-		}
-		if err := durable.RemoveTree(d.layout.prior); err != nil {
-			return err
-		}
-		if err := durable.Rename(d.layout.canonical, d.layout.prior); err != nil {
-			return err
-		}
-	}
-	return durable.Rename(d.layout.candidate, d.layout.canonical)
-}
-
-// settleSwap drives a resumed rename pair to its end: the canonical bundle
-// aside to prior, then the staged candidate into canonical. A resume holds no
-// attestation, so it re-verifies every generation it moves.
+// settleSwap drives the outstanding rename pair to its end: the canonical
+// bundle aside to prior, then the staged candidate into canonical.
 //
 // Each rename carries its own precondition, and that precondition is also its
 // idempotency check — a landed rename makes its own guard false. So the
@@ -131,9 +107,16 @@ func (d *Deployment) settleSwap(ctx context.Context, record swapRecord) error {
 // nothing, and quiescing a healthy daemon to delete a stale record would be
 // the larger harm.
 func (d *Deployment) recover(ctx context.Context) error {
-	record, outstanding, err := d.outstandingSwap()
-	if err != nil || !outstanding {
+	var record swapRecord
+	err := readRecord(d.layout.swap, &record)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
 		return err
+	}
+	if record.Target != d.layout.canonical {
+		return fmt.Errorf("%w: swap record names %q", ErrState, record.Target)
 	}
 	destroys, err := d.resumeDestroys(ctx, record)
 	if err != nil {
@@ -147,46 +130,7 @@ func (d *Deployment) recover(ctx context.Context) error {
 	if err := d.settleSwap(ctx, record); err != nil {
 		return err
 	}
-	if err := d.retireSeals(); err != nil {
-		return err
-	}
 	return d.retireSwap(record)
-}
-
-func (d *Deployment) outstandingSwap() (swapRecord, bool, error) {
-	var record swapRecord
-	err := readRecord(d.layout.swap, &record)
-	if errors.Is(err, os.ErrNotExist) {
-		return swapRecord{}, false, nil
-	}
-	if err != nil {
-		return swapRecord{}, false, err
-	}
-	if record.Target != d.layout.canonical {
-		return swapRecord{}, false, fmt.Errorf("%w: swap record names %q", ErrState, record.Target)
-	}
-	return record, true, nil
-}
-
-// landedSwap is the outstanding swap whose candidate the canonical path
-// already holds, by inode and then by digest: the supersede an Activate
-// completes. Another inode there is a swap still to settle.
-func (d *Deployment) landedSwap() (swapRecord, bool, error) {
-	record, outstanding, err := d.outstandingSwap()
-	if err != nil || !outstanding {
-		return swapRecord{}, false, err
-	}
-	id, err := identifyPath(d.layout.canonical)
-	if errors.Is(err, os.ErrNotExist) || (err == nil && id != record.Candidate.FileID) {
-		return swapRecord{}, false, nil
-	}
-	if err != nil {
-		return swapRecord{}, false, fmt.Errorf("deploy: identify bundle: %w", err)
-	}
-	if err := record.Candidate.unchanged(); err != nil {
-		return swapRecord{}, false, err
-	}
-	return record, true, nil
 }
 
 // resumeDestroys reports whether driving record to its end still moves or
@@ -208,20 +152,14 @@ func (d *Deployment) resumeDestroys(ctx context.Context, record swapRecord) (boo
 	return !occupant.sameTree(record.Candidate), nil
 }
 
-func (d *Deployment) retireSeals() error {
-	return errors.Join(
-		durable.Remove(d.layout.activation),
-		durable.Remove(d.layout.removal),
-	)
-}
-
-// retireSwap destroys the superseded tree the landed swap in record names,
-// then the record.
+// retireSwap discards everything the landed swap in record invalidates: the
+// superseded tree, the sealed activation its readiness no longer describes, and
+// the tombstone minted for a generation that is no longer installed.
 //
 // The prior tree is destroyed only when the record names one, and that is what
 // keeps this a gated destruction: a record naming a prior is one whose pass
-// proved the deployment empty and whose swap renamed that very generation
-// aside, so the bytes destroyed here are the bytes that gate scanned. A
+// proved the deployment empty and whose settle renamed that very generation
+// aside, so the bytes destroyed here are the bytes the gate just scanned. A
 // record naming none — a first install, whose canonical path was empty and
 // which therefore proves nothing absent — leaves a tree some earlier crash
 // stranded in the slot alone; reclaiming it is Reset's, under the whole gate.
@@ -230,12 +168,19 @@ func (d *Deployment) retireSeals() error {
 // while it is on disk the next verb's resume comes back through here, so a
 // crash mid-retirement cannot strand a stale record that no resume revisits.
 // A failure is the same window as a crash and gets the same cover, which is
-// why a prior tree that could not be destroyed keeps its record.
+// why the record's removal is a call of its own: errors.Join evaluates every
+// argument it is handed, so a prior tree that could not be destroyed would
+// still have had its record retired out from under it.
 func (d *Deployment) retireSwap(record swapRecord) error {
+	retired := []error{
+		durable.Remove(d.layout.activation),
+		durable.Remove(d.layout.removal),
+	}
 	if record.Prior != nil {
-		if err := durable.RemoveTree(d.layout.prior); err != nil {
-			return err
-		}
+		retired = append(retired, durable.RemoveTree(d.layout.prior))
+	}
+	if err := errors.Join(retired...); err != nil {
+		return err
 	}
 	return durable.Remove(d.layout.swap)
 }

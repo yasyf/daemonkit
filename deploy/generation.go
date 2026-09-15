@@ -94,7 +94,7 @@ func (d *Deployment) inspect(ctx context.Context, appPath string) (Generation, e
 	if err := validateCanonicalAppPath(appPath); err != nil {
 		return Generation{}, err
 	}
-	signature, err := d.verify(ctx, appPath, d.requirement)
+	signature, err := codesignVerifier{}.Verify(ctx, appPath, d.requirement)
 	if err != nil {
 		return Generation{}, fmt.Errorf("deploy: verify signed bundle: %w", err)
 	}
@@ -132,24 +132,6 @@ func (d *Deployment) attest(ctx context.Context, expected Generation) error {
 	}
 	if !reflect.DeepEqual(current, expected) {
 		return fmt.Errorf("%w: bundle at %q changed", ErrConflict, expected.Path)
-	}
-	return nil
-}
-
-// unchanged holds the bundle at g.Path to the attestation g carries without
-// running codesign again: the same inode and the same whole-tree digest are
-// every byte the verifier read, so what it proved of them still stands.
-func (g Generation) unchanged() error {
-	id, err := identifyPath(g.Path)
-	if err != nil {
-		return fmt.Errorf("deploy: identify bundle: %w", err)
-	}
-	tree, err := BundleDigest(g.Path)
-	if err != nil {
-		return err
-	}
-	if id != g.FileID || tree.String() != g.BundleDigest {
-		return fmt.Errorf("%w: bundle at %q changed", ErrConflict, g.Path)
 	}
 	return nil
 }

@@ -891,165 +891,11 @@ func TestSupersedeReplacesTheInstalledGeneration(t *testing.T) {
 	if landed.Version != "2.0" || landed.BundleDigest != next.Digest.String() {
 		t.Fatalf("Supersede = %+v, want version 2.0 at %q", landed, next.Digest)
 	}
-	if fileExists(f.deploy.layout.candidate) {
-		t.Fatal("Supersede stranded the staged candidate in its slot")
-	}
-	if !fileExists(f.deploy.layout.prior) || !fileExists(f.deploy.layout.swap) {
-		t.Fatal("Supersede retired the prior tree before an Activate proved the candidate serving")
+	if fileExists(f.deploy.layout.prior) || fileExists(f.deploy.layout.swap) {
+		t.Fatal("Supersede left the prior tree or the swap record behind")
 	}
 	if fileExists(f.deploy.layout.activation) {
 		t.Fatal("Supersede kept the departed generation's sealed activation")
-	}
-}
-
-// TestSupersedeVerifiesOnlyBeforeTheQuiesce pins the one budget deploy holds
-// over the window with no daemon listening: every codesign runs while the
-// incumbent still serves, and the swap and the Activate that completes it hold
-// the attested generations to their inode and digest instead.
-func TestSupersedeVerifiesOnlyBeforeTheQuiesce(t *testing.T) {
-	f := newFixture(t)
-	if _, err := f.deploy.Install(f.ctx(), f.candidate("First", "1.0", "one")); err != nil {
-		t.Fatalf("Install: %v", err)
-	}
-	f.startDaemonChild(0)
-	if _, err := f.deploy.Activate(f.ctx()); err != nil {
-		t.Fatalf("Activate: %v", err)
-	}
-	quiesced := false
-	verifies := map[bool]int{}
-	verify := f.deploy.verify
-	f.deploy.verify = func(ctx context.Context, appPath, requirement string) (signatureAttestation, error) {
-		verifies[quiesced]++
-		return verify(ctx, appPath, requirement)
-	}
-	f.deploy.run = func(_ context.Context, _ string, args ...string) (string, int, error) {
-		f.launchctls = append(f.launchctls, args)
-		switch args[0] {
-		case "bootout":
-			quiesced = true
-		case "bootstrap":
-			f.startDaemonChild(0)
-		}
-		return "", 0, nil
-	}
-	landed, err := f.deploy.Supersede(f.ctx(), f.candidate("Second", "2.0", "two"))
-	if err != nil {
-		t.Fatalf("Supersede: %v", err)
-	}
-	if !quiesced || verifies[false] == 0 {
-		t.Fatalf("quiesced = %v with %d verifies before it; the candidate was never attested", quiesced, verifies[false])
-	}
-	if verifies[true] != 0 {
-		t.Fatalf("codesign ran %d time(s) after the incumbent was quiesced", verifies[true])
-	}
-	activation, err := f.deploy.Activate(f.ctx())
-	if err != nil {
-		t.Fatalf("Activate: %v", err)
-	}
-	if verifies[true] != 0 {
-		t.Fatalf("Activate ran codesign %d time(s) over the generation the supersede attested", verifies[true])
-	}
-	if activation.Generation != landed {
-		t.Fatalf("Activate sealed %+v, want the landed %+v", activation.Generation, landed)
-	}
-}
-
-// TestSupersedeRefusesAGenerationChangedUnderTheQuiesce is what the swap's
-// identity check has to catch without codesign: a tree whose bytes changed
-// between its attestation and the rename is refused, and refused before
-// either rename runs, so the incumbent is still where the restore left it.
-func TestSupersedeRefusesAGenerationChangedUnderTheQuiesce(t *testing.T) {
-	tests := []struct {
-		name string
-		tree func(f *fixture) string
-	}{
-		{"candidate", func(f *fixture) string { return f.deploy.layout.candidate }},
-		{"prior", func(f *fixture) string { return f.deploy.layout.canonical }},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			f := newFixture(t)
-			if _, err := f.deploy.Install(f.ctx(), f.candidate("First", "1.0", "one")); err != nil {
-				t.Fatalf("Install: %v", err)
-			}
-			f.startDaemonChild(0)
-			if _, err := f.deploy.Activate(f.ctx()); err != nil {
-				t.Fatalf("Activate: %v", err)
-			}
-			f.deploy.run = func(_ context.Context, _ string, args ...string) (string, int, error) {
-				f.launchctls = append(f.launchctls, args)
-				if args[0] == "bootout" {
-					write(t, tt.tree(f), bundleBodyRel, "tampered", 0o644)
-				}
-				return "", 0, nil
-			}
-			if _, err := f.deploy.Supersede(f.ctx(), f.candidate("Second", "2.0", "two")); !errors.Is(err, ErrConflict) {
-				t.Fatalf("Supersede err = %v, want ErrConflict", err)
-			}
-			if fileExists(f.deploy.layout.prior) {
-				t.Fatal("the swap moved the incumbent aside for a generation it refused")
-			}
-			if !fileExists(f.deploy.layout.candidate) {
-				t.Fatal("the swap landed a generation it refused")
-			}
-		})
-	}
-}
-
-// TestActivateRetiresThePriorTreeAfterProvingReadiness pins where the
-// superseded tree's deletion sits: after the successor is proved serving and
-// its activation sealed, never in the window with no daemon listening, and
-// with the swap record kept until the tree is gone so a retry completes it.
-func TestActivateRetiresThePriorTreeAfterProvingReadiness(t *testing.T) {
-	f := newFixture(t)
-	if _, err := f.deploy.Install(f.ctx(), f.candidate("First", "1.0", "one")); err != nil {
-		t.Fatalf("Install: %v", err)
-	}
-	f.startDaemonChild(0)
-	if _, err := f.deploy.Activate(f.ctx()); err != nil {
-		t.Fatalf("Activate: %v", err)
-	}
-	spawn := false
-	f.deploy.run = func(_ context.Context, _ string, args ...string) (string, int, error) {
-		f.launchctls = append(f.launchctls, args)
-		if spawn && (args[0] == "bootstrap" || args[0] == "kickstart") {
-			spawn = false
-			f.startDaemonChild(0)
-		}
-		return "", 0, nil
-	}
-	landed, err := f.deploy.Supersede(f.ctx(), f.candidate("Second", "2.0", "two"))
-	if err != nil {
-		t.Fatalf("Supersede: %v", err)
-	}
-	if _, err := f.deploy.Activate(f.within(3 * time.Second)); !errors.Is(err, daemonkit.ErrAbsent) {
-		t.Fatalf("Activate err = %v, want ErrAbsent with nothing serving", err)
-	}
-	if !fileExists(f.deploy.layout.prior) || !fileExists(f.deploy.layout.swap) {
-		t.Fatal("the prior tree was retired before any daemon was proved serving")
-	}
-	unseal := sealTree(t, f.deploy.layout.prior)
-	spawn = true
-	sealedErr := errors.New("Activate = nil, want the undeletable prior tree's failure")
-	if _, err := f.deploy.Activate(f.ctx()); err != nil {
-		sealedErr = err
-	}
-	if !fileExists(f.deploy.layout.activation) {
-		t.Fatalf("Activate err = %v, and no readiness was sealed before it reached the prior tree", sealedErr)
-	}
-	if !fileExists(f.deploy.layout.swap) {
-		t.Fatal("Activate discarded the record that brings the next pass back to the surviving prior tree")
-	}
-	unseal()
-	activation, err := f.deploy.Activate(f.ctx())
-	if err != nil {
-		t.Fatalf("Activate retry: %v", err)
-	}
-	if activation.Generation != landed {
-		t.Fatalf("Activate sealed %+v, want the landed %+v", activation.Generation, landed)
-	}
-	if fileExists(f.deploy.layout.prior) || fileExists(f.deploy.layout.swap) {
-		t.Fatal("Activate left the prior tree or the swap record behind after proving the successor")
 	}
 }
 
@@ -1638,8 +1484,8 @@ func TestSupersedeConsumesAByteIdenticalCandidate(t *testing.T) {
 	if fileExists(f.deploy.layout.candidate) {
 		t.Fatal("Supersede stranded the staged candidate in its slot")
 	}
-	if !fileExists(f.deploy.layout.prior) || !fileExists(f.deploy.layout.swap) {
-		t.Fatal("Supersede retired the identical prior before an Activate proved the candidate serving")
+	if fileExists(f.deploy.layout.prior) || fileExists(f.deploy.layout.swap) {
+		t.Fatal("Supersede left the prior tree or the swap record behind")
 	}
 	if _, err := f.deploy.Supersede(f.ctx(), f.candidate("Next", "2.0", "two")); err != nil {
 		t.Fatalf("Supersede after an identical candidate: %v", err)
@@ -1848,23 +1694,17 @@ func TestSupersedeClearsAnOccupiedPriorSlot(t *testing.T) {
 			if landed.Version != "2.0" {
 				t.Fatalf("Supersede = %+v, want the 2.0 generation", landed)
 			}
-			if fileExists(f.deploy.layout.candidate) {
-				t.Error("Supersede stranded the staged candidate in its slot")
-			}
-			if !fileExists(f.deploy.layout.prior) || !fileExists(f.deploy.layout.swap) {
-				t.Error("Supersede retired the prior tree before an Activate proved the candidate serving")
-			}
-			if err := f.deploy.Reset(f.ctx()); err != nil {
-				t.Fatalf("Reset: %v", err)
-			}
 			for name, path := range map[string]string{
 				"swap":      f.deploy.layout.swap,
 				"prior":     f.deploy.layout.prior,
 				"candidate": f.deploy.layout.candidate,
 			} {
 				if fileExists(path) {
-					t.Errorf("Reset left %s behind at %q", name, path)
+					t.Errorf("Supersede left %s behind at %q", name, path)
 				}
+			}
+			if err := f.deploy.Reset(f.ctx()); err != nil {
+				t.Fatalf("Reset: %v", err)
 			}
 			installed, err := f.deploy.inspect(f.ctx(), f.app)
 			if err != nil || installed.Version != "2.0" {
