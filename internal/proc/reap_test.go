@@ -271,9 +271,6 @@ func TestReapRetainsRecordWhenKilledProcessNeverSettles(t *testing.T) {
 	}
 }
 
-// A killed process that takes 3s to leave the table settles under a 6s
-// deadline only because the TERM grace is cut to leave SettleGrace for the
-// kill: the 0.6 share alone would spend 3.6s on TERM and give the kill 2.4s.
 func TestReapReservesSettleGraceForTheKillTail(t *testing.T) {
 	s, _ := newTestStore(t)
 	var killedAt time.Time
@@ -315,6 +312,27 @@ func TestReapNamesAKilledProcessStillExitingAtTheDeadline(t *testing.T) {
 	_, err := s.reapIdentity(ladderContext(t, 400*time.Millisecond), identity{pid: 4242, start: 1, boot: testBoot}, 0)
 	if !errors.Is(err, ErrUnsettled) || !strings.Contains(err.Error(), "still exiting") {
 		t.Fatalf("reapIdentity() error = %v, want ErrUnsettled naming the exiting process", err)
+	}
+}
+
+func TestReapCancelledAfterSIGKILLReportsTheCancellation(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 400*time.Millisecond)
+	defer cancel()
+	prober := &funcProber{probeFn: func(int) (procInfo, error) {
+		return procInfo{start: 1}, nil
+	}}
+	signaler := &funcSignaler{fn: func(_ int, sig syscall.Signal) error {
+		if sig == syscall.SIGKILL {
+			cancel()
+		}
+		return nil
+	}}
+	s.prober, s.signaler = prober, signaler
+
+	_, err := s.reapIdentity(ctx, identity{pid: 4242, start: 1, boot: testBoot}, 0)
+	if !errors.Is(err, ErrUnsettled) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("reapIdentity() error = %v, want ErrUnsettled joined with the cancellation", err)
 	}
 }
 

@@ -9,17 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `deploy.ErrRestored` is joined to an aborted supersede's error once the
-  prior generation is proved serving again: its services re-applied and its
-  daemon proved ready, or that daemon found still ready. It is absent when the
-  swap had already committed, which forward recovery lands, and when the
-  restore itself failed, so a consumer can tell "unsettled, prior serving" from
-  every other abort before it retries.
+  incumbent is proved serving again: the build its daemon recorded before the
+  quiesce is the one answering ready, with every service the converge had
+  removed applied again. A ready daemon of another build is `ErrConflict`
+  instead, an incumbent that recorded no build certifies nothing, and the
+  sentinel is absent when the swap had already committed, which forward
+  recovery lands, and when the restore itself failed, so a consumer can tell
+  "unsettled, prior serving" from every other abort before it retries.
 
 ### Changed
 
-- The reap ladder's settlement deadline errors wrap `ErrUnsettled`, so a
-  `Terminate` whose kill was not observed in time matches it like a drain or a
-  Settle that ran out.
+- The reap ladder's settlement deadline errors wrap `ErrUnsettled` and the
+  context's own error, so a `Terminate` whose kill was not observed in time
+  matches it like a drain or a Settle that ran out, and a cancelled one still
+  matches `context.Canceled`.
+- A converge drops each label from the services record as its removal lands,
+  so an aborted supersede's restore puts back exactly the services it removed
+  when the daemon is still ready, where it used to leave a removed helper
+  behind a daemon that had come back.
 
 ### Fixed
 

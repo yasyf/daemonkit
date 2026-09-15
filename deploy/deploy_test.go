@@ -1117,6 +1117,107 @@ func TestSupersedeAbortRestoresRunningServices(t *testing.T) {
 	}
 }
 
+// TestSupersedeAbortDoesNotCertifyAnotherBuild has a differently signed copy
+// of the daemon take the socket while the incumbent's bootout hangs, so the
+// restore finds a ready daemon that is not the build the incumbent recorded.
+func TestSupersedeAbortDoesNotCertifyAnotherBuild(t *testing.T) {
+	f := newFixture(t)
+	if _, err := f.deploy.Install(f.ctx(), f.candidate("First", "1.0", "one")); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	f.startDaemonChild(0)
+	activation, err := f.deploy.Activate(f.ctx())
+	if err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	program, err := os.ReadFile(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(t.TempDir(), "other-build")
+	if err := os.WriteFile(other, program, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("/usr/bin/codesign", "--force", "--sign", "-", "--identifier", "other-build", other).CombinedOutput()
+	if err != nil {
+		t.Fatalf("codesign %q: %v\n%s", other, err, out)
+	}
+	f.deploy.run = func(_ context.Context, _ string, args ...string) (string, int, error) {
+		if args[0] != "bootout" {
+			return "", 0, nil
+		}
+		child := exec.Command(other)
+		child.Env = append(os.Environ(), daemonChildEnv+"=1", daemonChildLabel+"="+string(f.deploy.config.Daemon.Label), daemonChildDelay+"=0s", daemonChildPark+"=0")
+		child.Stderr = os.Stderr
+		if err := child.Start(); err != nil {
+			t.Fatalf("start other build: %v", err)
+		}
+		t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
+		return "", 0, daemonkit.ErrUnsettled
+	}
+	_, abort := f.deploy.Supersede(f.ctx(), f.candidate("Second", "2.0", "two"))
+	health, err := f.deploy.client.WaitReady(f.within(5 * time.Second))
+	if err != nil {
+		t.Fatalf("WaitReady: %v", err)
+	}
+	if health.Build == activation.Readiness.Build() {
+		t.Fatal("the other build reports the incumbent's build")
+	}
+	if !errors.Is(abort, daemonkit.ErrUnsettled) || !errors.Is(abort, ErrConflict) || errors.Is(abort, ErrRestored) {
+		t.Fatalf("Supersede err = %v, want the abort with ErrConflict over the other build and no ErrRestored", abort)
+	}
+}
+
+// TestSupersedeAbortRestoresTheServicesItRemoved removes the helper agent,
+// fails the daemon's bootout while the daemon comes back ready, and holds the
+// restore to putting the helper back before it certifies the incumbent.
+func TestSupersedeAbortRestoresTheServicesItRemoved(t *testing.T) {
+	f := newFixture(t)
+	helper := f.agent
+	helper.Label = "com.example.daemonkit.aaa-helper"
+	f.deploy.config.Agents = append(f.deploy.config.Agents, helper)
+	if _, err := f.deploy.Install(f.ctx(), f.candidate("First", "1.0", "one")); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	f.startDaemonChild(0)
+	if _, err := f.deploy.Activate(f.ctx()); err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	helperPlist, err := helper.PlistPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed := false
+	f.deploy.run = func(_ context.Context, _ string, args ...string) (string, int, error) {
+		f.launchctls = append(f.launchctls, args)
+		daemon := slices.ContainsFunc(args, func(arg string) bool { return strings.HasSuffix(arg, f.agent.Label) })
+		if args[0] != "bootout" || !daemon || failed {
+			return "", 0, nil
+		}
+		failed = true
+		f.startDaemonChild(0)
+		return "", 0, daemonkit.ErrUnsettled
+	}
+	_, abort := f.deploy.Supersede(f.ctx(), f.candidate("Second", "2.0", "two"))
+	if !failed {
+		t.Fatalf("the daemon's bootout never ran: %v", abort)
+	}
+	if !errors.Is(abort, ErrRestored) {
+		t.Fatalf("Supersede err = %v, want ErrRestored once the helper is back", abort)
+	}
+	if !fileExists(helperPlist) {
+		t.Fatalf("ErrRestored with the helper's plist %q still removed", helperPlist)
+	}
+	applied, err := f.deploy.appliedServices()
+	if err != nil || !slices.Equal(applied, []string{helper.Label, f.agent.Label}) {
+		t.Fatalf("applied services = %v, %v; want both labels recorded again", applied, err)
+	}
+}
+
 func TestSupersedeRequiresAnInstalledGeneration(t *testing.T) {
 	f := newFixture(t)
 	if _, err := f.deploy.Supersede(f.ctx(), f.candidate("Only", "1.0", "one")); !errors.Is(err, ErrConflict) {

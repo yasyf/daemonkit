@@ -28,6 +28,7 @@ import (
 	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/daemonkit/durable"
 	"github.com/yasyf/daemonkit/internal/flock"
+	"github.com/yasyf/daemonkit/internal/proc"
 	"github.com/yasyf/daemonkit/internal/trust"
 	"github.com/yasyf/daemonkit/launchd"
 )
@@ -305,32 +306,44 @@ func (d *Deployment) commitSupersede(ctx context.Context, record swapRecord) err
 	if err != nil {
 		return err
 	}
+	owner, _, err := proc.ReadOwner(d.config.Daemon.RecordPath())
+	if err != nil {
+		return fmt.Errorf("deploy: read owner record: %w", err)
+	}
+	incumbent := incumbent{generation: *record.Prior, build: owner.Build, labels: applied}
 	if _, err := d.quiesceAndConverge(ctx, nil); err != nil {
-		return errors.Join(err, d.restore(ctx, *record.Prior, applied))
+		return errors.Join(err, d.restore(ctx, incumbent))
 	}
 	if err := d.requireEmpty(); err != nil {
-		return errors.Join(err, d.restore(ctx, *record.Prior, applied))
+		return errors.Join(err, d.restore(ctx, incumbent))
 	}
 	if err := writeRecord(d.layout.swap, record); err != nil {
-		return errors.Join(err, d.restore(ctx, *record.Prior, applied))
+		return errors.Join(err, d.restore(ctx, incumbent))
 	}
 	return nil
 }
 
-// restore puts the incumbent an aborted supersede stopped back into service:
-// the agents whose labels the services record named before the quiesce are
-// re-applied — launchd.Apply kickstarts a loaded-but-dead job and re-bootstraps
-// a removed one — and the daemon is proved ready again. It inspects before it
-// acts: a swap record on disk means the commit landed and forward recovery
-// owns it; a canonical path no longer holding prior is nothing this can put
-// back; and a daemon still answering ready — a quiesce that failed before it
-// stopped anything — is left exactly as it is, since an Apply over a drifted
-// plist would boot it out with no absence proof behind it. The sealed
-// activation described the instance the quiesce ended, so it is discarded
-// rather than left to refuse the next Activate. The return is the abort's
-// restore verdict: ErrRestored once the prior generation is proved serving,
-// nil when the committed swap leaves nothing to put back.
-func (d *Deployment) restore(ctx context.Context, prior Generation, labels []string) error {
+// incumbent is what a supersede observed of the generation it is replacing
+// before it stopped anything: the tree, the build its daemon recorded, and
+// the services record. A restore certifies only a daemon of that build.
+type incumbent struct {
+	generation Generation
+	build      string
+	labels     []string
+}
+
+// restore puts the incumbent an aborted supersede stopped back into service
+// and returns the abort's restore verdict: ErrRestored once the incumbent's
+// own build is proved serving, nil when a committed swap leaves nothing to put
+// back. A swap record on disk means forward recovery owns the commit; a
+// canonical path no longer holding prior is nothing this can put back; a
+// daemon still answering ready is left as it is, since an Apply over a drifted
+// plist would boot it out with no absence proof behind it, and only the
+// services the converge already removed are applied again. A daemon that
+// left is re-applied with every recorded service and proved ready, its sealed
+// activation discarded first since it described the instance the quiesce
+// ended.
+func (d *Deployment) restore(ctx context.Context, prior incumbent) error {
 	if fileExists(d.layout.swap) {
 		return nil
 	}
@@ -340,22 +353,34 @@ func (d *Deployment) restore(ctx context.Context, prior Generation, labels []str
 	if err != nil {
 		return fmt.Errorf("deploy: restore incumbent: %w", err)
 	}
-	if !installed.sameTree(prior) {
+	if !installed.sameTree(prior.generation) {
 		return fmt.Errorf("%w: restore refused, the canonical app is no longer the incumbent", ErrConflict)
 	}
+	remaining, err := d.appliedServices()
+	if err != nil {
+		return fmt.Errorf("deploy: restore incumbent: %w", err)
+	}
+	removed := slices.DeleteFunc(slices.Clone(prior.labels), func(label string) bool {
+		return slices.Contains(remaining, label)
+	})
 	probeCtx, cancelProbe := context.WithTimeout(restoreCtx, restoreGrace/readinessReserve)
 	health, err := d.client.WaitReady(probeCtx)
 	cancelProbe()
-	if err == nil && health.Phase == daemonkit.PhaseReady {
-		return ErrRestored
+	ready := err == nil && health.Phase == daemonkit.PhaseReady
+	if ready && len(removed) == 0 {
+		return prior.certify(health.Build)
 	}
-	if err := durable.Remove(d.layout.activation); err != nil {
+	apply := removed
+	if !ready {
+		if err := durable.Remove(d.layout.activation); err != nil {
+			return fmt.Errorf("deploy: restore incumbent: %w", err)
+		}
+		apply = prior.labels
+	}
+	if err := d.recordServices(prior.labels); err != nil {
 		return fmt.Errorf("deploy: restore incumbent: %w", err)
 	}
-	if err := d.recordServices(labels); err != nil {
-		return fmt.Errorf("deploy: restore incumbent: %w", err)
-	}
-	for _, label := range labels {
+	for _, label := range apply {
 		index := slices.IndexFunc(d.config.Agents, func(agent launchd.Agent) bool { return agent.Label == label })
 		if index < 0 {
 			return fmt.Errorf("%w: restore has no agent for the recorded label %q", ErrConfig, label)
@@ -364,10 +389,25 @@ func (d *Deployment) restore(ctx context.Context, prior Generation, labels []str
 			return fmt.Errorf("deploy: restore agent %q: %w", label, err)
 		}
 	}
-	if _, err := d.prove(restoreCtx); err != nil {
+	readiness, err := d.prove(restoreCtx)
+	if err != nil {
 		return fmt.Errorf("deploy: restore incumbent: %w", err)
 	}
-	return ErrRestored
+	return prior.certify(readiness.Build())
+}
+
+// certify is the verdict over the build found serving after a restore: the
+// incumbent's own recorded build is ErrRestored, another build is ErrConflict,
+// and an incumbent that recorded no build certifies nothing.
+func (i incumbent) certify(build string) error {
+	switch {
+	case i.build == "":
+		return nil
+	case build == i.build:
+		return ErrRestored
+	default:
+		return fmt.Errorf("%w: restore found build %q serving in place of the incumbent's %q", ErrConflict, build, i.build)
+	}
 }
 
 // Activate converges launchd to the deployment's exact agent set and seals
@@ -614,10 +654,11 @@ func (d *Deployment) retiresServices() (bool, error) {
 // Nothing is ever discovered from the machine: a consumer always knows its own
 // labels, so no converge of one product can reach another product's agents.
 //
-// The record names the union before the first launchctl call and the desired
-// set after the last, so it is never a subset of what is applied — a crash
-// mid-converge leaves a label recorded that may already be gone, never one
-// that exists unrecorded.
+// The record names the union before the first launchctl call, drops each
+// label as its removal lands, and names the desired set after the last, so it
+// is never a subset of what is applied — a crash mid-converge leaves a label
+// recorded that may already be gone, never one that exists unrecorded — and a
+// restore can tell which removals happened.
 func (d *Deployment) converge(ctx context.Context, agents []launchd.Agent) error {
 	desired := make([]string, 0, len(agents))
 	for _, agent := range agents {
@@ -644,6 +685,10 @@ func (d *Deployment) converge(ctx context.Context, agents []launchd.Agent) error
 		}
 		if err := launchd.Remove(ctx, d.run, label); err != nil {
 			return fmt.Errorf("deploy: remove agent %q: %w", label, err)
+		}
+		held = slices.DeleteFunc(held, func(removed string) bool { return removed == label })
+		if err := d.recordServices(held); err != nil {
+			return err
 		}
 	}
 	return d.recordServices(desired)
