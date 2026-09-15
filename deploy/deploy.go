@@ -53,6 +53,13 @@ var (
 
 	// ErrState means a durable deployment record is corrupt or inexact.
 	ErrState = errors.New("deploy: durable deployment state is invalid")
+
+	// ErrRestored is joined to an aborted supersede's error when the prior
+	// generation was proved serving after the abort: its services re-applied
+	// and its daemon proved ready, or that daemon found still ready. It is
+	// absent when the swap had already committed, which forward recovery
+	// lands, and when the restore itself failed.
+	ErrRestored = errors.New("deploy: the prior generation is serving again")
 )
 
 const (
@@ -320,7 +327,9 @@ func (d *Deployment) commitSupersede(ctx context.Context, record swapRecord) err
 // stopped anything — is left exactly as it is, since an Apply over a drifted
 // plist would boot it out with no absence proof behind it. The sealed
 // activation described the instance the quiesce ended, so it is discarded
-// rather than left to refuse the next Activate.
+// rather than left to refuse the next Activate. The return is the abort's
+// restore verdict: ErrRestored once the prior generation is proved serving,
+// nil when the committed swap leaves nothing to put back.
 func (d *Deployment) restore(ctx context.Context, prior Generation, labels []string) error {
 	if fileExists(d.layout.swap) {
 		return nil
@@ -338,7 +347,7 @@ func (d *Deployment) restore(ctx context.Context, prior Generation, labels []str
 	health, err := d.client.WaitReady(probeCtx)
 	cancelProbe()
 	if err == nil && health.Phase == daemonkit.PhaseReady {
-		return nil
+		return ErrRestored
 	}
 	if err := durable.Remove(d.layout.activation); err != nil {
 		return fmt.Errorf("deploy: restore incumbent: %w", err)
@@ -358,7 +367,7 @@ func (d *Deployment) restore(ctx context.Context, prior Generation, labels []str
 	if _, err := d.prove(restoreCtx); err != nil {
 		return fmt.Errorf("deploy: restore incumbent: %w", err)
 	}
-	return nil
+	return ErrRestored
 }
 
 // Activate converges launchd to the deployment's exact agent set and seals

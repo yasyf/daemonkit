@@ -11,6 +11,10 @@ import (
 
 const settlementPollInterval = 10 * time.Millisecond
 
+// ErrUnsettled means the target was still in the process table when ctx
+// ended; the root package re-exports it as daemonkit.ErrUnsettled.
+var ErrUnsettled = errors.New("daemonkit: process did not provably exit")
+
 // ladder binds the reap ladder's boundaries once, so a Store and a
 // session-less Terminate run one identity-checked TERM→KILL→absence sequence.
 type ladder struct {
@@ -162,9 +166,9 @@ func (s *ladder) awaitSettlement(ctx context.Context, id identity, boot uint64) 
 		case !id.matches(identity{pid: id.pid, start: info.start, boot: boot}), info.zombie:
 			return ReapTerminated, nil
 		case ctx.Err() != nil && info.exiting:
-			return reapUndetermined, fmt.Errorf("killed process %d still exiting at settlement deadline", id.pid)
+			return reapUndetermined, fmt.Errorf("%w: killed process %d still exiting at settlement deadline", ErrUnsettled, id.pid)
 		case ctx.Err() != nil:
-			return reapUndetermined, errors.New("killed process remained live through settlement deadline")
+			return reapUndetermined, fmt.Errorf("%w: killed process remained live through settlement deadline", ErrUnsettled)
 		}
 		select {
 		case <-ctx.Done():
@@ -248,8 +252,8 @@ func (s *ladder) awaitSessionSettlement(ctx context.Context, session int, boot u
 		}
 		if ctx.Err() != nil {
 			return reapUndetermined, fmt.Errorf(
-				"killed session remained live through settlement deadline, %d of %d members exiting",
-				exitingMembers(members), len(members),
+				"%w: killed session remained live through settlement deadline, %d of %d members exiting",
+				ErrUnsettled, exitingMembers(members), len(members),
 			)
 		}
 		settled, err := s.signalSessionGroups(session, members, syscall.SIGKILL, boot)

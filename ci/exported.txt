@@ -370,6 +370,7 @@ deploy	func	DigestEntitlements	darwin
 deploy	var	ErrConfig	darwin
 deploy	var	ErrConflict	darwin
 deploy	var	ErrLive	darwin
+deploy	var	ErrRestored	darwin
 deploy	var	ErrState	darwin
 deploy	var	ErrUntrusted	darwin
 deploy	var	ErrVersion	darwin

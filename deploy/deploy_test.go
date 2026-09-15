@@ -1096,6 +1096,9 @@ func TestSupersedeAbortRestoresRunningServices(t *testing.T) {
 			if !errors.Is(err, tt.want) {
 				t.Fatalf("Supersede err = %v, want the abort %v reported", err, tt.want)
 			}
+			if !errors.Is(err, ErrRestored) {
+				t.Fatalf("Supersede err = %v, want ErrRestored joined once the incumbent is proved serving again", err)
+			}
 			if fileExists(f.deploy.layout.swap) {
 				t.Fatal("an aborted supersede committed the swap")
 			}

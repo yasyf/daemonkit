@@ -3,6 +3,7 @@ package daemonkit
 import (
 	"errors"
 
+	"github.com/yasyf/daemonkit/internal/proc"
 	"github.com/yasyf/daemonkit/internal/trust"
 	"github.com/yasyf/daemonkit/internal/wire"
 )
@@ -64,11 +65,12 @@ var (
 
 	// ErrUnsettled means the target was still in the process table when ctx
 	// ended: a delivered drain whose exit was not yet observed, a Settle whose
-	// recorded incumbent is still live, or an owned child, adopted record, or
-	// ownership scope whose settlement outran its deadline. The target keeps
-	// settling on its own ladder; re-observe with Settle, or leave the record
-	// for the next generation to reclaim.
-	ErrUnsettled = errors.New("daemonkit: process did not provably exit")
+	// recorded incumbent is still live, a Terminate whose kill was not yet
+	// observed, or an owned child, adopted record, or ownership scope whose
+	// settlement outran its deadline. The target keeps settling on its own
+	// ladder; re-observe with Settle, or leave the record for the next
+	// generation to reclaim.
+	ErrUnsettled = proc.ErrUnsettled
 
 	// errPinMoved means the process answering on a pinned session is no longer
 	// the one the attach pinned: the incumbent was replaced between two reads.

@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `deploy.ErrRestored` is joined to an aborted supersede's error once the
+  prior generation is proved serving again: its services re-applied and its
+  daemon proved ready, or that daemon found still ready. It is absent when the
+  swap had already committed, which forward recovery lands, and when the
+  restore itself failed, so a consumer can tell "unsettled, prior serving" from
+  every other abort before it retries.
+
+### Changed
+
+- The reap ladder's settlement deadline errors wrap `ErrUnsettled`, so a
+  `Terminate` whose kill was not observed in time matches it like a drain or a
+  Settle that ran out.
+
 ### Fixed
 
 - The reap ladder keeps one settlement grace for the kill. SIGTERM's grace is

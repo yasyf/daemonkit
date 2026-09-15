@@ -260,8 +260,8 @@ func TestReapRetainsRecordWhenKilledProcessNeverSettles(t *testing.T) {
 	s.prober, s.signaler = prober, signaler
 
 	reclaimed, _, err := s.Recover(ladderContext(t, 400*time.Millisecond))
-	if err == nil {
-		t.Fatal("Recover() succeeded although the killed process never settled")
+	if !errors.Is(err, ErrUnsettled) {
+		t.Fatalf("Recover() error = %v, want ErrUnsettled for a killed process that never settled", err)
 	}
 	if len(reclaimed) != 0 {
 		t.Fatalf("Recover() published %v for an unsettled kill", reclaimed)
@@ -313,8 +313,8 @@ func TestReapNamesAKilledProcessStillExitingAtTheDeadline(t *testing.T) {
 	s.prober, s.signaler = prober, signaler
 
 	_, err := s.reapIdentity(ladderContext(t, 400*time.Millisecond), identity{pid: 4242, start: 1, boot: testBoot}, 0)
-	if err == nil || !strings.Contains(err.Error(), "still exiting") {
-		t.Fatalf("reapIdentity() error = %v, want the exiting process named", err)
+	if !errors.Is(err, ErrUnsettled) || !strings.Contains(err.Error(), "still exiting") {
+		t.Fatalf("reapIdentity() error = %v, want ErrUnsettled naming the exiting process", err)
 	}
 }
 
