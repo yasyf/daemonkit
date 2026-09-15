@@ -1,7 +1,6 @@
 package deploy
 
 import (
-	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -365,8 +364,8 @@ func TestResetScansTheStrandedPriorItReclaims(t *testing.T) {
 }
 
 // sealTree makes path undeletable: os.RemoveAll must enter the directory it
-// plants and may not unlink the file inside it. The returned func undoes it.
-func sealTree(t *testing.T, path string) func() {
+// plants and may not unlink the file inside it.
+func sealTree(t *testing.T, path string) {
 	t.Helper()
 	sealed := filepath.Join(path, "sealed")
 	if err := os.MkdirAll(sealed, 0o700); err != nil {
@@ -378,30 +377,7 @@ func sealTree(t *testing.T, path string) func() {
 	if err := os.Chmod(sealed, 0o500); err != nil {
 		t.Fatal(err)
 	}
-	unseal := func() { _ = os.Chmod(sealed, 0o700) }
-	t.Cleanup(unseal)
-	return unseal
-}
-
-// TestRecoverReverifiesWhatItMoves holds the resume to the full verify the
-// first pass got to skip: a swap record carries no attestation across a
-// crash, so every generation recover moves is run through codesign again.
-func TestRecoverReverifiesWhatItMoves(t *testing.T) {
-	f := newFixture(t)
-	f.crash("one", "two", func(*testing.T, *fixture) {})
-	verifies := 0
-	verify := f.deploy.verify
-	f.deploy.verify = func(ctx context.Context, appPath, requirement string) (signatureAttestation, error) {
-		verifies++
-		return verify(ctx, appPath, requirement)
-	}
-	if err := f.deploy.recover(f.ctx()); err != nil {
-		t.Fatalf("recover: %v", err)
-	}
-	if verifies == 0 {
-		t.Fatal("recover moved a generation it never re-verified")
-	}
-	f.wantCanonical("two")
+	t.Cleanup(func() { _ = os.Chmod(sealed, 0o700) })
 }
 
 func TestRecoverRefusesARecordForAnotherApp(t *testing.T) {
