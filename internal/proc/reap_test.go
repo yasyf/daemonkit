@@ -3,6 +3,7 @@ package proc
 import (
 	"context"
 	"errors"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -259,14 +260,116 @@ func TestReapRetainsRecordWhenKilledProcessNeverSettles(t *testing.T) {
 	s.prober, s.signaler = prober, signaler
 
 	reclaimed, _, err := s.Recover(ladderContext(t, 400*time.Millisecond))
-	if err == nil {
-		t.Fatal("Recover() succeeded although the killed process never settled")
+	if !errors.Is(err, ErrUnsettled) {
+		t.Fatalf("Recover() error = %v, want ErrUnsettled for a killed process that never settled", err)
 	}
 	if len(reclaimed) != 0 {
 		t.Fatalf("Recover() published %v for an unsettled kill", reclaimed)
 	}
 	if !storeHolds(t, path, rec.id()) {
 		t.Fatal("unsettled record was removed")
+	}
+}
+
+func TestReapReservesSettleGraceForTheKillTail(t *testing.T) {
+	s, _ := newTestStore(t)
+	var killedAt time.Time
+	prober := &funcProber{probeFn: func(int) (procInfo, error) {
+		if !killedAt.IsZero() && time.Since(killedAt) >= 3*time.Second {
+			return procInfo{start: 1, zombie: true}, nil
+		}
+		return procInfo{start: 1, exiting: !killedAt.IsZero()}, nil
+	}}
+	signaler := &funcSignaler{fn: func(_ int, sig syscall.Signal) error {
+		if sig == syscall.SIGKILL && killedAt.IsZero() {
+			killedAt = time.Now()
+		}
+		return nil
+	}}
+	s.prober, s.signaler = prober, signaler
+
+	got, err := s.reapIdentity(ladderContext(t, 6*time.Second), identity{pid: 4242, start: 1, boot: testBoot}, 0)
+	if err != nil {
+		t.Fatalf("reapIdentity() error = %v; the TERM grace spent the kill's settlement tail", err)
+	}
+	if got != ReapTerminated {
+		t.Fatalf("reapIdentity() = %d, want ReapTerminated", got)
+	}
+}
+
+func TestReapNamesAKilledProcessStillExitingAtTheDeadline(t *testing.T) {
+	s, _ := newTestStore(t)
+	killed := false
+	prober := &funcProber{probeFn: func(int) (procInfo, error) {
+		return procInfo{start: 1, exiting: killed}, nil
+	}}
+	signaler := &funcSignaler{fn: func(_ int, sig syscall.Signal) error {
+		killed = killed || sig == syscall.SIGKILL
+		return nil
+	}}
+	s.prober, s.signaler = prober, signaler
+
+	_, err := s.reapIdentity(ladderContext(t, 400*time.Millisecond), identity{pid: 4242, start: 1, boot: testBoot}, 0)
+	if !errors.Is(err, ErrUnsettled) || !strings.Contains(err.Error(), "still exiting") {
+		t.Fatalf("reapIdentity() error = %v, want ErrUnsettled naming the exiting process", err)
+	}
+}
+
+func TestReapCancelledAfterSIGKILLReportsTheCancellation(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 400*time.Millisecond)
+	defer cancel()
+	prober := &funcProber{probeFn: func(int) (procInfo, error) {
+		return procInfo{start: 1}, nil
+	}}
+	signaler := &funcSignaler{fn: func(_ int, sig syscall.Signal) error {
+		if sig == syscall.SIGKILL {
+			cancel()
+		}
+		return nil
+	}}
+	s.prober, s.signaler = prober, signaler
+
+	_, err := s.reapIdentity(ctx, identity{pid: 4242, start: 1, boot: testBoot}, 0)
+	if !errors.Is(err, ErrUnsettled) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("reapIdentity() error = %v, want ErrUnsettled joined with the cancellation", err)
+	}
+}
+
+func TestReapSessionReservesSettleGraceForTheKillTail(t *testing.T) {
+	s, _ := newTestStore(t)
+	const session = 4242
+	member := groupMember{pid: 5000, info: procInfo{start: 50, group: 5000, session: session}}
+	var killedAt time.Time
+	gone := func() bool { return !killedAt.IsZero() && time.Since(killedAt) >= 3*time.Second }
+	prober := &funcProber{
+		probeFn: func(pid int) (procInfo, error) {
+			if pid == session || gone() {
+				return procInfo{}, errNoProc
+			}
+			return member.info, nil
+		},
+		membersFn: func(int) ([]groupMember, error) {
+			if gone() {
+				return nil, nil
+			}
+			return []groupMember{member}, nil
+		},
+	}
+	signaler := &funcSignaler{fn: func(_ int, sig syscall.Signal) error {
+		if sig == syscall.SIGKILL && killedAt.IsZero() {
+			killedAt = time.Now()
+		}
+		return nil
+	}}
+	s.prober, s.signaler = prober, signaler
+
+	got, err := s.reapIdentity(ladderContext(t, 6*time.Second), identity{pid: session, start: 1, boot: testBoot}, session)
+	if err != nil {
+		t.Fatalf("reapIdentity() error = %v; the TERM grace spent the session kill's settlement tail", err)
+	}
+	if got != ReapTerminated {
+		t.Fatalf("reapIdentity() = %d, want ReapTerminated", got)
 	}
 }
 

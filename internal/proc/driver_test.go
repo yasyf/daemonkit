@@ -113,6 +113,28 @@ func TestSessionLeaderExitSettlesDescendants(t *testing.T) {
 	}
 }
 
+func TestSessionSettlementAfterLeaderExitKeepsTermGrace(t *testing.T) {
+	s, _ := newTestStore(t)
+	dir := t.TempDir()
+	ready, flushed := filepath.Join(dir, "ready"), filepath.Join(dir, "flushed")
+	worker := "trap 'sleep 0.1; echo flushed > " + flushed + "; exit 0' TERM; echo ready > " + ready + "; while :; do sleep 1; done"
+	script := "/bin/sh -c \"" + worker + "\" & while [ ! -f " + ready + " ]; do sleep 0.01; done; exit 0"
+	child, err := s.Spawn(t.Context(), Cmd{Path: "/bin/sh", Args: []string{"-c", script}, Session: true}, nil)
+	if err != nil {
+		t.Fatalf("Spawn() = %v", err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(-child.PID(), syscall.SIGKILL) })
+	var exit Exit
+	select {
+	case exit = <-child.Done():
+	case <-time.After(15 * time.Second):
+		t.Fatal("session never settled")
+	}
+	if _, err := os.Stat(flushed); err != nil {
+		t.Fatalf("descendant was killed before its TERM cleanup ran; exit = %+v: %v", exit, err)
+	}
+}
+
 func TestTerminateChildReadyExitWinsBeforeAnySignal(t *testing.T) {
 	s, _ := newTestStore(t)
 	sig := &funcSignaler{}

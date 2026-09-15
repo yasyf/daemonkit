@@ -11,6 +11,10 @@ import (
 
 const settlementPollInterval = 10 * time.Millisecond
 
+// ErrUnsettled means the target was still in the process table when ctx
+// ended; the root package re-exports it as daemonkit.ErrUnsettled.
+var ErrUnsettled = errors.New("daemonkit: process did not provably exit")
+
 // ladder binds the reap ladder's boundaries once, so a Store and a
 // session-less Terminate run one identity-checked TERM→KILL→absence sequence.
 type ladder struct {
@@ -149,7 +153,6 @@ func (s *ladder) reapOrphan(ctx context.Context, id identity, boot uint64) (Reap
 
 func (s *ladder) awaitSettlement(ctx context.Context, id identity, boot uint64) (Reap, error) {
 	clk := clockOrReal(s.clock)
-	deadline, _ := ctx.Deadline()
 	for {
 		info, err := s.prober.probe(id.pid)
 		switch {
@@ -159,12 +162,13 @@ func (s *ladder) awaitSettlement(ctx context.Context, id identity, boot uint64) 
 			return reapUndetermined, fmt.Errorf("prove killed process %d settled: %w", id.pid, err)
 		case !id.matches(identity{pid: id.pid, start: info.start, boot: boot}), info.zombie:
 			return ReapTerminated, nil
-		case !clk.Now().Before(deadline):
-			return reapUndetermined, errors.New("killed process remained live through settlement deadline")
+		case ctx.Err() != nil && info.exiting:
+			return reapUndetermined, fmt.Errorf("%w: killed process %d still exiting at settlement deadline: %w", ErrUnsettled, id.pid, ctx.Err())
+		case ctx.Err() != nil:
+			return reapUndetermined, fmt.Errorf("%w: killed process remained live through settlement deadline: %w", ErrUnsettled, ctx.Err())
 		}
 		select {
 		case <-ctx.Done():
-			return reapUndetermined, ctx.Err()
 		case <-clk.After(settlementPollInterval):
 		}
 	}
@@ -190,13 +194,13 @@ func (s *ladder) reapSession(
 	case leaderErr != nil && !errors.Is(leaderErr, errNoProc):
 		return reapUndetermined, leaderErr
 	}
-	return s.settleSession(ctx, session, boot)
+	return s.settleSession(ctx, session, boot, graceShare(ctx, clockOrReal(s.clock)))
 }
 
 // settleSession terminates every verified member of the dedicated session:
-// SIGTERM per process group, a grace share of re-verified polls, then SIGKILL
-// to the ctx deadline.
-func (s *ladder) settleSession(ctx context.Context, session int, boot uint64) (Reap, error) {
+// SIGTERM per process group, termGrace of re-verified polls, then SIGKILL to
+// the ctx deadline.
+func (s *ladder) settleSession(ctx context.Context, session int, boot uint64, termGrace time.Duration) (Reap, error) {
 	members, err := s.verifiedMembers(session, boot)
 	if err != nil {
 		return reapUndetermined, err
@@ -212,7 +216,7 @@ func (s *ladder) settleSession(ctx context.Context, session int, boot uint64) (R
 		return ReapAbsent, nil
 	}
 	clk := clockOrReal(s.clock)
-	grace := clk.Now().Add(graceShare(ctx, clk))
+	grace := clk.Now().Add(termGrace)
 	for {
 		select {
 		case <-ctx.Done():
@@ -235,7 +239,6 @@ func (s *ladder) settleSession(ctx context.Context, session int, boot uint64) (R
 
 func (s *ladder) awaitSessionSettlement(ctx context.Context, session int, boot uint64) (Reap, error) {
 	clk := clockOrReal(s.clock)
-	deadline, _ := ctx.Deadline()
 	for {
 		members, err := s.verifiedMembers(session, boot)
 		if err != nil {
@@ -244,8 +247,11 @@ func (s *ladder) awaitSessionSettlement(ctx context.Context, session int, boot u
 		if len(members) == 0 {
 			return ReapTerminated, nil
 		}
-		if !clk.Now().Before(deadline) {
-			return reapUndetermined, errors.New("killed session remained live through settlement deadline")
+		if ctx.Err() != nil {
+			return reapUndetermined, fmt.Errorf(
+				"%w: killed session remained live through settlement deadline, %d of %d members exiting: %w",
+				ErrUnsettled, exitingMembers(members), len(members), ctx.Err(),
+			)
 		}
 		settled, err := s.signalSessionGroups(session, members, syscall.SIGKILL, boot)
 		if err != nil {
@@ -256,10 +262,19 @@ func (s *ladder) awaitSessionSettlement(ctx context.Context, session int, boot u
 		}
 		select {
 		case <-ctx.Done():
-			return reapUndetermined, ctx.Err()
 		case <-clk.After(settlementPollInterval):
 		}
 	}
+}
+
+func exitingMembers(members []groupMember) int {
+	exiting := 0
+	for _, member := range members {
+		if member.info.exiting {
+			exiting++
+		}
+	}
+	return exiting
 }
 
 // verifiedMembers re-verifies every enumerated member immediately before it
@@ -342,9 +357,10 @@ func (s *ladder) signalGone(pid int, sig syscall.Signal) (bool, error) {
 	return false, nil
 }
 
-// graceShare is the TERM grace: a named fraction of the time remaining on ctx
-// at entry, with SIGKILL and settlement spending the rest.
+// graceShare is a caller-budgeted reap's TERM grace: termShare of what is
+// left on ctx, cut so SettleGrace stays for SIGKILL and settlement.
 func graceShare(ctx context.Context, clk clock) time.Duration {
 	deadline, _ := ctx.Deadline()
-	return fractionOf(deadline.Sub(clk.Now()), termShare)
+	left := deadline.Sub(clk.Now())
+	return max(0, min(fractionOf(left, termShare), left-SettleGrace))
 }

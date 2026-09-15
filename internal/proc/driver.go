@@ -262,7 +262,8 @@ func sessionDeadline(demanded time.Time, clk clock) time.Time {
 func (s *Store) settleSessionSurvivors(session int, boot uint64, deadline time.Time) (Reap, bool) {
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
-	outcome, err := s.settleSession(ctx, session, boot)
+	clk := clockOrReal(s.clock)
+	outcome, err := s.settleSession(ctx, session, boot, fractionOf(deadline.Sub(clk.Now()), termShare))
 	if err != nil {
 		slog.Warn("proc: dedicated session did not settle; record kept", "session", session, "err", err)
 		return reapUndetermined, false

@@ -6,6 +6,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `deploy.ErrRestored` is joined to an aborted supersede's error once the
+  incumbent is proved serving again: the build its daemon recorded before the
+  quiesce is the one answering ready, with every service the converge had
+  removed applied again. A ready daemon of another build is `ErrConflict`
+  instead, an incumbent that recorded no build certifies nothing, and the
+  sentinel is absent when the swap had already committed, which forward
+  recovery lands, and when the restore itself failed, so a consumer can tell
+  "unsettled, prior serving" from every other abort before it retries.
+
+### Changed
+
+- The reap ladder's settlement deadline errors wrap `ErrUnsettled` and the
+  context's own error, so a `Terminate` whose kill was not observed in time
+  matches it like a drain or a Settle that ran out, and a cancelled one still
+  matches `context.Canceled`.
+- A converge drops each label from the services record as its removal lands,
+  so an aborted supersede's restore puts back exactly the services it removed
+  when the daemon is still ready, where it used to leave a removed helper
+  behind a daemon that had come back.
+
+### Fixed
+
+- The reap ladder keeps one settlement grace for the kill. SIGTERM's grace is
+  now cut so at least 5s of the caller's deadline is left for SIGKILL and the
+  observed absence that proves it, where it used to take 0.6 of whatever was
+  left and hand the kill the rest, so a survivor terminated on a short share
+  of a deploy budget was killed with under a second to leave the table and
+  the deploy aborted to a restore. Under 5s of budget SIGTERM gets no grace
+  and the ladder kills at once. A killed process still in the table at the
+  deadline is now reported as `still exiting` when the kernel has begun
+  tearing it down (`P_WEXIT`), and the ladder answers its deadline with one
+  last probe rather than the bare context error.
+
 ## [0.28.1] - 2026-09-14
 
 ### Fixed
