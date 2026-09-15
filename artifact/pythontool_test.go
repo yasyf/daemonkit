@@ -47,15 +47,16 @@ func TestResolvePythonToolInstallsAndIsIdempotent(t *testing.T) {
 	if info, err := os.Lstat(path); err != nil || info.Mode()&os.ModeSymlink != 0 {
 		t.Fatalf("Resolve returned a symlink, want the real entrypoint (%v)", info.Mode())
 	}
-	if calls, _ := os.ReadFile(marker); string(calls) != "tool install --force --refresh-package capt-hook capt-hook==1.2.3\n" {
-		t.Fatalf("uv args = %q, want the pinned install spec with a refreshed index for its dist", calls)
+	calls, _ := os.ReadFile(marker)
+	if string(calls) != "tool install --force --compile-bytecode --refresh-package capt-hook capt-hook==1.2.3\n" {
+		t.Fatalf("uv args = %q, want the pinned install spec, bytecode compiled, with a refreshed index for its dist", calls)
 	}
 
 	path2, err := store.Resolve(context.Background(), desc, WithUV(uv))
 	if err != nil || path2 != path {
 		t.Fatalf("second Resolve = %q, %v; want %q, nil", path2, err, path)
 	}
-	calls, _ := os.ReadFile(marker)
+	calls, _ = os.ReadFile(marker)
 	if got := strings.Count(string(calls), "install"); got != 1 {
 		t.Fatalf("uv invoked %d times, want 1 (env already materialized)", got)
 	}
