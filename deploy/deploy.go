@@ -117,6 +117,7 @@ type Deployment struct {
 	layout      layout
 	requirement string
 	run         launchd.Runner
+	verify      func(ctx context.Context, appPath, requirement string) (signatureAttestation, error)
 	client      *daemonkit.Client
 }
 
@@ -161,6 +162,7 @@ func Open(config Config) (*Deployment, error) {
 		layout:      layoutFor(config.App),
 		requirement: requirement,
 		run:         execRunner,
+		verify:      codesignVerifier{}.Verify,
 		client:      client,
 	}, nil
 }
@@ -226,7 +228,11 @@ func (d *Deployment) Install(ctx context.Context, candidate Candidate) (Generati
 // stopped. Only then is the incumbent quiesced — proved gone and its
 // executables proved empty — and moved aside with the candidate into place as
 // one recorded rename pair, so a crash anywhere in the middle resumes to the
-// same end.
+// same end. Every codesign runs before the quiesce: the swap holds each
+// generation to the inode and tree digest its attestation named. The
+// superseded tree stays aside, named by the swap record, until the Activate
+// that proves the candidate serving retires it, or another verb's gated
+// resume does first.
 //
 // Converging launchd empty is a bootout exec per label, long enough for a
 // process to come back onto the bytes the rename destroys, so the inventory
@@ -289,13 +295,18 @@ func (d *Deployment) land(ctx context.Context, candidate Candidate, supersede bo
 	if err != nil {
 		return Generation{}, err
 	}
-	if err := d.settleSwap(ctx, record); err != nil {
+	if err := d.swap(record); err != nil {
 		return Generation{}, err
 	}
-	if err := d.retireSwap(record); err != nil {
+	if err := d.retireSeals(); err != nil {
 		return Generation{}, err
 	}
-	return d.inspect(ctx, d.layout.canonical)
+	if prior == nil {
+		if err := d.retireSwap(record); err != nil {
+			return Generation{}, err
+		}
+	}
+	return record.Candidate, nil
 }
 
 // commitSupersede quiesces the incumbent, converges its services away, and
@@ -422,18 +433,28 @@ func (i incumbent) certify(build string) error {
 // A converge that only applies agents starts things and takes nothing away, so
 // it runs against the live daemon it is re-proving. One that also retires a
 // label goes through the gate first — see [Deployment.convergeAgents].
+//
+// A swap whose candidate already holds the canonical path is the supersede
+// this call completes: it seals the generation that swap attested, and
+// retires the superseded tree once readiness is proved and sealed.
 func (d *Deployment) Activate(ctx context.Context) (Activation, error) {
 	release, err := d.hold(ctx)
 	if err != nil {
 		return Activation{}, err
 	}
 	defer release()
-	if err := d.recover(ctx); err != nil {
-		return Activation{}, err
-	}
-	generation, err := d.inspect(ctx, d.layout.canonical)
+	landed, settled, err := d.landedSwap()
 	if err != nil {
 		return Activation{}, err
+	}
+	generation := landed.Candidate
+	if !settled {
+		if err := d.recover(ctx); err != nil {
+			return Activation{}, err
+		}
+		if generation, err = d.inspect(ctx, d.layout.canonical); err != nil {
+			return Activation{}, err
+		}
 	}
 	if err := d.convergeAgents(ctx); err != nil {
 		return Activation{}, err
@@ -459,6 +480,11 @@ func (d *Deployment) Activate(ctx context.Context) (Activation, error) {
 		writeRecord(d.layout.activation, record),
 	); err != nil {
 		return Activation{}, err
+	}
+	if settled {
+		if err := d.retireSwap(landed); err != nil {
+			return Activation{}, err
+		}
 	}
 	return Activation{Generation: generation, Readiness: readiness}, nil
 }

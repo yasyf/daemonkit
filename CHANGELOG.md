@@ -6,6 +6,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- A supersede runs every codesign before it quiesces the incumbent. The swap
+  holds the prior and the candidate to the inode and whole-tree digest their
+  attestation named, and refuses a tree whose bytes changed under the quiesce
+  with the incumbent still in place, where it used to re-verify each
+  generation with codesign between the daemon leaving and its successor
+  starting. A resume from the swap record still re-verifies everything it
+  moves.
+- The superseded tree stays aside, named by the swap record, until the
+  `Activate` that proves the candidate serving retires it after sealing the
+  readiness it proved; that `Activate` seals the generation the supersede
+  attested instead of inspecting the canonical path again. Any other verb's
+  resume retires the tree first, under the gate, and an `Activate` whose
+  retirement fails keeps the record so a retry completes it.
+- `artifact` installs a Python tool with `uv tool install --compile-bytecode`,
+  so a tool env is whole before its first process imports it rather than
+  compiled by every cold start after a deploy.
+
 ## [0.29.0] - 2026-09-14
 
 ### Added
