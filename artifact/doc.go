@@ -40,9 +40,11 @@
 // bundle when the app is superseded. Only that one file is copied — the
 // entrypoint must be self-contained, with its code signature embedded — into an
 // entry keyed by the app's version and the entrypoint's device, inode, size,
-// and mtime, so a warm resolution is a few stats and never reads the source
-// bytes; a miss copies, records the digest, and prunes the copies of the same
-// entrypoint that an earlier version or file left behind.
+// mtime, and ctime, so a warm resolution is a few stats and never reads the
+// source bytes; a miss copies from a descriptor it holds to that identity,
+// records the digest, and prunes the copies of the same entrypoint more than a
+// day old, so a copy another process resolved moments ago is never removed
+// from under it. The cache keeps one entry per app build until then.
 // Packaging and deployment activation are explicit consumer operations.
 //
 // # Version source and the supply-chain rule

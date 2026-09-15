@@ -31,7 +31,8 @@ type CacheEntry struct {
 // CacheEntries walks the content cache and returns one entry per digest
 // directory, reading each meta.json for provenance. A digest directory with a
 // missing or corrupt meta.json still yields an entry (Digest and Dir only) plus
-// one warning, so gc can prune it rather than orbit it forever.
+// one warning, so gc can prune it rather than orbit it forever; a directory
+// that is not a canonical digest entry, such as a staging one, is never listed.
 func (s Store) CacheEntries() ([]CacheEntry, error) {
 	if err := s.validate(); err != nil {
 		return nil, err
@@ -45,7 +46,7 @@ func (s Store) CacheEntries() ([]CacheEntry, error) {
 	}
 	var entries []CacheEntry
 	for _, shard := range shards {
-		if !shard.IsDir() {
+		if !shard.IsDir() || len(shard.Name()) != 2 || !isLowerHex(shard.Name()) {
 			continue
 		}
 		shardDir := filepath.Join(s.CacheDir(), shard.Name())
@@ -54,12 +55,16 @@ func (s Store) CacheEntries() ([]CacheEntry, error) {
 			return nil, fmt.Errorf("artifact: read cache shard %q: %w", shard.Name(), err)
 		}
 		for _, digest := range digests {
-			if digest.IsDir() {
+			if digest.IsDir() && canonicalDigestName(shard.Name(), digest.Name()) {
 				entries = append(entries, readCacheEntry(filepath.Join(shardDir, digest.Name()), digest.Name()))
 			}
 		}
 	}
 	return entries, nil
+}
+
+func canonicalDigestName(shard, name string) bool {
+	return len(name) == 64 && isLowerHex(name) && name[:2] == shard
 }
 
 func readCacheEntry(dir, digest string) CacheEntry {

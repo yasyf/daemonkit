@@ -11,36 +11,42 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"syscall"
+	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/yasyf/daemonkit/bundle"
 	"github.com/yasyf/daemonkit/durable"
 	dkversion "github.com/yasyf/daemonkit/version"
 )
 
+const execCopyRetention = 24 * time.Hour
+
+var openEntrypoint = os.Open
+
 func (s Store) resolveSignedApp(ctx context.Context, desc *Descriptor, version string, _ options) (string, error) {
 	exec := desc.App.Exec
 	if exec == "" {
 		exec = filepath.Join("Contents", "MacOS", desc.App.AppName)
 	}
-	entrypoint, info, err := attestSignedApp(desc, version, exec)
+	entrypoint, identity, err := attestSignedApp(desc, version, exec)
 	if err != nil {
 		return "", err
 	}
 	if !desc.App.CopyExec {
 		return entrypoint, nil
 	}
-	return s.resolveExecCopy(ctx, desc, version, entrypoint, info)
+	return s.resolveExecCopy(ctx, desc, version, entrypoint, identity)
 }
 
-func attestSignedApp(desc *Descriptor, version, exec string) (string, os.FileInfo, error) {
+func attestSignedApp(desc *Descriptor, version, exec string) (string, fileIdentity, error) {
 	dir, err := expandHome(desc.App.Dir)
 	if err != nil {
-		return "", nil, err
+		return "", fileIdentity{}, err
 	}
 	appPath, err := safeJoin(dir, desc.App.AppName+".app")
 	if err != nil {
-		return "", nil, err
+		return "", fileIdentity{}, err
 	}
 	want := ""
 	if !desc.Version.Dynamic() {
@@ -48,37 +54,37 @@ func attestSignedApp(desc *Descriptor, version, exec string) (string, os.FileInf
 	}
 	if _, err := os.Stat(appPath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return "", nil, &ManualUpgradeError{Name: desc.Name, Cask: desc.App.Cask, Formula: desc.App.Formula, Want: want}
+			return "", fileIdentity{}, &ManualUpgradeError{Name: desc.Name, Cask: desc.App.Cask, Formula: desc.App.Formula, Want: want}
 		}
-		return "", nil, fmt.Errorf("artifact: inspect installed app: %w", err)
+		return "", fileIdentity{}, fmt.Errorf("artifact: inspect installed app: %w", err)
 	}
 	switch {
 	case want != "":
 		installed, err := installedVersion(appPath)
 		if err != nil {
-			return "", nil, err
+			return "", fileIdentity{}, err
 		}
 		if !dkversion.Equal(installed, want) {
-			return "", nil, &ManualUpgradeError{Name: desc.Name, Cask: desc.App.Cask, Formula: desc.App.Formula, Want: want, Got: installed}
+			return "", fileIdentity{}, &ManualUpgradeError{Name: desc.Name, Cask: desc.App.Cask, Formula: desc.App.Formula, Want: want, Got: installed}
 		}
 	case desc.App.MinVersion != "":
 		installed, err := installedVersion(appPath)
 		if err != nil {
-			return "", nil, err
+			return "", fileIdentity{}, err
 		}
 		if dkversion.Newer(desc.App.MinVersion, installed) {
-			return "", nil, &ManualUpgradeError{Name: desc.Name, Cask: desc.App.Cask, Formula: desc.App.Formula, Want: desc.App.MinVersion, Got: installed, AtLeast: true}
+			return "", fileIdentity{}, &ManualUpgradeError{Name: desc.Name, Cask: desc.App.Cask, Formula: desc.App.Formula, Want: desc.App.MinVersion, Got: installed, AtLeast: true}
 		}
 	}
 	entrypoint, err := safeJoin(appPath, exec)
 	if err != nil {
-		return "", nil, err
+		return "", fileIdentity{}, err
 	}
-	info, err := os.Stat(entrypoint)
-	if err != nil || !info.Mode().IsRegular() {
-		return "", nil, fmt.Errorf("%w: installed app entrypoint %q missing", ErrInvalidDescriptor, exec)
+	var stat unix.Stat_t
+	if err := unix.Stat(entrypoint, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG {
+		return "", fileIdentity{}, fmt.Errorf("%w: installed app entrypoint %q missing", ErrInvalidDescriptor, exec)
 	}
-	return entrypoint, info, nil
+	return entrypoint, identify(&stat), nil
 }
 
 func installedVersion(appPath string) (string, error) {
@@ -89,36 +95,50 @@ func installedVersion(appPath string) (string, error) {
 	return installed, nil
 }
 
-type execCopyIdentity struct {
-	Name      string `json:"name"`
-	Version   string `json:"version"`
-	Source    string `json:"source"`
-	Device    string `json:"device"`
-	Inode     string `json:"inode"`
-	Size      int64  `json:"size"`
-	ModTimeNS int64  `json:"mtime_ns"`
+type fileIdentity struct {
+	Device       string `json:"device"`
+	Inode        uint64 `json:"inode"`
+	Size         int64  `json:"size"`
+	ModTimeNS    int64  `json:"mtime_ns"`
+	ChangeTimeNS int64  `json:"ctime_ns"`
 }
 
-func execCopyKey(desc *Descriptor, version, source string, info os.FileInfo) string {
-	stat := info.Sys().(*syscall.Stat_t)
-	identity, err := json.Marshal(execCopyIdentity{
-		Name:      desc.Name,
-		Version:   version,
-		Source:    source,
-		Device:    fmt.Sprint(stat.Dev),
-		Inode:     fmt.Sprint(stat.Ino),
-		Size:      info.Size(),
-		ModTimeNS: info.ModTime().UnixNano(),
-	})
+func identify(stat *unix.Stat_t) fileIdentity {
+	return fileIdentity{
+		Device:       fmt.Sprint(stat.Dev),
+		Inode:        stat.Ino,
+		Size:         stat.Size,
+		ModTimeNS:    stat.Mtim.Nano(),
+		ChangeTimeNS: stat.Ctim.Nano(),
+	}
+}
+
+func identifyOpen(file *os.File) (fileIdentity, error) {
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
+		return fileIdentity{}, fmt.Errorf("artifact: stat opened entrypoint: %w", err)
+	}
+	return identify(&stat), nil
+}
+
+type execCopyKeySource struct {
+	Name    string       `json:"name"`
+	Version string       `json:"version"`
+	Source  string       `json:"source"`
+	File    fileIdentity `json:"file"`
+}
+
+func execCopyKey(desc *Descriptor, version, source string, identity fileIdentity) string {
+	encoded, err := json.Marshal(execCopyKeySource{Name: desc.Name, Version: version, Source: source, File: identity})
 	if err != nil {
 		panic(err)
 	}
-	sum := sha256.Sum256(identity)
+	sum := sha256.Sum256(encoded)
 	return hex.EncodeToString(sum[:])
 }
 
-func (s Store) resolveExecCopy(ctx context.Context, desc *Descriptor, version, source string, info os.FileInfo) (string, error) {
-	key := execCopyKey(desc, version, source, info)
+func (s Store) resolveExecCopy(ctx context.Context, desc *Descriptor, version, source string, identity fileIdentity) (string, error) {
+	key := execCopyKey(desc, version, source, identity)
 	digestDir := s.digestDir(key)
 	target := filepath.Join(digestDir, filepath.Base(source))
 	if cacheHit(digestDir, target) {
@@ -130,7 +150,7 @@ func (s Store) resolveExecCopy(ctx context.Context, desc *Descriptor, version, s
 			return nil
 		}
 		materialized = true
-		return s.materializeExecCopy(desc, version, source, digestDir, target)
+		return s.materializeExecCopy(desc, version, source, identity, digestDir, target)
 	}); err != nil {
 		return "", err
 	}
@@ -140,7 +160,7 @@ func (s Store) resolveExecCopy(ctx context.Context, desc *Descriptor, version, s
 	return target, nil
 }
 
-func (s Store) materializeExecCopy(desc *Descriptor, version, source, digestDir, target string) error {
+func (s Store) materializeExecCopy(desc *Descriptor, version, source string, identity fileIdentity, digestDir, target string) error {
 	shardDir := filepath.Dir(digestDir)
 	if err := os.MkdirAll(shardDir, 0o750); err != nil {
 		return fmt.Errorf("artifact: create cache shard: %w", err)
@@ -155,7 +175,7 @@ func (s Store) materializeExecCopy(desc *Descriptor, version, source, digestDir,
 			_ = os.RemoveAll(stage)
 		}
 	}()
-	digest, err := copyExecutable(source, filepath.Join(stage, filepath.Base(target)))
+	digest, err := copyExecutable(source, filepath.Join(stage, filepath.Base(target)), identity)
 	if err != nil {
 		return err
 	}
@@ -175,12 +195,15 @@ func (s Store) materializeExecCopy(desc *Descriptor, version, source, digestDir,
 	return durable.SyncDir(shardDir)
 }
 
-func copyExecutable(source, target string) (string, error) {
-	in, err := os.Open(source)
+func copyExecutable(source, target string, attested fileIdentity) (string, error) {
+	in, err := openEntrypoint(source)
 	if err != nil {
 		return "", fmt.Errorf("artifact: open installed app entrypoint: %w", err)
 	}
 	defer in.Close()
+	if err := requireIdentity(in, attested); err != nil {
+		return "", err
+	}
 	out, err := durable.Create(target, 0o755)
 	if err != nil {
 		return "", fmt.Errorf("artifact: create entrypoint copy: %w", err)
@@ -190,10 +213,24 @@ func copyExecutable(source, target string) (string, error) {
 	if _, err := io.Copy(io.MultiWriter(out, hash), in); err != nil {
 		return "", fmt.Errorf("artifact: copy installed app entrypoint: %w", err)
 	}
+	if err := requireIdentity(in, attested); err != nil {
+		return "", err
+	}
 	if err := out.Commit(); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func requireIdentity(file *os.File, attested fileIdentity) error {
+	opened, err := identifyOpen(file)
+	if err != nil {
+		return err
+	}
+	if opened != attested {
+		return fmt.Errorf("%w: %s", ErrEntrypointChanged, file.Name())
+	}
+	return nil
 }
 
 func (s Store) pruneExecCopies(ctx context.Context, source, current string) {
@@ -202,8 +239,9 @@ func (s Store) pruneExecCopies(ctx context.Context, source, current string) {
 		slog.Warn("artifact: enumerate cache for stale signed-app copies", "error", err)
 		return
 	}
+	cutoff := time.Now().Add(-execCopyRetention)
 	for _, entry := range entries {
-		if entry.Source != source || entry.Dir == current {
+		if entry.Source != source || entry.Dir == current || entry.FetchedAt.After(cutoff) {
 			continue
 		}
 		if err := s.removeCacheEntry(ctx, entry); err != nil {

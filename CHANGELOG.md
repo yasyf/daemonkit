@@ -14,11 +14,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process on the bundle that a supersede has to quiesce. Only that one file is
   copied, so the entrypoint must be self-contained with its signature
   embedded. The entry is keyed by the app's version and the entrypoint's
-  device, inode, size, and mtime, so a warm resolution is a few stats and
-  never reads the source; a miss copies the file, records its digest in the
-  entry's `meta.json` beside a new `source` field, and prunes the copies an
-  earlier version or file of the same entrypoint left behind. `CacheEntry`
+  device, inode, size, mtime, and ctime, so a warm resolution is a few stats
+  and never reads the source; a miss copies the file from a descriptor it
+  holds to that identity, refusing with `ErrEntrypointChanged` when the file
+  changed underneath, records the digest in the entry's `meta.json` beside a
+  new `source` field, and prunes the copies of the same entrypoint that are
+  more than a day old. The prune is deliberately loose rather than exact: a
+  copy a concurrent resolver returned moments ago is never removed, and the
+  cache keeps one entry per app build until that day passes. `CacheEntry`
   gains `Source` for that field.
+- `CacheEntries` lists only canonical digest directories, so a staging
+  directory mid-publication is never handed to a collector.
 
 ## [0.30.1] - 2026-09-15
 

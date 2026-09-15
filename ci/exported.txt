@@ -272,6 +272,7 @@ artifact	method	Descriptor.Validate	all
 artifact	field	Descriptor.Version	all
 artifact	var	ErrChecksumMismatch	all
 artifact	var	ErrDynamicIntegrity	all
+artifact	var	ErrEntrypointChanged	all
 artifact	var	ErrInvalidDescriptor	all
 artifact	var	ErrManualUpgrade	all
 artifact	var	ErrSchemaVersion	all

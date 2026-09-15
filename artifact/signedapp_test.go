@@ -7,11 +7,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/yasyf/daemonkit/internal/realhome"
 )
@@ -307,10 +311,9 @@ func TestResolveSignedAppCopyExecReturnsCachedCopy(t *testing.T) {
 	}
 }
 
-func TestResolveSignedAppCopyExecHitNeverReadsSource(t *testing.T) {
+func TestResolveSignedAppCopyExecHitNeverOpensSource(t *testing.T) {
 	dir := t.TempDir()
 	writeApp(t, dir, "Captain Hook", "12.15.3", "Contents/Helpers/capt-hookd")
-	source := filepath.Join(dir, "Captain Hook.app", "Contents", "Helpers", "capt-hookd")
 	store := Store{Root: t.TempDir()}
 	desc := copyExecDescriptor(dir, "12.15.3")
 
@@ -318,10 +321,10 @@ func TestResolveSignedAppCopyExecHitNeverReadsSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Resolve() = %v", err)
 	}
-	if err := os.Chmod(source, 0); err != nil {
-		t.Fatal(err)
+	openEntrypoint = func(path string) (*os.File, error) {
+		return nil, fmt.Errorf("warm resolve opened %q", path)
 	}
-	t.Cleanup(func() { _ = os.Chmod(source, 0o755) })
+	t.Cleanup(func() { openEntrypoint = os.Open })
 
 	second, err := store.Resolve(context.Background(), desc)
 	if err != nil {
@@ -332,7 +335,39 @@ func TestResolveSignedAppCopyExecHitNeverReadsSource(t *testing.T) {
 	}
 }
 
-func TestResolveSignedAppCopyExecUpgradePrunesOldCopy(t *testing.T) {
+func backdateEntry(t *testing.T, dir string) {
+	t.Helper()
+	meta := readMeta(t, dir)
+	meta.FetchedAt = time.Now().UTC().Add(-2 * execCopyRetention)
+	data, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "meta.json"), append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func seedExecCopy(t *testing.T, store Store, source, digest string, fetched time.Time) string {
+	t.Helper()
+	dir := filepath.Join(store.CacheDir(), digest[:2], digest)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, filepath.Base(source)), []byte("#!/bin/sh\necho seeded\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(cacheMeta{Name: "Captain Hook", Tag: "12.0.0", Digest: digest, Source: source, FetchedAt: fetched})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "meta.json"), append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func TestResolveSignedAppCopyExecUpgradeMintsNewEntry(t *testing.T) {
 	tests := []struct {
 		name    string
 		upgrade func(t *testing.T, dir string) *Descriptor
@@ -345,6 +380,27 @@ func TestResolveSignedAppCopyExecUpgradePrunesOldCopy(t *testing.T) {
 			source := filepath.Join(dir, "Captain Hook.app", "Contents", "Helpers", "capt-hookd")
 			if err := os.WriteFile(source, []byte("#!/bin/sh\necho rebuilt\n"), 0o755); err != nil {
 				t.Fatal(err)
+			}
+			return copyExecDescriptor(dir, "12.15.3")
+		}},
+		{"same-length rewrite with mtime preserved", func(t *testing.T, dir string) *Descriptor {
+			source := filepath.Join(dir, "Captain Hook.app", "Contents", "Helpers", "capt-hookd")
+			before, err := os.Stat(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(source, []byte("#!/bin/SH\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chtimes(source, before.ModTime(), before.ModTime()); err != nil {
+				t.Fatal(err)
+			}
+			after, err := os.Stat(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime()) {
+				t.Fatalf("rewrite changed size or mtime: %d/%v -> %d/%v", before.Size(), before.ModTime(), after.Size(), after.ModTime())
 			}
 			return copyExecDescriptor(dir, "12.15.3")
 		}},
@@ -379,103 +435,131 @@ func TestResolveSignedAppCopyExecUpgradePrunesOldCopy(t *testing.T) {
 			if !bytes.Equal(got, want) {
 				t.Fatalf("copy = %q, want %q", got, want)
 			}
-			if _, err := os.Stat(filepath.Dir(old)); !errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("old entry stat = %v, want ErrNotExist", err)
-			}
-			entries, err := store.CacheEntries()
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(entries) != 1 || entries[0].Dir != filepath.Dir(current) {
-				t.Fatalf("entries = %+v, want only the current copy", entries)
+			if !regular(old) {
+				t.Fatalf("fresh prior entry %q was pruned, want it kept for %v", old, execCopyRetention)
 			}
 		})
 	}
 }
 
-func TestResolveSignedAppCopyExecHitDoesNotPrune(t *testing.T) {
+func TestResolveSignedAppCopyExecPrunesOnlyOldEntriesOnMiss(t *testing.T) {
 	dir := t.TempDir()
 	writeApp(t, dir, "Captain Hook", "12.15.3", "Contents/Helpers/capt-hookd")
+	source := filepath.Join(dir, "Captain Hook.app", "Contents", "Helpers", "capt-hookd")
 	store := Store{Root: t.TempDir()}
-	stale := seedCacheEntry(t, store, "Captain Hook", "12.14.0", strings.Repeat("c", 64))
 	desc := copyExecDescriptor(dir, "12.15.3")
 
-	if _, err := store.Resolve(context.Background(), desc); err != nil {
+	first, err := store.Resolve(context.Background(), desc)
+	if err != nil {
 		t.Fatalf("Resolve() = %v", err)
 	}
-	if _, err := store.Resolve(context.Background(), desc); err != nil {
-		t.Fatalf("second Resolve() = %v", err)
+	stale := seedExecCopy(t, store, source, strings.Repeat("c", 64), time.Now().UTC().Add(-2*execCopyRetention))
+	fresh := seedExecCopy(t, store, source, strings.Repeat("d", 64), time.Now().UTC())
+	unrelated := seedCacheEntry(t, store, "tool", "v1", strings.Repeat("e", 64))
+
+	hit, err := store.Resolve(context.Background(), desc)
+	if err != nil {
+		t.Fatalf("warm Resolve() = %v", err)
 	}
-	if _, err := os.Stat(stale.Dir); err != nil {
-		t.Fatalf("unrelated entry stat = %v, want it untouched", err)
+	if hit != first {
+		t.Fatalf("warm path = %q, want %q", hit, first)
+	}
+	for _, dir := range []string{stale, fresh, unrelated.Dir} {
+		if _, err := os.Stat(dir); err != nil {
+			t.Fatalf("hit pruned %q: %v", dir, err)
+		}
+	}
+
+	backdateEntry(t, filepath.Dir(first))
+	writeApp(t, dir, "Captain Hook", "12.16.0", "Contents/Helpers/capt-hookd")
+	current, err := store.Resolve(context.Background(), copyExecDescriptor(dir, "12.16.0"))
+	if err != nil {
+		t.Fatalf("Resolve() after upgrade = %v", err)
+	}
+	for _, dir := range []string{stale, filepath.Dir(first)} {
+		if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("miss kept old entry %q: %v", dir, err)
+		}
+	}
+	for _, dir := range []string{fresh, unrelated.Dir, filepath.Dir(current)} {
+		if _, err := os.Stat(dir); err != nil {
+			t.Fatalf("miss pruned %q: %v", dir, err)
+		}
 	}
 }
 
-func TestResolveSignedAppCopyExecConcurrentResolvesConverge(t *testing.T) {
+func TestCopyExecutableRefusesChangedSource(t *testing.T) {
 	dir := t.TempDir()
-	writeApp(t, dir, "Captain Hook", "12.15.3", "Contents/Helpers/capt-hookd")
-	store := Store{Root: t.TempDir()}
-	desc := copyExecDescriptor(dir, "12.15.3")
+	source := filepath.Join(dir, "capt-hookd")
+	if err := os.WriteFile(source, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var stat unix.Stat_t
+	if err := unix.Stat(source, &stat); err != nil {
+		t.Fatal(err)
+	}
+	attested := identify(&stat)
+	attested.ChangeTimeNS++
 
-	const resolvers = 8
-	paths := make([]string, resolvers)
-	errs := make([]error, resolvers)
-	var wg sync.WaitGroup
-	for i := range resolvers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			paths[i], errs[i] = store.Resolve(context.Background(), desc)
-		}()
+	_, err := copyExecutable(source, filepath.Join(dir, "copy"), attested)
+	if !errors.Is(err, ErrEntrypointChanged) {
+		t.Fatalf("copyExecutable() = %v, want ErrEntrypointChanged", err)
 	}
-	wg.Wait()
-	for i := range resolvers {
-		if errs[i] != nil {
-			t.Fatalf("resolver %d: %v", i, errs[i])
-		}
-		if paths[i] != paths[0] {
-			t.Fatalf("resolver %d path = %q, want %q", i, paths[i], paths[0])
+	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+		t.Fatalf("dir = %v, want only the source left behind", entries)
+	}
+}
+
+func buildSignedFixture(t *testing.T) []byte {
+	t.Helper()
+	dir := t.TempDir()
+	sources := map[string]string{
+		"go.mod":  "module fixture\n\ngo 1.22\n",
+		"main.go": "package main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n)\n\nfunc main() { fmt.Println(os.Args[1]) }\n",
+	}
+	for name, body := range sources {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
 		}
 	}
-	entries, err := store.CacheEntries()
+	bin := filepath.Join(dir, "fixture")
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Dir = dir
+	build.Env = append(os.Environ(), "CGO_ENABLED=0", "GOWORK=off", "GOTOOLCHAIN=local")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build fixture: %v\n%s", err, out)
+	}
+	if out, err := exec.Command("codesign", "--force", "--sign", "-", bin).CombinedOutput(); err != nil {
+		t.Fatalf("codesign fixture: %v\n%s", err, out)
+	}
+	data, err := os.ReadFile(bin)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 1 {
-		t.Fatalf("entries = %d, want 1", len(entries))
-	}
-	if !regular(paths[0]) {
-		t.Fatalf("%q is not a regular file", paths[0])
-	}
+	return data
 }
 
-func TestResolveSignedAppCopyExecKeepsManualUpgradePaths(t *testing.T) {
-	tests := []struct {
-		name string
-		desc func(t *testing.T) *Descriptor
-		got  string
-	}{
-		{"version mismatch", func(t *testing.T) *Descriptor {
-			dir := t.TempDir()
-			writeApp(t, dir, "Captain Hook", "12.15.3", "Contents/Helpers/capt-hookd")
-			return copyExecDescriptor(dir, "12.15.4")
-		}, "12.15.3"},
-		{"missing app", func(t *testing.T) *Descriptor {
-			return copyExecDescriptor(t.TempDir(), "12.15.3")
-		}, ""},
+func TestResolveSignedAppCopyExecRelocatesSignedMachO(t *testing.T) {
+	dir := t.TempDir()
+	writeApp(t, dir, "Captain Hook", "12.15.3", "Contents/Helpers/capt-hookd")
+	source := filepath.Join(dir, "Captain Hook.app", "Contents", "Helpers", "capt-hookd")
+	if err := os.WriteFile(source, buildSignedFixture(t), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			store := Store{Root: t.TempDir()}
+	store := Store{Root: t.TempDir()}
 
-			_, err := store.Resolve(context.Background(), tt.desc(t))
-			var upgrade *ManualUpgradeError
-			if !errors.As(err, &upgrade) || upgrade.Got != tt.got || upgrade.Cask != "captain-hook" {
-				t.Fatalf("Resolve() = %v, want ManualUpgradeError with Got %q", err, tt.got)
-			}
-			if _, err := os.Stat(store.CacheDir()); !errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("cache dir stat = %v, want ErrNotExist", err)
-			}
-		})
+	path, err := store.Resolve(context.Background(), copyExecDescriptor(dir, "12.15.3"))
+	if err != nil {
+		t.Fatalf("Resolve() = %v", err)
+	}
+	if out, err := exec.Command("codesign", "--verify", "--strict", "--verbose=2", path).CombinedOutput(); err != nil {
+		t.Fatalf("codesign --verify %q: %v\n%s", path, err, out)
+	}
+	out, err := exec.Command(path, "relocated").Output()
+	if err != nil {
+		t.Fatalf("run %q: %v", path, err)
+	}
+	if string(out) != "relocated\n" {
+		t.Fatalf("output = %q, want relocated", out)
 	}
 }
