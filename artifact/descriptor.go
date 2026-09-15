@@ -104,7 +104,8 @@ type ToolSpec struct {
 // AppSpec is the signed-app payload. Exactly one of Cask and Formula names the
 // Homebrew package a ManualUpgradeError tells the user to upgrade. MinVersion,
 // valid only with a host-authoritative version, is the oldest release triple
-// the installed app may report; a dev build always satisfies it.
+// the installed app may report; a dev build always satisfies it. CopyExec
+// resolves to a cached copy of the self-contained entrypoint, never the bundle.
 type AppSpec struct {
 	Dir        string `json:"dir"`
 	AppName    string `json:"app_name"`
@@ -112,6 +113,7 @@ type AppSpec struct {
 	Cask       string `json:"cask,omitempty"`
 	Formula    string `json:"formula,omitempty"`
 	MinVersion string `json:"min_version,omitempty"`
+	CopyExec   bool   `json:"copy_exec,omitempty"`
 }
 
 // CurrentPlatform returns the dotslash platform key for the running host.

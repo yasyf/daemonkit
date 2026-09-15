@@ -6,6 +6,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A signed-app descriptor can set `app.copy_exec`: `Resolve` then returns a
+  copy of the attested entrypoint in the content cache instead of the file
+  inside the bundle, so a short-lived client running it is never a live
+  process on the bundle that a supersede has to quiesce. Only that one file is
+  copied, so the entrypoint must be self-contained with its signature
+  embedded. The entry is keyed by the app's version and the entrypoint's
+  device, inode, size, mtime, and ctime, so a warm resolution is a few stats
+  and never reads the source; a miss copies the file from a descriptor it
+  holds to that identity, refusing with `ErrEntrypointChanged` when the file
+  changed underneath, records the digest in the entry's `meta.json` beside a
+  new `source` field, and prunes the copies of the same entrypoint that are
+  more than a day old. The prune is deliberately loose rather than exact: a
+  copy a concurrent resolver returned moments ago is never removed, and the
+  cache keeps one entry per app build until that day passes. `CacheEntry`
+  gains `Source` for that field.
+- `CacheEntries` lists only canonical digest directories, so a staging
+  directory mid-publication is never handed to a collector.
+
 ## [0.30.1] - 2026-09-15
 
 ### Changed
@@ -19,26 +39,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.30.0] - 2026-09-15
 
-### Changed
-
-- A supersede runs every codesign before it quiesces the incumbent. The swap
-  holds the prior and the candidate to the inode and whole-tree digest their
-  attestation named, and refuses a tree whose bytes changed under the quiesce
-  with the incumbent still in place, where it used to re-verify each
-  generation with codesign between the daemon leaving and its successor
-  starting. A resume from the swap record still re-verifies everything it
-  moves.
-- The superseded tree stays aside, named by the swap record, until the
-  `Activate` that proves the candidate serving retires it after sealing the
-  readiness it proved; that `Activate` seals the generation the supersede
-  attested instead of inspecting the canonical path again. Any other verb's
-  resume retires the tree first, under the gate, and an `Activate` whose
-  retirement fails keeps the record so a retry completes it.
-- `artifact` installs a Python tool with `uv tool install --compile-bytecode`,
-  so a tool env is whole before its first process imports it rather than
-  compiled by every cold start after a deploy.
-
-||||||| d442166 (deploy: ⚡️ attest once before quiesce and compile python bytecode at install (#27))
 ### Changed
 
 - A supersede runs every codesign before it quiesces the incumbent. The swap

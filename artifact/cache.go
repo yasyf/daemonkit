@@ -14,22 +14,25 @@ import (
 	"github.com/yasyf/daemonkit/durable"
 )
 
-// CacheEntry is one materialized release-binary in the content-addressed cache,
-// as enumerated for garbage collection. Digest and Dir are always set; Name,
-// Tag, and FetchedAt come from the entry's meta.json and are zero when it is
-// missing or unreadable, so a damaged entry can still be pruned.
+// CacheEntry is one materialized release-binary or signed-app entrypoint copy
+// in the content-addressed cache, as enumerated for garbage collection. Digest
+// and Dir are always set; the rest comes from the entry's meta.json and is zero
+// when it is missing or unreadable, so a damaged entry can still be pruned.
+// Source is the installed entrypoint a signed-app copy was taken from.
 type CacheEntry struct {
 	Name      string
 	Tag       string
 	Digest    string
 	Dir       string
+	Source    string
 	FetchedAt time.Time
 }
 
 // CacheEntries walks the content cache and returns one entry per digest
 // directory, reading each meta.json for provenance. A digest directory with a
 // missing or corrupt meta.json still yields an entry (Digest and Dir only) plus
-// one warning, so gc can prune it rather than orbit it forever.
+// one warning, so gc can prune it rather than orbit it forever; a directory
+// that is not a canonical digest entry, such as a staging one, is never listed.
 func (s Store) CacheEntries() ([]CacheEntry, error) {
 	if err := s.validate(); err != nil {
 		return nil, err
@@ -43,7 +46,7 @@ func (s Store) CacheEntries() ([]CacheEntry, error) {
 	}
 	var entries []CacheEntry
 	for _, shard := range shards {
-		if !shard.IsDir() {
+		if !shard.IsDir() || len(shard.Name()) != 2 || !isLowerHex(shard.Name()) {
 			continue
 		}
 		shardDir := filepath.Join(s.CacheDir(), shard.Name())
@@ -52,12 +55,16 @@ func (s Store) CacheEntries() ([]CacheEntry, error) {
 			return nil, fmt.Errorf("artifact: read cache shard %q: %w", shard.Name(), err)
 		}
 		for _, digest := range digests {
-			if digest.IsDir() {
+			if digest.IsDir() && canonicalDigestName(shard.Name(), digest.Name()) {
 				entries = append(entries, readCacheEntry(filepath.Join(shardDir, digest.Name()), digest.Name()))
 			}
 		}
 	}
 	return entries, nil
+}
+
+func canonicalDigestName(shard, name string) bool {
+	return len(name) == 64 && isLowerHex(name) && name[:2] == shard
 }
 
 func readCacheEntry(dir, digest string) CacheEntry {
@@ -74,6 +81,7 @@ func readCacheEntry(dir, digest string) CacheEntry {
 	}
 	entry.Name = meta.Name
 	entry.Tag = meta.Tag
+	entry.Source = meta.Source
 	entry.FetchedAt = meta.FetchedAt
 	return entry
 }
@@ -164,13 +172,17 @@ func within(root, dir string) error {
 // digest completes whole before the removal begins and never observes a
 // half-deleted entry.
 func (s Store) RemoveCacheEntry(entry CacheEntry) error {
+	return s.removeCacheEntry(context.Background(), entry)
+}
+
+func (s Store) removeCacheEntry(ctx context.Context, entry CacheEntry) error {
 	if err := s.validate(); err != nil {
 		return err
 	}
 	if err := within(s.CacheDir(), entry.Dir); err != nil {
 		return err
 	}
-	return s.withLock(context.Background(), "release:"+entry.Digest, func() error {
+	return s.withLock(ctx, "release:"+entry.Digest, func() error {
 		if err := durable.RemoveTree(entry.Dir); err != nil {
 			return fmt.Errorf("artifact: remove cache entry: %w", err)
 		}

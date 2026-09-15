@@ -159,16 +159,13 @@ type cacheMeta struct {
 	Name      string    `json:"name"`
 	Tag       string    `json:"tag"`
 	Digest    string    `json:"digest"`
+	Source    string    `json:"source,omitempty"`
 	FetchedAt time.Time `json:"fetched_at"`
 }
 
-func writeCacheMeta(digestDir, name string, entry PlatformEntry) error {
-	data, err := json.Marshal(cacheMeta{
-		Name:      name,
-		Tag:       entry.Providers[0].Tag,
-		Digest:    entry.Digest,
-		FetchedAt: time.Now().UTC(),
-	})
+func writeCacheMeta(digestDir string, meta cacheMeta) error {
+	meta.FetchedAt = time.Now().UTC()
+	data, err := json.Marshal(meta)
 	if err != nil {
 		return fmt.Errorf("artifact: encode cache meta: %w", err)
 	}

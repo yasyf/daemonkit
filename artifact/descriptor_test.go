@@ -24,6 +24,17 @@ func TestParseToleratesShebang(t *testing.T) {
 	}
 }
 
+func TestParseReadsCopyExec(t *testing.T) {
+	body := []byte(`{"schema":1,"name":"capt-hook","kind":"signed-app","version":{"static":"12.15.3"},"app":{"dir":"~/Applications","app_name":"Captain Hook","exec":"Contents/Helpers/capt-hookd","cask":"captain-hook","copy_exec":true}}`)
+	desc, err := Parse(body)
+	if err != nil {
+		t.Fatalf("Parse() = %v", err)
+	}
+	if !desc.App.CopyExec {
+		t.Fatalf("descriptor = %+v, want app.copy_exec set", desc.App)
+	}
+}
+
 func TestValidate(t *testing.T) {
 	rbEntry := map[Platform]PlatformEntry{
 		"macos-aarch64": {

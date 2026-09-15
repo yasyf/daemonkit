@@ -31,6 +31,9 @@ var (
 	// ErrManualUpgrade means an attested signed app is missing or stale and must
 	// be upgraded out of band. Inspect a ManualUpgradeError for the handoff.
 	ErrManualUpgrade = errors.New("artifact: signed app requires a manual upgrade")
+	// ErrEntrypointChanged means a signed app's entrypoint was replaced or
+	// rewritten between its attestation and the copy that resolution took of it.
+	ErrEntrypointChanged = errors.New("artifact: installed app entrypoint changed during resolution")
 )
 
 // ManualUpgradeError is the typed attest failure a caller renders as a

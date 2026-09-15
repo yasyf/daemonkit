@@ -34,7 +34,17 @@
 // descriptor — that its version matches, or — for a host-authoritative one
 // with app.min_version — that it is no older than that release, and otherwise
 // returns a ManualUpgradeError the caller renders as a "brew upgrade" handoff
-// naming the descriptor's cask or formula.
+// naming the descriptor's cask or formula. With app.copy_exec the attested
+// entrypoint is resolved as a copy in the content cache rather than the file
+// inside the bundle, so a process running it is never a live process on the
+// bundle when the app is superseded. Only that one file is copied — the
+// entrypoint must be self-contained, with its code signature embedded — into an
+// entry keyed by the app's version and the entrypoint's device, inode, size,
+// mtime, and ctime, so a warm resolution is a few stats and never reads the
+// source bytes; a miss copies from a descriptor it holds to that identity,
+// records the digest, and prunes the copies of the same entrypoint more than a
+// day old, so a copy another process resolved moments ago is never removed
+// from under it. The cache keeps one entry per app build until then.
 // Packaging and deployment activation are explicit consumer operations.
 //
 // # Version source and the supply-chain rule
