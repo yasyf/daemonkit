@@ -246,6 +246,7 @@
 artifact	type	AppSpec	all
 artifact	field	AppSpec.AppName	all
 artifact	field	AppSpec.Cask	all
+artifact	field	AppSpec.CopyExec	all
 artifact	field	AppSpec.Dir	all
 artifact	field	AppSpec.Exec	all
 artifact	field	AppSpec.Formula	all
@@ -255,6 +256,7 @@ artifact	field	CacheEntry.Digest	all
 artifact	field	CacheEntry.Dir	all
 artifact	field	CacheEntry.FetchedAt	all
 artifact	field	CacheEntry.Name	all
+artifact	field	CacheEntry.Source	all
 artifact	field	CacheEntry.Tag	all
 artifact	func	CurrentPlatform	all
 artifact	func	DefaultStore	all

@@ -14,15 +14,17 @@ import (
 	"github.com/yasyf/daemonkit/durable"
 )
 
-// CacheEntry is one materialized release-binary in the content-addressed cache,
-// as enumerated for garbage collection. Digest and Dir are always set; Name,
-// Tag, and FetchedAt come from the entry's meta.json and are zero when it is
-// missing or unreadable, so a damaged entry can still be pruned.
+// CacheEntry is one materialized release-binary or signed-app entrypoint copy
+// in the content-addressed cache, as enumerated for garbage collection. Digest
+// and Dir are always set; the rest comes from the entry's meta.json and is zero
+// when it is missing or unreadable, so a damaged entry can still be pruned.
+// Source is the installed entrypoint a signed-app copy was taken from.
 type CacheEntry struct {
 	Name      string
 	Tag       string
 	Digest    string
 	Dir       string
+	Source    string
 	FetchedAt time.Time
 }
 
@@ -74,6 +76,7 @@ func readCacheEntry(dir, digest string) CacheEntry {
 	}
 	entry.Name = meta.Name
 	entry.Tag = meta.Tag
+	entry.Source = meta.Source
 	entry.FetchedAt = meta.FetchedAt
 	return entry
 }
@@ -164,13 +167,17 @@ func within(root, dir string) error {
 // digest completes whole before the removal begins and never observes a
 // half-deleted entry.
 func (s Store) RemoveCacheEntry(entry CacheEntry) error {
+	return s.removeCacheEntry(context.Background(), entry)
+}
+
+func (s Store) removeCacheEntry(ctx context.Context, entry CacheEntry) error {
 	if err := s.validate(); err != nil {
 		return err
 	}
 	if err := within(s.CacheDir(), entry.Dir); err != nil {
 		return err
 	}
-	return s.withLock(context.Background(), "release:"+entry.Digest, func() error {
+	return s.withLock(ctx, "release:"+entry.Digest, func() error {
 		if err := durable.RemoveTree(entry.Dir); err != nil {
 			return fmt.Errorf("artifact: remove cache entry: %w", err)
 		}
