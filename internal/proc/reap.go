@@ -147,9 +147,11 @@ func (s *ladder) reapOrphan(ctx context.Context, id identity, boot uint64) (Reap
 	return s.awaitSettlement(ctx, id, boot)
 }
 
+// awaitSettlement polls for the killed instance's absence and answers the
+// deadline with one last probe, so the verdict names what the table still
+// held: a process the kernel is tearing down, or one that ignored SIGKILL.
 func (s *ladder) awaitSettlement(ctx context.Context, id identity, boot uint64) (Reap, error) {
 	clk := clockOrReal(s.clock)
-	deadline, _ := ctx.Deadline()
 	for {
 		info, err := s.prober.probe(id.pid)
 		switch {
@@ -159,12 +161,13 @@ func (s *ladder) awaitSettlement(ctx context.Context, id identity, boot uint64) 
 			return reapUndetermined, fmt.Errorf("prove killed process %d settled: %w", id.pid, err)
 		case !id.matches(identity{pid: id.pid, start: info.start, boot: boot}), info.zombie:
 			return ReapTerminated, nil
-		case !clk.Now().Before(deadline):
+		case ctx.Err() != nil && info.exiting:
+			return reapUndetermined, fmt.Errorf("killed process %d still exiting at settlement deadline", id.pid)
+		case ctx.Err() != nil:
 			return reapUndetermined, errors.New("killed process remained live through settlement deadline")
 		}
 		select {
 		case <-ctx.Done():
-			return reapUndetermined, ctx.Err()
 		case <-clk.After(settlementPollInterval):
 		}
 	}
@@ -235,7 +238,6 @@ func (s *ladder) settleSession(ctx context.Context, session int, boot uint64) (R
 
 func (s *ladder) awaitSessionSettlement(ctx context.Context, session int, boot uint64) (Reap, error) {
 	clk := clockOrReal(s.clock)
-	deadline, _ := ctx.Deadline()
 	for {
 		members, err := s.verifiedMembers(session, boot)
 		if err != nil {
@@ -244,8 +246,11 @@ func (s *ladder) awaitSessionSettlement(ctx context.Context, session int, boot u
 		if len(members) == 0 {
 			return ReapTerminated, nil
 		}
-		if !clk.Now().Before(deadline) {
-			return reapUndetermined, errors.New("killed session remained live through settlement deadline")
+		if ctx.Err() != nil {
+			return reapUndetermined, fmt.Errorf(
+				"killed session remained live through settlement deadline, %d of %d members exiting",
+				exitingMembers(members), len(members),
+			)
 		}
 		settled, err := s.signalSessionGroups(session, members, syscall.SIGKILL, boot)
 		if err != nil {
@@ -256,10 +261,19 @@ func (s *ladder) awaitSessionSettlement(ctx context.Context, session int, boot u
 		}
 		select {
 		case <-ctx.Done():
-			return reapUndetermined, ctx.Err()
 		case <-clk.After(settlementPollInterval):
 		}
 	}
+}
+
+func exitingMembers(members []groupMember) int {
+	exiting := 0
+	for _, member := range members {
+		if member.info.exiting {
+			exiting++
+		}
+	}
+	return exiting
 }
 
 // verifiedMembers re-verifies every enumerated member immediately before it
@@ -343,8 +357,10 @@ func (s *ladder) signalGone(pid int, sig syscall.Signal) (bool, error) {
 }
 
 // graceShare is the TERM grace: a named fraction of the time remaining on ctx
-// at entry, with SIGKILL and settlement spending the rest.
+// at entry, cut so that SettleGrace of it stays for SIGKILL and settlement.
+// Under SettleGrace of budget, TERM gets no grace at all.
 func graceShare(ctx context.Context, clk clock) time.Duration {
 	deadline, _ := ctx.Deadline()
-	return fractionOf(deadline.Sub(clk.Now()), termShare)
+	left := deadline.Sub(clk.Now())
+	return max(0, min(fractionOf(left, termShare), left-SettleGrace))
 }

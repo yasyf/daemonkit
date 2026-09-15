@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The reap ladder keeps one settlement grace for the kill. SIGTERM's grace is
+  now cut so at least 5s of the caller's deadline is left for SIGKILL and the
+  observed absence that proves it, where it used to take 0.6 of whatever was
+  left and hand the kill the rest, so a survivor terminated on a short share
+  of a deploy budget was killed with under a second to leave the table and
+  the deploy aborted to a restore. Under 5s of budget SIGTERM gets no grace
+  and the ladder kills at once. A killed process still in the table at the
+  deadline is now reported as `still exiting` when the kernel has begun
+  tearing it down (`P_WEXIT`), and the ladder answers its deadline with one
+  last probe rather than the bare context error.
+
 ## [0.28.1] - 2026-09-14
 
 ### Fixed

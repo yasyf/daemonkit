@@ -12,6 +12,7 @@ import (
 const (
 	darwinStopState   = 4
 	darwinZombieState = 5
+	darwinExitingFlag = 0x2000
 )
 
 // errNoProc is the package's one definitive "gone" sentinel, distinct from a
@@ -25,6 +26,7 @@ type procInfo struct {
 	session int
 	zombie  bool
 	stopped bool
+	exiting bool
 }
 
 type groupMember struct {
@@ -114,6 +116,7 @@ func procInfoFromKinfo(kp unix.KinfoProc, sessionID int) procInfo {
 		session: sessionID,
 		zombie:  kp.Proc.P_stat == darwinZombieState,
 		stopped: kp.Proc.P_stat == darwinStopState,
+		exiting: kp.Proc.P_flag&darwinExitingFlag != 0,
 	}
 }
 
