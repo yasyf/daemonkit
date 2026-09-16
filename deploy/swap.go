@@ -189,13 +189,27 @@ func (d *Deployment) retireSwap(record swapRecord) error {
 // slot, beside the canonical path so the swap is a rename and never a copy,
 // and re-attests the source before and the copy after: bytes that changed
 // under the copy never reach the slot.
+//
+// An occupied slot is adopted only when it holds the generation this request
+// is landing, which resumes an install interrupted after its copy. A slot
+// holding any other generation is a tree an earlier install abandoned before
+// its swap record, which no record names and no path derives from, so it is
+// discarded rather than refused: refusing it failed every later upgrade
+// against a bundle no caller had asked for until someone deleted it by hand.
+// A slot that cannot be inspected is neither adopted nor destroyed, so a
+// deadline here never costs a resumable tree.
 func (d *Deployment) stage(ctx context.Context, candidate Candidate) (Generation, error) {
 	if fileExists(d.layout.candidate) {
 		staged, err := d.inspect(ctx, d.layout.candidate)
 		if err != nil {
 			return Generation{}, err
 		}
-		return staged, candidate.matches(staged)
+		if candidate.matches(staged) == nil {
+			return staged, nil
+		}
+		if err := d.discardCandidate(); err != nil {
+			return Generation{}, err
+		}
 	}
 	source, err := d.inspect(ctx, candidate.Source)
 	if err != nil {
@@ -213,6 +227,25 @@ func (d *Deployment) stage(ctx context.Context, candidate Candidate) (Generation
 		return Generation{}, errors.Join(stageErr, durable.RemoveTree(stagePath))
 	}
 	return staged, nil
+}
+
+// discardCandidate reclaims the candidate slot on the inventory gate's terms,
+// scoped to that one slot: the deployment-wide requireEmpty would refuse for
+// the incumbent, which this runs before the quiesce of and which is still
+// deliberately serving.
+func (d *Deployment) discardCandidate() error {
+	carried, err := bundleExecutables(d.layout.candidate)
+	if err != nil {
+		return err
+	}
+	found, err := Inventory(carried...)
+	if err != nil {
+		return err
+	}
+	if err := liveError(found.Live); err != nil {
+		return err
+	}
+	return durable.RemoveTree(d.layout.candidate)
 }
 
 // generationSlots is every location this deployment can move or copy a whole

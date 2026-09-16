@@ -1,6 +1,7 @@
 package deploy
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -360,6 +361,89 @@ func TestResetScansTheStrandedPriorItReclaims(t *testing.T) {
 	f.terminated(stray)
 	if fileExists(stranded) {
 		t.Fatal("Reset left the stranded prior tree behind")
+	}
+}
+
+// TestStageAdoptsTheSlotHoldingTheGenerationItIsLanding is why an occupied
+// candidate slot is looked at rather than cleared: an install interrupted after
+// its copy resumes without making that copy again.
+func TestStageAdoptsTheSlotHoldingTheGenerationItIsLanding(t *testing.T) {
+	f := newFixture(t)
+	if err := f.deploy.layout.ensureMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	candidate := f.candidate("Source", "2.0", "two")
+	first, err := f.deploy.stage(f.ctx(), candidate)
+	if err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+	resumed, err := f.deploy.stage(f.ctx(), candidate)
+	if err != nil {
+		t.Fatalf("resumed stage: %v", err)
+	}
+	if resumed.FileID != first.FileID {
+		t.Fatal("the resumed stage copied the candidate again instead of adopting the slot it had staged")
+	}
+}
+
+// TestStageDiscardsACandidateSlotItIsNotLanding is the wedge that adoption cost
+// before it was conditional: an install aborted between its copy and its swap
+// record leaves a version no later request names, and refusing it failed every
+// later upgrade until the slot was deleted by hand.
+func TestStageDiscardsACandidateSlotItIsNotLanding(t *testing.T) {
+	f := newFixture(t)
+	if err := f.deploy.layout.ensureMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	rename(t, f.bundle("Abandoned", "2.0", "two"), f.deploy.layout.candidate)
+	landed, err := f.deploy.Install(f.ctx(), f.candidate("Source", "3.0", "three"))
+	if err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if landed.Version != "3.0" {
+		t.Fatalf("landed version = %q, want 3.0", landed.Version)
+	}
+	if fileExists(f.deploy.layout.candidate) {
+		t.Fatal("Install left the candidate slot occupied")
+	}
+}
+
+// TestStageRefusesToDiscardACandidateSlotUnderALiveProcess keeps the discard on
+// the inventory gate's terms: the tree a process is running out of is also the
+// path a later gate needs to name it.
+func TestStageRefusesToDiscardACandidateSlotUnderALiveProcess(t *testing.T) {
+	f := newFixture(t)
+	if err := f.deploy.layout.ensureMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	rename(t, f.bundle("Abandoned", "2.0", "two"), f.deploy.layout.candidate)
+	program := filepath.Join(f.deploy.layout.candidate, "Contents", "MacOS", "example")
+	stray := f.live(program)
+	if _, err := f.deploy.Install(f.ctx(), f.candidate("Source", "3.0", "three")); !errors.Is(err, ErrLive) {
+		t.Fatalf("Install err = %v, want ErrLive", err)
+	}
+	if !fileExists(f.deploy.layout.candidate) {
+		t.Fatal("Install destroyed the candidate slot under a live process")
+	}
+	f.settle(stray, program)
+}
+
+// TestStageKeepsACandidateSlotItCannotInspect is why the discard follows a
+// successful inspection: a deadline here would otherwise cost a resumable tree
+// and report a missing source instead of the deadline.
+func TestStageKeepsACandidateSlotItCannotInspect(t *testing.T) {
+	f := newFixture(t)
+	if err := f.deploy.layout.ensureMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	rename(t, f.bundle("Abandoned", "2.0", "two"), f.deploy.layout.candidate)
+	ctx, cancel := context.WithCancel(f.ctx())
+	cancel()
+	if _, err := f.deploy.stage(ctx, f.candidate("Source", "3.0", "three")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("stage err = %v, want context.Canceled", err)
+	}
+	if !fileExists(f.deploy.layout.candidate) {
+		t.Fatal("an uninspectable candidate slot was destroyed")
 	}
 }
 

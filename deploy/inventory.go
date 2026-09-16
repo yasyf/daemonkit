@@ -318,6 +318,12 @@ func (d *Deployment) requireEmpty() error {
 	if err != nil {
 		return err
 	}
+	return liveError(remaining)
+}
+
+// liveError names the processes a gate is refusing for, and is how every gate
+// refuses: nil when nothing survived.
+func liveError(remaining []LiveProcess) error {
 	if len(remaining) == 0 {
 		return nil
 	}
