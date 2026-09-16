@@ -1,6 +1,7 @@
 package deploy
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -404,6 +405,45 @@ func TestStageDiscardsACandidateSlotItIsNotLanding(t *testing.T) {
 	}
 	if fileExists(f.deploy.layout.candidate) {
 		t.Fatal("Install left the candidate slot occupied")
+	}
+}
+
+// TestStageRefusesToDiscardACandidateSlotUnderALiveProcess keeps the discard on
+// the inventory gate's terms: the tree a process is running out of is also the
+// path a later gate needs to name it.
+func TestStageRefusesToDiscardACandidateSlotUnderALiveProcess(t *testing.T) {
+	f := newFixture(t)
+	if err := f.deploy.layout.ensureMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	rename(t, f.bundle("Abandoned", "2.0", "two"), f.deploy.layout.candidate)
+	program := filepath.Join(f.deploy.layout.candidate, "Contents", "MacOS", "example")
+	stray := f.live(program)
+	if _, err := f.deploy.Install(f.ctx(), f.candidate("Source", "3.0", "three")); !errors.Is(err, ErrLive) {
+		t.Fatalf("Install err = %v, want ErrLive", err)
+	}
+	if !fileExists(f.deploy.layout.candidate) {
+		t.Fatal("Install destroyed the candidate slot under a live process")
+	}
+	f.settle(stray, program)
+}
+
+// TestStageKeepsACandidateSlotItCannotInspect is why the discard follows a
+// successful inspection: a deadline here would otherwise cost a resumable tree
+// and report a missing source instead of the deadline.
+func TestStageKeepsACandidateSlotItCannotInspect(t *testing.T) {
+	f := newFixture(t)
+	if err := f.deploy.layout.ensureMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	rename(t, f.bundle("Abandoned", "2.0", "two"), f.deploy.layout.candidate)
+	ctx, cancel := context.WithCancel(f.ctx())
+	cancel()
+	if _, err := f.deploy.stage(ctx, f.candidate("Source", "3.0", "three")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("stage err = %v, want context.Canceled", err)
+	}
+	if !fileExists(f.deploy.layout.candidate) {
+		t.Fatal("an uninspectable candidate slot was destroyed")
 	}
 }
 

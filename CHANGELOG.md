@@ -14,7 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after its copy resume without copying again, but it was unconditional, so a
   slot left behind by an install that aborted between its copy and its swap
   record made every later upgrade fail against a bundle no caller had asked
-  for, on every attempt after, until the slot was deleted by hand.
+  for, on every attempt after, until the slot was deleted by hand. The discard
+  carries the inventory gate's terms scoped to that one slot, so a live process
+  on the tree refuses with `ErrLive` rather than losing the path a later gate
+  needs to name it, and a slot that cannot be inspected is left alone, so a
+  deadline reaching this point never costs a resumable tree.
 
 ## [0.31.0] - 2026-09-15
 

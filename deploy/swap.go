@@ -190,21 +190,24 @@ func (d *Deployment) retireSwap(record swapRecord) error {
 // and re-attests the source before and the copy after: bytes that changed
 // under the copy never reach the slot.
 //
-// An occupied slot is adopted only when it is the generation this request is
-// landing, which is what lets an install interrupted after its copy resume
-// without making that copy again. Anything else in the slot is discarded. It
-// can only be a staging tree an earlier install abandoned between its copy and
-// its swap record: no record names it, no path derives from it, and nothing is
-// launched from it. Refusing it instead failed every later upgrade with a
-// version mismatch against a bundle no caller had asked for, on every attempt
-// after, until someone deleted the slot by hand.
+// An occupied slot is adopted only when it holds the generation this request
+// is landing, which resumes an install interrupted after its copy. A slot
+// holding any other generation is a tree an earlier install abandoned before
+// its swap record, which no record names and no path derives from, so it is
+// discarded rather than refused: refusing it failed every later upgrade
+// against a bundle no caller had asked for until someone deleted it by hand.
+// A slot that cannot be inspected is neither adopted nor destroyed, so a
+// deadline here never costs a resumable tree.
 func (d *Deployment) stage(ctx context.Context, candidate Candidate) (Generation, error) {
 	if fileExists(d.layout.candidate) {
 		staged, err := d.inspect(ctx, d.layout.candidate)
-		if err == nil && candidate.matches(staged) == nil {
+		if err != nil {
+			return Generation{}, err
+		}
+		if candidate.matches(staged) == nil {
 			return staged, nil
 		}
-		if err := durable.RemoveTree(d.layout.candidate); err != nil {
+		if err := d.discardCandidate(); err != nil {
 			return Generation{}, err
 		}
 	}
@@ -224,6 +227,25 @@ func (d *Deployment) stage(ctx context.Context, candidate Candidate) (Generation
 		return Generation{}, errors.Join(stageErr, durable.RemoveTree(stagePath))
 	}
 	return staged, nil
+}
+
+// discardCandidate reclaims the candidate slot on the inventory gate's terms,
+// scoped to that one slot: the deployment-wide requireEmpty would refuse for
+// the incumbent, which this runs before the quiesce of and which is still
+// deliberately serving.
+func (d *Deployment) discardCandidate() error {
+	carried, err := bundleExecutables(d.layout.candidate)
+	if err != nil {
+		return err
+	}
+	found, err := Inventory(carried...)
+	if err != nil {
+		return err
+	}
+	if err := liveError(found.Live); err != nil {
+		return err
+	}
+	return durable.RemoveTree(d.layout.candidate)
 }
 
 // generationSlots is every location this deployment can move or copy a whole
