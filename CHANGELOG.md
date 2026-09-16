@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- An install whose private candidate slot already holds a different generation
+  now discards it and stages afresh, instead of refusing with
+  `ErrVersion`. Adopting an occupied slot is what lets an install interrupted
+  after its copy resume without copying again, but it was unconditional, so a
+  slot left behind by an install that aborted between its copy and its swap
+  record made every later upgrade fail against a bundle no caller had asked
+  for, on every attempt after, until the slot was deleted by hand.
+
 ## [0.31.0] - 2026-09-15
 
 ### Added

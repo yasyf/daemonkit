@@ -189,13 +189,24 @@ func (d *Deployment) retireSwap(record swapRecord) error {
 // slot, beside the canonical path so the swap is a rename and never a copy,
 // and re-attests the source before and the copy after: bytes that changed
 // under the copy never reach the slot.
+//
+// An occupied slot is adopted only when it is the generation this request is
+// landing, which is what lets an install interrupted after its copy resume
+// without making that copy again. Anything else in the slot is discarded. It
+// can only be a staging tree an earlier install abandoned between its copy and
+// its swap record: no record names it, no path derives from it, and nothing is
+// launched from it. Refusing it instead failed every later upgrade with a
+// version mismatch against a bundle no caller had asked for, on every attempt
+// after, until someone deleted the slot by hand.
 func (d *Deployment) stage(ctx context.Context, candidate Candidate) (Generation, error) {
 	if fileExists(d.layout.candidate) {
 		staged, err := d.inspect(ctx, d.layout.candidate)
-		if err != nil {
+		if err == nil && candidate.matches(staged) == nil {
+			return staged, nil
+		}
+		if err := durable.RemoveTree(d.layout.candidate); err != nil {
 			return Generation{}, err
 		}
-		return staged, candidate.matches(staged)
 	}
 	source, err := d.inspect(ctx, candidate.Source)
 	if err != nil {
