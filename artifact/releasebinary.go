@@ -104,7 +104,7 @@ func (s Store) materializeReleaseBinary(ctx context.Context, desc *Descriptor, e
 	if err := os.Chmod(stageEntry, 0o755); err != nil { // #nosec G302 -- the verified entrypoint must be executable.
 		return fmt.Errorf("artifact: mark entrypoint executable: %w", err)
 	}
-	if err := writeCacheMeta(stage, desc.Name, entry); err != nil {
+	if err := writeCacheMeta(stage, cacheMeta{Name: desc.Name, Tag: entry.Providers[0].Tag, Digest: entry.Digest}); err != nil {
 		return err
 	}
 	if err := durable.SyncDir(stage); err != nil {

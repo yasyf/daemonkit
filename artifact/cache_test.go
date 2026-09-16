@@ -329,3 +329,23 @@ func TestRemoveToolEntryWaitsForConcurrentInstall(t *testing.T) {
 		t.Fatalf("tool entry dir not removed after lock release: %v", err)
 	}
 }
+
+func TestCacheEntriesSkipsNonCanonicalDirectories(t *testing.T) {
+	store := Store{Root: t.TempDir()}
+	canonical := seedCacheEntry(t, store, "tool", "v1", strings.Repeat("a", 64))
+	for _, dir := range []string{
+		filepath.Join(store.CacheDir(), "aa", ".stage-123456"),
+		filepath.Join(store.CacheDir(), "aa", strings.Repeat("b", 64)),
+		filepath.Join(store.CacheDir(), "aa", "short"),
+		filepath.Join(store.CacheDir(), ".stage-shard", strings.Repeat("c", 64)),
+	} {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	byDigest := entriesByDigest(t, store)
+	if len(byDigest) != 1 || !sameEntry(byDigest[canonical.Digest], canonical) {
+		t.Fatalf("entries = %+v, want only %+v", byDigest, canonical)
+	}
+}
