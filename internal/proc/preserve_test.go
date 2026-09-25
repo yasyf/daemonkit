@@ -227,7 +227,7 @@ func TestPreserveSnapshotDeadlineAndClosedStoreFailClosed(t *testing.T) {
 
 func TestPreserveRunRefusesBeforeSpawn(t *testing.T) {
 	s, _ := preservingTestStore(t)
-	_, err := s.Run(ladderContext(t, time.Second), Cmd{Path: "/bin/true"}, func(*Child) { t.Fatal("Run spawned") })
+	_, err := s.Run(ladderContext(t, time.Second), Cmd{Path: "/bin/cat"}, func(*Child) { t.Fatal("Run spawned") })
 	if err == nil {
 		t.Fatal("Run accepted preserving store")
 	}

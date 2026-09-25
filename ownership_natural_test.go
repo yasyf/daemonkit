@@ -209,7 +209,7 @@ func TestNaturalDrainRejectsForeignProducer(t *testing.T) {
 
 func TestPreserveOwnedRefusesDisposableRun(t *testing.T) {
 	o, _ := preservingOwned(t)
-	_, err := o.Run(bounded(t, time.Second), Cmd{Path: "/bin/true", Exec: ServingSameUser()})
+	_, err := o.Run(bounded(t, time.Second), Cmd{Path: "/bin/cat", Exec: ServingSameUser()})
 	if err == nil || !strings.Contains(err.Error(), "Spawn and WaitNatural") {
 		t.Fatalf("Run() = %v", err)
 	}
