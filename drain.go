@@ -10,7 +10,8 @@ import (
 	"github.com/yasyf/daemonkit/internal/wire"
 )
 
-// ErrMaintenance rejects ordinary work while a preserving drain is reversible.
+// ErrMaintenance certifies the product rejected a request before admission or
+// side effects. The wire preserves it as a retryable undispatched rejection.
 var ErrMaintenance = wire.ErrMaintenance
 
 // DrainPreparation retains the product's admission barriers through commitment.

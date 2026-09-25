@@ -70,6 +70,13 @@ func TestMaintenanceDisableBlocksRespawn(t *testing.T) {
 	}
 	lease, err := PauseRestarts(ctx, run, label, pid)
 	if err != nil {
+		output, code, probeErr := run(ctx, launchctlPath, "print-disabled", domainTarget())
+		t.Logf("disabled-state probe exit=%d error=%v", code, probeErr)
+		for _, line := range strings.Split(output, "\n") {
+			if strings.Contains(line, label) {
+				t.Logf("exact fixture state: %q", line)
+			}
+		}
 		t.Fatal(err)
 	}
 	if err := lease.unchanged(ctx); err != nil {

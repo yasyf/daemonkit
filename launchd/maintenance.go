@@ -7,11 +7,12 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
-	"github.com/yasyf/daemonkit/internal/proc"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/yasyf/daemonkit/internal/proc"
 )
 
 // ErrMaintenanceUnproven means a no-signal restart exclusion was not established.
@@ -28,8 +29,10 @@ type Maintenance struct {
 	plist    [32]byte
 }
 
-var loadedPID = regexp.MustCompile(`(?m)^\tpid = ([0-9]+)$`)
-var loadedProperties = regexp.MustCompile(`(?m)^\tproperties = (.+)$`)
+var (
+	loadedPID        = regexp.MustCompile(`(?m)^\tpid = ([0-9]+)$`)
+	loadedProperties = regexp.MustCompile(`(?m)^\tproperties = (.+)$`)
+)
 
 func (c applier) loadedIdentity(ctx context.Context, label string) (int, error) {
 	result := c.launchctl(ctx, "print", serviceTarget(label))

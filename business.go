@@ -410,6 +410,9 @@ func Undispatched(err error) bool {
 // Call decodes either.
 func handleBusiness(ctx context.Context, req wire.Request, handle Handler) (any, error) {
 	reply, err := handle(ctx, requestOf(req))
+	if errors.Is(err, ErrMaintenance) {
+		return nil, wire.ErrMaintenance
+	}
 	if err != nil {
 		return businessEnvelope{Error: productError(err)}, nil
 	}

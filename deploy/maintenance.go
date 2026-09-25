@@ -20,6 +20,10 @@ import (
 // restarting an incumbent after an uncertain or partly applied replacement.
 var ErrMaintenanceIncomplete = errors.New("deploy: preserving maintenance is incomplete")
 
+// ErrFirstInstallUnavailable requires the caller to provision the canonical
+// installation directory before a preserving first-install transaction.
+var ErrFirstInstallUnavailable = errors.New("deploy: preserving first install requires an existing canonical directory")
+
 type maintenanceRecord struct {
 	Identity string      `json:"identity"`
 	Schema   int         `json:"schema"`
@@ -104,6 +108,9 @@ func (m *stoppedMaintenance) restore(ctx context.Context) error {
 	if fresh.PID != m.before.PID || fresh.Generation != m.before.Generation || fresh.Build != m.before.Build {
 		return daemonkit.ErrWrongIncumbent
 	}
+	if fresh.Phase != daemonkit.PhaseReady {
+		return fmt.Errorf("%w: product did not resume readiness", daemonkit.ErrDrainBusy)
+	}
 	var failures []error
 	for i := len(m.jobs) - 1; i >= 0; i-- {
 		if err := m.jobs[i].Restore(ctx); err != nil {
@@ -180,6 +187,11 @@ func (d *Deployment) Replace(ctx context.Context, candidate Candidate, quiesceAp
 		return Activation{}, ErrConfig
 	}
 	if err := d.VerifyCandidate(ctx, candidate); err != nil {
+		return Activation{}, err
+	}
+	if _, err := filepath.EvalSymlinks(filepath.Dir(d.layout.canonical)); errors.Is(err, os.ErrNotExist) {
+		return Activation{}, ErrFirstInstallUnavailable
+	} else if err != nil {
 		return Activation{}, err
 	}
 	release, err := d.hold(ctx)

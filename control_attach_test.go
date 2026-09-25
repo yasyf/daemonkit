@@ -26,12 +26,22 @@ func TestMain(m *testing.M) {
 }
 
 func runControlChild() {
+	if directory := os.Getenv(controlPreserveDescendant); directory != "" {
+		runPreservationDescendant(directory)
+		os.Exit(0)
+	}
 	d := Daemon{
 		Label:    Label(os.Getenv(controlChildLabel)),
 		Schemas:  []Schema{"test.v1"},
 		Shutdown: Grace(5 * time.Second),
 	}
-	_, err := Serve(context.Background(), d, func(Ctx) (Product, error) { return &stubProduct{}, nil })
+	var product Product = &stubProduct{}
+	if directory := os.Getenv(controlPreservePark); directory != "" {
+		d.ShutdownPolicy = PreserveOwned
+		product = &committedParkProduct{directory: directory}
+		observePreservationSignals(directory, "host")
+	}
+	_, err := Serve(context.Background(), d, func(Ctx) (Product, error) { return product, nil })
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "control child: %v\n", err)
 		os.Exit(71)
@@ -129,6 +139,10 @@ func TestControlRefusesAnUntrustedServer(t *testing.T) {
 }
 
 func startControlChild(t *testing.T, label string) *exec.Cmd {
+	return startControlChildEnv(t, label)
+}
+
+func startControlChildEnv(t *testing.T, label string, environment ...string) *exec.Cmd {
 	t.Helper()
 	executable, err := os.Executable()
 	if err != nil {
@@ -136,6 +150,7 @@ func startControlChild(t *testing.T, label string) *exec.Cmd {
 	}
 	child := exec.Command(executable)
 	child.Env = append(os.Environ(), controlChildEnv+"=1", controlChildLabel+"="+label)
+	child.Env = append(child.Env, environment...)
 	child.Stderr = os.Stderr
 	if err := child.Start(); err != nil {
 		t.Fatalf("start child: %v", err)

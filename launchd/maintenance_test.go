@@ -40,6 +40,7 @@ func (r *maintenanceRunner) run(_ context.Context, _ string, args ...string) (st
 		return "unexpected verb", 1, errors.New("unexpected launchctl mutation")
 	}
 }
+
 func TestMaintenanceOnlyChangesExactLabelEnablement(t *testing.T) {
 	for _, disabled := range []bool{false, true} {
 		t.Run(fmt.Sprint(disabled), func(t *testing.T) {
@@ -70,6 +71,7 @@ func TestMaintenanceOnlyChangesExactLabelEnablement(t *testing.T) {
 		})
 	}
 }
+
 func TestMaintenanceRefusesChangedLoadedIdentityWithoutSignaling(t *testing.T) {
 	dir := launchAgentsDir(t)
 	agent := applyAgent(t, "com.example.maintenance-race")

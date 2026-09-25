@@ -57,15 +57,20 @@ func serveDaemonChild() {
 		os.Exit(70)
 	}
 	var product daemonkit.Product = stubProduct{}
+	policy := daemonkit.TerminateOwned
 	if os.Getenv(daemonChildPark) == "1" {
 		product = parkedProduct{}
+	} else if os.Getenv(daemonChildPark) == "preserve-abort-failure" {
+		product = failedResumeProduct{}
+		policy = daemonkit.PreserveOwned
 	}
 	_, err = daemonkit.Serve(
 		context.Background(),
 		daemonkit.Daemon{
-			Label:    daemonkit.Label(os.Getenv(daemonChildLabel)),
-			Schemas:  []daemonkit.Schema{"deploy.test.v1"},
-			Shutdown: daemonChildShutdown,
+			Label:          daemonkit.Label(os.Getenv(daemonChildLabel)),
+			Schemas:        []daemonkit.Schema{"deploy.test.v1"},
+			Shutdown:       daemonChildShutdown,
+			ShutdownPolicy: policy,
 		},
 		func(daemonkit.Ctx) (daemonkit.Product, error) {
 			time.Sleep(delay)

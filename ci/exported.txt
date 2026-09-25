@@ -426,6 +426,7 @@ deploy	method	Deployment.VerifyCandidate	darwin
 deploy	func	DigestEntitlements	darwin
 deploy	var	ErrConfig	darwin
 deploy	var	ErrConflict	darwin
+deploy	var	ErrFirstInstallUnavailable	darwin
 deploy	var	ErrLive	darwin
 deploy	var	ErrMaintenanceIncomplete	darwin
 deploy	var	ErrRestored	darwin

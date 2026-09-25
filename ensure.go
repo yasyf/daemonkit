@@ -323,8 +323,11 @@ func (c *Client) evict(ctx context.Context, before Health, observed proc.Identit
 		var maintenance *launchd.Maintenance
 		if control.PreservationRequired() {
 			health, healthErr := control.Health(drainCtx)
-			if healthErr != nil || !health.PreserveOwned {
-				return fmt.Errorf("%w: preservation support is unproven: %v", ErrDrainBusy, healthErr)
+			if healthErr != nil {
+				return fmt.Errorf("%w: preservation support is unproven: %s", ErrDrainBusy, healthErr.Error())
+			}
+			if !health.PreserveOwned {
+				return fmt.Errorf("%w: incumbent lacks preservation support", ErrDrainBusy)
 			}
 			if target.expect().mismatch(health.Build, health.Generation) {
 				return ErrWrongIncumbent
@@ -335,17 +338,24 @@ func (c *Client) evict(ctx context.Context, before Health, observed proc.Identit
 				if maintenance != nil {
 					pauseErr = errors.Join(pauseErr, maintenance.Restore(ctx))
 				}
-				return fmt.Errorf("%w: restart exclusion failed: %v", ErrDrainBusy, pauseErr)
+				return fmt.Errorf("%w: restart exclusion failed: %s", ErrDrainBusy, pauseErr.Error())
 			}
 		}
 		_, drainErr := control.Drain(drainCtx, target.expect())
 		if errors.Is(drainErr, ErrDrainBusy) && maintenance != nil {
+			fresh, healthErr := control.Health(ctx)
+			if healthErr != nil || fresh.Phase != PhaseReady || target.expect().mismatch(fresh.Build, fresh.Generation) || fresh.PID != before.PID {
+				return fmt.Errorf("%w: product readiness after refusal is unproven", ErrDrainBusy)
+			}
 			if restoreErr := maintenance.Restore(ctx); restoreErr != nil {
-				return fmt.Errorf("%w: resume job enablement: %v", ErrDrainBusy, restoreErr)
+				return fmt.Errorf("%w: resume job enablement: %s", ErrDrainBusy, restoreErr.Error())
 			}
 		}
 		if drainErr == nil {
 			return nil
+		}
+		if control.PreservationRequired() && errors.Is(drainErr, ErrUnsettled) {
+			return fmt.Errorf("%w: acknowledged preserving host did not exit; quiet scope cannot be revalidated", ErrDrainPreparationTimeout)
 		}
 		if drainRefused(drainErr) || (!errors.Is(drainErr, ErrUnsettled) && !spent(drainCtx, drainErr)) {
 			return drainErr

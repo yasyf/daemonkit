@@ -18,7 +18,7 @@ type preparationProduct struct {
 }
 
 func (p *preparationProduct) Handle(context.Context, Request) (Reply, error) { return Reply{}, nil }
-func (p *preparationProduct) Drain(Budget) error { p.drained.Add(1); return nil }
+func (p *preparationProduct) Drain(Budget) error                             { p.drained.Add(1); return nil }
 
 func (p *preparationProduct) Close(Budget) error { p.closed.Add(1); return nil }
 

@@ -19,6 +19,22 @@ type evidenceProduct struct {
 	evidence atomic.Int32
 }
 
+type rejectingAdmissionProduct struct{ *preparationProduct }
+
+func (*rejectingAdmissionProduct) Handle(context.Context, Request) (Reply, error) {
+	return Reply{}, ErrMaintenance
+}
+
+func TestProductAdmissionRaceRetainsUndispatchedMaintenance(t *testing.T) {
+	product := &rejectingAdmissionProduct{preparationProduct: &preparationProduct{}}
+	runtime := preservingRuntime(t, product)
+	client := maintenanceBusiness(t, runtime)
+	result, err := client.Call(drainContext(t), "new-job", nil)
+	if err != nil || !errors.Is(result.Rejection(), ErrMaintenance) || result.Terminal() != nil {
+		t.Fatalf("Call=%+v err=%v", result, err)
+	}
+}
+
 func (p *evidenceProduct) Handle(context.Context, Request) (Reply, error) {
 	p.ordinary.Add(1)
 	return Reply{}, nil
