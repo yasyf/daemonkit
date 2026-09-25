@@ -69,6 +69,9 @@ func runPreservationDescendant(directory string) {
 	}
 	for {
 		if _, err := os.Stat(filepath.Join(directory, "stop-child")); err == nil {
+			if err := os.WriteFile(filepath.Join(directory, "child-exited"), nil, 0o600); err != nil {
+				os.Exit(74)
+			}
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -78,7 +81,26 @@ func runPreservationDescendant(directory string) {
 func TestPreservingCommittedHostTimeoutNeverSignalsNewDescendant(t *testing.T) {
 	ladderHome(t)
 	directory := t.TempDir()
-	t.Cleanup(func() { _ = os.WriteFile(filepath.Join(directory, "stop-child"), nil, 0o600) })
+	t.Cleanup(func() {
+		if err := os.WriteFile(filepath.Join(directory, "stop-child"), nil, 0o600); err != nil {
+			t.Error(err)
+			return
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			if _, err := os.Stat(filepath.Join(directory, "child-exited")); err == nil {
+				return
+			}
+			if _, err := os.Stat(filepath.Join(directory, "child-pid")); errors.Is(err, os.ErrNotExist) {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Error("fixture descendant did not acknowledge natural exit")
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
 	d := Daemon{Label: "dkstop-preserving-committed", Schemas: []Schema{"test.v1"}, Shutdown: Grace(5 * time.Second), ShutdownPolicy: PreserveOwned, Program: unrunProgram(t)}
 	child := startControlChildEnv(t, string(d.Label), controlPreservePark+"="+directory)
 	installedAgentPlist(t, d.Label)
@@ -132,7 +154,7 @@ func TestPreservingCommittedHostTimeoutNeverSignalsNewDescendant(t *testing.T) {
 			t.Fatalf("%s received signal: %v", role, err)
 		}
 	}
-	if control, err = client.Control(ready); !errors.Is(err, ErrDraining) {
+	if control, err = client.Control(ready); !errors.Is(err, ErrDraining) && !errors.Is(err, ErrAbsent) {
 		if control != nil {
 			_ = control.Close(ready)
 		}

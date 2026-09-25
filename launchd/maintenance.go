@@ -122,11 +122,11 @@ func PauseRestarts(ctx context.Context, run Runner, label string, pid int) (*Mai
 	}
 	disabled, err = c.disabled(ctx, label)
 	if err != nil || !disabled {
-		return lease, fmt.Errorf("%w: disable state did not converge: %v", ErrMaintenanceUnproven, err)
+		return lease, errors.Join(fmt.Errorf("%w: disable state did not converge", ErrMaintenanceUnproven), err)
 	}
 	actual, err = c.loadedIdentity(ctx, label)
 	if err != nil || actual != pid {
-		return lease, fmt.Errorf("%w: loaded identity changed: %v", ErrMaintenanceUnproven, err)
+		return lease, errors.Join(fmt.Errorf("%w: loaded identity changed", ErrMaintenanceUnproven), err)
 	}
 	return lease, nil
 }
@@ -140,13 +140,13 @@ func (m *Maintenance) Restore(ctx context.Context) error {
 	if !m.enabled {
 		disabled, err := m.client.disabled(ctx, m.label)
 		if err != nil || !disabled {
-			return fmt.Errorf("%w: original disabled state changed: %v", ErrMaintenanceUnproven, err)
+			return errors.Join(fmt.Errorf("%w: original disabled state changed", ErrMaintenanceUnproven), err)
 		}
 		return nil
 	}
 	actual, err := m.client.loadedIdentity(ctx, m.label)
 	if err != nil || actual != m.pid {
-		return fmt.Errorf("%w: restoration identity differs: %v", ErrMaintenanceUnproven, err)
+		return errors.Join(fmt.Errorf("%w: restoration identity differs", ErrMaintenanceUnproven), err)
 	}
 	result := m.client.launchctl(ctx, "enable", serviceTarget(m.label))
 	if err := result.fail(); err != nil {
@@ -154,7 +154,7 @@ func (m *Maintenance) Restore(ctx context.Context) error {
 	}
 	disabled, err := m.client.disabled(ctx, m.label)
 	if err != nil || disabled {
-		return fmt.Errorf("%w: enable state did not converge: %v", ErrMaintenanceUnproven, err)
+		return errors.Join(fmt.Errorf("%w: enable state did not converge", ErrMaintenanceUnproven), err)
 	}
 	return nil
 }
@@ -162,11 +162,11 @@ func (m *Maintenance) Restore(ctx context.Context) error {
 func (m *Maintenance) unchanged(ctx context.Context) error {
 	_, gone, err := proc.Observe(m.identity)
 	if err != nil || gone {
-		return fmt.Errorf("%w: loaded process changed: %v", ErrMaintenanceUnproven, err)
+		return errors.Join(fmt.Errorf("%w: loaded process changed", ErrMaintenanceUnproven), err)
 	}
 	pid, err := m.client.loadedIdentity(ctx, m.label)
 	if err != nil || pid != m.pid {
-		return fmt.Errorf("%w: loaded label changed: %v", ErrMaintenanceUnproven, err)
+		return errors.Join(fmt.Errorf("%w: loaded label changed", ErrMaintenanceUnproven), err)
 	}
 	path, err := plistPath(m.label)
 	if err != nil {

@@ -71,7 +71,7 @@ func (d *Deployment) requirePristine() error {
 		}
 	}
 	if err := d.requireEmpty(); err != nil {
-		return fmt.Errorf("%w: pristine executable inventory is unproven: %v", daemonkit.ErrDrainBusy, err)
+		return fmt.Errorf("%w: pristine executable inventory is unproven: %s", daemonkit.ErrDrainBusy, err.Error())
 	}
 	return nil
 }
@@ -123,12 +123,12 @@ func (m *stoppedMaintenance) restore(ctx context.Context) error {
 func (d *Deployment) pauseAndStop(ctx context.Context) (*stoppedMaintenance, error) {
 	control, err := d.client.Control(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("%w: preserving control is unavailable: %v", daemonkit.ErrDrainBusy, err)
+		return nil, fmt.Errorf("%w: preserving control is unavailable: %s", daemonkit.ErrDrainBusy, err.Error())
 	}
 	before, err := control.Health(ctx)
 	if err != nil {
 		_ = control.Close(ctx)
-		return nil, fmt.Errorf("%w: preserving health is unavailable: %v", daemonkit.ErrDrainBusy, err)
+		return nil, fmt.Errorf("%w: preserving health is unavailable: %s", daemonkit.ErrDrainBusy, err.Error())
 	}
 	m := &stoppedMaintenance{control: control, before: before}
 	if !before.PreserveOwned {
@@ -154,12 +154,12 @@ func (d *Deployment) pauseAndStop(ctx context.Context) (*stoppedMaintenance, err
 			m.jobs = append(m.jobs, lease)
 		}
 		if err != nil {
-			return m, fmt.Errorf("%w: restart exclusion failed: %v", daemonkit.ErrDrainBusy, err)
+			return m, fmt.Errorf("%w: restart exclusion failed: %s", daemonkit.ErrDrainBusy, err.Error())
 		}
 	}
 	fresh, err := control.Health(ctx)
 	if err != nil {
-		return m, fmt.Errorf("%w: disabled job identity is unproven: %v", daemonkit.ErrDrainBusy, err)
+		return m, fmt.Errorf("%w: disabled job identity is unproven: %s", daemonkit.ErrDrainBusy, err.Error())
 	}
 	if fresh.PID != before.PID || fresh.Generation != before.Generation || fresh.Build != before.Build {
 		return m, daemonkit.ErrWrongIncumbent

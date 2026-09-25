@@ -223,7 +223,7 @@ func (d *Deployment) settle(ctx context.Context) (daemonkit.Expect, daemonkit.St
 func (d *Deployment) terminateSurvivors(ctx context.Context) error {
 	if d.config.Daemon.ShutdownPolicy == daemonkit.PreserveOwned {
 		if err := d.requireEmpty(); err != nil {
-			return fmt.Errorf("%w: executable inventory is not quiet: %v", daemonkit.ErrDrainBusy, err)
+			return fmt.Errorf("%w: executable inventory is not quiet: %s", daemonkit.ErrDrainBusy, err.Error())
 		}
 		return nil
 	}
