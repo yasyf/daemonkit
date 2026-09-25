@@ -49,6 +49,9 @@ import (
 // deploy.Uninstall's. Like every verb it requires a context deadline — the
 // whole stop budget, from which every stall bound inside derives.
 func (c *Client) Stop(ctx context.Context) error {
+	if c.daemon.ShutdownPolicy == PreserveOwned {
+		return ErrPreservationUnavailable
+	}
 	if _, ok := ctx.Deadline(); !ok {
 		return errors.New("daemonkit: Stop requires a context deadline")
 	}

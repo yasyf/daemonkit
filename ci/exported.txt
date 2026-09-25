@@ -126,6 +126,7 @@
 .	var	ErrNotReady	darwin
 .	var	ErrOversize	darwin
 .	var	ErrPeerGone	darwin
+.	var	ErrPreservationUnavailable	darwin
 .	var	ErrSessionCapacity	darwin
 .	var	ErrTruncated	darwin
 .	var	ErrUnrecorded	darwin

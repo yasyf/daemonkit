@@ -65,6 +65,8 @@ jobs:
           go vet -unsafeptr=false ./_e2e
           go vet -unsafeptr=false ./_e2e/trust
           go vet -unsafeptr=false -tags dke2e ./deploy
+      - name: Preserving transitions refuse before mutation
+        run: ./scripts/test.sh -run '^TestPreservationUnavailable' ./ ./deploy ./launchd
       - name: Test (race, via the process-cap harness)
         run: ./scripts/test.sh -race ./...
       - name: Disposable preservation restart exclusion

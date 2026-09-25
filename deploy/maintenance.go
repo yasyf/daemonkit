@@ -12,6 +12,7 @@ import (
 	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/daemonkit/durable"
 	"github.com/yasyf/daemonkit/internal/flock"
+	"github.com/yasyf/daemonkit/internal/maintenance"
 	"github.com/yasyf/daemonkit/launchd"
 	"github.com/yasyf/daemonkit/paths"
 )
@@ -23,6 +24,13 @@ var ErrMaintenanceIncomplete = errors.New("deploy: preserving maintenance is inc
 // ErrFirstInstallUnavailable requires the caller to provision the canonical
 // installation directory before a preserving first-install transaction.
 var ErrFirstInstallUnavailable = errors.New("deploy: preserving first install requires an existing canonical directory")
+
+func (d *Deployment) requireSupportedTransition() error {
+	if d.config.Daemon.ShutdownPolicy == daemonkit.PreserveOwned {
+		return maintenance.RequireTransition()
+	}
+	return nil
+}
 
 type maintenanceRecord struct {
 	Identity string      `json:"identity"`
@@ -176,13 +184,12 @@ func (d *Deployment) pauseAndStop(ctx context.Context) (*stoppedMaintenance, err
 	return m, nil
 }
 
-// Replace installs a verified candidate while holding both deployment and
-// daemon-start writers through readiness. quiesceApplication may stop the signed
-// application UI after the held daemon drain commits; it must not run brew or
-// reenter daemonkit deployment/Ensure. An existing target requires acknowledged
-// preserving drain commitment; a first install must pass the pristine-state gate.
-// Failure after commitment leaves a durable unavailable state, never a rollback.
+// Replace refuses preserving deployment with ErrPreservationUnavailable before
+// validation, filesystem changes, application callbacks, or launchd operations.
 func (d *Deployment) Replace(ctx context.Context, candidate Candidate, quiesceApplication func(context.Context) error) (activation Activation, err error) {
+	if err := d.requireSupportedTransition(); err != nil {
+		return Activation{}, err
+	}
 	if d.config.Daemon.ShutdownPolicy != daemonkit.PreserveOwned || quiesceApplication == nil {
 		return Activation{}, ErrConfig
 	}
@@ -287,9 +294,11 @@ func (d *Deployment) Replace(ctx context.Context, candidate Candidate, quiesceAp
 	return activation, durable.Remove(d.maintenancePath())
 }
 
-// Remove consumes the same held preserving drain across application quiescence
-// and removal. The callback has the same non-reentrancy contract as Replace.
+// Remove refuses preserving deployment before application or service mutation.
 func (d *Deployment) Remove(ctx context.Context, quiesceApplication func(context.Context) error) (removal Removal, err error) {
+	if err := d.requireSupportedTransition(); err != nil {
+		return Removal{}, err
+	}
 	if d.config.Daemon.ShutdownPolicy != daemonkit.PreserveOwned || quiesceApplication == nil {
 		return Removal{}, ErrConfig
 	}

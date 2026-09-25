@@ -272,6 +272,9 @@ func (c *Control) pinnedBy(report wire.HealthReport) error {
 // observed within ctx; the incumbent keeps draining on its own Shutdown
 // budget and Settle re-observes without a session.
 func (c *Control) Drain(ctx context.Context, expect Expect) (Stopped, error) {
+	if c.PreservationRequired() {
+		return Stopped{}, ErrPreservationUnavailable
+	}
 	if _, ok := ctx.Deadline(); !ok {
 		return Stopped{}, errors.New("daemonkit: Drain requires a context deadline")
 	}

@@ -94,6 +94,9 @@ type Ensured struct {
 // asks what daemonkit owns machine-wide, so one consumer's Ensure cannot
 // disturb another product's agents.
 func (c *Client) Ensure(ctx context.Context) (Ensured, error) {
+	if c.daemon.ShutdownPolicy == PreserveOwned {
+		return Ensured{}, ErrPreservationUnavailable
+	}
 	if _, ok := ctx.Deadline(); !ok {
 		return Ensured{}, errors.New("daemonkit: Ensure requires a context deadline")
 	}
@@ -159,6 +162,9 @@ func (c *Client) ensureOnce(ctx context.Context, want string, agent launchd.Agen
 		return Ensured{}, err
 	}
 	before := healthFromReport(world.Health)
+	if before.PreserveOwned {
+		return Ensured{}, ErrPreservationUnavailable
+	}
 	preserving := c.daemon.ShutdownPolicy == PreserveOwned || before.PreserveOwned
 	el, err := c.daemon.Label.element()
 	if err != nil {
@@ -320,6 +326,9 @@ func (c *Client) evict(ctx context.Context, before Health, observed proc.Identit
 	switch {
 	case err == nil:
 		defer func() { _ = control.Close(drainCtx) }()
+		if control.PreservationRequired() {
+			return ErrPreservationUnavailable
+		}
 		var maintenance *launchd.Maintenance
 		if control.PreservationRequired() {
 			health, healthErr := control.Health(drainCtx)

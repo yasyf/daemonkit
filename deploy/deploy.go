@@ -217,6 +217,9 @@ func (c Candidate) matches(g Generation) error {
 // occupied canonical path: replacing a live installation is Supersede's job,
 // and only Supersede quiesces the incumbent first.
 func (d *Deployment) Install(ctx context.Context, candidate Candidate) (Generation, error) {
+	if err := d.requireSupportedTransition(); err != nil {
+		return Generation{}, err
+	}
 	return d.land(ctx, candidate, false)
 }
 
@@ -240,6 +243,9 @@ func (d *Deployment) Install(ctx context.Context, candidate Candidate) (Generati
 // restore's outcome is reported joined with the abort's. Once the record is
 // written the swap is committed and only forward recovery drives it.
 func (d *Deployment) Supersede(ctx context.Context, candidate Candidate) (Generation, error) {
+	if err := d.requireSupportedTransition(); err != nil {
+		return Generation{}, err
+	}
 	return d.land(ctx, candidate, true)
 }
 
@@ -431,6 +437,9 @@ func (i incumbent) certify(build string) error {
 // it runs against the live daemon it is re-proving. One that also retires a
 // label goes through the gate first — see [Deployment.convergeAgents].
 func (d *Deployment) Activate(ctx context.Context) (Activation, error) {
+	if err := d.requireSupportedTransition(); err != nil {
+		return Activation{}, err
+	}
 	release, err := d.hold(ctx)
 	if err != nil {
 		return Activation{}, err
@@ -499,6 +508,9 @@ func (d *Deployment) activateGeneration(ctx context.Context, generation Generati
 // and an uninstall that left them behind left the application it removed on
 // disk.
 func (d *Deployment) Uninstall(ctx context.Context) (Removal, error) {
+	if err := d.requireSupportedTransition(); err != nil {
+		return Removal{}, err
+	}
 	release, err := d.hold(ctx)
 	if err != nil {
 		return Removal{}, err
@@ -589,6 +601,9 @@ func (d *Deployment) tombstone(ctx context.Context, runtime RuntimeProof) (remov
 // destroys installed bytes: the canonical path keeps whatever generation the
 // settled swap left there.
 func (d *Deployment) Reset(ctx context.Context) error {
+	if err := d.requireSupportedTransition(); err != nil {
+		return err
+	}
 	release, err := d.hold(ctx)
 	if err != nil {
 		return err

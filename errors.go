@@ -16,6 +16,8 @@ import (
 var (
 	// ErrDrainBusy refuses shutdown before protected work can be disturbed.
 	ErrDrainBusy = maintenance.ErrDrainBusy
+	// ErrPreservationUnavailable rejects a transition whose safety cannot be proved.
+	ErrPreservationUnavailable = maintenance.ErrPreservationUnavailable
 
 	// ErrDrainPreparationTimeout refuses shutdown after its reversible wait expires.
 	ErrDrainPreparationTimeout = maintenance.ErrDrainPreparationTimeout

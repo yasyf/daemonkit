@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/yasyf/daemonkit/internal/maintenance"
 	"github.com/yasyf/daemonkit/internal/proc"
 )
 
@@ -79,10 +80,12 @@ func (c applier) disabled(ctx context.Context, label string) (bool, error) {
 	}
 }
 
-// PauseRestarts disables one owned, currently loaded job without stopping it.
-// Its PID is compared before and after the change; callers must also recheck
-// their authenticated process-generation pin before committing a daemon drain.
+// PauseRestarts refuses with ErrPreservationUnavailable before touching launchd.
+// Disabling a loaded KeepAlive job does not prevent its process from restarting.
 func PauseRestarts(ctx context.Context, run Runner, label string, pid int) (*Maintenance, error) {
+	if err := maintenance.RequireTransition(); err != nil {
+		return nil, err
+	}
 	if _, ok := ctx.Deadline(); !ok {
 		return nil, errors.New("launchd: maintenance requires a deadline")
 	}
@@ -141,9 +144,11 @@ func PauseRestarts(ctx context.Context, run Runner, label string, pid int) (*Mai
 	return lease, nil
 }
 
-// Restore reinstates the prior enablement only while the same loaded PID remains.
-// It sends no stop, bootstrap, or kickstart operation.
+// Restore refuses because no supported restart-exclusion lease can be issued.
 func (m *Maintenance) Restore(ctx context.Context) error {
+	if err := maintenance.RequireTransition(); err != nil {
+		return err
+	}
 	if err := m.unchanged(ctx); err != nil {
 		return err
 	}
