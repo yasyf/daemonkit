@@ -1,1 +1,1 @@
-{"v":1,"lamport":3,"ops":[{"kind":"set_branch","branch":"feat/owned-output-completion"}]}
+{"v":1,"lamport":4,"ops":[{"kind":"set_criterion_status","id":"59cf04e7c6cc5a52c4a1ac426fc844c0","status":"met","note":"PR36 exact194b72109 CI36187063215 native/race tests passed, including blocked stderr/cancellation/store closure fixtures; all30 checks green and2 intentional skips."}]}
