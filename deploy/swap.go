@@ -107,6 +107,9 @@ func (d *Deployment) settleSwap(ctx context.Context, record swapRecord) error {
 // nothing, and quiescing a healthy daemon to delete a stale record would be
 // the larger harm.
 func (d *Deployment) recover(ctx context.Context) error {
+	if err := d.checkMaintenance(); err != nil {
+		return err
+	}
 	var record swapRecord
 	err := readRecord(d.layout.swap, &record)
 	if errors.Is(err, os.ErrNotExist) {

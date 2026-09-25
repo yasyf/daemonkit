@@ -110,6 +110,9 @@ func (p ReadinessProof) Digest() SHA256 { return p.digest }
 // carrying a deadline: it is the whole settlement budget, and every stall
 // bound inside derives from it.
 func (d *Deployment) Quiesce(ctx context.Context) (RuntimeProof, error) {
+	if d.config.Daemon.ShutdownPolicy == daemonkit.PreserveOwned {
+		return RuntimeProof{}, fmt.Errorf("%w: preserving deployment requires Replace or Remove", daemonkit.ErrDrainBusy)
+	}
 	if _, ok := ctx.Deadline(); !ok {
 		return RuntimeProof{}, errors.New("deploy: Quiesce requires a context deadline")
 	}

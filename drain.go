@@ -10,6 +10,9 @@ import (
 	"github.com/yasyf/daemonkit/internal/wire"
 )
 
+// ErrMaintenance rejects ordinary work while a preserving drain is reversible.
+var ErrMaintenance = wire.ErrMaintenance
+
 // DrainPreparation retains the product's admission barriers through commitment.
 // Abort must resume producers before reopening ownership admissions. A failed
 // Abort leaves the daemon unavailable. Both methods must honor their budget.

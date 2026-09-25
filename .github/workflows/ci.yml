@@ -67,6 +67,10 @@ jobs:
           go vet -unsafeptr=false -tags dke2e ./deploy
       - name: Test (race, via the process-cap harness)
         run: ./scripts/test.sh -race ./...
+      - name: Disposable preservation restart exclusion
+        env:
+          DAEMONKIT_MAINTENANCE_E2E: "1"
+        run: ./scripts/test.sh -run '^TestMaintenanceDisableBlocksRespawn$' ./launchd
       - name: Build (pure)
         run: CGO_ENABLED=0 go build ./...
 

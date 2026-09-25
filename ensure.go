@@ -122,9 +122,12 @@ func (c *Client) Ensure(ctx context.Context) (Ensured, error) {
 		return Ensured{}, fmt.Errorf("daemonkit: serialize ensure: %w", err)
 	}
 	defer func() { _ = lock.Close() }()
-	replaced, err := c.daemon.Program.place(el)
-	if err != nil {
-		return Ensured{}, err
+	replaced := false
+	if c.daemon.ShutdownPolicy != PreserveOwned {
+		replaced, err = c.daemon.Program.place(el)
+		if err != nil {
+			return Ensured{}, err
+		}
 	}
 	timer := time.NewTimer(attachCadence(ctx))
 	defer timer.Stop()
@@ -174,6 +177,15 @@ func (c *Client) ensureOnce(ctx context.Context, want string, agent launchd.Agen
 		}
 	} else if err := c.proveRecorded(ctx, world); err != nil {
 		return Ensured{}, err
+	}
+	if c.daemon.ShutdownPolicy == PreserveOwned {
+		el, err := c.daemon.Label.element()
+		if err != nil {
+			return Ensured{}, err
+		}
+		if _, err := c.daemon.Program.place(el); err != nil {
+			return Ensured{}, err
+		}
 	}
 	if err := launchd.Apply(ctx, c.launchctl, agent); err != nil {
 		return Ensured{}, fmt.Errorf("daemonkit: apply %q: %w", agent.Label, err)
@@ -313,6 +325,9 @@ func (c *Client) evict(ctx context.Context, before Health, observed proc.Identit
 			var pauseErr error
 			maintenance, pauseErr = launchd.PauseRestarts(drainCtx, c.launchctl, string(c.daemon.Label), health.PID)
 			if pauseErr != nil {
+				if maintenance != nil {
+					pauseErr = errors.Join(pauseErr, maintenance.Restore(ctx))
+				}
 				return fmt.Errorf("%w: restart exclusion failed: %v", ErrDrainBusy, pauseErr)
 			}
 		}

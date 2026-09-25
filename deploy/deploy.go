@@ -255,6 +255,11 @@ func (d *Deployment) land(ctx context.Context, candidate Candidate, supersede bo
 	if err := d.recover(ctx); err != nil {
 		return Generation{}, err
 	}
+	if !supersede && d.config.Daemon.ShutdownPolicy == daemonkit.PreserveOwned {
+		if err := d.requirePristine(); err != nil {
+			return Generation{}, err
+		}
+	}
 	var prior *Generation
 	switch installed := fileExists(d.layout.canonical); {
 	case installed && !supersede:
@@ -438,6 +443,10 @@ func (d *Deployment) Activate(ctx context.Context) (Activation, error) {
 	if err != nil {
 		return Activation{}, err
 	}
+	return d.activateGeneration(ctx, generation)
+}
+
+func (d *Deployment) activateGeneration(ctx context.Context, generation Generation) (Activation, error) {
 	if err := d.convergeAgents(ctx); err != nil {
 		return Activation{}, err
 	}
@@ -502,6 +511,10 @@ func (d *Deployment) Uninstall(ctx context.Context) (Removal, error) {
 	if err != nil {
 		return Removal{}, err
 	}
+	return d.removeGeneration(ctx, runtime)
+}
+
+func (d *Deployment) removeGeneration(ctx context.Context, runtime RuntimeProof) (Removal, error) {
 	record, err := d.tombstone(ctx, runtime)
 	if err != nil {
 		return Removal{}, err
@@ -595,6 +608,7 @@ func (d *Deployment) Reset(ctx context.Context) error {
 		durable.Remove(d.layout.removal),
 		durable.Remove(d.layout.swap),
 		durable.Remove(d.layout.services),
+		durable.Remove(d.maintenancePath()),
 		d.discardGenerations(),
 	)
 }

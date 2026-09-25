@@ -587,11 +587,19 @@ func (r *serveRuntime) Handle(ctx context.Context, req wire.Request) (any, error
 func (r *serveRuntime) HandleMaintenance(ctx context.Context, req wire.Request) (any, error) {
 	r.mu.Lock()
 	product, ok := r.product.(MaintenanceHandler)
+	phase := r.snapshot.Phase
 	r.mu.Unlock()
-	if !ok {
+	if !ok || phase != wire.PhaseMaintenance {
 		return nil, wire.ErrMaintenance
 	}
-	return handleBusiness(ctx, req, product.HandleMaintenance)
+	reply, err := product.HandleMaintenance(ctx, requestOf(req))
+	if errors.Is(err, ErrMaintenance) {
+		return nil, wire.ErrMaintenance
+	}
+	if err != nil {
+		return businessEnvelope{Error: productError(err)}, nil
+	}
+	return businessEnvelope{Body: reply.Body}, nil
 }
 
 func (r *serveRuntime) Phase() wire.PhaseSnapshot {
