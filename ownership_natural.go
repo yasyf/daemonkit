@@ -14,7 +14,9 @@ import (
 type ShutdownPolicy uint8
 
 const (
+	// TerminateOwned permits the automatic termination ladder during settlement.
 	TerminateOwned ShutdownPolicy = iota
+	// PreserveOwned retains live scopes without automatic signals or retirement.
 	PreserveOwned
 )
 

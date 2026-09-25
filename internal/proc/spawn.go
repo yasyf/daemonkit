@@ -117,14 +117,12 @@ func (s *Store) spawn(ctx context.Context, c Cmd, childOut, childErr *os.File) (
 	if c.Verify != nil {
 		if err := c.Verify(pid); err != nil {
 			aborted := s.abortSpawn(pid, parentEnd, err)
-			<-s.retire(id)
-			return nil, aborted
+			return nil, errors.Join(aborted, s.rollbackRecord(ctx, id))
 		}
 	}
 	if err := releaseChild(pid); err != nil {
 		aborted := s.abortSpawn(pid, parentEnd, fmt.Errorf("release suspended pid %d: %w", pid, err))
-		<-s.retire(id)
-		return nil, aborted
+		return nil, errors.Join(aborted, s.rollbackRecord(ctx, id))
 	}
 	child := &Child{
 		store:   s,

@@ -10,6 +10,7 @@ import (
 
 const observationPollInterval = 100 * time.Millisecond
 
+// ScopeObservation describes the recorded leader and its live session members.
 type ScopeObservation struct {
 	Identity  Identity
 	Session   int
@@ -19,11 +20,13 @@ type ScopeObservation struct {
 	Uncertain bool
 }
 
+// Observation includes all recorded scopes from one store generation.
 type Observation struct {
 	Generation uint64
 	Scopes     []ScopeObservation
 }
 
+// Complete requires certainty and absence of every unexcluded live member.
 func (o Observation) Complete() bool {
 	for _, scope := range o.Scopes {
 		if !scope.complete() {
@@ -101,7 +104,7 @@ func (s *Store) inspectScope(ctx context.Context, scope *ScopeObservation) error
 		if scope.Session <= 1 || scope.Session != scope.Identity.PID {
 			return errors.New("proc: session record has no durable dedicated-session identity")
 		}
-		members, err := s.verifiedMembersContext(ctx, scope.Session, scope.Identity.Boot)
+		members, err := s.verifiedMembers(ctx, scope.Session, scope.Identity.Boot)
 		if err != nil {
 			return err
 		}
@@ -123,6 +126,7 @@ func (s *Store) inspectScope(ctx context.Context, scope *ScopeObservation) error
 	return nil
 }
 
+// RetireQuiet removes only records whose exact scopes are observed quiet.
 func (s *Store) RetireQuiet(ctx context.Context) error {
 	observation, err := s.Observe(ctx, nil)
 	if err != nil {
@@ -149,21 +153,15 @@ func (s *Store) retireQuietScope(ctx context.Context, id identity, session int) 
 	if !scope.complete() {
 		return fmt.Errorf("%w: %s remains live", ErrUnsettled, scope.Identity)
 	}
-	select {
-	case fate := <-s.retireContext(ctx, id):
-		if fate != RecordRemoved {
-			return fmt.Errorf("%w: record %d was not observed removed", ErrUnsettled, id.pid)
-		}
-		return nil
-	case <-ctx.Done():
-		return errors.Join(ErrUnsettled, ctx.Err())
-	}
+	return s.retireBounded(ctx, id)
 }
 
+// Observe checks the child and its recorded session without signaling.
 func (c *Child) Observe(ctx context.Context) (ScopeObservation, error) {
 	return c.store.observeScope(ctx, c.id, c.session)
 }
 
+// WaitNatural requires a deadline and leaves the child untouched on expiry.
 func (c *Child) WaitNatural(ctx context.Context) (Exit, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		return Exit{}, errors.New("proc: natural wait requires a context deadline")
@@ -196,10 +194,12 @@ func (s *Store) awaitNaturalScope(c *Child, clk clock) (Reap, bool) {
 	}
 }
 
+// Observe checks the adopted identity and recorded session without signaling.
 func (a *Adopted) Observe(ctx context.Context) (ScopeObservation, error) {
 	return a.store.observeScope(ctx, a.id, a.session)
 }
 
+// ObserveAndRetire requires a deadline and retains records until their scope is quiet.
 func (a *Adopted) ObserveAndRetire(ctx context.Context) (Reap, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		return reapUndetermined, errors.New("proc: observe and retire requires a context deadline")

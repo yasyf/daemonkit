@@ -221,14 +221,14 @@ func (s *ladder) reapSession(
 // SIGTERM per process group, termGrace of re-verified polls, then SIGKILL to
 // the ctx deadline.
 func (s *ladder) settleSession(ctx context.Context, session int, boot uint64, termGrace time.Duration) (Reap, error) {
-	members, err := s.verifiedMembers(session, boot)
+	members, err := s.verifiedMembers(ctx, session, boot)
 	if err != nil {
 		return reapUndetermined, err
 	}
 	if len(members) == 0 {
 		return ReapAbsent, nil
 	}
-	settled, err := s.signalSessionGroups(session, members, syscall.SIGTERM, boot)
+	settled, err := s.signalSessionGroups(ctx, session, members, syscall.SIGTERM, boot)
 	if err != nil {
 		return reapUndetermined, err
 	}
@@ -243,7 +243,7 @@ func (s *ladder) settleSession(ctx context.Context, session int, boot uint64, te
 			return reapUndetermined, ctx.Err()
 		case <-clk.After(min(settlementPollInterval, grace.Sub(clk.Now()))):
 		}
-		members, err = s.verifiedMembers(session, boot)
+		members, err = s.verifiedMembers(ctx, session, boot)
 		if err != nil {
 			return reapUndetermined, err
 		}
@@ -260,7 +260,7 @@ func (s *ladder) settleSession(ctx context.Context, session int, boot uint64, te
 func (s *ladder) awaitSessionSettlement(ctx context.Context, session int, boot uint64) (Reap, error) {
 	clk := clockOrReal(s.clock)
 	for {
-		members, err := s.verifiedMembers(session, boot)
+		members, err := s.verifiedMembers(ctx, session, boot)
 		if err != nil {
 			return reapUndetermined, fmt.Errorf("prove killed session %d settled: %w", session, err)
 		}
@@ -273,7 +273,7 @@ func (s *ladder) awaitSessionSettlement(ctx context.Context, session int, boot u
 				ErrUnsettled, exitingMembers(members), len(members), ctx.Err(),
 			)
 		}
-		settled, err := s.signalSessionGroups(session, members, syscall.SIGKILL, boot)
+		settled, err := s.signalSessionGroups(ctx, session, members, syscall.SIGKILL, boot)
 		if err != nil {
 			return reapUndetermined, err
 		}
@@ -300,11 +300,7 @@ func exitingMembers(members []groupMember) int {
 // verifiedMembers re-verifies every enumerated member immediately before it
 // can be signaled: identity re-probed through matches, session membership
 // still the recorded one, zombies excluded.
-func (s *ladder) verifiedMembers(session int, boot uint64) ([]groupMember, error) {
-	return s.verifiedMembersContext(context.Background(), session, boot)
-}
-
-func (s *ladder) verifiedMembersContext(ctx context.Context, session int, boot uint64) ([]groupMember, error) {
+func (s *ladder) verifiedMembers(ctx context.Context, session int, boot uint64) ([]groupMember, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -337,6 +333,7 @@ func (s *ladder) verifiedMembersContext(ctx context.Context, session int, boot u
 // members. Darwin may deny killpg after the verified group exits; only a
 // fresh exact absence proof settles that denial.
 func (s *ladder) signalSessionGroups(
+	ctx context.Context,
 	session int,
 	members []groupMember,
 	sig syscall.Signal,
@@ -357,12 +354,15 @@ func (s *ladder) signalSessionGroups(
 	slices.Sort(groups)
 	allGone := true
 	for _, group := range groups {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
 		gone, err := s.signalGone(-group, sig)
 		if err != nil {
 			if !errors.Is(err, syscall.EPERM) {
 				return false, err
 			}
-			remaining, verifyErr := s.verifiedMembers(session, boot)
+			remaining, verifyErr := s.verifiedMembers(ctx, session, boot)
 			if verifyErr != nil {
 				return false, errors.Join(err, fmt.Errorf("revalidate dedicated session after denied signal: %w", verifyErr))
 			}

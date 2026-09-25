@@ -12,10 +12,13 @@ import (
 
 const recordSchema state.Schema = 1
 
+// ShutdownPolicy controls automatic settlement of recorded processes.
 type ShutdownPolicy uint8
 
 const (
+	// TerminateOwned permits automatic termination during settlement.
 	TerminateOwned ShutdownPolicy = iota
+	// PreserveOwned requires observational settlement without automatic signals.
 	PreserveOwned
 )
 
@@ -113,6 +116,7 @@ func OpenStore(ctx context.Context, path string) (*Store, error) {
 	return OpenStoreWithPolicy(ctx, path, TerminateOwned)
 }
 
+// OpenStoreWithPolicy binds automatic settlement policy and preserves prior records.
 func OpenStoreWithPolicy(ctx context.Context, path string, policy ShutdownPolicy) (*Store, error) {
 	if policy != TerminateOwned && policy != PreserveOwned {
 		return nil, fmt.Errorf("proc: invalid shutdown policy %d", policy)
@@ -174,6 +178,7 @@ func openLocked(path string, lock *durable.Lock, policy ShutdownPolicy) (*Store,
 // Generation is this instance's record tag, surfaced as Health.Generation.
 func (s *Store) Generation() uint64 { return s.generation }
 
+// Policy returns the automatic settlement policy fixed when this store opened.
 func (s *Store) Policy() ShutdownPolicy { return s.policy }
 
 // Close idempotently waits out the writer loop and releases the store's lock.
@@ -197,7 +202,12 @@ func (s *Store) writer(value records) {
 }
 
 func (s *Store) send(op func(*records)) bool {
-	return s.sendContext(context.Background(), op) == nil
+	select {
+	case s.ops <- op:
+		return true
+	case <-s.closed:
+		return false
+	}
 }
 
 func (s *Store) sendContext(ctx context.Context, op func(*records)) error {
@@ -219,12 +229,9 @@ func (s *Store) sendContext(ctx context.Context, op func(*records)) error {
 	}
 }
 
-// An add that reports failure leaves no record: the queued write outlives the
-// caller's deadline, so an expiry that merely reported would record a process
-// the caller was told this generation does not own.
 func (s *Store) add(ctx context.Context, rec record) error {
 	reply := make(chan error, 1)
-	sent := s.send(func(value *records) {
+	err := s.sendContext(ctx, func(value *records) {
 		next := retained(*value, rec.id())
 		next.Live = append(next.Live, rec)
 		if err := s.file.Store(next); err != nil {
@@ -243,16 +250,15 @@ func (s *Store) add(ctx context.Context, rec record) error {
 		*value = verified.Value
 		reply <- nil
 	})
-	if !sent {
-		return errors.New("proc: record store is closed")
+	if err != nil {
+		return err
 	}
 	select {
 	case err := <-reply:
 		return err
 	case <-ctx.Done():
 		expiry := fmt.Errorf("proc: record %d did not land within the caller's deadline: %w", rec.PID, ctx.Err())
-		<-s.retire(rec.id())
-		return expiry
+		return errors.Join(expiry, s.rollbackRecord(ctx, rec.id()))
 	}
 }
 
@@ -311,4 +317,22 @@ func (s *Store) snapshot(ctx context.Context) ([]record, error) {
 	case <-s.closed:
 		return nil, errors.New("proc: record store is closed")
 	}
+}
+
+func (s *Store) retireBounded(ctx context.Context, id identity) error {
+	select {
+	case fate := <-s.retireContext(ctx, id):
+		if fate != RecordRemoved {
+			return fmt.Errorf("%w: record %d was not observed removed", ErrUnsettled, id.pid)
+		}
+		return nil
+	case <-ctx.Done():
+		return errors.Join(ErrUnsettled, ctx.Err())
+	}
+}
+
+func (s *Store) rollbackRecord(ctx context.Context, id identity) error {
+	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), SettleGrace)
+	defer cancel()
+	return s.retireBounded(cleanup, id)
 }

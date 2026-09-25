@@ -7,6 +7,7 @@ internal/csposture
 internal/csposture/csposturetest
 internal/duplexconn
 internal/flock
+internal/maintenance
 internal/realhome
 internal/state
 internal/trustfixture

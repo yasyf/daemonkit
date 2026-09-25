@@ -58,7 +58,7 @@ func (a *Adopted) Stop(ctx context.Context) (Reap, error) {
 	if err != nil {
 		return reapUndetermined, err
 	}
-	if err := a.Release(); err != nil {
+	if err := a.store.retireBounded(ctx, a.id); err != nil {
 		return outcome, err
 	}
 	return outcome, nil
