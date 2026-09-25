@@ -27,10 +27,18 @@ const spawnNonceBytes = 32
 // Contention returns durable.ErrLockBusy. ctx must carry a deadline; it
 // bounds the lock and the reclaim.
 func OwnProcesses(ctx context.Context, recordPath string) (*Owned, error) {
+	return OwnProcessesWithPolicy(ctx, recordPath, TerminateOwned)
+}
+
+// OwnProcessesWithPolicy applies policy to new work and prior recorded scopes.
+func OwnProcessesWithPolicy(ctx context.Context, recordPath string, policy ShutdownPolicy) (*Owned, error) {
 	if err := budgeted(ctx, "OwnProcesses"); err != nil {
 		return nil, err
 	}
-	store, err := proc.OpenStore(ctx, recordPath)
+	if policy != TerminateOwned && policy != PreserveOwned {
+		return nil, fmt.Errorf("daemonkit: invalid shutdown policy %d", policy)
+	}
+	store, err := proc.OpenStoreWithPolicy(ctx, recordPath, proc.ShutdownPolicy(policy))
 	if err != nil {
 		return nil, err
 	}
@@ -46,24 +54,22 @@ type Owned struct {
 	store     *proc.Store
 	reclaimed []Reclaimed
 
-	mu       sync.Mutex
-	closed   bool
-	starting map[*reservation]struct{}
-	children map[*Child]struct{}
-	tracked  map[*Tracked]struct{}
+	mu         sync.Mutex
+	closed     bool
+	released   bool
+	drain      *NaturalDrain
+	admissions uint64
+	starting   map[*reservation]struct{}
+	children   map[*Child]struct{}
+	tracked    map[*Tracked]struct{}
 }
 
-// reservation is one verb's admission, taken before the verb may start
-// anything and resolved by whatever it started. Admission and registration are
-// therefore one step under one lock: a verb that reserved is already in the
-// set settle observes, well before its child exists, so no process this scope
-// started can exist outside that set. child and tracked are written before
-// done closes and read only after it.
 type reservation struct {
-	verb    string
-	done    chan struct{}
-	child   *Child
-	tracked *Tracked
+	verb     string
+	done     chan struct{}
+	child    *Child
+	tracked  *Tracked
+	unproven bool
 }
 
 func newOwned(store *proc.Store, reclaimed []proc.Reclaimed) *Owned {
@@ -122,6 +128,9 @@ func (o *Owned) Ctx(ctx context.Context) Ctx {
 // descendant that setsid()s out of it: macOS offers no scope that survives
 // that, so it is neither signalled nor counted.
 func (o *Owned) Run(ctx context.Context, c Cmd) (RunResult, error) {
+	if o.store.Policy() == proc.PreserveOwned {
+		return RunResult{}, errors.New("daemonkit: PreserveOwned refuses disposable Run; use Spawn and WaitNatural")
+	}
 	if err := budgeted(ctx, "Run"); err != nil {
 		return RunResult{}, err
 	}
@@ -223,9 +232,15 @@ func (o *Owned) Spawn(ctx context.Context, c Cmd, channel Channel, stderr io.Wri
 // process, so the caller's own Wait and this record cannot race a lost
 // wakeup. Session leadership is probed, never declared: a leader is recorded
 // as its group.
+//
+// PreserveOwned keeps an unproven admission after failed registration;
+// a failed write cannot establish that the externally started process exited.
 func (o *Owned) Adopt(ctx context.Context, pid int) (*Tracked, error) {
 	if err := budgeted(ctx, "Adopt"); err != nil {
 		return nil, err
+	}
+	if pid <= 1 {
+		return nil, fmt.Errorf("daemonkit: refusing to adopt pid %d", pid)
 	}
 	res, err := o.reserve("Adopt")
 	if err != nil {
@@ -234,6 +249,11 @@ func (o *Owned) Adopt(ctx context.Context, pid int) (*Tracked, error) {
 	defer o.abandon(res)
 	adopted, err := o.store.Adopt(ctx, pid)
 	if err != nil {
+		if o.store.Policy() == proc.PreserveOwned && !errors.Is(err, proc.ErrNoProcess) {
+			o.mu.Lock()
+			res.unproven = true
+			o.mu.Unlock()
+		}
 		return nil, fmt.Errorf("daemonkit: adopt pid %d: %w", pid, err)
 	}
 	tracked := &Tracked{adopted: adopted, owner: o}
@@ -241,25 +261,32 @@ func (o *Owned) Adopt(ctx context.Context, pid int) (*Tracked, error) {
 	return tracked, nil
 }
 
-// Close settles the scope: every live child and adopted record is terminated
-// and proven gone within ctx, the store closes, the lock releases. A scope
-// that could not settle everything returns ErrUnsettled joined with the
-// detail — the caller's "did everything drain" answer is err == nil.
-//
-// A verb admitted before the settle is waited out, not raced: a Run or Spawn
-// whose child was still being started is settled here like any other, and one
-// that has not finished starting when ctx runs out is itself an ErrUnsettled
-// fault naming the verb, since whatever it started is durably recorded and the
-// next generation reclaims it.
-//
-// What "terminated and proven gone" covers is exactly the kernel scope each
-// verb recorded. A Run child's is its whole dedicated session, descendants
-// included. A Spawn child's is its session when the Cmd named one, and the
-// child alone otherwise — the descendants of a session-less Spawn are the
-// caller's to account for. An Adopt record's is the session the probe found
-// it leading, and otherwise the process itself. Nothing here reaches a
-// descendant that setsid()s out of its session.
+// Close settles admitted work before releasing the ownership lock. PreserveOwned
+// observes without signaling and keeps the lock and records on timeout;
+// TerminateOwned explicitly terminates the recorded scopes. Escaped descendants
+// require adoption. An uncommitted natural drain must be committed or aborted first.
 func (o *Owned) Close(ctx context.Context) error {
+	if o.store.Policy() == proc.PreserveOwned {
+		o.mu.Lock()
+		released := o.released
+		o.mu.Unlock()
+		if released {
+			return nil
+		}
+		if err := o.settle(ctx); err != nil {
+			return err
+		}
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		if o.released {
+			return nil
+		}
+		if err := o.store.Close(); err != nil {
+			return err
+		}
+		o.released = true
+		return nil
+	}
 	return errors.Join(o.settle(ctx), o.store.Close())
 }
 
@@ -271,6 +298,9 @@ func (o *Owned) Close(ctx context.Context) error {
 // starting within ctx is an ErrUnsettled fault of its own rather than a child
 // answered over.
 func (o *Owned) settle(ctx context.Context) error {
+	if o.store.Policy() == proc.PreserveOwned {
+		return o.settleNatural(ctx)
+	}
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		return errors.New("daemonkit: settling an ownership scope requires a context deadline")
@@ -337,6 +367,10 @@ func (o *Owned) reserve(verb string) (*reservation, error) {
 	if o.closed {
 		return nil, errScopeSettling
 	}
+	if o.drain != nil {
+		return nil, ErrDrainBusy
+	}
+	o.admissions++
 	res := &reservation{verb: verb, done: make(chan struct{})}
 	o.starting[res] = struct{}{}
 	return res, nil
@@ -368,11 +402,12 @@ func (o *Owned) hold(res *reservation, child *Child) {
 	o.resolve(res)
 }
 
-// abandon resolves a reservation whose verb started nothing. A verb that
-// already resolved its own is unaffected, so it is the safe tail of every verb.
 func (o *Owned) abandon(res *reservation) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if res.unproven {
+		return
+	}
 	o.resolve(res)
 }
 

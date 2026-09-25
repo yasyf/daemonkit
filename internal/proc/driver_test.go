@@ -34,7 +34,10 @@ func TestTerminateDemandWinsAgainstFreshSpawn(t *testing.T) {
 	if exit.Record != RecordRemoved {
 		t.Fatalf("Exit.Record = %d, want RecordRemoved", exit.Record)
 	}
-	loaded := s.snapshot()
+	loaded, err := s.snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(loaded) != 0 {
 		t.Fatalf("terminated child left records: %v", loaded)
 	}
@@ -68,7 +71,11 @@ func TestRetireFailureIsAbandonedAndDoneStillCloses(t *testing.T) {
 		t.Fatalf("chmod: %v", err)
 	}
 	found := false
-	for _, rec := range s.snapshot() {
+	live, err := s.snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rec := range live {
 		if rec.PID == child.PID() {
 			found = true
 		}

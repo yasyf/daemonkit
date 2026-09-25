@@ -3,6 +3,7 @@ package daemonkit
 import (
 	"errors"
 
+	"github.com/yasyf/daemonkit/internal/maintenance"
 	"github.com/yasyf/daemonkit/internal/proc"
 	"github.com/yasyf/daemonkit/internal/trust"
 	"github.com/yasyf/daemonkit/internal/wire"
@@ -13,6 +14,12 @@ import (
 // and one this module already declares deeper down is aliased rather than
 // re-declared, so the two spellings cannot name two errors.
 var (
+	// ErrDrainBusy refuses shutdown before protected work can be disturbed.
+	ErrDrainBusy = maintenance.ErrDrainBusy
+
+	// ErrDrainPreparationTimeout refuses shutdown after its reversible wait expires.
+	ErrDrainPreparationTimeout = maintenance.ErrDrainPreparationTimeout
+
 	// ErrBusy means Serve found a live incumbent owning the socket; no
 	// takeover exists here.
 	ErrBusy = errors.New("daemonkit: daemon already serving")

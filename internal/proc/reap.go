@@ -49,29 +49,44 @@ func (s *Store) Recover(ctx context.Context) ([]Reclaimed, string, error) {
 	}
 	var reclaimed []Reclaimed
 	var errs []error
-	for _, rec := range s.snapshot() {
+	live, err := s.snapshot(ctx)
+	if err != nil {
+		return nil, s.archived, err
+	}
+	for _, rec := range live {
 		if rec.Generation == s.generation {
 			continue
 		}
-		reclaimed, errs = s.recoverOne(ctx, rec.id(), rec.Session, reclaimed, errs)
+		reclaimed, errs = s.recoverOne(ctx, rec, reclaimed, errs)
 	}
 	return reclaimed, s.archived, errors.Join(errs...)
 }
 
 func (s *Store) recoverOne(
 	ctx context.Context,
-	id identity,
-	session int,
+	rec record,
 	reclaimed []Reclaimed,
 	errs []error,
 ) ([]Reclaimed, []error) {
-	outcome, err := s.reapIdentity(ctx, id, session)
+	id := rec.id()
+	var outcome Reap
+	var err error
+	if s.policy == PreserveOwned || rec.Policy == PreserveOwned {
+		var scope ScopeObservation
+		scope, err = s.observeScope(ctx, id, rec.Session)
+		outcome = scope.Reap
+		if err == nil && !scope.complete() {
+			err = ErrUnsettled
+		}
+	} else {
+		outcome, err = s.reapIdentity(ctx, id, rec.Session)
+	}
 	if err != nil {
 		return reclaimed, append(errs, fmt.Errorf("reap child %d: %w", id.pid, err))
 	}
 	fate := RecordAbandoned
 	select {
-	case fate = <-s.retire(id):
+	case fate = <-s.retireContext(ctx, id):
 	case <-ctx.Done():
 	}
 	return append(reclaimed, Reclaimed{PID: id.pid, Exit: Exit{Code: -1, Reap: outcome, Record: fate}}), errs
@@ -80,6 +95,10 @@ func (s *Store) recoverOne(
 // An undecided outcome always keeps the record, so a probe failure can never
 // read as dead.
 func (s *ladder) reapIdentity(ctx context.Context, id identity, session int) (Reap, error) {
+	return s.reapIdentityWithGrace(ctx, id, session, graceShare(ctx, clockOrReal(s.clock)))
+}
+
+func (s *ladder) reapIdentityWithGrace(ctx context.Context, id identity, session int, termGrace time.Duration) (Reap, error) {
 	boot, err := s.prober.boot()
 	if err != nil {
 		return reapUndetermined, fmt.Errorf("load current boot identity: %w", err)
@@ -92,7 +111,7 @@ func (s *ladder) reapIdentity(ctx context.Context, id identity, session int) (Re
 	}
 	info, err := s.prober.probe(id.pid)
 	if session != 0 {
-		return s.reapSession(ctx, id, session, info, err, boot)
+		return s.reapSession(ctx, id, session, info, err, boot, termGrace)
 	}
 	switch {
 	case errors.Is(err, errNoProc):
@@ -184,6 +203,7 @@ func (s *ladder) reapSession(
 	leader procInfo,
 	leaderErr error,
 	boot uint64,
+	termGrace time.Duration,
 ) (Reap, error) {
 	if session <= 1 || session != id.pid {
 		return reapUndetermined, errors.New("session record has no durable dedicated-session identity")
@@ -194,21 +214,21 @@ func (s *ladder) reapSession(
 	case leaderErr != nil && !errors.Is(leaderErr, errNoProc):
 		return reapUndetermined, leaderErr
 	}
-	return s.settleSession(ctx, session, boot, graceShare(ctx, clockOrReal(s.clock)))
+	return s.settleSession(ctx, session, boot, termGrace)
 }
 
 // settleSession terminates every verified member of the dedicated session:
 // SIGTERM per process group, termGrace of re-verified polls, then SIGKILL to
 // the ctx deadline.
 func (s *ladder) settleSession(ctx context.Context, session int, boot uint64, termGrace time.Duration) (Reap, error) {
-	members, err := s.verifiedMembers(session, boot)
+	members, err := s.verifiedMembers(ctx, session, boot)
 	if err != nil {
 		return reapUndetermined, err
 	}
 	if len(members) == 0 {
 		return ReapAbsent, nil
 	}
-	settled, err := s.signalSessionGroups(session, members, syscall.SIGTERM, boot)
+	settled, err := s.signalSessionGroups(ctx, session, members, syscall.SIGTERM, boot)
 	if err != nil {
 		return reapUndetermined, err
 	}
@@ -223,7 +243,7 @@ func (s *ladder) settleSession(ctx context.Context, session int, boot uint64, te
 			return reapUndetermined, ctx.Err()
 		case <-clk.After(min(settlementPollInterval, grace.Sub(clk.Now()))):
 		}
-		members, err = s.verifiedMembers(session, boot)
+		members, err = s.verifiedMembers(ctx, session, boot)
 		if err != nil {
 			return reapUndetermined, err
 		}
@@ -240,7 +260,7 @@ func (s *ladder) settleSession(ctx context.Context, session int, boot uint64, te
 func (s *ladder) awaitSessionSettlement(ctx context.Context, session int, boot uint64) (Reap, error) {
 	clk := clockOrReal(s.clock)
 	for {
-		members, err := s.verifiedMembers(session, boot)
+		members, err := s.verifiedMembers(ctx, session, boot)
 		if err != nil {
 			return reapUndetermined, fmt.Errorf("prove killed session %d settled: %w", session, err)
 		}
@@ -253,7 +273,7 @@ func (s *ladder) awaitSessionSettlement(ctx context.Context, session int, boot u
 				ErrUnsettled, exitingMembers(members), len(members), ctx.Err(),
 			)
 		}
-		settled, err := s.signalSessionGroups(session, members, syscall.SIGKILL, boot)
+		settled, err := s.signalSessionGroups(ctx, session, members, syscall.SIGKILL, boot)
 		if err != nil {
 			return reapUndetermined, err
 		}
@@ -280,13 +300,19 @@ func exitingMembers(members []groupMember) int {
 // verifiedMembers re-verifies every enumerated member immediately before it
 // can be signaled: identity re-probed through matches, session membership
 // still the recorded one, zombies excluded.
-func (s *ladder) verifiedMembers(session int, boot uint64) ([]groupMember, error) {
+func (s *ladder) verifiedMembers(ctx context.Context, session int, boot uint64) ([]groupMember, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, errors.Join(ErrUnsettled, err)
+	}
 	members, err := s.prober.groupMembers(session)
 	if err != nil {
 		return nil, fmt.Errorf("enumerate dedicated session %d: %w", session, err)
 	}
 	stable := make([]groupMember, 0, len(members))
 	for _, member := range members {
+		if err := ctx.Err(); err != nil {
+			return nil, errors.Join(ErrUnsettled, err)
+		}
 		info, err := s.prober.probe(member.pid)
 		enumerated := identity{pid: member.pid, start: member.info.start, boot: boot}
 		switch {
@@ -307,6 +333,7 @@ func (s *ladder) verifiedMembers(session int, boot uint64) ([]groupMember, error
 // members. Darwin may deny killpg after the verified group exits; only a
 // fresh exact absence proof settles that denial.
 func (s *ladder) signalSessionGroups(
+	ctx context.Context,
 	session int,
 	members []groupMember,
 	sig syscall.Signal,
@@ -327,12 +354,15 @@ func (s *ladder) signalSessionGroups(
 	slices.Sort(groups)
 	allGone := true
 	for _, group := range groups {
+		if err := ctx.Err(); err != nil {
+			return false, errors.Join(ErrUnsettled, err)
+		}
 		gone, err := s.signalGone(-group, sig)
 		if err != nil {
 			if !errors.Is(err, syscall.EPERM) {
 				return false, err
 			}
-			remaining, verifyErr := s.verifiedMembers(session, boot)
+			remaining, verifyErr := s.verifiedMembers(ctx, session, boot)
 			if verifyErr != nil {
 				return false, errors.Join(err, fmt.Errorf("revalidate dedicated session after denied signal: %w", verifyErr))
 			}

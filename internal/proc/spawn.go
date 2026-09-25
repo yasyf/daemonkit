@@ -110,23 +110,24 @@ func (s *Store) spawn(ctx context.Context, c Cmd, childOut, childErr *os.File) (
 		session = pid
 	}
 	id := identity{pid: pid, start: info.start, boot: boot}
-	rec := record{PID: pid, Start: info.start, Boot: boot, Generation: s.generation, Session: session, Comm: info.comm}
+	rec := record{PID: pid, Start: info.start, Boot: boot, Generation: s.generation, Session: session, Comm: info.comm, Policy: s.policy}
 	if err := s.add(ctx, rec); err != nil {
 		return nil, s.abortSpawn(pid, parentEnd, err)
 	}
 	if c.Verify != nil {
 		if err := c.Verify(pid); err != nil {
 			aborted := s.abortSpawn(pid, parentEnd, err)
-			<-s.retire(id)
-			return nil, aborted
+			return nil, errors.Join(aborted, s.rollbackRecord(ctx, id))
 		}
 	}
 	if err := releaseChild(pid); err != nil {
 		aborted := s.abortSpawn(pid, parentEnd, fmt.Errorf("release suspended pid %d: %w", pid, err))
-		<-s.retire(id)
-		return nil, aborted
+		return nil, errors.Join(aborted, s.rollbackRecord(ctx, id))
 	}
 	child := &Child{
+		store:   s,
+		id:      id,
+		session: session,
 		pid:     pid,
 		demand:  make(chan time.Time, 1),
 		stdin:   stdinDelivered,

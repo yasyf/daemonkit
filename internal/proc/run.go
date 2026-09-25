@@ -38,6 +38,9 @@ type Result struct {
 // registered unconditionally and an owner settling its scope terminates a run
 // in flight on its own budget rather than answering over it.
 func (s *Store) Run(ctx context.Context, c Cmd, hold func(*Child)) (Result, error) {
+	if s.policy == PreserveOwned {
+		return Result{}, errors.New("proc: Run is unavailable under PreserveOwned; use Spawn and WaitNatural")
+	}
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		return Result{}, errors.New("proc: run requires a context deadline")

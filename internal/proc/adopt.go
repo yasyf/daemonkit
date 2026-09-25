@@ -40,7 +40,7 @@ func (s *Store) Adopt(ctx context.Context, pid int) (*Adopted, error) {
 		session = pid
 	}
 	id := identity{pid: pid, start: info.start, boot: boot}
-	rec := record{PID: pid, Start: info.start, Boot: boot, Generation: s.generation, Session: session, Comm: info.comm}
+	rec := record{PID: pid, Start: info.start, Boot: boot, Generation: s.generation, Session: session, Comm: info.comm, Policy: s.policy}
 	if err := s.add(ctx, rec); err != nil {
 		return nil, err
 	}
@@ -58,15 +58,19 @@ func (a *Adopted) Stop(ctx context.Context) (Reap, error) {
 	if err != nil {
 		return reapUndetermined, err
 	}
-	if err := a.Release(); err != nil {
+	if err := a.store.retireBounded(ctx, a.id); err != nil {
 		return outcome, err
 	}
 	return outcome, nil
 }
 
-// Release retires the record without touching the process, for a caller whose
-// own Wait already proved the exit.
+// Release requires a quiet scope under PreserveOwned.
 func (a *Adopted) Release() error {
+	if a.store.policy == PreserveOwned {
+		ctx, cancel := context.WithTimeout(context.Background(), SettleGrace)
+		defer cancel()
+		return a.store.retireQuietScope(ctx, a.id, a.session)
+	}
 	if fate := <-a.store.retire(a.id); fate != RecordRemoved {
 		return fmt.Errorf("proc: adopted record %d was not observed removed", a.id.pid)
 	}
