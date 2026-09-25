@@ -1,1 +1,1 @@
-{"v":1,"lamport":4,"ops":[{"kind":"set_criterion_status","id":"516900ad61079f308f15f2bed60d2971","status":"met","note":"PR35 e4c8b747 native/race CI36185983534 and all fleet checks passed; root merged ab6e70e. Natural observation fixtures assert zero signals and retained live/uncertain records."}]}
+{"v":1,"lamport":5,"ops":[{"kind":"set_criterion_status","id":"b1eafeecae2fd184cb681e3726e666a5","status":"met","note":"PR35 green native/race CI proves pending admissions, producer identity exclusion, stale/cross-lease proof rejection and held lock on timeout."}]}
