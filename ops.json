@@ -1,1 +1,1 @@
-{"v":1,"lamport":5,"ops":[{"kind":"set_criterion_status","id":"8fbfe74169a1128d017500cc1f597030","status":"met","note":"PR36 exact194b72109 CI36187063215 native/race tests passed, including fake wait EINTR and ECHILD abort fixtures. Source retains ErrUnsettled admission and post-record abort records."}]}
+{"v":1,"lamport":6,"ops":[{"kind":"set_status","status":"done"},{"kind":"link_commit","sha":"194b72109f03dcd19c37a8d3d0df96f233de60c4"}]}
