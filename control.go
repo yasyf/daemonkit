@@ -87,10 +87,12 @@ const (
 // and refuses when PID or Generation moved — a replacement on the same
 // socket is a dead session, never a silently retargeted one.
 type Control struct {
-	session    *wire.Client
-	pinned     proc.Identity
-	generation uint64
-	observe    func(proc.Identity) (proc.Reap, bool, error)
+	preserveOwned       bool
+	requirePreservation bool
+	session             *wire.Client
+	pinned              proc.Identity
+	generation          uint64
+	observe             func(proc.Identity) (proc.Reap, bool, error)
 }
 
 // Control attaches the control lane. It exists only past Trust.Control (the
@@ -140,10 +142,12 @@ func (c *Client) Control(ctx context.Context) (*Control, error) {
 		return nil, err
 	}
 	return &Control{
-		session:    session,
-		pinned:     pinned,
-		generation: report.Generation,
-		observe:    proc.Observe,
+		session:             session,
+		preserveOwned:       c.daemon.ShutdownPolicy == PreserveOwned || report.PreserveOwned,
+		requirePreservation: c.daemon.ShutdownPolicy == PreserveOwned,
+		pinned:              pinned,
+		generation:          report.Generation,
+		observe:             proc.Observe,
 	}, nil
 }
 
@@ -273,10 +277,16 @@ func (c *Control) Drain(ctx context.Context, expect Expect) (Stopped, error) {
 	}
 	report, err := c.session.Health(ctx)
 	if err != nil {
+		if c.preserveOwned {
+			return Stopped{}, fmt.Errorf("%w: pre-drain health unavailable: %v", ErrDrainPreparationTimeout, err)
+		}
 		return Stopped{}, fmt.Errorf("daemonkit: pre-drain health: %w", err)
 	}
 	if err := c.pinnedBy(report); err != nil {
 		return Stopped{}, err
+	}
+	if c.requirePreservation && !report.PreserveOwned {
+		return Stopped{}, fmt.Errorf("%w: incumbent does not support preservation preparation", ErrDrainBusy)
 	}
 	before := healthFromReport(report)
 	if expect.mismatch(before.Build, before.Generation) {
@@ -303,6 +313,9 @@ func (c *Control) dispatchDrain(ctx context.Context) error {
 		}
 		return fmt.Errorf("daemonkit: drain refused: %w", rejection)
 	}
+	if c.preserveOwned && (err != nil || result.Outcome != wire.Delivered || result.Terminal() != nil) {
+		return fmt.Errorf("%w: drain commitment was not acknowledged", ErrDrainPreparationTimeout)
+	}
 	if err != nil && result.Outcome == wire.PreSendFailure {
 		return fmt.Errorf("daemonkit: send drain: %w", err)
 	}
@@ -319,3 +332,7 @@ func (c *Control) Close(ctx context.Context) error {
 	}
 	return c.session.Close(ctx)
 }
+
+// PreservationRequired reports whether this pinned control must observe a
+// successful preservation commitment before treating drain as dispatched.
+func (c *Control) PreservationRequired() bool { return c.preserveOwned }

@@ -6,10 +6,14 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/yasyf/daemonkit/internal/maintenance"
 	"github.com/yasyf/daemonkit/internal/trust"
 )
 
 var (
+	ErrDrainBusy               = maintenance.ErrDrainBusy
+	ErrDrainPreparationTimeout = maintenance.ErrDrainPreparationTimeout
+	ErrMaintenance             = errors.New("wire: runtime is in maintenance")
 	// ErrQueueFull means a bounded session queue cannot accept more work.
 	ErrQueueFull = errors.New("wire: queue at capacity")
 	// ErrFlowControl means a peer exceeded a fixed stream bound.
@@ -45,7 +49,8 @@ const (
 	// PhaseStarting precedes readiness; business dispatch is typed-rejected.
 	PhaseStarting Phase = "runtime_starting"
 	// PhaseReady admits business dispatch.
-	PhaseReady Phase = "runtime_ready"
+	PhaseReady       Phase = "runtime_ready"
+	PhaseMaintenance Phase = "runtime_maintenance"
 	// PhaseDraining means intake is closing; reconnect elsewhere.
 	PhaseDraining Phase = "runtime_draining"
 	// PhaseFailed is the runtime's terminal failure.
@@ -70,6 +75,7 @@ type Runtime interface {
 	// deadline and session/server cancellation. An unknown op returns an error;
 	// wire turns it into a terminal Response.
 	Handle(ctx context.Context, req Request) (any, error)
+	HandleMaintenance(ctx context.Context, req Request) (any, error)
 
 	// Phase returns the current snapshot; WaitPhase blocks until Sequence >
 	// after or ctx ends. This is the stream the per-session phase pump and
@@ -80,7 +86,7 @@ type Runtime interface {
 	// Drain is the trust-gated control verb's landing point. Idempotent. The
 	// runtime closes product intake and drives Phase to PhaseDraining; the
 	// wire server observes the transition through the phase stream.
-	Drain()
+	Drain(context.Context) error
 }
 
 // RuntimeFailedError reports the runtime's terminal failed phase.
@@ -97,7 +103,10 @@ type ResponseCode string
 
 const (
 	// ResponseCodeRuntimeStarting identifies pre-ready non-dispatch.
-	ResponseCodeRuntimeStarting ResponseCode = "runtime_starting"
+	ResponseCodeRuntimeStarting         ResponseCode = "runtime_starting"
+	ResponseCodeRuntimeMaintenance      ResponseCode = "runtime_maintenance"
+	ResponseCodeDrainBusy               ResponseCode = "drain_busy"
+	ResponseCodeDrainPreparationTimeout ResponseCode = "drain_preparation_timeout"
 	// ResponseCodeRuntimeDraining identifies closed-intake non-dispatch.
 	ResponseCodeRuntimeDraining ResponseCode = "runtime_draining"
 	// ResponseCodeBuildMismatch identifies a schema-set attach rejection.
@@ -175,6 +184,12 @@ func (e *TerminalError) Unwrap() error { return responseCodeCause(e.Code) }
 
 func responseCodeCause(code ResponseCode) error {
 	switch code {
+	case ResponseCodeRuntimeMaintenance:
+		return ErrMaintenance
+	case ResponseCodeDrainBusy:
+		return ErrDrainBusy
+	case ResponseCodeDrainPreparationTimeout:
+		return ErrDrainPreparationTimeout
 	case ResponseCodeRuntimeStarting:
 		return ErrNotReady
 	case ResponseCodeRuntimeDraining:

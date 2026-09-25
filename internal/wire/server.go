@@ -571,13 +571,17 @@ func (s *Server) gatePhase() error {
 		return nil
 	case PhaseStarting:
 		return ErrNotReady
+	case PhaseMaintenance:
+		return ErrMaintenance
 	default:
 		return ErrDraining
 	}
 }
 
 func (s *Server) executeDrain(ctx context.Context) (any, error) {
-	s.rt.Drain()
+	if err := s.rt.Drain(ctx); err != nil {
+		return nil, err
+	}
 	snapshot := s.rt.Phase()
 	for snapshot.Phase != PhaseDraining && snapshot.Phase != PhaseFailed {
 		var err error

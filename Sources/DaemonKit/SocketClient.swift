@@ -592,7 +592,7 @@ extension SocketClientCore {
                 throw RuntimeFailedError(snapshot: state.snapshot)
             case .draining:
                 throw SessionDrainingError()
-            case .starting:
+            case .starting, .maintenance:
                 break
             }
             if state.closed {

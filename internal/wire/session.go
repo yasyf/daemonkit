@@ -458,10 +458,10 @@ func (s *session) execute(sessCtx, requestCtx context.Context, frame Frame, stat
 		s.requestWG.Done()
 	}()
 	value, err := s.dispatch(requestCtx, frame, state)
-	if requestErr := requestCtx.Err(); requestErr != nil {
+	if requestErr := requestCtx.Err(); requestErr != nil && !preservationRefusal(err) {
 		err = requestErr
 	}
-	if transportErr := state.error(); transportErr != nil {
+	if transportErr := state.error(); transportErr != nil && !preservationRefusal(err) {
 		err = transportErr
 	}
 	if code, rejected := rejectionCode(err); rejected {
@@ -500,7 +500,7 @@ func (s *session) dispatch(requestCtx context.Context, frame Frame, state *reque
 	case s.lane != LaneBusiness:
 		return nil, ErrPermissionDenied
 	default:
-		if err := s.server.gatePhase(); err != nil {
+		if err := s.server.gatePhase(); err != nil && !errors.Is(err, ErrMaintenance) {
 			return nil, err
 		}
 		select {
@@ -511,7 +511,10 @@ func (s *session) dispatch(requestCtx context.Context, frame Frame, state *reque
 			return nil, s.ctx.Err()
 		}
 		defer func() { <-s.server.handleSem }()
-		return s.server.rt.Handle(requestCtx, Request{
+		if err := s.server.gatePhase(); err != nil && !errors.Is(err, ErrMaintenance) {
+			return nil, err
+		}
+		request := Request{
 			ID:      frame.ID,
 			Op:      frame.Op,
 			Peer:    s.peer,
@@ -519,12 +522,26 @@ func (s *session) dispatch(requestCtx context.Context, frame Frame, state *reque
 			Payload: append([]byte(nil), frame.Payload...),
 			Chunks:  state.chunks,
 			Session: s.accepted,
-		})
+		}
+		if s.server.rt.Phase().Phase == PhaseMaintenance {
+			return s.server.rt.HandleMaintenance(requestCtx, request)
+		}
+		return s.server.rt.Handle(requestCtx, request)
 	}
+}
+
+func preservationRefusal(err error) bool {
+	return errors.Is(err, ErrDrainBusy) || errors.Is(err, ErrDrainPreparationTimeout)
 }
 
 func rejectionCode(err error) (ResponseCode, bool) {
 	switch {
+	case errors.Is(err, ErrDrainBusy):
+		return ResponseCodeDrainBusy, true
+	case errors.Is(err, ErrDrainPreparationTimeout):
+		return ResponseCodeDrainPreparationTimeout, true
+	case errors.Is(err, ErrMaintenance):
+		return ResponseCodeRuntimeMaintenance, true
 	case errors.Is(err, ErrNotReady):
 		return ResponseCodeRuntimeStarting, true
 	case errors.Is(err, ErrDraining):

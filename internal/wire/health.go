@@ -12,10 +12,11 @@ const healthOp Op = "daemon.health"
 // wire's own Phase and Protocol. Detail returns the product's report bytes
 // verbatim; nil means no product detail.
 type Serving struct {
-	PID        int
-	Build      string
-	Generation uint64
-	Detail     func() []byte
+	PreserveOwned bool
+	PID           int
+	Build         string
+	Generation    uint64
+	Detail        func() []byte
 }
 
 // HealthReport is the daemon.health verb's terminal payload: one observation
@@ -27,21 +28,23 @@ type Serving struct {
 // needs no ProtocolVersion bump and an older client must keep attaching to
 // the newer daemon it is about to drain.
 type HealthReport struct {
-	Phase      Phase  `json:"phase"`
-	Protocol   uint16 `json:"protocol"`
-	Generation uint64 `json:"generation"`
-	PID        int    `json:"pid"`
-	Build      string `json:"build"`
-	Detail     []byte `json:"detail,omitempty"`
+	PreserveOwned bool   `json:"preserve_owned,omitempty"`
+	Phase         Phase  `json:"phase"`
+	Protocol      uint16 `json:"protocol"`
+	Generation    uint64 `json:"generation"`
+	PID           int    `json:"pid"`
+	Build         string `json:"build"`
+	Detail        []byte `json:"detail,omitempty"`
 }
 
 func (s *Server) executeHealth() (any, error) {
 	report := HealthReport{
-		Phase:      s.rt.Phase().Phase,
-		Protocol:   ProtocolVersion,
-		Generation: s.cfg.Serving.Generation,
-		PID:        s.cfg.Serving.PID,
-		Build:      s.cfg.Serving.Build,
+		PreserveOwned: s.cfg.Serving.PreserveOwned,
+		Phase:         s.rt.Phase().Phase,
+		Protocol:      ProtocolVersion,
+		Generation:    s.cfg.Serving.Generation,
+		PID:           s.cfg.Serving.PID,
+		Build:         s.cfg.Serving.Build,
 	}
 	if s.cfg.Serving.Detail != nil {
 		report.Detail = s.cfg.Serving.Detail()

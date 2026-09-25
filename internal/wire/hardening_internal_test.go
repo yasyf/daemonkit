@@ -167,7 +167,7 @@ func (r *drainableRuntime) WaitPhase(ctx context.Context, after uint64) (PhaseSn
 	}
 }
 
-func (r *drainableRuntime) Drain() {
+func (r *drainableRuntime) Drain(context.Context) error {
 	r.once.Do(func() {
 		r.mu.Lock()
 		r.snapshot = PhaseSnapshot{Sequence: r.snapshot.Sequence + 1, Phase: PhaseDraining}
@@ -175,6 +175,8 @@ func (r *drainableRuntime) Drain() {
 		r.mu.Unlock()
 		close(r.drained)
 	})
+
+	return nil
 }
 
 func TestInboundPreambleDrainsThroughTheTrustGate(t *testing.T) {
@@ -310,4 +312,8 @@ func assertDescriptorClosed(t *testing.T, kept *os.File) {
 	if _, err := canary.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
 		t.Fatalf("canary read = %v, want io.EOF: the descriptor outlived the connection it arrived on", err)
 	}
+}
+
+func (*drainableRuntime) HandleMaintenance(context.Context, Request) (any, error) {
+	return nil, ErrMaintenance
 }

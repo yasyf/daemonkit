@@ -104,7 +104,9 @@ func (r spawnedRuntime) WaitPhase(ctx context.Context, after uint64) (wire.Phase
 	return wire.PhaseSnapshot{}, ctx.Err()
 }
 
-func (spawnedRuntime) Drain() {}
+func (spawnedRuntime) Drain(context.Context) error {
+	return nil
+}
 
 // claimSpawnedHandoff performs the one claim both child-side entry points
 // share. The DAEMONKIT_SPAWNED_* variables are read once and unset here: they
@@ -183,4 +185,8 @@ func CloseInheritedFDs() error {
 		_ = unix.Close(fd)
 	}
 	return nil
+}
+
+func (spawnedRuntime) HandleMaintenance(context.Context, wire.Request) (any, error) {
+	return nil, wire.ErrMaintenance
 }

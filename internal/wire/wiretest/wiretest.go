@@ -150,9 +150,15 @@ func (r *StubRuntime) SetPhase(phase wire.Phase, detail []byte) {
 }
 
 // Drain closes Drained and publishes PhaseDraining.
-func (r *StubRuntime) Drain() {
+func (r *StubRuntime) Drain(context.Context) error {
 	r.drainOnce.Do(func() {
 		close(r.Drained)
 		r.SetPhase(wire.PhaseDraining, nil)
 	})
+
+	return nil
+}
+
+func (*StubRuntime) HandleMaintenance(context.Context, wire.Request) (any, error) {
+	return nil, wire.ErrMaintenance
 }

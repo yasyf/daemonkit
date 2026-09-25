@@ -106,6 +106,9 @@ func (c *Client) stopOnce(ctx context.Context) error {
 		return c.evict(ctx, healthFromReport(world.Health), world.Observed())
 	}
 	if spent(ctx, world.Attach) {
+		if c.daemon.ShutdownPolicy == PreserveOwned {
+			return ErrDrainPreparationTimeout
+		}
 		return errors.Join(world.Attach, context.DeadlineExceeded)
 	}
 	if errors.Is(world.Attach, ErrAbsent) || errors.Is(world.Attach, ErrDraining) {

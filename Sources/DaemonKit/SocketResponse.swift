@@ -10,6 +10,9 @@ public struct SocketResponseCode: RawRepresentable, Equatable, Hashable, Sendabl
     }
 
     public static let runtimeStarting = SocketResponseCode(rawValue: "runtime_starting")
+    public static let runtimeMaintenance = SocketResponseCode(rawValue: "runtime_maintenance")
+    public static let drainBusy = SocketResponseCode(rawValue: "drain_busy")
+    public static let drainPreparationTimeout = SocketResponseCode(rawValue: "drain_preparation_timeout")
     public static let runtimeDraining = SocketResponseCode(rawValue: "runtime_draining")
     public static let buildMismatch = SocketResponseCode(rawValue: "build_mismatch")
     public static let sessionCapacity = SocketResponseCode(rawValue: "session_capacity")

@@ -154,6 +154,8 @@ func (d *Deployment) stop(ctx context.Context) (daemonkit.Stopped, error) {
 	switch {
 	case err == nil:
 		return stopped, nil
+	case preservationRefused(err):
+		return daemonkit.Stopped{}, err
 	case errors.Is(err, daemonkit.ErrUnsettled), timedOut(err):
 		return d.client.Terminate(ctx, expect)
 	default:
@@ -165,13 +167,22 @@ func (d *Deployment) drain(ctx context.Context) (daemonkit.Expect, daemonkit.Sto
 	control, err := d.client.Control(ctx)
 	switch {
 	case errors.Is(err, daemonkit.ErrDraining), errors.Is(err, daemonkit.ErrAbsent):
+		if d.config.Daemon.ShutdownPolicy == daemonkit.PreserveOwned {
+			return daemonkit.Expect{}, daemonkit.Stopped{}, fmt.Errorf("%w: no prepared drain commitment was acknowledged", daemonkit.ErrDrainBusy)
+		}
 		return d.settle(ctx)
 	case err != nil:
+		if d.config.Daemon.ShutdownPolicy == daemonkit.PreserveOwned && timedOut(err) {
+			return daemonkit.Expect{}, daemonkit.Stopped{}, fmt.Errorf("%w: drain attachment did not finish", daemonkit.ErrDrainPreparationTimeout)
+		}
 		return daemonkit.Expect{}, daemonkit.Stopped{}, err
 	}
 	defer func() { _ = control.Close(ctx) }()
 	health, err := control.Health(ctx)
 	if err != nil {
+		if control.PreservationRequired() {
+			return daemonkit.Expect{}, daemonkit.Stopped{}, fmt.Errorf("%w: preserving control health is unavailable", daemonkit.ErrDrainPreparationTimeout)
+		}
 		return daemonkit.Expect{}, daemonkit.Stopped{}, err
 	}
 	expect := daemonkit.Expect{Build: health.Build, Generation: health.Generation}
@@ -194,6 +205,9 @@ func (d *Deployment) settle(ctx context.Context) (daemonkit.Expect, daemonkit.St
 	}
 	expect := daemonkit.Expect{Build: owner.Build, Generation: owner.Generation}
 	stopped, err := d.client.Settle(ctx, expect)
+	if d.config.Daemon.ShutdownPolicy == daemonkit.PreserveOwned && (errors.Is(err, daemonkit.ErrUnsettled) || timedOut(err)) {
+		return expect, stopped, fmt.Errorf("%w: incumbent absence was not proven", daemonkit.ErrDrainPreparationTimeout)
+	}
 	return expect, stopped, err
 }
 
@@ -204,6 +218,12 @@ func (d *Deployment) settle(ctx context.Context) (daemonkit.Expect, daemonkit.St
 // each gets an equal share of what is left, so one that ignores SIGTERM cannot
 // spend the next one's SIGKILL.
 func (d *Deployment) terminateSurvivors(ctx context.Context) error {
+	if d.config.Daemon.ShutdownPolicy == daemonkit.PreserveOwned {
+		if err := d.requireEmpty(); err != nil {
+			return fmt.Errorf("%w: executable inventory is not quiet: %v", daemonkit.ErrDrainBusy, err)
+		}
+		return nil
+	}
 	owned, err := d.ownedExecutables()
 	if err != nil {
 		return err
@@ -367,4 +387,8 @@ func (p ReadinessProof) stored() storedProof {
 
 func (p RuntimeProof) stored() storedRuntime {
 	return storedRuntime{Absent: p.absent, Generation: p.generation, Digest: p.digest.String()}
+}
+
+func preservationRefused(err error) bool {
+	return errors.Is(err, daemonkit.ErrDrainBusy) || errors.Is(err, daemonkit.ErrDrainPreparationTimeout)
 }

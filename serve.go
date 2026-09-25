@@ -194,7 +194,7 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 		return Drained{}, err
 	}
 	ownCtx, cancelOwn := d.ShutdownGrace().mint("own").Context(ctx)
-	store, err := proc.OpenStore(ownCtx, el.record())
+	store, err := proc.OpenStoreWithPolicy(ownCtx, el.record(), proc.ShutdownPolicy(d.ShutdownPolicy))
 	cancelOwn()
 	if err != nil {
 		if errors.Is(err, durable.ErrLockBusy) {
@@ -226,6 +226,7 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 	}
 
 	rt := newServeRuntime(int(MaxDetail(d.MaxFrame)))
+	rt.policy, rt.grace = d.ShutdownPolicy, d.ShutdownGrace()
 	server, err := wire.NewServer(rt, wire.Config{
 		Schemas:     d.wireSchemas(),
 		Trust:       wire.Trust{Control: wireRequirement(d.Trust.Control), Business: wireRequirements(d.Trust.Business)},
@@ -233,7 +234,7 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 		MaxFrame:    int(d.MaxFrame),
 		Handshake:   time.Duration(d.Handshake),
 		Idle:        idleOrDefault(d.Idle),
-		Serving:     wire.Serving{PID: os.Getpid(), Build: build, Generation: store.Generation(), Detail: rt.reportDetail},
+		Serving:     wire.Serving{PID: os.Getpid(), Build: build, Generation: store.Generation(), Detail: rt.reportDetail, PreserveOwned: d.ShutdownPolicy == PreserveOwned},
 	})
 	if err != nil {
 		_ = ln.Close()
@@ -246,16 +247,19 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve(serveCtx, ln) }()
 
-	stopWatch := context.AfterFunc(ctx, rt.Drain)
+	stopWatch := context.AfterFunc(ctx, rt.triggerDrain)
 	defer stopWatch()
 	armDone := make(chan struct{})
 	stopForwarder := sync.OnceFunc(func() { close(armDone) })
 	defer stopForwarder()
 	go func() {
-		select {
-		case <-signals:
-			rt.Drain()
-		case <-armDone:
+		for {
+			select {
+			case <-signals:
+				rt.triggerDrain()
+			case <-armDone:
+				return
+			}
 		}
 	}()
 
@@ -265,7 +269,7 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 		Context:      activationCtx,
 		Reclaimed:    owned.Reclaimed(),
 		Report:       rt.report,
-		Stop:         func(error) { rt.Drain() },
+		Stop:         func(error) { go rt.triggerDrain() },
 		owner:        owned,
 		adoptMinted:  server.AdoptMinted,
 		adoptHandoff: server.AdoptHandoff,
@@ -276,12 +280,23 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 		rt.fail()
 		product = nil
 	} else {
-		rt.ready(product)
+		if err := rt.ready(product); err != nil {
+			startErr = err
+			rt.fail()
+		}
+	}
+	if startErr == nil || d.ShutdownPolicy == PreserveOwned {
 		select {
 		case <-rt.stopped.Done():
 		case serveErr = <-serveDone:
 			serveReturned = true
-			rt.Drain()
+			rt.triggerDrain()
+			if d.ShutdownPolicy == PreserveOwned {
+				if rt.Phase().Phase != wire.PhaseDraining {
+					rt.fail()
+				}
+				<-rt.stopped.Done()
+			}
 		}
 	}
 
@@ -529,6 +544,9 @@ func wiredRequirement(r Requirement) trust.Requirement {
 // product mux, and the stop context every drain trigger lands on — the one
 // Serve's ladder waits for and the one a blocked Start is released by.
 type serveRuntime struct {
+	policy    ShutdownPolicy
+	grace     Grace
+	preparing *drainAttempt
 	mu        sync.Mutex
 	snapshot  wire.PhaseSnapshot
 	changed   chan struct{}
@@ -546,6 +564,7 @@ func newServeRuntime(maxDetail int) *serveRuntime {
 		snapshot:  wire.PhaseSnapshot{Sequence: 1, Phase: wire.PhaseStarting},
 		changed:   make(chan struct{}),
 		maxDetail: maxDetail,
+		grace:     Grace(30 * time.Second),
 		stopped:   stopped,
 		signal:    signalStop,
 	}
@@ -554,8 +573,25 @@ func newServeRuntime(maxDetail int) *serveRuntime {
 func (r *serveRuntime) Handle(ctx context.Context, req wire.Request) (any, error) {
 	r.mu.Lock()
 	product := r.product
+	phase := r.snapshot.Phase
 	r.mu.Unlock()
+	if phase == wire.PhaseMaintenance {
+		return r.HandleMaintenance(ctx, req)
+	}
+	if phase != wire.PhaseReady {
+		return nil, wire.ErrNotReady
+	}
 	return handleBusiness(ctx, req, product.Handle)
+}
+
+func (r *serveRuntime) HandleMaintenance(ctx context.Context, req wire.Request) (any, error) {
+	r.mu.Lock()
+	product, ok := r.product.(MaintenanceHandler)
+	r.mu.Unlock()
+	if !ok {
+		return nil, wire.ErrMaintenance
+	}
+	return handleBusiness(ctx, req, product.HandleMaintenance)
 }
 
 func (r *serveRuntime) Phase() wire.PhaseSnapshot {
@@ -581,21 +617,17 @@ func (r *serveRuntime) WaitPhase(ctx context.Context, after uint64) (wire.PhaseS
 	}
 }
 
-// Drain publishes PhaseDraining synchronously, then signals the ladder — the
-// structural heir of the deleted daemon.Runtime.signalStop. The wire server's
-// executeDrain re-reads Phase right after Drain returns, so the publication
-// can never lag the ack; the ladder's executor is Serve's own goroutine,
-// never this caller.
-func (r *serveRuntime) Drain() {
-	r.publish(wire.PhaseDraining)
-	r.signal()
-}
-
-func (r *serveRuntime) ready(product Product) {
+func (r *serveRuntime) ready(product Product) error {
+	if r.policy == PreserveOwned {
+		if _, ok := product.(DrainPreparer); !ok {
+			return fmt.Errorf("%w: preserving product must implement DrainPreparer", ErrDrainBusy)
+		}
+	}
 	r.mu.Lock()
 	r.product = product
 	r.mu.Unlock()
 	r.publish(wire.PhaseReady)
+	return nil
 }
 
 func (r *serveRuntime) fail() {
@@ -606,6 +638,10 @@ func (r *serveRuntime) fail() {
 func (r *serveRuntime) publish(phase wire.Phase) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.publishLocked(phase)
+}
+
+func (r *serveRuntime) publishLocked(phase wire.Phase) {
 	if r.snapshot.Phase == wire.PhaseDraining || r.snapshot.Phase == wire.PhaseFailed {
 		return
 	}

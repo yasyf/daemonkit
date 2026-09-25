@@ -36,7 +36,9 @@ func (r stubRuntime) WaitPhase(ctx context.Context, after uint64) (PhaseSnapshot
 	return PhaseSnapshot{}, ctx.Err()
 }
 
-func (stubRuntime) Drain() {}
+func (stubRuntime) Drain(context.Context) error {
+	return nil
+}
 
 func testSocketDir(t *testing.T) string {
 	t.Helper()
@@ -417,4 +419,8 @@ func TestOldEraPeersGetProtocolMismatch(t *testing.T) {
 			t.Fatalf("clientHandshake() against an old-era server = %v, want ErrProtocolVersion", err)
 		}
 	})
+}
+
+func (stubRuntime) HandleMaintenance(context.Context, Request) (any, error) {
+	return nil, ErrMaintenance
 }

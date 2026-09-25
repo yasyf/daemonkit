@@ -301,17 +301,40 @@ func (c *Client) evict(ctx context.Context, before Health, observed proc.Identit
 	switch {
 	case err == nil:
 		defer func() { _ = control.Close(drainCtx) }()
+		var maintenance *launchd.Maintenance
+		if control.PreservationRequired() {
+			health, healthErr := control.Health(drainCtx)
+			if healthErr != nil || !health.PreserveOwned {
+				return fmt.Errorf("%w: preservation support is unproven: %v", ErrDrainBusy, healthErr)
+			}
+			if target.expect().mismatch(health.Build, health.Generation) {
+				return ErrWrongIncumbent
+			}
+			var pauseErr error
+			maintenance, pauseErr = launchd.PauseRestarts(drainCtx, c.launchctl, string(c.daemon.Label), health.PID)
+			if pauseErr != nil {
+				return fmt.Errorf("%w: restart exclusion failed: %v", ErrDrainBusy, pauseErr)
+			}
+		}
 		_, drainErr := control.Drain(drainCtx, target.expect())
+		if errors.Is(drainErr, ErrDrainBusy) && maintenance != nil {
+			if restoreErr := maintenance.Restore(ctx); restoreErr != nil {
+				return fmt.Errorf("%w: resume job enablement: %v", ErrDrainBusy, restoreErr)
+			}
+		}
 		if drainErr == nil {
 			return nil
 		}
-		if !errors.Is(drainErr, ErrUnsettled) && !spent(drainCtx, drainErr) {
+		if drainRefused(drainErr) || (!errors.Is(drainErr, ErrUnsettled) && !spent(drainCtx, drainErr)) {
 			return drainErr
 		}
 		return c.prove(ctx, target, control.pinned)
 	case errors.Is(err, ErrAbsent), errors.Is(err, ErrDraining), spent(drainCtx, err):
 	default:
 		return err
+	}
+	if c.daemon.ShutdownPolicy == PreserveOwned || before.PreserveOwned {
+		return fmt.Errorf("%w: no prepared drain commitment was acknowledged", ErrDrainBusy)
 	}
 	return c.prove(ctx, target, observed)
 }
@@ -348,6 +371,9 @@ func (i incumbent) expect() Expect { return Expect{Build: i.build, Generation: i
 // record appearing between that observation and this one describes a runtime
 // this Ensure never saw and holds no authority over.
 func (c *Client) proveRecorded(ctx context.Context, world converge.World) error {
+	if c.daemon.ShutdownPolicy == PreserveOwned {
+		return fmt.Errorf("%w: an absent owner is not an owned-scope proof", ErrDrainBusy)
+	}
 	if !world.Recorded {
 		return c.inventoryClear(world.Observed())
 	}

@@ -312,6 +312,9 @@ func (d *Deployment) commitSupersede(ctx context.Context, record swapRecord) err
 	}
 	incumbent := incumbent{generation: *record.Prior, build: owner.Build, labels: applied}
 	if _, err := d.quiesceAndConverge(ctx, nil); err != nil {
+		if preservationRefused(err) {
+			return err
+		}
 		return errors.Join(err, d.restore(ctx, incumbent))
 	}
 	if err := d.requireEmpty(); err != nil {
@@ -762,4 +765,18 @@ func execRunner(ctx context.Context, path string, args ...string) (string, int, 
 		return string(out), -1, err
 	}
 	return string(out), 0, nil
+}
+
+// VerifyCandidate checks the complete candidate's publisher, resources, version,
+// and tree digest without changing deployment or service state. It is not a
+// held activation proof; mutation paths re-attest the candidate under their lock.
+func (d *Deployment) VerifyCandidate(ctx context.Context, candidate Candidate) error {
+	if err := candidate.validate(); err != nil {
+		return err
+	}
+	generation, err := d.inspect(ctx, candidate.Source)
+	if err != nil {
+		return err
+	}
+	return candidate.matches(generation)
 }

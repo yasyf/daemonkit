@@ -43,6 +43,7 @@ const (
 	// and no product was ever mounted. The health verb answers below the
 	// phase gate, so a failed daemon still reports it.
 	PhaseFailed
+	PhaseMaintenance
 )
 
 // Health is one observation of a serving daemon. Build is diagnostic to
@@ -52,12 +53,13 @@ const (
 // by another instance; it is an instance name, not an ordering. Detail
 // carries the product's Report bytes verbatim.
 type Health struct {
-	Phase      Phase
-	Protocol   uint16
-	Generation uint64
-	PID        int
-	Build      string
-	Detail     []byte
+	PreserveOwned bool
+	Phase         Phase
+	Protocol      uint16
+	Generation    uint64
+	PID           int
+	Build         string
+	Detail        []byte
 }
 
 func phaseFromWire(phase wire.Phase) Phase {
@@ -70,6 +72,8 @@ func phaseFromWire(phase wire.Phase) Phase {
 		return PhaseDraining
 	case wire.PhaseFailed:
 		return PhaseFailed
+	case wire.PhaseMaintenance:
+		return PhaseMaintenance
 	default:
 		return phaseInvalid
 	}
@@ -77,11 +81,12 @@ func phaseFromWire(phase wire.Phase) Phase {
 
 func healthFromReport(report wire.HealthReport) Health {
 	return Health{
-		Phase:      phaseFromWire(report.Phase),
-		Protocol:   report.Protocol,
-		Generation: report.Generation,
-		PID:        report.PID,
-		Build:      report.Build,
-		Detail:     report.Detail,
+		PreserveOwned: report.PreserveOwned,
+		Phase:         phaseFromWire(report.Phase),
+		Protocol:      report.Protocol,
+		Generation:    report.Generation,
+		PID:           report.PID,
+		Build:         report.Build,
+		Detail:        report.Detail,
 	}
 }

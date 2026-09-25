@@ -127,6 +127,7 @@ public enum SessionPhase: String, Codable, Sendable {
     case starting = "runtime_starting"
     /// Business dispatch is admitted.
     case ready = "runtime_ready"
+    case maintenance = "runtime_maintenance"
     /// Intake is closing; reconnect elsewhere.
     case draining = "runtime_draining"
     /// The runtime's terminal failure.

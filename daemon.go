@@ -16,18 +16,19 @@ import (
 // and none can disagree with another. Socket, lock, state dir, record file,
 // and launchd job all derive from Label through paths.
 type Daemon struct {
-	Label       Label
-	Program     Program // the executable launchd runs; Ensure places it
-	Args        []string
-	Schemas     []Schema // [0] is what this build speaks; the rest are prior eras still accepted
-	Trust       Trust    // lane requirements; the same-EUID floor is not here and cannot be turned off
-	Restart     Restart
-	Shutdown    Grace  // the whole drain budget AND the plist's ExitTimeOut; 30s when zero
-	Handshake   Grace  // the whole admission budget; 10s when zero
-	Idle        Grace  // reclaims a session slot after this long quiet and unoccupied; 15m when zero
-	Log         string // launchd's stderr sink
-	MaxFrame    Bytes  // 4 MiB when zero
-	Concurrency int    // in-flight requests; every queue depth derives; 8 when zero
+	ShutdownPolicy ShutdownPolicy
+	Label          Label
+	Program        Program // the executable launchd runs; Ensure places it
+	Args           []string
+	Schemas        []Schema // [0] is what this build speaks; the rest are prior eras still accepted
+	Trust          Trust    // lane requirements; the same-EUID floor is not here and cannot be turned off
+	Restart        Restart
+	Shutdown       Grace  // the whole drain budget AND the plist's ExitTimeOut; 30s when zero
+	Handshake      Grace  // the whole admission budget; 10s when zero
+	Idle           Grace  // reclaims a session slot after this long quiet and unoccupied; 15m when zero
+	Log            string // launchd's stderr sink
+	MaxFrame       Bytes  // 4 MiB when zero
+	Concurrency    int    // in-flight requests; every queue depth derives; 8 when zero
 }
 
 // Label names one daemon; every path, lock, record file, and launchd job
@@ -127,6 +128,9 @@ const maxGrace = Grace(24 * time.Hour)
 // disjunction over nothing admits nobody, and reading as the unset field
 // instead would open the lane to every same-UID peer.
 func (d Daemon) ValidateForServe() error {
+	if d.ShutdownPolicy != TerminateOwned && d.ShutdownPolicy != PreserveOwned {
+		return errors.New("daemonkit: unknown shutdown policy")
+	}
 	if _, err := d.Label.element(); err != nil {
 		return err
 	}
@@ -151,6 +155,9 @@ func (d Daemon) ValidateForServe() error {
 // value — Handshake bounds admission on the serving side and no client verb
 // reads it, so it is not judged here.
 func (d Daemon) ValidateForClient() error {
+	if d.ShutdownPolicy != TerminateOwned && d.ShutdownPolicy != PreserveOwned {
+		return errors.New("daemonkit: unknown shutdown policy")
+	}
 	if _, err := d.Label.element(); err != nil {
 		return err
 	}
