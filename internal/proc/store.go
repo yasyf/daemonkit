@@ -12,13 +12,21 @@ import (
 
 const recordSchema state.Schema = 1
 
+type ShutdownPolicy uint8
+
+const (
+	TerminateOwned ShutdownPolicy = iota
+	PreserveOwned
+)
+
 type record struct {
-	PID        int    `json:"pid"`
-	Start      uint64 `json:"start"`
-	Boot       uint64 `json:"boot"`
-	Generation uint64 `json:"generation"`
-	Session    int    `json:"session,omitempty"`
-	Comm       string `json:"comm,omitempty"`
+	PID        int            `json:"pid"`
+	Start      uint64         `json:"start"`
+	Boot       uint64         `json:"boot"`
+	Generation uint64         `json:"generation"`
+	Session    int            `json:"session,omitempty"`
+	Comm       string         `json:"comm,omitempty"`
+	Policy     ShutdownPolicy `json:"policy,omitempty"`
 }
 
 func (r record) id() identity { return identity{pid: r.PID, start: r.Start, boot: r.Boot} }
@@ -44,7 +52,7 @@ func (r records) Cores() []state.Core {
 func rescued(cores []state.Core) records {
 	live := make([]record, len(cores))
 	for i, core := range cores {
-		live[i] = record{PID: core.PID, Start: core.Start, Boot: core.Boot, Generation: core.Generation, Session: core.Session}
+		live[i] = record{PID: core.PID, Start: core.Start, Boot: core.Boot, Generation: core.Generation, Session: core.Session, Policy: PreserveOwned}
 	}
 	return records{Live: live}
 }
@@ -79,6 +87,7 @@ type Store struct {
 	file       *state.File[records]
 	lock       *durable.Lock
 	generation uint64
+	policy     ShutdownPolicy
 	archived   string
 
 	ops       chan func(*records)
@@ -101,11 +110,18 @@ func LockPath(path string) string { return path + ".lock" }
 // and an archived era's cores are re-persisted as prior-generation records so
 // a crash before Recover cannot orphan them.
 func OpenStore(ctx context.Context, path string) (*Store, error) {
+	return OpenStoreWithPolicy(ctx, path, TerminateOwned)
+}
+
+func OpenStoreWithPolicy(ctx context.Context, path string, policy ShutdownPolicy) (*Store, error) {
+	if policy != TerminateOwned && policy != PreserveOwned {
+		return nil, fmt.Errorf("proc: invalid shutdown policy %d", policy)
+	}
 	lock, err := durable.AcquireLock(ctx, LockPath(path))
 	if err != nil {
 		return nil, err
 	}
-	s, err := openLocked(path, lock)
+	s, err := openLocked(path, lock, policy)
 	if err != nil {
 		_ = lock.Close()
 		return nil, err
@@ -113,7 +129,7 @@ func OpenStore(ctx context.Context, path string) (*Store, error) {
 	return s, nil
 }
 
-func openLocked(path string, lock *durable.Lock) (*Store, error) {
+func openLocked(path string, lock *durable.Lock, policy ShutdownPolicy) (*Store, error) {
 	generation, err := mintGeneration()
 	if err != nil {
 		return nil, err
@@ -126,6 +142,16 @@ func openLocked(path string, lock *durable.Lock) (*Store, error) {
 	value := loaded.Value
 	if loaded.Archived != "" {
 		value = rescued(loaded.Cores)
+	}
+	for i := range value.Live {
+		if value.Live[i].Policy != TerminateOwned && value.Live[i].Policy != PreserveOwned {
+			return nil, fmt.Errorf("proc: invalid record shutdown policy %d", value.Live[i].Policy)
+		}
+		if policy == PreserveOwned {
+			value.Live[i].Policy = PreserveOwned
+		}
+	}
+	if loaded.Archived != "" || policy == PreserveOwned {
 		if err := file.Store(value); err != nil {
 			return nil, fmt.Errorf("proc: rescue archived cores: %w", err)
 		}
@@ -134,6 +160,7 @@ func openLocked(path string, lock *durable.Lock) (*Store, error) {
 		file:       file,
 		lock:       lock,
 		generation: generation,
+		policy:     policy,
 		archived:   loaded.Archived,
 		ops:        make(chan func(*records)),
 		closed:     make(chan struct{}),
@@ -146,6 +173,8 @@ func openLocked(path string, lock *durable.Lock) (*Store, error) {
 
 // Generation is this instance's record tag, surfaced as Health.Generation.
 func (s *Store) Generation() uint64 { return s.generation }
+
+func (s *Store) Policy() ShutdownPolicy { return s.policy }
 
 // Close idempotently waits out the writer loop and releases the store's lock.
 // Live children are the caller's to settle first (Serve's drain order).
@@ -168,11 +197,25 @@ func (s *Store) writer(value records) {
 }
 
 func (s *Store) send(op func(*records)) bool {
+	return s.sendContext(context.Background(), op) == nil
+}
+
+func (s *Store) sendContext(ctx context.Context, op func(*records)) error {
+	select {
+	case <-s.closed:
+		return errors.New("proc: record store is closed")
+	default:
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	select {
 	case s.ops <- op:
-		return true
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-s.closed:
-		return false
+		return errors.New("proc: record store is closed")
 	}
 }
 
@@ -216,8 +259,12 @@ func (s *Store) add(ctx context.Context, rec record) error {
 // A store failure is RecordAbandoned, never a control edge: the caller bounds
 // its own wait and an unread reply is simply dropped.
 func (s *Store) retire(id identity) <-chan RecordFate {
+	return s.retireContext(context.Background(), id)
+}
+
+func (s *Store) retireContext(ctx context.Context, id identity) <-chan RecordFate {
 	reply := make(chan RecordFate, 1)
-	sent := s.send(func(value *records) {
+	err := s.sendContext(ctx, func(value *records) {
 		next := retained(*value, id)
 		if err := s.file.Store(next); err != nil {
 			reply <- RecordAbandoned
@@ -235,21 +282,33 @@ func (s *Store) retire(id identity) <-chan RecordFate {
 		}
 		reply <- RecordRemoved
 	})
-	if !sent {
+	if err != nil {
 		reply <- RecordAbandoned
 	}
 	return reply
 }
 
-func (s *Store) snapshot() []record {
+func (s *Store) snapshot(ctx context.Context) ([]record, error) {
 	reply := make(chan []record, 1)
-	sent := s.send(func(value *records) {
+	err := s.sendContext(ctx, func(value *records) {
 		live := make([]record, len(value.Live))
 		copy(live, value.Live)
 		reply <- live
 	})
-	if !sent {
-		return nil
+	if err != nil {
+		return nil, err
 	}
-	return <-reply
+	select {
+	case live := <-reply:
+		select {
+		case <-s.closed:
+			return nil, errors.New("proc: record store is closed")
+		default:
+		}
+		return live, ctx.Err()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-s.closed:
+		return nil, errors.New("proc: record store is closed")
+	}
 }

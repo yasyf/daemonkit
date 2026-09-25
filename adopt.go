@@ -37,8 +37,8 @@ func (t *Tracked) Stop(ctx context.Context) (Reap, error) {
 	return Reap(reap), nil
 }
 
-// Release retires the record without touching the process, for a caller whose
-// own Wait already proved the exit.
+// Release trusts the caller's exit proof under TerminateOwned. PreserveOwned
+// requires a fresh observation that the exact identity and session are quiet.
 func (t *Tracked) Release() error {
 	if err := t.adopted.Release(); err != nil {
 		return err

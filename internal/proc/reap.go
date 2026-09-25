@@ -49,29 +49,44 @@ func (s *Store) Recover(ctx context.Context) ([]Reclaimed, string, error) {
 	}
 	var reclaimed []Reclaimed
 	var errs []error
-	for _, rec := range s.snapshot() {
+	live, err := s.snapshot(ctx)
+	if err != nil {
+		return nil, s.archived, err
+	}
+	for _, rec := range live {
 		if rec.Generation == s.generation {
 			continue
 		}
-		reclaimed, errs = s.recoverOne(ctx, rec.id(), rec.Session, reclaimed, errs)
+		reclaimed, errs = s.recoverOne(ctx, rec, reclaimed, errs)
 	}
 	return reclaimed, s.archived, errors.Join(errs...)
 }
 
 func (s *Store) recoverOne(
 	ctx context.Context,
-	id identity,
-	session int,
+	rec record,
 	reclaimed []Reclaimed,
 	errs []error,
 ) ([]Reclaimed, []error) {
-	outcome, err := s.reapIdentity(ctx, id, session)
+	id := rec.id()
+	var outcome Reap
+	var err error
+	if s.policy == PreserveOwned || rec.Policy == PreserveOwned {
+		var scope ScopeObservation
+		scope, err = s.observeScope(ctx, id, rec.Session)
+		outcome = scope.Reap
+		if err == nil && !scope.complete() {
+			err = ErrUnsettled
+		}
+	} else {
+		outcome, err = s.reapIdentity(ctx, id, rec.Session)
+	}
 	if err != nil {
 		return reclaimed, append(errs, fmt.Errorf("reap child %d: %w", id.pid, err))
 	}
 	fate := RecordAbandoned
 	select {
-	case fate = <-s.retire(id):
+	case fate = <-s.retireContext(ctx, id):
 	case <-ctx.Done():
 	}
 	return append(reclaimed, Reclaimed{PID: id.pid, Exit: Exit{Code: -1, Reap: outcome, Record: fate}}), errs
@@ -80,6 +95,10 @@ func (s *Store) recoverOne(
 // An undecided outcome always keeps the record, so a probe failure can never
 // read as dead.
 func (s *ladder) reapIdentity(ctx context.Context, id identity, session int) (Reap, error) {
+	return s.reapIdentityWithGrace(ctx, id, session, graceShare(ctx, clockOrReal(s.clock)))
+}
+
+func (s *ladder) reapIdentityWithGrace(ctx context.Context, id identity, session int, termGrace time.Duration) (Reap, error) {
 	boot, err := s.prober.boot()
 	if err != nil {
 		return reapUndetermined, fmt.Errorf("load current boot identity: %w", err)
@@ -92,7 +111,7 @@ func (s *ladder) reapIdentity(ctx context.Context, id identity, session int) (Re
 	}
 	info, err := s.prober.probe(id.pid)
 	if session != 0 {
-		return s.reapSession(ctx, id, session, info, err, boot)
+		return s.reapSession(ctx, id, session, info, err, boot, termGrace)
 	}
 	switch {
 	case errors.Is(err, errNoProc):
@@ -184,6 +203,7 @@ func (s *ladder) reapSession(
 	leader procInfo,
 	leaderErr error,
 	boot uint64,
+	termGrace time.Duration,
 ) (Reap, error) {
 	if session <= 1 || session != id.pid {
 		return reapUndetermined, errors.New("session record has no durable dedicated-session identity")
@@ -194,7 +214,7 @@ func (s *ladder) reapSession(
 	case leaderErr != nil && !errors.Is(leaderErr, errNoProc):
 		return reapUndetermined, leaderErr
 	}
-	return s.settleSession(ctx, session, boot, graceShare(ctx, clockOrReal(s.clock)))
+	return s.settleSession(ctx, session, boot, termGrace)
 }
 
 // settleSession terminates every verified member of the dedicated session:
@@ -281,12 +301,22 @@ func exitingMembers(members []groupMember) int {
 // can be signaled: identity re-probed through matches, session membership
 // still the recorded one, zombies excluded.
 func (s *ladder) verifiedMembers(session int, boot uint64) ([]groupMember, error) {
+	return s.verifiedMembersContext(context.Background(), session, boot)
+}
+
+func (s *ladder) verifiedMembersContext(ctx context.Context, session int, boot uint64) ([]groupMember, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	members, err := s.prober.groupMembers(session)
 	if err != nil {
 		return nil, fmt.Errorf("enumerate dedicated session %d: %w", session, err)
 	}
 	stable := make([]groupMember, 0, len(members))
 	for _, member := range members {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		info, err := s.prober.probe(member.pid)
 		enumerated := identity{pid: member.pid, start: member.info.start, boot: boot}
 		switch {

@@ -15,10 +15,8 @@ type Reclaimed struct {
 	Exit Exit
 }
 
-// Child is one running owned process. Its identity model — {pid, start, boot}
-// — is sealed: PID is the only identity fact exposed, and every proof that
-// needs more (anti-PID-reuse observation, signal targeting, reclaim) runs
-// inside, where it cannot be recomposed wrongly.
+// Child binds observation and explicit termination to one immutable process
+// identity. Observation data grants no signal or retirement authority.
 type Child struct {
 	child   *proc.Child
 	channel Channel

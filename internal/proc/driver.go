@@ -71,14 +71,15 @@ type Reclaimed struct {
 	Exit Exit
 }
 
-// Child is a running owned process. It has no record, store, or reaper field:
-// settlement's only executor is the driver goroutine Spawn started, which
-// closes over all three.
+// Child is an owned process whose driver publishes its settlement.
 type Child struct {
-	pid    int
-	demand chan time.Time
-	stdin  <-chan error // nil unless Cmd.Stdin was delivered; carries the delivery outcome
-	stderr *stderrCopy  // nil unless Spawn was given a stderr writer
+	store   *Store
+	id      identity
+	session int
+	pid     int
+	demand  chan time.Time
+	stdin   <-chan error
+	stderr  *stderrCopy
 
 	settled  chan struct{}
 	exit     Exit
@@ -172,36 +173,45 @@ func (c *stderrCopy) err() error {
 
 func (c *stderrCopy) abort() { _ = c.reader.Close() }
 
-// Reap authority lives only in this goroutine's closure: identity, writer,
-// and ladder are locals no Child field can reach. An undetermined terminal —
-// the demanded settlement timed out — publishes without retiring, so the next
-// open reclaims the record.
 func (s *Store) drive(c *Child, id identity, session int) {
 	clk := clockOrReal(s.clock)
 	exited := make(chan status, 1)
 	go func() { exited <- awaitExit(c.pid) }()
+	s.driveExit(c, id, session, exited, clk)
+}
 
+func (s *Store) driveExit(c *Child, id identity, session int, exited <-chan status, clk clock) {
 	terminal, reap := s.awaitTerminal(c, exited, clk)
+
+	if s.policy == PreserveOwned && c.demanded.IsZero() {
+		var ok bool
+		reap, ok = s.awaitNaturalScope(c, clk)
+		if !ok {
+			return
+		}
+	}
 
 	settled := reap != reapUndetermined
 	sessionSettled := true
-	if settled && session != 0 {
-		outcome, ok := s.settleSessionSurvivors(session, id.boot, sessionDeadline(c.demanded, clk))
+	if settled && session != 0 && (s.policy != PreserveOwned || !c.demanded.IsZero()) {
+		outcome, ok := s.settleSessionSurvivors(id, session, sessionDeadline(c.demanded, clk))
 		sessionSettled = ok
 		switch {
 		case !ok:
 			reap = reapUndetermined
-		case outcome == ReapTerminated:
-			reap = ReapTerminated
+		case outcome != ReapAbsent:
+			reap = outcome
 		}
 	}
 
 	fate := RecordAbandoned
 	if settled && sessionSettled {
+		ctx, cancel := context.WithTimeout(context.Background(), fractionOf(SettleGrace, retireShare))
 		select {
-		case fate = <-s.retire(id):
-		case <-clk.After(fractionOf(SettleGrace, retireShare)):
+		case fate = <-s.retireContext(ctx, id):
+		case <-ctx.Done():
 		}
+		cancel()
 	}
 
 	c.exit = Exit{Code: terminal.code, Signal: terminal.signal, Reap: reap, Record: fate}
@@ -259,11 +269,11 @@ func sessionDeadline(demanded time.Time, clk clock) time.Time {
 // exit: the leader's exit is not the group's, so a false return publishes an
 // undetermined terminal and keeps the record for the next open to reclaim —
 // a leader proven gone over survivors that were not is not a proof.
-func (s *Store) settleSessionSurvivors(session int, boot uint64, deadline time.Time) (Reap, bool) {
+func (s *Store) settleSessionSurvivors(id identity, session int, deadline time.Time) (Reap, bool) {
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 	clk := clockOrReal(s.clock)
-	outcome, err := s.settleSession(ctx, session, boot, fractionOf(deadline.Sub(clk.Now()), termShare))
+	outcome, err := s.reapIdentityWithGrace(ctx, id, session, fractionOf(deadline.Sub(clk.Now()), termShare))
 	if err != nil {
 		slog.Warn("proc: dedicated session did not settle; record kept", "session", session, "err", err)
 		return reapUndetermined, false
