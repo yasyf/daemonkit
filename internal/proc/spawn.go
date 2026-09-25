@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/internal/duplexconn"
+
+	"golang.org/x/sys/unix"
 )
 
 // Bytes is a byte-count limit; zero means the field's documented default.
@@ -117,11 +119,17 @@ func (s *Store) spawn(ctx context.Context, c Cmd, childOut, childErr *os.File) (
 	if c.Verify != nil {
 		if err := c.Verify(pid); err != nil {
 			aborted := s.abortSpawn(pid, parentEnd, err)
+			if errors.Is(aborted, ErrUnsettled) {
+				return nil, aborted
+			}
 			return nil, errors.Join(aborted, s.rollbackRecord(ctx, id))
 		}
 	}
 	if err := releaseChild(pid); err != nil {
 		aborted := s.abortSpawn(pid, parentEnd, fmt.Errorf("release suspended pid %d: %w", pid, err))
+		if errors.Is(aborted, ErrUnsettled) {
+			return nil, aborted
+		}
 		return nil, errors.Join(aborted, s.rollbackRecord(ctx, id))
 	}
 	child := &Child{
@@ -161,12 +169,17 @@ func validateCmd(c Cmd) error {
 	return nil
 }
 
-// SIGKILL reaches suspended processes, and the wait4 reaps the zombie so the
-// pid cannot linger.
 func (s *Store) abortSpawn(pid int, parentEnd net.Conn, cause error) error {
-	_ = syscall.Kill(pid, syscall.SIGKILL)
-	awaitExit(pid)
+	return s.abortSpawnWithWait(pid, parentEnd, cause, unix.Wait4)
+}
+
+func (s *Store) abortSpawnWithWait(pid int, parentEnd net.Conn, cause error, wait waitProcess) error {
+	signalErr := s.signaler.signal(pid, syscall.SIGKILL)
+	terminal := awaitExitWith(pid, wait)
 	closeIfOpen(parentEnd)
+	if terminal.err != nil {
+		return errors.Join(cause, signalErr, fmt.Errorf("%w: abort of pid %d was not proven reaped: %w", ErrUnsettled, pid, terminal.err))
+	}
 	return cause
 }
 

@@ -32,6 +32,7 @@
 .	method	Child.Done	darwin
 .	method	Child.Observe	darwin
 .	method	Child.PID	darwin
+.	method	Child.StderrDone	darwin
 .	method	Child.StderrErr	darwin
 .	method	Child.Stop	darwin
 .	method	Child.WaitNatural	darwin

@@ -179,6 +179,9 @@ func (o *Owned) Run(ctx context.Context, c Cmd) (RunResult, error) {
 // write, the probe, and the verification — never the child's life. stderr
 // nil goes to /dev/null; the copy runs for the child's whole life and a copy
 // failure surfaces via Child.StderrErr without touching the child.
+//
+// Under PreserveOwned, ErrUnsettled keeps the spawn admission when abort
+// cannot prove exit; natural drain and Close remain blocked by that admission.
 func (o *Owned) Spawn(ctx context.Context, c Cmd, channel Channel, stderr io.Writer) (*Child, error) {
 	if err := budgeted(ctx, "Spawn"); err != nil {
 		return nil, err
@@ -217,6 +220,11 @@ func (o *Owned) Spawn(ctx context.Context, c Cmd, channel Channel, stderr io.Wri
 	}
 	spawned, err := o.store.Spawn(ctx, spawnCmd, stderr)
 	if err != nil {
+		if o.store.Policy() == proc.PreserveOwned && errors.Is(err, ErrUnsettled) {
+			o.mu.Lock()
+			res.unproven = true
+			o.mu.Unlock()
+		}
 		return nil, err
 	}
 	child := &Child{child: spawned, channel: channel, nonce: nonce, limits: c.Limits, token: token}
