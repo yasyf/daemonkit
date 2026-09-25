@@ -61,12 +61,22 @@ func (c applier) disabled(ctx context.Context, label string) (bool, error) {
 	if !strings.Contains(result.out, "disabled services = {") {
 		return false, ErrMaintenanceUnproven
 	}
-	pattern := regexp.MustCompile(`(?m)^\s*"` + regexp.QuoteMeta(label) + `"\s*=>\s*(true|false)\s*$`)
+	pattern := regexp.MustCompile(`(?m)^\s*"` + regexp.QuoteMeta(label) + `"\s*=>\s*([^\r\n]*)$`)
 	matches := pattern.FindAllStringSubmatch(result.out, -1)
 	if len(matches) > 1 {
 		return false, ErrMaintenanceUnproven
 	}
-	return len(matches) == 1 && matches[0][1] == "true", nil
+	if len(matches) == 0 {
+		return false, nil
+	}
+	switch strings.TrimSpace(matches[0][1]) {
+	case "disabled":
+		return true, nil
+	case "enabled":
+		return false, nil
+	default:
+		return false, ErrMaintenanceUnproven
+	}
 }
 
 // PauseRestarts disables one owned, currently loaded job without stopping it.

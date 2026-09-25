@@ -82,6 +82,16 @@ func TestMaintenanceDisableBlocksRespawn(t *testing.T) {
 	if err := lease.unchanged(ctx); err != nil {
 		t.Fatal(err)
 	}
+	if err := lease.Restore(ctx); err != nil {
+		t.Fatal(err)
+	}
+	lease, err = PauseRestarts(ctx, run, label, pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.unchanged(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(directory, "exit"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}

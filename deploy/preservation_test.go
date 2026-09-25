@@ -58,7 +58,11 @@ func TestPreservingFailedResumeRetainsDisabledJobsAndDurableFence(t *testing.T) 
 				case "print":
 					return fmt.Sprintf("gui/%d/%s = {\n\tpid = %d\n\tproperties = keepalive | runatload\n}\n", os.Getuid(), agent.Label, child.Process.Pid), 0, nil
 				case "print-disabled":
-					return fmt.Sprintf("disabled services = {\n\t\"%s\" => %v\n}\n", agent.Label, disabled), 0, nil
+					state := "enabled"
+					if disabled {
+						state = "disabled"
+					}
+					return fmt.Sprintf("disabled services = {\n\t\"%s\" => %s\n}\n", agent.Label, state), 0, nil
 				case "disable":
 					disabled = true
 					return "", 0, nil

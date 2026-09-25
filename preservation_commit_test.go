@@ -121,7 +121,11 @@ func TestPreservingCommittedHostTimeoutNeverSignalsNewDescendant(t *testing.T) {
 		case "print":
 			return fmt.Sprintf("gui/%d/%s = {\n\tpid = %d\n\tproperties = keepalive | runatload\n}\n", os.Getuid(), d.Label, child.Process.Pid), 0, nil
 		case "print-disabled":
-			return fmt.Sprintf("disabled services = {\n\t\"%s\" => %v\n}\n", d.Label, disabled), 0, nil
+			state := "enabled"
+			if disabled {
+				state = "disabled"
+			}
+			return fmt.Sprintf("disabled services = {\n\t\"%s\" => %s\n}\n", d.Label, state), 0, nil
 		case "disable":
 			disabled = true
 			return "", 0, nil
