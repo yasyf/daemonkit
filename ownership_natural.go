@@ -103,8 +103,14 @@ func (o *Owned) observe(ctx context.Context, drain *NaturalDrain) (OwnershipObse
 	}
 	admissions := o.admissions
 	pending := make([]string, 0, len(o.starting))
+	unproven := false
 	for res := range o.starting {
-		pending = append(pending, res.verb)
+		verb := res.verb
+		if res.unproven {
+			unproven = true
+			verb += " (registration unproven)"
+		}
+		pending = append(pending, verb)
 	}
 	var excluded []*proc.Child
 	if drain != nil {
@@ -120,7 +126,7 @@ func (o *Owned) observe(ctx context.Context, drain *NaturalDrain) (OwnershipObse
 		Coverage:   RecordedScopeCoverage,
 		Pending:    pending,
 		Scopes:     make([]ScopeObservation, len(observed.Scopes)),
-		Uncertain:  err != nil,
+		Uncertain:  err != nil || unproven,
 	}
 	for i, scope := range observed.Scopes {
 		result.Scopes[i] = scopeObservation(scope)

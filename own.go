@@ -64,17 +64,12 @@ type Owned struct {
 	tracked    map[*Tracked]struct{}
 }
 
-// reservation is one verb's admission, taken before the verb may start
-// anything and resolved by whatever it started. Admission and registration are
-// therefore one step under one lock: a verb that reserved is already in the
-// set settle observes, well before its child exists, so no process this scope
-// started can exist outside that set. child and tracked are written before
-// done closes and read only after it.
 type reservation struct {
-	verb    string
-	done    chan struct{}
-	child   *Child
-	tracked *Tracked
+	verb     string
+	done     chan struct{}
+	child    *Child
+	tracked  *Tracked
+	unproven bool
 }
 
 func newOwned(store *proc.Store, reclaimed []proc.Reclaimed) *Owned {
@@ -237,9 +232,15 @@ func (o *Owned) Spawn(ctx context.Context, c Cmd, channel Channel, stderr io.Wri
 // process, so the caller's own Wait and this record cannot race a lost
 // wakeup. Session leadership is probed, never declared: a leader is recorded
 // as its group.
+//
+// PreserveOwned keeps an unproven admission after failed registration;
+// a failed write cannot establish that the externally started process exited.
 func (o *Owned) Adopt(ctx context.Context, pid int) (*Tracked, error) {
 	if err := budgeted(ctx, "Adopt"); err != nil {
 		return nil, err
+	}
+	if pid <= 1 {
+		return nil, fmt.Errorf("daemonkit: refusing to adopt pid %d", pid)
 	}
 	res, err := o.reserve("Adopt")
 	if err != nil {
@@ -248,6 +249,11 @@ func (o *Owned) Adopt(ctx context.Context, pid int) (*Tracked, error) {
 	defer o.abandon(res)
 	adopted, err := o.store.Adopt(ctx, pid)
 	if err != nil {
+		if o.store.Policy() == proc.PreserveOwned && !errors.Is(err, proc.ErrNoProcess) {
+			o.mu.Lock()
+			res.unproven = true
+			o.mu.Unlock()
+		}
 		return nil, fmt.Errorf("daemonkit: adopt pid %d: %w", pid, err)
 	}
 	tracked := &Tracked{adopted: adopted, owner: o}
@@ -396,11 +402,12 @@ func (o *Owned) hold(res *reservation, child *Child) {
 	o.resolve(res)
 }
 
-// abandon resolves a reservation whose verb started nothing. A verb that
-// already resolved its own is unaffected, so it is the safe tail of every verb.
 func (o *Owned) abandon(res *reservation) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if res.unproven {
+		return
+	}
 	o.resolve(res)
 }
 

@@ -98,6 +98,47 @@ func TestNaturalDrainWaitsForAdmittedRegistration(t *testing.T) {
 	}
 }
 
+func TestNaturalDrainCannotDiscardUnprovenAdoption(t *testing.T) {
+	o, _ := preservingOwned(t)
+	reservation, err := o.reserve("Adopt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	o.mu.Lock()
+	reservation.unproven = true
+	o.mu.Unlock()
+	t.Cleanup(func() {
+		o.mu.Lock()
+		reservation.unproven = false
+		o.mu.Unlock()
+		o.abandon(reservation)
+	})
+	o.abandon(reservation)
+	select {
+	case <-reservation.done:
+		t.Fatal("unproven adoption was discharged")
+	default:
+	}
+	observed, err := o.Observe(bounded(t, time.Second))
+	if err != nil || !observed.Uncertain || observed.Complete() || !reflect.DeepEqual(observed.Pending, []string{"Adopt (registration unproven)"}) {
+		t.Fatalf("Observe() = %+v, %v", observed, err)
+	}
+	drain, err := o.BeginNaturalDrain(bounded(t, time.Second), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := drain.Wait(bounded(t, 25*time.Millisecond)); !errors.Is(err, ErrDrainPreparationTimeout) {
+		t.Fatalf("Wait() = %v", err)
+	}
+	if err := drain.Abort(); err != nil {
+		t.Fatal(err)
+	}
+	observed, err = o.Observe(bounded(t, time.Second))
+	if err != nil || observed.Complete() || !observed.Uncertain {
+		t.Fatalf("Abort discarded uncertainty: %+v, %v", observed, err)
+	}
+}
+
 func TestNaturalProofCannotCrossLeasesOrOwners(t *testing.T) {
 	o, _ := preservingOwned(t)
 	first, err := o.BeginNaturalDrain(bounded(t, time.Second), nil)
