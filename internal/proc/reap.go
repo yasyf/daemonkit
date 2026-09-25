@@ -302,7 +302,7 @@ func exitingMembers(members []groupMember) int {
 // still the recorded one, zombies excluded.
 func (s *ladder) verifiedMembers(ctx context.Context, session int, boot uint64) ([]groupMember, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, errors.Join(ErrUnsettled, err)
 	}
 	members, err := s.prober.groupMembers(session)
 	if err != nil {
@@ -311,7 +311,7 @@ func (s *ladder) verifiedMembers(ctx context.Context, session int, boot uint64) 
 	stable := make([]groupMember, 0, len(members))
 	for _, member := range members {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, errors.Join(ErrUnsettled, err)
 		}
 		info, err := s.prober.probe(member.pid)
 		enumerated := identity{pid: member.pid, start: member.info.start, boot: boot}
@@ -355,7 +355,7 @@ func (s *ladder) signalSessionGroups(
 	allGone := true
 	for _, group := range groups {
 		if err := ctx.Err(); err != nil {
-			return false, err
+			return false, errors.Join(ErrUnsettled, err)
 		}
 		gone, err := s.signalGone(-group, sig)
 		if err != nil {
