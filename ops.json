@@ -1,1 +1,1 @@
-{"v":1,"lamport":5,"ops":[{"kind":"set_criterion_status","id":"b1eafeecae2fd184cb681e3726e666a5","status":"met","note":"PR35 green native/race CI proves pending admissions, producer identity exclusion, stale/cross-lease proof rejection and held lock on timeout."}]}
+{"v":1,"lamport":6,"ops":[{"kind":"set_criterion_status","id":"fa9254b7c0ea84ac3047e00076dd42af","status":"met","note":"PR35 e4c8b747 all30 checks successful,2 intentional skips; CI36185983534 includes focused preservation/reuse/adoption/abort/lock fixtures via scripts/test.sh."}]}
