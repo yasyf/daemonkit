@@ -76,6 +76,41 @@ func TestVerifyCandidateDoesNotCreateDeploymentState(t *testing.T) {
 	}
 }
 
+func TestVerifyCandidateIgnoresPathCodesign(t *testing.T) {
+	f := newFixture(t)
+	candidate := f.candidate("First", "1.0", "one")
+	directory := t.TempDir()
+	marker := filepath.Join(directory, "invoked")
+	program := "#!/bin/sh\nprintf invoked > '" + marker + "'\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(directory, "codesign"), []byte(program), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", directory)
+	if err := f.deploy.VerifyCandidate(f.ctx(), candidate); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("untrusted codesign was invoked: %v", err)
+	}
+}
+
+func TestReplaceReattestsPreviouslyVerifiedCandidate(t *testing.T) {
+	f := newFixture(t)
+	f.deploy.config.Daemon.ShutdownPolicy = daemonkit.PreserveOwned
+	candidate := f.candidate("First", "1.0", "one")
+	if err := f.deploy.VerifyCandidate(f.ctx(), candidate); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(candidate.Source, bundleBodyRel), []byte("changed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	_, err := f.deploy.Replace(f.ctx(), candidate, func(context.Context) error { called = true; return nil })
+	if !errors.Is(err, ErrUntrusted) || called || fileExists(f.deploy.maintenancePath()) || len(f.launchctls) != 0 {
+		t.Fatalf("changed candidate crossed preparation: err=%v called=%v", err, called)
+	}
+}
+
 func TestPreservingSupersedeRefusesBeforeRemovalOrSwap(t *testing.T) {
 	f := newFixture(t)
 	if _, err := f.deploy.Install(f.ctx(), f.candidate("First", "1.0", "one")); err != nil {

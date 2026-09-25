@@ -18,7 +18,7 @@ type codesignVerifier struct{}
 // outer signature untouched.
 func (codesignVerifier) Verify(ctx context.Context, appPath, requirement string) (signatureAttestation, error) {
 	cmd := exec.CommandContext(
-		ctx, "codesign", "--verify", "--strict", "--deep", "--all-architectures", "-R="+requirement, appPath,
+		ctx, "/usr/bin/codesign", "--verify", "--strict", "--deep", "--all-architectures", "-R="+requirement, appPath,
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -31,7 +31,7 @@ func (codesignVerifier) Verify(ctx context.Context, appPath, requirement string)
 		}
 		return signatureAttestation{}, fmt.Errorf("codesign --verify %q: %w: %s", appPath, err, strings.TrimSpace(string(out)))
 	}
-	cmd = exec.CommandContext(ctx, "codesign", "-d", "--verbose=4", appPath)
+	cmd = exec.CommandContext(ctx, "/usr/bin/codesign", "-d", "--verbose=4", appPath)
 	out, err = cmd.CombinedOutput()
 	if err != nil {
 		if ctx.Err() != nil {
@@ -49,7 +49,7 @@ func (codesignVerifier) Verify(ctx context.Context, appPath, requirement string)
 	if !validCDHash(cdHash) {
 		return signatureAttestation{}, fmt.Errorf("codesign -d %q returned invalid CDHash %q", appPath, cdHash)
 	}
-	cmd = exec.CommandContext(ctx, "codesign", "-d", "--entitlements", "-", "--xml", appPath)
+	cmd = exec.CommandContext(ctx, "/usr/bin/codesign", "-d", "--entitlements", "-", "--xml", appPath)
 	out, err = cmd.CombinedOutput()
 	if err != nil {
 		if ctx.Err() != nil {
