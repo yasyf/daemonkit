@@ -17,7 +17,9 @@ func TestPreservingStopDoesNotRemoveAnUnsupportedIncumbent(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
 	control := awaitControl(ctx, t, client)
-	defer func() { _ = control.Close(ctx) }()
+	if err := control.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
 	rec := &launchctlRecorder{}
 	client.launchctl = rec.run
 	if err := client.Stop(ctx); !errors.Is(err, ErrDrainBusy) {
@@ -29,6 +31,8 @@ func TestPreservingStopDoesNotRemoveAnUnsupportedIncumbent(t *testing.T) {
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("agent changed: %v", err)
 	}
+	control = awaitControl(ctx, t, client)
+	defer func() { _ = control.Close(ctx) }()
 	health, err := control.Health(ctx)
 	if err != nil || health.Phase != PhaseReady {
 		t.Fatalf("incumbent=%+v err=%v", health, err)

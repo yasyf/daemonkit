@@ -278,7 +278,7 @@ func (c *Control) Drain(ctx context.Context, expect Expect) (Stopped, error) {
 	report, err := c.session.Health(ctx)
 	if err != nil {
 		if c.preserveOwned {
-			return Stopped{}, fmt.Errorf("%w: pre-drain health unavailable: %v", ErrDrainPreparationTimeout, err)
+			return Stopped{}, fmt.Errorf("%w: pre-drain health unavailable: %s", ErrDrainPreparationTimeout, err.Error())
 		}
 		return Stopped{}, fmt.Errorf("daemonkit: pre-drain health: %w", err)
 	}

@@ -11,9 +11,12 @@ import (
 )
 
 var (
-	ErrDrainBusy               = maintenance.ErrDrainBusy
+	// ErrDrainBusy refuses shutdown while owned work remains unsettled.
+	ErrDrainBusy = maintenance.ErrDrainBusy
+	// ErrDrainPreparationTimeout refuses escalation after unproven preparation.
 	ErrDrainPreparationTimeout = maintenance.ErrDrainPreparationTimeout
-	ErrMaintenance             = errors.New("wire: runtime is in maintenance")
+	// ErrMaintenance rejects new work during reversible shutdown preparation.
+	ErrMaintenance = errors.New("wire: runtime is in maintenance")
 	// ErrQueueFull means a bounded session queue cannot accept more work.
 	ErrQueueFull = errors.New("wire: queue at capacity")
 	// ErrFlowControl means a peer exceeded a fixed stream bound.
@@ -49,7 +52,8 @@ const (
 	// PhaseStarting precedes readiness; business dispatch is typed-rejected.
 	PhaseStarting Phase = "runtime_starting"
 	// PhaseReady admits business dispatch.
-	PhaseReady       Phase = "runtime_ready"
+	PhaseReady Phase = "runtime_ready"
+	// PhaseMaintenance limits dispatch to admitted continuations.
 	PhaseMaintenance Phase = "runtime_maintenance"
 	// PhaseDraining means intake is closing; reconnect elsewhere.
 	PhaseDraining Phase = "runtime_draining"
@@ -103,9 +107,12 @@ type ResponseCode string
 
 const (
 	// ResponseCodeRuntimeStarting identifies pre-ready non-dispatch.
-	ResponseCodeRuntimeStarting         ResponseCode = "runtime_starting"
-	ResponseCodeRuntimeMaintenance      ResponseCode = "runtime_maintenance"
-	ResponseCodeDrainBusy               ResponseCode = "drain_busy"
+	ResponseCodeRuntimeStarting ResponseCode = "runtime_starting"
+	// ResponseCodeRuntimeMaintenance rejects ordinary work during preparation.
+	ResponseCodeRuntimeMaintenance ResponseCode = "runtime_maintenance"
+	// ResponseCodeDrainBusy refuses a shutdown that could disturb owned work.
+	ResponseCodeDrainBusy ResponseCode = "drain_busy"
+	// ResponseCodeDrainPreparationTimeout preserves an unproven shutdown outcome.
 	ResponseCodeDrainPreparationTimeout ResponseCode = "drain_preparation_timeout"
 	// ResponseCodeRuntimeDraining identifies closed-intake non-dispatch.
 	ResponseCodeRuntimeDraining ResponseCode = "runtime_draining"

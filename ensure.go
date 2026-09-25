@@ -123,16 +123,10 @@ func (c *Client) Ensure(ctx context.Context) (Ensured, error) {
 	}
 	defer func() { _ = lock.Close() }()
 	replaced := false
-	if c.daemon.ShutdownPolicy != PreserveOwned {
-		replaced, err = c.daemon.Program.place(el)
-		if err != nil {
-			return Ensured{}, err
-		}
-	}
 	timer := time.NewTimer(attachCadence(ctx))
 	defer timer.Stop()
 	for {
-		ensured, err := c.ensureOnce(ctx, want, agent, replaced)
+		ensured, err := c.ensureOnce(ctx, want, agent, &replaced)
 		if !moved(err) {
 			return ensured, err
 		}
@@ -159,13 +153,25 @@ func moved(err error) bool {
 	return errors.Is(err, ErrWrongIncumbent) || errors.Is(err, errPinMoved)
 }
 
-func (c *Client) ensureOnce(ctx context.Context, want string, agent launchd.Agent, replaced bool) (Ensured, error) {
+func (c *Client) ensureOnce(ctx context.Context, want string, agent launchd.Agent, replaced *bool) (Ensured, error) {
 	world, action, err := c.settle(ctx, want, agent)
 	if err != nil {
 		return Ensured{}, err
 	}
 	before := healthFromReport(world.Health)
-	if action == ActionNothing && world.Applied && !replaced {
+	preserving := c.daemon.ShutdownPolicy == PreserveOwned || before.PreserveOwned
+	el, err := c.daemon.Label.element()
+	if err != nil {
+		return Ensured{}, err
+	}
+	if !preserving {
+		placed, err := c.daemon.Program.place(el)
+		if err != nil {
+			return Ensured{}, err
+		}
+		*replaced = *replaced || placed
+	}
+	if action == ActionNothing && world.Applied && !*replaced {
 		return Ensured{Before: before, Did: ActionNothing, After: before}, nil
 	}
 	if world.Serving() {
@@ -175,14 +181,15 @@ func (c *Client) ensureOnce(ctx context.Context, want string, agent launchd.Agen
 		if err := c.evict(ctx, before, world.Observed()); err != nil {
 			return Ensured{}, err
 		}
+		if preserving {
+			if err := c.removeAgent(ctx, el.label); err != nil {
+				return Ensured{}, err
+			}
+		}
 	} else if err := c.proveRecorded(ctx, world); err != nil {
 		return Ensured{}, err
 	}
-	if c.daemon.ShutdownPolicy == PreserveOwned {
-		el, err := c.daemon.Label.element()
-		if err != nil {
-			return Ensured{}, err
-		}
+	if preserving {
 		if _, err := c.daemon.Program.place(el); err != nil {
 			return Ensured{}, err
 		}

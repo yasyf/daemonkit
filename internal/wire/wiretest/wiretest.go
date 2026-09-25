@@ -159,6 +159,7 @@ func (r *StubRuntime) Drain(context.Context) error {
 	return nil
 }
 
+// HandleMaintenance rejects work unless a fixture provides an explicit handler.
 func (*StubRuntime) HandleMaintenance(context.Context, wire.Request) (any, error) {
 	return nil, wire.ErrMaintenance
 }

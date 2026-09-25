@@ -43,6 +43,7 @@ const (
 	// and no product was ever mounted. The health verb answers below the
 	// phase gate, so a failed daemon still reports it.
 	PhaseFailed
+	// PhaseMaintenance permits only the product's explicit continuation handler.
 	PhaseMaintenance
 )
 

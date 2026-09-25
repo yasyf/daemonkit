@@ -107,7 +107,9 @@ func contractServer(t *testing.T, draining bool) string {
 	t.Helper()
 	runtime := wiretest.NewStubRuntime()
 	if draining {
-		runtime.Drain()
+		if err := runtime.Drain(t.Context()); err != nil {
+			t.Fatal(err)
+		}
 	}
 	server, err := wire.NewServer(runtime, wire.Config{Schemas: wire.Schemas{contractSchema}})
 	if err != nil {

@@ -247,7 +247,7 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve(serveCtx, ln) }()
 
-	stopWatch := context.AfterFunc(ctx, rt.triggerDrain)
+	stopWatch := context.AfterFunc(ctx, func() { rt.triggerDrain(ctx) })
 	defer stopWatch()
 	armDone := make(chan struct{})
 	stopForwarder := sync.OnceFunc(func() { close(armDone) })
@@ -256,7 +256,7 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 		for {
 			select {
 			case <-signals:
-				rt.triggerDrain()
+				rt.triggerDrain(ctx)
 			case <-armDone:
 				return
 			}
@@ -269,7 +269,7 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 		Context:      activationCtx,
 		Reclaimed:    owned.Reclaimed(),
 		Report:       rt.report,
-		Stop:         func(error) { go rt.triggerDrain() },
+		Stop:         func(error) { go rt.triggerDrain(ctx) },
 		owner:        owned,
 		adoptMinted:  server.AdoptMinted,
 		adoptHandoff: server.AdoptHandoff,
@@ -290,7 +290,7 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 		case <-rt.stopped.Done():
 		case serveErr = <-serveDone:
 			serveReturned = true
-			rt.triggerDrain()
+			rt.triggerDrain(ctx)
 			if d.ShutdownPolicy == PreserveOwned {
 				if rt.Phase().Phase != wire.PhaseDraining {
 					rt.fail()

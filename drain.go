@@ -115,7 +115,7 @@ func (r *serveRuntime) prepareDrain(attempt *drainAttempt, preparer DrainPrepare
 	if errors.Is(err, ErrDrainPreparationTimeout) || errors.Is(err, context.DeadlineExceeded) {
 		refusal = ErrDrainPreparationTimeout
 	}
-	attempt.err = fmt.Errorf("%w: %v", refusal, err)
+	attempt.err = fmt.Errorf("%w: %s", refusal, err.Error())
 	var aborted error
 	if missing {
 		aborted = err
@@ -133,13 +133,13 @@ func (r *serveRuntime) prepareDrain(attempt *drainAttempt, preparer DrainPrepare
 		r.preparing = nil
 		r.publishLocked(wire.PhaseReady)
 	} else {
-		attempt.err = fmt.Errorf("%w: product resume failed: %v", refusal, aborted)
+		attempt.err = fmt.Errorf("%w: product resume failed: %s", refusal, aborted.Error())
 	}
 	close(attempt.done)
 }
 
-func (r *serveRuntime) triggerDrain() {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(r.grace))
+func (r *serveRuntime) triggerDrain(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Duration(r.grace))
 	defer cancel()
 	if err := r.Drain(ctx); err != nil {
 		slog.Warn("daemonkit: shutdown preparation refused; runtime retained", "err", err)

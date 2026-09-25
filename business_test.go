@@ -67,7 +67,9 @@ func serveBusinessConfig(t *testing.T, cfg wire.Config) string {
 func serveBusinessProduct(t *testing.T, cfg wire.Config, product Product) string {
 	t.Helper()
 	rt := newServeRuntime(int(MaxDetail(0)))
-	rt.ready(product)
+	if err := rt.ready(product); err != nil {
+		t.Fatal(err)
+	}
 	server, err := wire.NewServer(rt, cfg)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
@@ -484,7 +486,9 @@ func TestBusinessSurvivesATypedRejectionOnItsSingleSession(t *testing.T) {
 	if !Undispatched(notReady) {
 		t.Error("Undispatched() = false for a rejection the server proved undispatched")
 	}
-	rt.ready(businessProduct{})
+	if err := rt.ready(businessProduct{}); err != nil {
+		t.Fatal(err)
+	}
 	reply, err := lane.Call(ctx, echoOp, []byte("after"))
 	if err != nil {
 		t.Fatalf("Call() after ready = %v, want the session a rejection never impeached", err)

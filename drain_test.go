@@ -18,8 +18,10 @@ type preparationProduct struct {
 }
 
 func (p *preparationProduct) Handle(context.Context, Request) (Reply, error) { return Reply{}, nil }
-func (p *preparationProduct) Drain(Budget) error                             { p.drained.Add(1); return nil }
-func (p *preparationProduct) Close(Budget) error                             { p.closed.Add(1); return nil }
+func (p *preparationProduct) Drain(Budget) error { p.drained.Add(1); return nil }
+
+func (p *preparationProduct) Close(Budget) error { p.closed.Add(1); return nil }
+
 func (p *preparationProduct) PrepareDrain(b Budget) (DrainPreparation, error) {
 	p.calls.Add(1)
 	return p.prepare(b)
@@ -43,12 +45,14 @@ func preservingRuntime(t *testing.T, product Product) *serveRuntime {
 	}
 	return r
 }
+
 func drainContext(t *testing.T) context.Context {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	t.Cleanup(cancel)
 	return ctx
 }
+
 func requireNotStopped(t *testing.T, r *serveRuntime) {
 	t.Helper()
 	select {

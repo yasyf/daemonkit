@@ -39,9 +39,11 @@ func (r maintenanceRecord) validate() error {
 	}
 	return nil
 }
+
 func (d *Deployment) maintenancePath() string {
 	return filepath.Join(d.layout.metadata, "maintenance.json")
 }
+
 func (d *Deployment) checkMaintenance() error {
 	var record maintenanceRecord
 	err := readRecord(d.maintenancePath(), &record)
@@ -110,6 +112,7 @@ func (m *stoppedMaintenance) restore(ctx context.Context) error {
 	}
 	return errors.Join(failures...)
 }
+
 func (d *Deployment) pauseAndStop(ctx context.Context) (*stoppedMaintenance, error) {
 	control, err := d.client.Control(ctx)
 	if err != nil {
@@ -219,12 +222,12 @@ func (d *Deployment) Replace(ctx context.Context, candidate Candidate, quiesceAp
 			return
 		}
 		if errors.Is(err, daemonkit.ErrDrainBusy) && maintenance != nil && !maintenance.committed {
-			if resumed := maintenance.restore(ctx); resumed == nil {
+			resumed := maintenance.restore(ctx)
+			if resumed == nil {
 				err = errors.Join(err, durable.Remove(d.maintenancePath()))
 				return
-			} else {
-				err = errors.Join(err, resumed)
 			}
+			err = errors.Join(err, resumed)
 		}
 		err = errors.Join(ErrMaintenanceIncomplete, err)
 	}()
@@ -307,12 +310,12 @@ func (d *Deployment) Remove(ctx context.Context, quiesceApplication func(context
 			return
 		}
 		if errors.Is(err, daemonkit.ErrDrainBusy) && maintenance != nil && !maintenance.committed {
-			if resumed := maintenance.restore(ctx); resumed == nil {
+			resumed := maintenance.restore(ctx)
+			if resumed == nil {
 				err = errors.Join(err, durable.Remove(d.maintenancePath()))
 				return
-			} else {
-				err = errors.Join(err, resumed)
 			}
+			err = errors.Join(err, resumed)
 		}
 		err = errors.Join(ErrMaintenanceIncomplete, err)
 	}()

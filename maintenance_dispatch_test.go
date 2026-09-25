@@ -23,6 +23,7 @@ func (p *evidenceProduct) Handle(context.Context, Request) (Reply, error) {
 	p.ordinary.Add(1)
 	return Reply{}, nil
 }
+
 func (p *evidenceProduct) HandleMaintenance(_ context.Context, req Request) (Reply, error) {
 	if req.Op != "evidence" {
 		return Reply{}, ErrMaintenance
@@ -30,6 +31,7 @@ func (p *evidenceProduct) HandleMaintenance(_ context.Context, req Request) (Rep
 	p.evidence.Add(1)
 	return Reply{Body: []byte("evidence")}, nil
 }
+
 func maintenanceBusiness(t *testing.T, r *serveRuntime) *wire.Client {
 	t.Helper()
 	server, err := wire.NewServer(r, wire.Config{Schemas: wire.Schemas{"test.v1"}, Concurrency: 1})
@@ -57,6 +59,7 @@ func maintenanceBusiness(t *testing.T, r *serveRuntime) *wire.Client {
 	t.Cleanup(func() { _ = client.Abort(nil) })
 	return client
 }
+
 func TestMaintenanceDispatchNeverFallsBackToOrdinaryHandle(t *testing.T) {
 	product := &evidenceProduct{preparationProduct: &preparationProduct{prepare: func(Budget) (DrainPreparation, error) { return nil, ErrDrainBusy }}}
 	runtime := preservingRuntime(t, product)
@@ -75,6 +78,7 @@ func TestMaintenanceDispatchNeverFallsBackToOrdinaryHandle(t *testing.T) {
 	}
 	requireNotStopped(t, runtime)
 }
+
 func TestMaintenanceWithoutExplicitHandlerRejectsAllBusiness(t *testing.T) {
 	product := &preparationProduct{prepare: func(Budget) (DrainPreparation, error) { return nil, ErrDrainBusy }}
 	runtime := preservingRuntime(t, product)
