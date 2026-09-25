@@ -69,11 +69,13 @@ func (c *Child) Done() <-chan Exit {
 	return terminal
 }
 
-// StderrErr reports the stderr copy's failure, nil while the copy is healthy.
-// A failed copy never kills the child — losing diagnostics is not a reason to
-// kill a working process — so a caller that cares polls here or checks after
-// the terminal.
+// StderrErr reports the stderr copy's failure, finalized when StderrDone closes.
+// A failed copy never kills the child.
 func (c *Child) StderrErr() error { return c.child.StderrErr() }
+
+// StderrDone closes after the final stderr write, reader close, and error publication.
+// A child without stderr copying returns an already-closed channel.
+func (c *Child) StderrDone() <-chan struct{} { return c.child.StderrDone() }
 
 // Stop demands termination and blocks until the exit is proven, bounded by
 // ctx, which must carry a deadline. Idempotent: every call converges on the

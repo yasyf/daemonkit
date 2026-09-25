@@ -24,6 +24,12 @@ const (
 	retireShare = 0.4
 )
 
+var stderrAbsentDone = func() <-chan struct{} {
+	done := make(chan struct{})
+	close(done)
+	return done
+}()
+
 // Reap is what observation of the process table proved. Zero is undetermined:
 // it is published only when a demanded settlement timed out with nothing
 // proved, and then the record is kept for the next open to reclaim.
@@ -124,6 +130,15 @@ func (c *Child) StderrErr() error {
 	return c.stderr.err()
 }
 
+// StderrDone closes after the final stderr write, reader close, and error publication.
+// A child without stderr copying returns an already-closed channel.
+func (c *Child) StderrDone() <-chan struct{} {
+	if c.stderr == nil {
+		return stderrAbsentDone
+	}
+	return c.stderr.done
+}
+
 // TakeChannel returns the parent end of the spawn's channel, single-take. A
 // second take, and a take on a channel-less child, are distinct refusals.
 func (c *Child) TakeChannel() (net.Conn, error) {
@@ -146,13 +161,14 @@ func (c *Child) TakeChannel() (net.Conn, error) {
 // losing diagnostics is not a reason to kill a working process.
 type stderrCopy struct {
 	reader *os.File
+	done   chan struct{}
 
 	mu     sync.Mutex
 	failed error
 }
 
 func startStderrCopy(reader *os.File, sink io.Writer) *stderrCopy {
-	drain := &stderrCopy{reader: reader}
+	drain := &stderrCopy{reader: reader, done: make(chan struct{})}
 	go func() {
 		_, err := io.Copy(sink, reader)
 		_ = reader.Close()
@@ -161,6 +177,7 @@ func startStderrCopy(reader *os.File, sink io.Writer) *stderrCopy {
 			drain.failed = err
 			drain.mu.Unlock()
 		}
+		close(drain.done)
 	}()
 	return drain
 }
@@ -286,17 +303,24 @@ func (s *Store) settleSessionSurvivors(id identity, session int, deadline time.T
 type status struct {
 	code   int
 	signal syscall.Signal
+	err    error
 }
 
+type waitProcess func(int, *unix.WaitStatus, int, *unix.Rusage) (int, error)
+
 func awaitExit(pid int) status {
+	return awaitExitWith(pid, unix.Wait4)
+}
+
+func awaitExitWith(pid int, wait waitProcess) status {
 	var wstatus unix.WaitStatus
 	for {
-		wpid, err := unix.Wait4(pid, &wstatus, 0, nil)
+		wpid, err := wait(pid, &wstatus, 0, nil)
 		if errors.Is(err, unix.EINTR) {
 			continue
 		}
 		if err != nil {
-			return status{code: -1}
+			return status{code: -1, err: err}
 		}
 		if wpid != pid {
 			continue
