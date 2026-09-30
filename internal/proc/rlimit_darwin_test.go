@@ -1,6 +1,7 @@
 package proc
 
 import (
+	"os"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -46,14 +47,20 @@ func TestChildNprocCapRestoresTheSoftLimitAcrossSpawns(t *testing.T) {
 		}
 	})
 
+	procs, err := unix.SysctlKinfoProcSlice("kern.proc.ruid", os.Getuid())
+	if err != nil {
+		t.Fatalf("count real-UID processes: %v", err)
+	}
+	mustLower := before.Cur > uint64(len(procs)+2*spawnNprocHeadroom)
+
 	for range 2 {
 		var during unix.Rlimit
 		err := withChildNprocCap(func() error { return unix.Getrlimit(unix.RLIMIT_NPROC, &during) })
 		if err != nil {
 			t.Fatalf("withChildNprocCap() = %v", err)
 		}
-		if during.Cur >= before.Cur {
-			t.Fatalf("soft limit during the spawn = %d, want it lowered below %d", during.Cur, before.Cur)
+		if during.Cur > before.Cur || mustLower && during.Cur == before.Cur {
+			t.Fatalf("soft limit during the spawn = %d, want it at most %d and lowered when it sits far above the census", during.Cur, before.Cur)
 		}
 		var after unix.Rlimit
 		if err := unix.Getrlimit(unix.RLIMIT_NPROC, &after); err != nil {
