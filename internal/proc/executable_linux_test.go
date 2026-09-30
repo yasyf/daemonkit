@@ -57,6 +57,42 @@ func TestExecutablePathSurvivesAnInPlaceUpgrade(t *testing.T) {
 	}
 }
 
+// TestExecutablePathSurvivesAnUpgradeThatKeepsAnotherLink replaces a program
+// whose inode a second name still holds. The kernel marks the path deleted for
+// the replaced directory entry, not for the inode's link count, so a link left
+// elsewhere must not make the marker read as part of the name.
+func TestExecutablePathSurvivesAnUpgradeThatKeepsAnotherLink(t *testing.T) {
+	program := copyOf(t, "/bin/sleep")
+	if err := os.Link(program, program+".kept"); err != nil {
+		t.Fatal(err)
+	}
+	pid := suspendedChild(t, program)
+	replacement := program + ".next"
+	if err := os.WriteFile(replacement, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, program); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ExecutablePath(pid); err != nil || got != program {
+		t.Fatalf("ExecutablePath() after the program was replaced = %q, %v, want %q", got, err, program)
+	}
+}
+
+// TestExecutablePathKeepsANameThatEndsInTheMarker runs a program whose own
+// name ends in the kernel's deleted marker.
+func TestExecutablePathKeepsANameThatEndsInTheMarker(t *testing.T) {
+	staged := copyOf(t, "/bin/sleep")
+	program := staged + deletedSuffix
+	if err := os.Rename(staged, program); err != nil {
+		t.Fatal(err)
+	}
+	pid := suspendedChild(t, program)
+	if got, err := ExecutablePath(pid); err != nil || got != program {
+		t.Fatalf("ExecutablePath() = %q, %v, want the literal name %q", got, err, program)
+	}
+}
+
 // TestExecutablePathReportsAnUnlinkedProgramAsUnnameable is the other half: a
 // process whose program is gone for good runs from a path that names nothing,
 // so it is reported beside its pin rather than matched or dropped.

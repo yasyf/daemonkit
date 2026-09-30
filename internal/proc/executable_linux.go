@@ -12,7 +12,7 @@ import (
 )
 
 // deletedSuffix is what the kernel appends to the path of an executable whose
-// inode has no link left.
+// directory entry was unlinked or replaced, whatever links the inode keeps.
 const deletedSuffix = " (deleted)"
 
 // ExecutablePath returns the absolute exec path the kernel holds for pid. A
@@ -34,7 +34,8 @@ func ExecutablePath(pid int) (string, error) {
 	if err := unix.Stat(link, &image); err != nil {
 		return "", unnamedProcess(pid, err)
 	}
-	if image.Nlink != 0 {
+	var named unix.Stat_t
+	if err := unix.Stat(target, &named); err == nil && named.Dev == image.Dev && named.Ino == image.Ino {
 		return target, nil
 	}
 	resolved, err := filepath.EvalSymlinks(recorded)

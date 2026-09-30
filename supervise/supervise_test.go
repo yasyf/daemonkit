@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -638,6 +639,56 @@ func TestTheControlSocketIsPrivate(t *testing.T) {
 	}
 	if dir.Mode().Perm() != 0o700 {
 		t.Fatalf("state directory mode = %v, want 0700", dir.Mode().Perm())
+	}
+}
+
+// TestTheSupervisorRefusesAStateDirectoryOthersCanReach covers a home placed
+// somewhere shared: whoever can write the state directory chooses the program
+// the supervisor runs.
+func TestTheSupervisorRefusesAStateDirectoryOthersCanReach(t *testing.T) {
+	testHome(t)
+	const name = "com.example.shared"
+	where, err := layoutFor(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(where.dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(where.dir, 0o770); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(bounded(t, 30*time.Second), name, testThrottle); err == nil || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a supervisor over a group-writable state directory returned %v, want a refusal", err)
+	}
+	if _, err := os.Stat(where.records()); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the refused supervisor left a record store behind: %v", err)
+	}
+}
+
+// TestApplyRefusesALogPathThatIsALink keeps service output out of whatever a
+// planted link points at.
+func TestApplyRefusesALogPathThatIsALink(t *testing.T) {
+	testHome(t)
+	const name = "com.example.linkedlog"
+	supervised(t, name)
+	program, pids := script(t, "exec sleep 600")
+	desired := service(t, name, program, NoRestart)
+	victim := filepath.Join(t.TempDir(), "victim")
+	if err := os.WriteFile(victim, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, desired.LogPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := Apply(bounded(t, 20*time.Second), desired); err == nil {
+		t.Fatal("Apply() over a log path that is a symlink succeeded, want it refused")
+	}
+	if started, err := os.ReadFile(pids); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the refused service ran anyway: pids %q, %v", started, err)
+	}
+	if body, err := os.ReadFile(victim); err != nil || len(body) != 0 {
+		t.Fatalf("the link's target holds %q, %v, want it untouched", body, err)
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/yasyf/daemonkit/internal/label"
@@ -183,6 +184,20 @@ func layoutFor(name string) (layout, error) {
 		return layout{}, err
 	}
 	return layout{dir: paths.Agent(name).StateDir()}, nil
+}
+
+// private refuses a state directory another user could have planted a service
+// in: the supervisor executes what that directory's service.json names.
+func (l layout) private() error {
+	info, err := os.Lstat(l.dir)
+	if err != nil {
+		return fmt.Errorf("supervise: stat state dir: %w", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || !info.IsDir() || int64(stat.Uid) != int64(os.Geteuid()) || info.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("supervise: state dir %s must be a directory this user owns with no group or world access", l.dir)
+	}
+	return nil
 }
 
 func (l layout) spec() string    { return filepath.Join(l.dir, specName) }

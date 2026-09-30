@@ -54,6 +54,9 @@ func run(ctx context.Context, name string, throttle time.Duration) error {
 	if err := os.MkdirAll(where.dir, 0o700); err != nil {
 		return fmt.Errorf("supervise: create state dir: %w", err)
 	}
+	if err := where.private(); err != nil {
+		return err
+	}
 	openCtx, cancelOpen := context.WithTimeout(ctx, proc.SettleGrace)
 	store, err := proc.OpenStore(openCtx, where.records())
 	cancelOpen()
