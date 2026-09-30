@@ -422,12 +422,14 @@ func (c *Client) Terminate(ctx context.Context, expect Expect) (Stopped, error) 
 
 // inventoryClear proves absence the one way a record file cannot forge: the
 // executable-scoped process inventory over the path this daemon's program runs
-// from. The inventory compares against the path the kernel holds, which is
-// fully symlink-resolved, so the program is resolved to that same form first —
-// an unresolved component matches no process at all and would report a clear
-// inventory for a daemon still running. This gate authorizes irreversible
-// actions, so a path that cannot be resolved is an error, never an empty
-// answer.
+// from, and then the departure of whatever this ladder observed. The query is
+// the program path made absolute and nothing more. The inventory puts it in
+// the form the kernel reports for itself, refuses a query it cannot put in
+// that form, and answers one that names no file by scanning anyway: nothing
+// the kernel can name runs from a path that is not there, and a Stable program
+// whose bytes were never placed — an uninstall before any install — is exactly
+// such a path, not an error. This gate authorizes irreversible actions, so
+// every resolution failure past absence stays an error, never an empty answer.
 //
 // The query is this daemon's own program and nothing else. A path guessed by
 // name — a sibling under the program root every daemonkit consumer shares — is
@@ -439,6 +441,15 @@ func (c *Client) Terminate(ctx context.Context, expect Expect) (Stopped, error) 
 // into this gate is entered precisely because the record named nobody, so a
 // re-read would correlate against nothing — which is why every caller hands
 // down what it observed, and the zero identity when it observed nothing.
+//
+// The observed pin is then proven departed on its own, by {pid, start, boot}
+// and no path at all. A daemon still running an executable that was unlinked
+// out from under it, or one reached through an alias that no longer exists
+// while the file behind it stays live, is nameable by nothing the query can
+// match — and a scan that cleared over it would clear this gate for a daemon
+// still running. A reused PID and a foreign boot session are departures; a
+// probe that could not classify is an error; the zero identity names nobody
+// and is not probed.
 //
 // The residual is exact and stated rather than papered over: a husk this ladder
 // never observed is attributable to nothing, and no scan of the process table
@@ -457,7 +468,7 @@ func (c *Client) inventoryClear(observed proc.Identity) error {
 	if err != nil {
 		return err
 	}
-	program, err := c.daemon.Program.resolved(el)
+	program, err := c.daemon.Program.query(el)
 	if err != nil {
 		return err
 	}
@@ -471,14 +482,28 @@ func (c *Client) inventoryClear(observed proc.Identity) error {
 			live = append(live, husk)
 		}
 	}
-	if len(live) == 0 {
+	if len(live) > 0 {
+		names := make([]string, len(live))
+		for i, identity := range live {
+			names[i] = identity.String()
+		}
+		return fmt.Errorf("%w: live process(es) remain: %s", ErrUnsettled, strings.Join(names, ", "))
+	}
+	return departed(observed)
+}
+
+func departed(observed proc.Identity) error {
+	if observed == (proc.Identity{}) {
 		return nil
 	}
-	names := make([]string, len(live))
-	for i, identity := range live {
-		names[i] = identity.String()
+	_, settled, err := proc.Observe(observed)
+	if err != nil {
+		return fmt.Errorf("daemonkit: observe pid %d (start %d, boot %d): %w", observed.PID, observed.Start, observed.Boot, err)
 	}
-	return fmt.Errorf("%w: live process(es) remain: %s", ErrUnsettled, strings.Join(names, ", "))
+	if !settled {
+		return fmt.Errorf("%w: observed pid %d (start %d, boot %d) remains", ErrUnsettled, observed.PID, observed.Start, observed.Boot)
+	}
+	return nil
 }
 
 // exitTimeOut is Shutdown as launchd's own ExitTimeOut key: the SIGKILL that

@@ -121,11 +121,11 @@ func (p Program) path(el element) (string, error) { return p.policy.path(el) }
 
 func (p Program) place(el element) (bool, error) { return p.policy.place(el) }
 
-// resolved is the program path in the form the kernel reports an executable:
-// absolute and symlink-free. A path that resolves to nothing is an error, never
-// an empty answer — a caller comparing against the kernel's own paths would
-// otherwise match nothing and read that as proof.
-func (p Program) resolved(el element) (string, error) {
+// query is the executable-scoped inventory's query: absolute, because
+// DAEMONKIT_HOME is honored verbatim and the kernel names no relative path,
+// and otherwise unresolved, because the inventory resolves it itself and
+// answers a path naming no file rather than refusing it.
+func (p Program) query(el element) (string, error) {
 	path, err := p.path(el)
 	if err != nil {
 		return "", err
@@ -134,11 +134,7 @@ func (p Program) resolved(el element) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("daemonkit: resolve program %q: %w", path, err)
 	}
-	resolved, err := filepath.EvalSymlinks(absolute)
-	if err != nil {
-		return "", fmt.Errorf("daemonkit: resolve program %q: %w", path, err)
-	}
-	return resolved, nil
+	return absolute, nil
 }
 
 // copied runs the daemon from a copy of source, kept at a Label-derived path
