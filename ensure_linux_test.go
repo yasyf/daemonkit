@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -43,24 +44,28 @@ func supervisedDaemon(t *testing.T, label Label) (Daemon, string) {
 	}, program
 }
 
-// superviseInBackground runs the label's supervisor for the life of the test
-// and waits until it answers.
-func superviseInBackground(t *testing.T, d Daemon) {
+// superviseInBackground runs the label's supervisor until stop is called or
+// the test ends, whichever comes first, and waits until it answers.
+func superviseInBackground(t *testing.T, d Daemon) (stop func()) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- Supervise(ctx, d.Label) }()
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Errorf("Supervise() = %v", err)
+	var once sync.Once
+	stop = func() {
+		once.Do(func() {
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Errorf("Supervise() = %v", err)
+				}
+			case <-time.After(30 * time.Second):
+				t.Error("Supervise never returned")
 			}
-		case <-time.After(30 * time.Second):
-			t.Error("Supervise never returned")
-		}
-	})
+		})
+	}
+	t.Cleanup(stop)
 	agent, err := d.agent()
 	if err != nil {
 		t.Fatalf("agent() = %v", err)
@@ -71,7 +76,7 @@ func superviseInBackground(t *testing.T, d Daemon) {
 		_, err := supervise.Verify(verifyCtx, agent)
 		cancelVerify()
 		if err == nil {
-			return
+			return stop
 		}
 		if !errors.Is(err, supervise.ErrNoSupervisor) || time.Now().After(deadline) {
 			t.Fatalf("the supervisor never answered: %v", err)

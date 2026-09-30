@@ -89,6 +89,44 @@ func TestStopIsSuccessWithNothingInstalled(t *testing.T) {
 	}
 }
 
+// TestStopIsSuccessBeforeTheProgramWasEverPlaced is the uninstall-before-
+// install shape: a Stable program whose bytes were never placed names a path
+// nothing runs from, which the inventory scans and clears rather than refuses.
+// Stop succeeds, succeeds again, places nothing, and still takes a marked
+// LaunchAgent down through the ordinary removal when one is there.
+func TestStopIsSuccessBeforeTheProgramWasEverPlaced(t *testing.T) {
+	t.Run("nothing installed", func(t *testing.T) {
+		shortHome(t)
+		d, program := neverPlacedDaemon(t, "com.example.stopunplaced")
+		client := openClient(t, d)
+		rec := &launchctlRecorder{}
+		client.launchctl = rec.run
+
+		stopTwiceWithoutPlacing(t, client, program)
+
+		if len(rec.verbs) != 0 {
+			t.Fatalf("verbs = %v, want launchd asked nothing", rec.verbs)
+		}
+	})
+	t.Run("a marked agent remains", func(t *testing.T) {
+		ladderHome(t)
+		d, program := neverPlacedDaemon(t, "com.example.stopunplacedagent")
+		path := installedAgentPlist(t, d.Label)
+		client := openClient(t, d)
+		rec := &launchctlRecorder{}
+		client.launchctl = rec.run
+
+		stopTwiceWithoutPlacing(t, client, program)
+
+		if want := []string{"bootout"}; !slices.Equal(rec.verbs, want) {
+			t.Fatalf("verbs = %v, want %v", rec.verbs, want)
+		}
+		if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("plist survived Stop: %v", err)
+		}
+	})
+}
+
 // TestStopHoldsTheStartLock is the D2/D3 regression: a Stop serialized behind
 // another launcher's start lock removes nothing, so it can never take down the
 // replacement an in-flight Ensure is starting.

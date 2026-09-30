@@ -6,6 +6,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `Client.Stop` on a `Stable` program whose bytes were never placed, the
+  shape of an uninstall that runs before any install did, no longer fails with
+  `no such file or directory` from resolving the program path. The
+  executable-scoped inventory is now asked over the absolute program path and
+  resolves it itself: a path nothing was placed at is scanned and answered
+  rather than refused, while a symlink loop, a component under a regular
+  file, or a directory the user may not search remains an error. The gate is
+  stronger for it. Before it clears, any process the ladder observed, the
+  session's peer or an incumbent a since-vanished record named, is proven
+  departed by its own `{pid, start, boot}`, so a daemon still running an
+  unlinked executable, or one reached through an alias that no longer exists,
+  refuses `Stop` and `Ensure` with `ErrUnsettled` where the scan alone could
+  not name it. A process nobody observed remains nobody's.
+
 ## [0.32.1] - 2026-09-30
 
 ### Fixed

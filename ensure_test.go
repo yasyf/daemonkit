@@ -487,6 +487,15 @@ func selfPath(t *testing.T) string {
 
 const inventoryLabel = Label("com.example.inventory")
 
+func programPath(t *testing.T, d Daemon) string {
+	t.Helper()
+	path, err := d.Program.path(mustElement(t, d.Label))
+	if err != nil {
+		t.Fatalf("Program.path() error = %v", err)
+	}
+	return path
+}
+
 func TestInventoryClearProvesAbsenceOverTheProcessTable(t *testing.T) {
 	unrun := filepath.Join(t.TempDir(), "never-executed")
 	if err := os.WriteFile(unrun, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
@@ -533,7 +542,7 @@ func TestInventoryClearQueriesTheProgramPathAlone(t *testing.T) {
 
 // live starts a real process on program and blocks until the kernel's own
 // process table reports it under that exact path.
-func live(t *testing.T, program string) {
+func live(t *testing.T, program string) *exec.Cmd {
 	t.Helper()
 	body, err := os.ReadFile("/bin/sleep")
 	if err != nil {
@@ -559,7 +568,7 @@ func live(t *testing.T, program string) {
 			t.Fatalf("ExecutableIdentities(%q): %v", resolved, err)
 		}
 		if slices.ContainsFunc(found.Matched, func(id proc.Identity) bool { return id.PID == child.Process.Pid }) {
-			return
+			return child
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("the process at %q never reached the process table", program)
@@ -568,11 +577,34 @@ func live(t *testing.T, program string) {
 	}
 }
 
+// awaitUnnameable blocks until the scan over program reports pid among the
+// processes nothing could name: the kernel drops the name of an unlinked
+// executable on its own schedule, and until it does a scan still matches the
+// literal path.
+func awaitUnnameable(t *testing.T, program string, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		found, err := proc.ExecutableIdentities(program)
+		if err != nil {
+			t.Fatalf("ExecutableIdentities(%q): %v", program, err)
+		}
+		if slices.ContainsFunc(found.Unnameable, func(id proc.Identity) bool { return id.PID == pid }) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pid %d never became unnameable after %q was unlinked", pid, program)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // TestInventoryClearNeverPassesOnAnUnresolvedProgram is the fail-open gate's
-// regression: the kernel reports a fully symlink-resolved executable, so an
-// unresolved program path matches nothing and reports a clear inventory for a
-// process that is very much running. os.Executable() is exactly such a path on
-// darwin — /var/folders/… for a binary the kernel calls /private/var/folders/….
+// regression: the kernel reports a fully symlink-resolved executable, so a
+// query compared in its unresolved form matches nothing and reports a clear
+// inventory for a process that is very much running. os.Executable() is
+// exactly such a path on darwin — /var/folders/… for a binary the kernel calls
+// /private/var/folders/….
 func TestInventoryClearNeverPassesOnAnUnresolvedProgram(t *testing.T) {
 	self := selfPath(t)
 	linked := filepath.Join(t.TempDir(), "daemon")
@@ -582,19 +614,191 @@ func TestInventoryClearNeverPassesOnAnUnresolvedProgram(t *testing.T) {
 	tests := []struct {
 		name    string
 		program string
-		wantErr error
 	}{
-		{"the unresolved path of this very process", self, ErrUnsettled},
-		{"a symlink to this very process", linked, ErrUnsettled},
-		{"a program that resolves to nothing", filepath.Join(t.TempDir(), "absent"), os.ErrNotExist},
+		{"the unresolved path of this very process", self},
+		{"a symlink to this very process", linked},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client := openClient(t, Daemon{Label: inventoryLabel, Program: Program{policy: bundled{file: tt.program}}})
-			if err := client.inventoryClear(proc.Identity{}); !errors.Is(err, tt.wantErr) {
-				t.Fatalf("inventoryClear() error = %v, want %v", err, tt.wantErr)
+			if err := client.inventoryClear(proc.Identity{}); !errors.Is(err, ErrUnsettled) {
+				t.Fatalf("inventoryClear() error = %v, want %v", err, ErrUnsettled)
 			}
 		})
+	}
+}
+
+// TestInventoryClearScansAMissingProgramAndHoldsTheObservedPin is the
+// uninstall-before-install contract: a program path nothing was ever placed at
+// is a query the scan answers, never an error, and what the scan cannot see
+// there — a process the ladder observed — is proven departed by its own pin.
+// This very process is that pin: live, nameable, and running nothing the
+// missing query names.
+func TestInventoryClearScansAMissingProgramAndHoldsTheObservedPin(t *testing.T) {
+	self := probed(t, os.Getpid())
+	tests := []struct {
+		name     string
+		observed proc.Identity
+		wantErr  error
+	}{
+		{"nothing observed", proc.Identity{}, nil},
+		{"the observed pin is this live process", self, ErrUnsettled},
+		{"the observed pid now names this process", proc.Identity{PID: self.PID, Start: self.Start + 1, Boot: self.Boot}, nil},
+		{"the observed pin is from another boot session", proc.Identity{PID: self.PID, Start: self.Start, Boot: self.Boot + 1}, nil},
+		{"the observed process left", departedIdentity(t), nil},
+	}
+	absent := filepath.Join(t.TempDir(), "never-placed")
+	client := openClient(t, Daemon{Label: inventoryLabel, Program: Program{policy: bundled{file: absent}}})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := client.inventoryClear(tt.observed); !errors.Is(err, tt.wantErr) {
+				t.Fatalf("inventoryClear(%+v) error = %v, want %v", tt.observed, err, tt.wantErr)
+			}
+		})
+	}
+	if _, err := os.Lstat(absent); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Lstat(%q) = %v, want the gate to have placed nothing", absent, err)
+	}
+}
+
+// TestInventoryClearRefusesAQueryItCannotResolve holds the other half of the
+// missing-query contract: absence is the one resolution failure the scan
+// answers. A symlink loop and a component under a regular file are queries
+// the scan could not put in the kernel's form, and a gate that matched
+// nothing over them would always pass.
+func TestInventoryClearRefusesAQueryItCannotResolve(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "file")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loop := filepath.Join(dir, "loop")
+	if err := os.Symlink(loop, loop); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{"a symlink loop", loop},
+		{"a component under a regular file", filepath.Join(file, "under")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := openClient(t, Daemon{Label: inventoryLabel, Program: Program{policy: bundled{file: tt.query}}})
+			err := client.inventoryClear(proc.Identity{})
+			if err == nil || errors.Is(err, ErrUnsettled) {
+				t.Fatalf("inventoryClear() over %q = %v, want a resolution error", tt.query, err)
+			}
+		})
+	}
+}
+
+// TestInventoryClearRefusesAQueryItMayNotSearch is the same refusal for a
+// directory this user cannot traverse: the scan cannot say what is or is not
+// there, so the gate errs rather than clears.
+func TestInventoryClearRefusesAQueryItMayNotSearch(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root searches every directory")
+	}
+	sealed := filepath.Join(t.TempDir(), "sealed")
+	if err := os.Mkdir(sealed, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(sealed, 0o700) })
+	query := filepath.Join(sealed, "under")
+	client := openClient(t, Daemon{Label: inventoryLabel, Program: Program{policy: bundled{file: query}}})
+	err := client.inventoryClear(proc.Identity{})
+	if err == nil || errors.Is(err, ErrUnsettled) {
+		t.Fatalf("inventoryClear() over %q = %v, want a resolution error", query, err)
+	}
+}
+
+// TestInventoryClearHoldsTheObservedPinOverAnUnlinkedProgram is the upgrade
+// that unlinked the daemon's bytes: the process runs on, the kernel can no
+// longer name what it runs, and the query names a file that is not there. The
+// scan reports the process unnameable, the pin the ladder observed correlates
+// to it, and the gate refuses; a pin nobody observed attributes nothing, so a
+// stranger's husk never wedges the gate shut, and a pin the kernel has since
+// handed to another instance is a departure, never a refusal.
+func TestInventoryClearHoldsTheObservedPinOverAnUnlinkedProgram(t *testing.T) {
+	program := filepath.Join(realPath(t, t.TempDir()), "daemon")
+	child := live(t, program)
+	pin := probed(t, child.Process.Pid)
+	if err := os.Remove(program); err != nil {
+		t.Fatal(err)
+	}
+	awaitUnnameable(t, program, pin.PID)
+	client := openClient(t, Daemon{Label: inventoryLabel, Program: Program{policy: bundled{file: program}}})
+	tests := []struct {
+		name     string
+		observed proc.Identity
+		wantErr  error
+	}{
+		{"the observed pin", pin, ErrUnsettled},
+		{"nothing observed", proc.Identity{}, nil},
+		{"a stale pin at the same pid", proc.Identity{PID: pin.PID, Start: pin.Start + 1, Boot: pin.Boot}, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := client.inventoryClear(tt.observed); !errors.Is(err, tt.wantErr) {
+				t.Fatalf("inventoryClear(%+v) error = %v, want %v", tt.observed, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestInventoryClearHoldsTheObservedPinBehindAVanishedAlias is a program
+// declared through a symlinked root — an .app alias — whose alias went away
+// while the file behind it stays live. The kernel names the process by its
+// real path, the query names a path that is not there, and nothing about the
+// scan can attribute the one to the other: only the pin the ladder observed
+// can, and it does. With nothing observed the process is the stated residual,
+// nobody's.
+func TestInventoryClearHoldsTheObservedPinBehindAVanishedAlias(t *testing.T) {
+	root := realPath(t, t.TempDir())
+	app := filepath.Join(root, "Real.app")
+	if err := os.Mkdir(app, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "Alias.app")
+	if err := os.Symlink(app, alias); err != nil {
+		t.Fatal(err)
+	}
+	child := live(t, filepath.Join(app, "daemon"))
+	pin := probed(t, child.Process.Pid)
+	client := openClient(t, Daemon{Label: inventoryLabel, Program: Program{policy: bundled{file: filepath.Join(alias, "daemon")}}})
+	if err := client.inventoryClear(proc.Identity{}); !errors.Is(err, ErrUnsettled) {
+		t.Fatalf("inventoryClear() through the alias = %v, want %v", err, ErrUnsettled)
+	}
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.inventoryClear(pin); !errors.Is(err, ErrUnsettled) {
+		t.Fatalf("inventoryClear() past the vanished alias with the pin observed = %v, want %v", err, ErrUnsettled)
+	}
+	if err := client.inventoryClear(proc.Identity{}); err != nil {
+		t.Fatalf("inventoryClear() past the vanished alias with nothing observed = %v, want the residual: a process no query and no pin names is nobody's", err)
+	}
+}
+
+// TestInventoryClearQueriesAnAbsoluteProgramUnderARelativeHome pins the one
+// normalization the query keeps. DAEMONKIT_HOME is honored verbatim, so a
+// relative override names a relative program; the kernel reports absolute
+// paths alone, and a relative query compared against them would clear the
+// gate over a live daemon.
+func TestInventoryClearQueriesAnAbsoluteProgramUnderARelativeHome(t *testing.T) {
+	cwd := realPath(t, t.TempDir())
+	t.Chdir(cwd)
+	t.Setenv(realhome.EnvOverride, "home")
+	program := filepath.Join(cwd, "home", ".daemonkit", "bin", string(inventoryLabel))
+	if err := os.MkdirAll(filepath.Dir(program), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	live(t, program)
+	client := openClient(t, Daemon{Label: inventoryLabel, Program: Program{policy: copied{}}})
+	if err := client.inventoryClear(proc.Identity{}); !errors.Is(err, ErrUnsettled) {
+		t.Fatalf("inventoryClear() under a relative home = %v, want %v", err, ErrUnsettled)
 	}
 }
 
