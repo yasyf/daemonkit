@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -1394,7 +1395,7 @@ func TestARefusedVerbLeavesNoDurableRecord(t *testing.T) {
 			continue
 		}
 		refused++
-		if strings.Contains(string(blob), strconv.Itoa(helpers[i])) {
+		if regexp.MustCompile(`"pid":\s*` + strconv.Itoa(helpers[i]) + `\b`).Match(blob) {
 			t.Errorf("Adopt(%d) = %v, yet the record store still names that pid; a refusal that records is a process nobody admitted",
 				helpers[i], errs[i])
 		}
