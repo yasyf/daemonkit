@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-09-30
+
 ### Added
 
 - Linux runtime support on amd64 and arm64, including process identity from
@@ -19,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trust is unchanged.
 
 ### Fixed
+
+- The Linux supervisor refuses further starts when it cannot prove that the
+  previous service's process scope was reaped, including automatic restarts.
+  It preserves the process record so a later supervisor can settle ownership.
 
 - A `Business` lane from `Client.Business` held across the daemon's idle window
   now attaches a fresh session on its next `Call`. The daemon closes a session
@@ -37,6 +43,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attaches another to drain the incumbent, so an upgrade could fail with
   `wire: session capacity exhausted` against a daemon nobody else was
   attached to. The daemon now frees the slot and then acknowledges.
+
+### Known limits
+
+- Linux trust by user ID (UID) is intended for private, single-user VMs.
+  Other processes under that UID can connect to the runtime or stall a
+  suspended spawn. Session cleanup still has a process-group ID reuse race.
+
+- A call racing the idle timer can still have an unknown delivery outcome.
+  Control sessions do not reattach after expiry.
 
 ## [0.31.1] - 2026-09-16
 
@@ -1657,7 +1672,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.31.1...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.32.0...HEAD
+[0.32.0]: https://github.com/yasyf/daemonkit/compare/v0.31.1...v0.32.0
 [0.31.1]: https://github.com/yasyf/daemonkit/compare/v0.31.0...v0.31.1
 [0.31.0]: https://github.com/yasyf/daemonkit/compare/v0.30.1...v0.31.0
 [0.30.1]: https://github.com/yasyf/daemonkit/compare/v0.30.0...v0.30.1
