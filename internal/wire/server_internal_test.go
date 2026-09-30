@@ -326,6 +326,9 @@ func TestGoAwayAcknowledgementFollowsTheLaneSlotRelease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient() = %v", err)
 	}
+	if _, err := client.Health(ctx); err != nil {
+		t.Fatalf("Health() = %v", err)
+	}
 	if got := len(server.controlSlot); got != 1 {
 		t.Fatalf("control slots after admission = %d, want 1", got)
 	}
