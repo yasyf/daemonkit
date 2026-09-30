@@ -97,6 +97,13 @@ func run(ctx context.Context, name string, throttle time.Duration) error {
 			s.retry()
 		}
 	}
+	return s.serve(ctx, verbs)
+}
+
+// serve runs the loop until ctx ends or a child's reap goes unproven. That
+// child's record stays in the store, so the supervisor returns rather than
+// start anything beside it: the next Run reclaims it or refuses the label.
+func (s *supervisor) serve(ctx context.Context, verbs <-chan verb) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -108,9 +115,12 @@ func run(ctx context.Context, name string, throttle time.Duration) error {
 		case <-s.restart:
 			s.restart = nil
 			if err := s.start(ctx); err != nil {
-				slog.Error("supervise: restart the service", "label", name, "err", err)
+				slog.Error("supervise: restart the service", "label", s.label, "err", err)
 				s.retry()
 			}
+		}
+		if s.unsettled != nil {
+			return s.unsettled
 		}
 	}
 }
@@ -137,6 +147,9 @@ type supervisor struct {
 	exited  <-chan proc.Exit
 	started time.Time
 	restart <-chan time.Time
+	// unsettled is the child whose reap was never proven. It is terminal:
+	// nothing starts under this supervisor once it is set.
+	unsettled error
 }
 
 func (s *supervisor) load() error {
@@ -189,6 +202,9 @@ func (s *supervisor) handle(ctx context.Context, asked request) response {
 }
 
 func (s *supervisor) apply(ctx context.Context, service Service) error {
+	if s.unsettled != nil {
+		return s.unsettled
+	}
 	if service.Label != s.label {
 		return fmt.Errorf("supervise: this supervisor holds %q, not %q", s.label, service.Label)
 	}
@@ -238,6 +254,9 @@ func (s *supervisor) remove() error {
 // runs an instruction, which is what lets the next supervisor reclaim it if
 // this one dies first.
 func (s *supervisor) start(ctx context.Context) error {
+	if s.unsettled != nil {
+		return s.unsettled
+	}
 	service := *s.desired
 	s.started = time.Now()
 	if err := validateProgram(service.Program); err != nil {
@@ -282,25 +301,38 @@ func (s *supervisor) live(ctx context.Context) (bool, error) {
 // whole exit timeout, then SIGKILL. A child that outlives the ladder stays
 // recorded and is an error, never a quiet success.
 func (s *supervisor) stop() error {
+	if s.unsettled != nil {
+		return s.unsettled
+	}
 	if s.child == nil {
 		return nil
 	}
 	s.child.TerminateBy(time.Now().Add(proc.KillAfter(s.running.exitTimeOut())))
-	exit := <-s.exited
 	pid := s.child.PID()
-	s.child, s.exited = nil, nil
-	if !exit.Reap.Proven() {
-		return fmt.Errorf("%w: service pid %d", proc.ErrUnsettled, pid)
+	if err := s.release(<-s.exited); err != nil {
+		return err
 	}
 	slog.Info("supervise: service stopped", "label", s.label, "pid", pid)
 	return nil
 }
 
+// release gives up the exited child only when its reap was proven. An unproven
+// one still has a record, and possibly a process, that a start would run
+// beside.
+func (s *supervisor) release(exit proc.Exit) error {
+	pid := s.child.PID()
+	s.child, s.exited = nil, nil
+	if !exit.Reap.Proven() {
+		s.unsettled = fmt.Errorf("%w: service pid %d", proc.ErrUnsettled, pid)
+		slog.Error("supervise: the service's exit was not proven", "label", s.label, "pid", pid)
+	}
+	return s.unsettled
+}
+
 // settled applies the restart policy to a child that exited by itself.
 func (s *supervisor) settled(exit proc.Exit) {
 	slog.Info("supervise: service exited", "label", s.label, "pid", s.child.PID(), "code", exit.Code, "signal", exit.Signal)
-	s.child, s.exited = nil, nil
-	if s.desired == nil {
+	if s.release(exit) != nil || s.desired == nil {
 		return
 	}
 	failed := exit.Code != 0 || exit.Signal != 0
@@ -359,5 +391,10 @@ func answer(conn *net.UnixConn, verbs chan<- verb, done <-chan struct{}) {
 	case answered := <-reply:
 		_ = send(conn, answered)
 	case <-done:
+		select {
+		case answered := <-reply:
+			_ = send(conn, answered)
+		default:
+		}
 	}
 }

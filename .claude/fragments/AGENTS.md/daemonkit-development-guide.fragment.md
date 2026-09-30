@@ -38,7 +38,7 @@ the next render.
 | `ghrelease` | queries GitHub for a repository's latest published release. | 2 | 170 |
 | `launchd` | is the value-type model for one exact macOS user LaunchAgent and the stateless primitives that apply it. | 12 | 2410 |
 | `paths` | owns the canonical state-directory layout under the user's home directory, resolved through the passwd database — never the caller's HOME or CLAUDE_CONFIG_DIR — so a sandboxed environment cannot relocate state. | 4 | 278 |
-| `supervise` | is the service layer for a linux host with no init system to register with: the value-type model for one exact supervised service and the foreground supervisor that runs it. | 5 | 1560 |
+| `supervise` | is the service layer for a linux host with no init system to register with: the value-type model for one exact supervised service and the foreground supervisor that runs it. | 5 | 1696 |
 | `templates` | — | 2 | 218 |
 | `version` | classifies and compares release and development builds for launcher-owned runtime settlement and release ordering. | 2 | 302 |
 <!-- END GENERATED: package table -->

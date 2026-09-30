@@ -642,6 +642,105 @@ func TestTheControlSocketIsPrivate(t *testing.T) {
 	}
 }
 
+// unsupervised opens a label's supervisor without running its loop, so a test
+// can stand between the supervisor and what its child's driver reports.
+func unsupervised(t *testing.T, name string) *supervisor {
+	t.Helper()
+	where, err := layoutFor(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(where.dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := proc.OpenStore(bounded(t, proc.SettleGrace), where.records())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return &supervisor{label: name, where: where, store: store, throttle: testThrottle}
+}
+
+// unproven rewrites the exit the live child's driver publishes into one whose
+// reap was never proven, which is what the driver reports when a member of the
+// service's session outlives the ladder.
+func unproven(s *supervisor) {
+	driver, exited := s.exited, make(chan proc.Exit, 1)
+	go func() {
+		exit := <-driver
+		var undetermined proc.Reap
+		exit.Reap = undetermined
+		exited <- exit
+	}()
+	s.exited = exited
+}
+
+// TestAStopThatCannotProveTheReapStartsNothingAfterIt is the stop path of the
+// ownership rule: a service whose exit went unproven still has a record, so a
+// retried Apply must not put a second service beside it.
+func TestAStopThatCannotProveTheReapStartsNothingAfterIt(t *testing.T) {
+	testHome(t)
+	const name = "com.example.unprovenstop"
+	s := unsupervised(t, name)
+	program, pids := script(t, "exec sleep 600")
+	first := service(t, name, program, RestartAlways)
+	ctx := bounded(t, 30*time.Second)
+	if err := s.apply(ctx, first); err != nil {
+		t.Fatalf("apply() = %v", err)
+	}
+	starts(t, pids, 1)
+	unproven(s)
+
+	second := first
+	second.Args = []string{"changed"}
+	for range 2 {
+		if err := s.apply(ctx, second); !errors.Is(err, proc.ErrUnsettled) {
+			t.Fatalf("apply() over an unproven stop = %v, want ErrUnsettled", err)
+		}
+	}
+	if err := s.start(ctx); !errors.Is(err, proc.ErrUnsettled) {
+		t.Fatalf("start() after an unproven stop = %v, want ErrUnsettled", err)
+	}
+	if err := s.remove(); !errors.Is(err, proc.ErrUnsettled) {
+		t.Fatalf("remove() after an unproven stop = %v, want ErrUnsettled", err)
+	}
+	if s.desired == nil || !s.desired.equal(first) {
+		t.Fatalf("desired = %+v, want the first service still applied: the refused one was never persisted", s.desired)
+	}
+	if recorded := starts(t, pids, 1); len(recorded) != 1 {
+		t.Fatalf("the service started %d times, want only the first", len(recorded))
+	}
+}
+
+// TestAnExitThatCannotProveTheReapEndsTheSupervisor is the restart path: the
+// policy asks for another start, and the supervisor returns instead of making
+// it.
+func TestAnExitThatCannotProveTheReapEndsTheSupervisor(t *testing.T) {
+	testHome(t)
+	const name = "com.example.unprovenexit"
+	s := unsupervised(t, name)
+	program, pids := script(t, "sleep 0.2; exit 1")
+	desired := service(t, name, program, RestartAlways)
+	ctx := bounded(t, 30*time.Second)
+	if err := s.apply(ctx, desired); err != nil {
+		t.Fatalf("apply() = %v", err)
+	}
+	unproven(s)
+	if err := s.serve(ctx, make(chan verb)); !errors.Is(err, proc.ErrUnsettled) {
+		t.Fatalf("serve() after an unproven exit = %v, want ErrUnsettled", err)
+	}
+	if s.restart != nil {
+		t.Fatal("a restart is scheduled over an unproven exit")
+	}
+	if err := s.start(ctx); !errors.Is(err, proc.ErrUnsettled) {
+		t.Fatalf("start() after an unproven exit = %v, want ErrUnsettled", err)
+	}
+	time.Sleep(4 * testThrottle)
+	if recorded := starts(t, pids, 1); len(recorded) != 1 {
+		t.Fatalf("the service started %d times, want only the first", len(recorded))
+	}
+}
+
 // TestTheSupervisorRefusesAStateDirectoryOthersCanReach covers a home placed
 // somewhere shared: whoever can write the state directory chooses the program
 // the supervisor runs.
