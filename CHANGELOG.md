@@ -20,6 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `Business` lane from `Client.Business` held across the daemon's idle window
+  now attaches a fresh session on its next `Call`. The daemon closes a session
+  that stays quiet for `Daemon.Idle`, 15 minutes by default, and the lane kept
+  handing that closed session back, so the first `Call` after the gap failed
+  with `wire: read: EOF` and `Undispatched` true, and only the one after it
+  reconnected. The lane now reads the session's own failure before it sends
+  anything, so no request is written to the dead session and none is sent
+  twice. A single-session lane from `Child.Business` or `BusinessOverConn` is
+  unchanged: it has no second session to attach.
 - A session closed with `Control.Close` or `Business.Close` now has its lane
   slot back before the close returns. The daemon acknowledged the close first
   and freed the slot afterwards, so an attach made right after a close could

@@ -319,7 +319,11 @@ func (b *Business) acquire(ctx context.Context) (*wire.Client, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.session != nil {
-		return b.session, nil
+		if b.single || b.session.Failure() == nil {
+			return b.session, nil
+		}
+		_ = b.session.Abort(nil)
+		b.session = nil
 	}
 	if b.closed {
 		return nil, ErrLaneClosed
