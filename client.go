@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/internal/proc"
-	"github.com/yasyf/daemonkit/launchd"
 )
 
 // Open prepares a client for d's daemon and performs no I/O beyond
@@ -18,16 +17,16 @@ func Open(d Daemon) (*Client, error) {
 	if err := d.ValidateForClient(); err != nil {
 		return nil, err
 	}
-	return &Client{daemon: d, launchctl: launchctl}, nil
+	return &Client{daemon: d, serviceLayer: openServiceLayer()}, nil
 }
 
 // Client reaches one daemon named by its Daemon identity. Every field past the
 // identity is a boundary this package talks to — the process table, the record
-// file, the socket, launchctl — bound once at Open so the repair ladder has no
-// boundary it reaches around.
+// file, the socket, the platform's service layer — bound once at Open so the
+// repair ladder has no boundary it reaches around.
 type Client struct {
-	daemon    Daemon
-	launchctl launchd.Runner
+	daemon Daemon
+	serviceLayer
 }
 
 // record is the durable owner record's path, derived past the Label rule

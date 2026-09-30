@@ -59,6 +59,7 @@ type session struct {
 	lane         Lane
 	schema       string
 	generation   []byte
+	release      func()
 	accepted     *AcceptedSession
 	outbound     chan sessionOutbound
 	requestsDone chan struct{}
@@ -153,6 +154,7 @@ func (s *session) run(ctx context.Context) error {
 			_ = s.conn.Close()
 			return s.writerErr
 		}
+		s.release()
 		if err := s.codec.WriteFrame(Frame{Kind: FrameGoAway, Flags: FlagEnd}); err != nil {
 			_ = s.conn.Close()
 			return err

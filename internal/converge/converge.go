@@ -1,7 +1,8 @@
 // Package converge observes what is actually on the system. Every fact in a
 // World is re-derived from a real boundary at the moment it is read — the
-// socket, the durable owner record, launchd's own view of the LaunchAgent — so
-// a repair decision is never taken from an intent someone claimed and stored.
+// socket, the durable owner record, the service layer's own view of the
+// daemon's service — so a repair decision is never taken from an intent someone
+// claimed and stored.
 package converge
 
 import (
@@ -11,23 +12,7 @@ import (
 
 	"github.com/yasyf/daemonkit/internal/proc"
 	"github.com/yasyf/daemonkit/internal/wire"
-	"github.com/yasyf/daemonkit/launchd"
 )
-
-// Sources are the boundaries Observe re-derives a World from.
-type Sources struct {
-	// Serving asks whatever is on the socket for the health it publishes, and
-	// names the process instance the attach pinned to answer it.
-	Serving func(context.Context) (wire.HealthReport, proc.Identity, error)
-	// Recorded shared-reads the durable owner record.
-	Recorded func(string) (proc.Owner, bool, error)
-	// RecordPath is the record file Recorded reads.
-	RecordPath string
-	// Agent is the desired LaunchAgent whose applied state is observed.
-	Agent launchd.Agent
-	// Launchctl is how launchd itself is asked about that agent.
-	Launchctl launchd.Runner
-}
 
 // World is one observation of everything a repair ladder decides from.
 type World struct {
@@ -45,12 +30,13 @@ type World struct {
 	Owner proc.Owner
 	// Recorded reports whether a well-formed owner record names an incumbent.
 	Recorded bool
-	// Applied reports whether launchd is already running exactly the desired
-	// agent: the byte-exact plist where launchd reads it and launchd itself
-	// reporting the job bootstrapped. It is a fact about launchd's
-	// configuration, never about the process — a loaded job whose program
-	// exited still reads true — but an agent launchd has never heard of does
-	// not, however exact its plist.
+	// Applied reports whether the service layer already holds exactly the
+	// desired service. On darwin that is the byte-exact plist where launchd
+	// reads it and launchd itself reporting the job bootstrapped; on linux, the
+	// label's supervisor answering with the same specification. It is a fact
+	// about the service layer's configuration, never about the process — a
+	// loaded service whose program exited still reads true — but one the
+	// service layer has never heard of does not, however exact its file.
 	Applied bool
 }
 
@@ -76,25 +62,6 @@ func (w World) Observed() proc.Identity {
 		return proc.Identity{}
 	}
 	return w.Owner.Identity()
-}
-
-// Observe re-derives a World from s. A boundary that answers with a refusal is
-// recorded as that refusal; only a boundary that could not be consulted at all
-// fails the observation.
-func Observe(ctx context.Context, s Sources) (World, error) {
-	if s.Serving == nil || s.Recorded == nil || s.Launchctl == nil {
-		return World{}, errors.New("converge: Serving, Recorded, and Launchctl observers are required")
-	}
-	world, err := ObserveRuntime(ctx, s)
-	if err != nil {
-		return World{}, err
-	}
-	applied, err := launchd.Verify(ctx, s.Launchctl, s.Agent)
-	if err != nil {
-		return World{}, fmt.Errorf("converge: observe applied agent %q: %w", s.Agent.Label, err)
-	}
-	world.Applied = applied
-	return world, nil
 }
 
 // ObserveRuntime re-derives the runtime half of a World — the socket and the

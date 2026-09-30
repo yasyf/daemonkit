@@ -216,8 +216,8 @@ func TestUntrustedPreambleLeavesTheRuntimeServing(t *testing.T) {
 	if _, err := clientConn.Write(drainPreamble[:]); err != nil {
 		t.Fatal(err)
 	}
-	if err := <-done; !errors.Is(err, trust.ErrUntrustedPeer) {
-		t.Fatalf("startConnection() on an untrusted preamble = %v, want trust.ErrUntrustedPeer", err)
+	if err := <-done; !errors.Is(err, requirementDenial) {
+		t.Fatalf("startConnection() on an untrusted preamble = %v, want %v", err, requirementDenial)
 	}
 	select {
 	case <-rt.drained:

@@ -43,8 +43,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macOS only: daemonkit is a macOS library and no longer compiles off
-        # darwin — the sysctl, csops, and LOCAL_PEERCRED seams have no stubs.
+        # The macOS half. linux has its own job below: it vets no darwin-only
+        # surface and its harness cap is sized differently.
         os: [macos-latest]
     steps:
       - uses: actions/checkout@v7
@@ -70,8 +70,31 @@ jobs:
       - name: Build (pure)
         run: CGO_ENABLED=0 go build ./...
 
-  # The subset fleet consumers that ship linux build against. Cross-compiles,
-  # so a linux runner is both cheap and the honest host for it.
+  # The linux half, run natively: the /proc, pidfd, ptrace-suspended spawn,
+  # SO_PEERCRED, and supervisor paths execute nowhere else.
+  test-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # RLIMIT_NPROC counts every thread of the uid on linux, and the harness
+      # sizes its cap from a process count, so the default headroom is reached
+      # by the race-instrumented suite's own threads.
+      TEST_NPROC_HEADROOM: "4000"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Vet
+        run: go vet ./...
+      - name: Test (race, via the process-cap harness)
+        run: ./scripts/test.sh -race ./...
+      - name: Build (pure)
+        run: CGO_ENABLED=0 go build ./...
+
+  # The declared boundary of what builds on linux, gated in both directions.
+  # Cross-compiles, so it costs a linux runner nothing to enumerate darwin too.
   portable:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -84,14 +107,24 @@ jobs:
       - name: Portable subset gate
         run: ./scripts/portable-gate.sh
 
-  # Static analysis type-checks the tree, so it runs for darwin. GOOS/GOARCH
-  # keep it on a cheap linux runner instead of billing macOS minutes 10x.
+  # Static analysis type-checks the tree, so it runs once per platform.
+  # GOOS/GOARCH keep both on a cheap linux runner instead of billing macOS
+  # minutes 10x.
   lint:
+    name: lint (${{ matrix.goos }})
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: darwin
+            goarch: arm64
+          - goos: linux
+            goarch: amd64
     env:
-      GOOS: darwin
-      GOARCH: arm64
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
@@ -104,11 +137,20 @@ jobs:
           version: latest
 
   vuln:
+    name: vuln (${{ matrix.goos }})
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: darwin
+            goarch: arm64
+          - goos: linux
+            goarch: amd64
     env:
-      GOOS: darwin
-      GOARCH: arm64
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6

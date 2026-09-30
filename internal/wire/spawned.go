@@ -130,7 +130,7 @@ func RunSpawnedSession(ctx context.Context, config SpawnedSessionConfig) error {
 		return err
 	}
 	codec.WriteTimeout = server.writeTimeout()
-	return server.runSession(ctx, conn, codec, LaneBusiness, hello.Schema, peer, generation)
+	return server.runSession(ctx, conn, codec, LaneBusiness, hello.Schema, peer, generation, func() {})
 }
 
 // authorizeSpawnedConn is the spawned lane's named Authorize waiver. The lane's

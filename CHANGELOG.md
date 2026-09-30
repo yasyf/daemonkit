@@ -6,6 +6,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Linux runtime support on amd64 and arm64, including process identity from
+  `/proc`, pidfd signalling, suspended spawn through ptrace, and same-UID peer
+  credentials. The Linux-only `supervise` package and `daemonkit.Supervise`
+  run one foreground supervisor per label without root or systemd, persist
+  the applied service across supervisor restarts, and serve the existing
+  `Client.Ensure` and `Client.Stop` calls. Linux accepts `ServingSameUser()`;
+  signed policies fail with `ErrNoVerifier` at validation and runtime entry
+  points and never silently downgrade to same-user trust. macOS code-signing
+  trust is unchanged.
+
+### Fixed
+
+- A session closed with `Control.Close` or `Business.Close` now has its lane
+  slot back before the close returns. The daemon acknowledged the close first
+  and freed the slot afterwards, so an attach made right after a close could
+  arrive in between and be refused with `ErrSessionCapacity`. The control lane
+  holds one session, and `Client.Ensure` closes its observing session and
+  attaches another to drain the incumbent, so an upgrade could fail with
+  `wire: session capacity exhausted` against a daemon nobody else was
+  attached to. The daemon now frees the slot and then acknowledges.
+
 ## [0.31.1] - 2026-09-16
 
 ### Fixed

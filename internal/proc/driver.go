@@ -50,6 +50,9 @@ const (
 	ReapTerminated
 )
 
+// Proven reports whether observation proved the process gone.
+func (r Reap) Proven() bool { return r != reapUndetermined }
+
 // RecordFate is what the post-write re-read of the store proved.
 type RecordFate uint8
 
@@ -102,6 +105,12 @@ func (c *Child) PID() int { return c.pid }
 // TerminateBy is a demand bounded by the caller's own settlement deadline:
 // non-blocking, idempotent, unordered with Done.
 func (c *Child) TerminateBy(deadline time.Time) { c.demandBy(deadline) }
+
+// KillAfter is the TerminateBy budget whose ladder holds SIGKILL back for the
+// whole of grace: the ladder spends termShare of its budget on SIGTERM.
+func KillAfter(grace time.Duration) time.Duration {
+	return time.Duration(float64(grace) / termShare)
+}
 
 func (c *Child) demandBy(deadline time.Time) {
 	select {
@@ -189,13 +198,6 @@ func (c *stderrCopy) err() error {
 }
 
 func (c *stderrCopy) abort() { _ = c.reader.Close() }
-
-func (s *Store) drive(c *Child, id identity, session int) {
-	clk := clockOrReal(s.clock)
-	exited := make(chan status, 1)
-	go func() { exited <- awaitExit(c.pid) }()
-	s.driveExit(c, id, session, exited, clk)
-}
 
 func (s *Store) driveExit(c *Child, id identity, session int, exited <-chan status, clk clock) {
 	terminal, reap := s.awaitTerminal(c, exited, clk)

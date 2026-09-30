@@ -1,6 +1,6 @@
 # ![daemonkit](docs/assets/readme-banner.webp)
 
-**Daemons that spawn detached, trust by codesign, and drain on upgrade.** daemonkit is the daemon + signed-app pattern extracted from fusekit, claude-pool, cc-interact, and synckit, shipped as one Go module and one Swift package. It is macOS-only. The trust, process, and service layers read kernel state directly, so the module does not compile off darwin.
+**Daemons that spawn detached, verify peers, and drain on upgrade.** daemonkit is the daemon + signed-app pattern extracted from fusekit, claude-pool, cc-interact, and synckit, shipped as one Go module and one Swift package. The Go runtime supports macOS and Linux on amd64 and arm64. Linux uses same-user trust and a foreground supervisor in place of launchd; code-signing trust, `deploy`, `launchd`, and the Swift package are macOS-only.
 
 [![CI](https://img.shields.io/github/actions/workflow/status/yasyf/daemonkit/ci.yml?branch=main&label=ci)](https://github.com/yasyf/daemonkit/actions/workflows/ci.yml)
 [![License: PolyForm-Noncommercial-1.0.0](https://img.shields.io/badge/License-PolyForm--Noncommercial--1.0.0-blue.svg)](https://github.com/yasyf/daemonkit/blob/main/LICENSE)
@@ -53,7 +53,7 @@ and exact process identity to settle before it starts the replacement.
 
 ### Trust the process on the other end of the socket
 
-A unix socket's permission bits say which UID connected, not which binary. daemonkit's trust check resolves the peer's audit token to its code signature and pins team + signing identifier — same-team-but-different-tool is rejected, and a configured requirement with no verifier fails closed.
+A unix socket's permission bits say which UID connected, not which binary. On macOS, daemonkit's trust check resolves the peer's audit token to its code signature and pins team + signing identifier — same-team-but-different-tool is rejected, and a configured requirement with no verifier fails closed.
 
 ### Own a typed Swift service generation
 
@@ -74,13 +74,14 @@ disappears cannot leave a stale row behind.
 <!-- BEGIN GENERATED: package table (scripts/gen-package-table.sh) -->
 | Package | Owns | Files | Lines |
 |---|---|---|---|
-| `artifact` | resolves a version-exact executable from a declarative descriptor, for the cc-family's one central "give me the binary that matches my version" primitive. | 16 | 3404 |
+| `artifact` | resolves a version-exact executable from a declarative descriptor, for the cc-family's one central "give me the binary that matches my version" primitive. | 17 | 3412 |
 | `bundle` | reads a macOS .app's Info.plist and resolves the stable bundle paths a daemon installs to. | 5 | 208 |
-| `deploy` | owns sealed installation, activation, supersession, and removal of one fixed signed application. | 15 | 6376 |
+| `deploy` | owns sealed installation, activation, supersession, and removal of one fixed signed application. | 15 | 6404 |
 | `durable` | makes filesystem state survive crashes: atomic, fsynced publication of files and directory mutations, a strict validated JSON codec, and one bounded cross-process lock. | 9 | 1029 |
 | `ghrelease` | queries GitHub for a repository's latest published release. | 2 | 170 |
-| `launchd` | is the value-type model for one exact macOS user LaunchAgent and the stateless primitives that apply it. | 12 | 2417 |
+| `launchd` | is the value-type model for one exact macOS user LaunchAgent and the stateless primitives that apply it. | 12 | 2410 |
 | `paths` | owns the canonical state-directory layout under the user's home directory, resolved through the passwd database — never the caller's HOME or CLAUDE_CONFIG_DIR — so a sandboxed environment cannot relocate state. | 4 | 278 |
+| `supervise` | is the service layer for a linux host with no init system to register with: the value-type model for one exact supervised service and the foreground supervisor that runs it. | 5 | 1728 |
 | `templates` | — | 2 | 218 |
 | `version` | classifies and compares release and development builds for launcher-owned runtime settlement and release ordering. | 2 | 302 |
 <!-- END GENERATED: package table -->
@@ -118,12 +119,34 @@ the private stage, swap the installed app, inspect the records' JSON, or remove
 the canonical app. Exact v1 receipts, service state, and locks live beside the
 app under `.daemonkit-deploy/<Product>`.
 
+## Linux
+
+Start one foreground supervisor per label with `daemonkit.Supervise(ctx, label)`
+or `supervise.Run`. The workspace owns that process; run it from a container
+entrypoint, a process manager, or a terminal. It runs without root or systemd.
+`Client.Ensure` and `Client.Stop` use it without API changes and return
+`supervise.ErrNoSupervisor` when none is running. The supervisor resumes its
+persisted `service.json` when restarted; `supervise.Apply`, `Verify`, and
+`Remove` apply, inspect, and remove a service. A second supervisor for the same
+label returns `supervise.ErrBusy`.
+
+Linux trust admits only peers with the same UID. Use `ServingSameUser()`.
+Both ends of the supervisor's `sv.sock` check `SO_PEERCRED`; the socket is mode
+0600 in the label's 0700 state directory. Any process of the same user can
+control or impersonate the supervisor. `ServingSigned` and requirements in
+`Trust.Control`, `Trust.Business`, or `Cmd.Exec` fail with `ErrNoVerifier` at the applicable
+validation, client, serving, or spawn entry point. A signed policy never
+downgrades to same-user trust.
+
+Linux hosts need kernel 5.3 or newer, `/proc`, and permission to use ptrace for
+suspended spawn. Build with `CGO_ENABLED=0`.
+
 ## The consumer trust contract
 
-Peer verification is a handful of kernel reads against the accepted socket's
-audit token, in the daemon's own process. A product owes it nothing: no child
-verb to dispatch, no worker lane to size, no framework to load. Declare what a
-peer must prove and daemonkit enforces it in the acceptor:
+On macOS, peer verification is a handful of kernel reads against the accepted
+socket's audit token, in the daemon's own process. A product owes it nothing: no
+child verb to dispatch, no worker lane to size, no framework to load. Declare
+what a peer must prove and daemonkit enforces it in the acceptor:
 
 ```go
 daemonkit.Daemon{
@@ -138,12 +161,11 @@ daemonkit.Daemon{
 ```
 
 The same-effective-UID floor runs first, unconditionally, for every peer; no
-`Trust` value can express its absence. A configured `Requirement` on a build
-with no verifier — a `daemonkit_unsigned` build — is denied outright rather
-than downgraded to UID-only. What the check proves, and what it does not, is
-`Requirement`'s documented contract: it authenticates the peer's main Mach-O as
-a program a team signed under an identifier, not the product you installed, not
-an up-to-date build, and not a principal.
+`Trust` value can express its absence. Linux and `daemonkit_unsigned` builds
+deny a configured `Requirement` with `ErrNoVerifier`. They never downgrade it
+to UID-only. `Requirement`'s documented contract on macOS authenticates the
+peer's main Mach-O as a program a team signed under an identifier. It does not
+authenticate the installed product, an up-to-date build, or a principal.
 
 Status: the module is pre-1.0 and hard-cut — no release carries a compatibility
 shim for the one before it. Protocol and durable-state epochs begin at 1 with

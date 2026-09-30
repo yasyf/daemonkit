@@ -158,6 +158,11 @@ func (c Cmd) validate(verb string, channel Channel) error {
 	if !c.Exec.stated() {
 		return fmt.Errorf("daemonkit: %s requires a stated Cmd.Exec posture (ServingSigned or ServingSameUser)", verb)
 	}
+	if _, signed := c.Exec.policy.(signedServing); signed {
+		if err := requirementVerifiable("Cmd.Exec"); err != nil {
+			return err
+		}
+	}
 	if channel >= channelLimit {
 		return fmt.Errorf("daemonkit: channel %d is not one of ChannelNone, ChannelHandoff, ChannelStdio", channel)
 	}

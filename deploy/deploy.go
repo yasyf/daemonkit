@@ -1,3 +1,5 @@
+//go:build darwin
+
 // Package deploy owns sealed installation, activation, supersession, and
 // removal of one fixed signed application.
 //

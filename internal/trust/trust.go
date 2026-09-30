@@ -30,7 +30,8 @@ var ErrNoVerifier = errors.New("trust: no code-identity verifier for a configure
 var ErrPeerGone = errors.New("trust: peer exited before code-identity verification completed")
 
 // Peer is the kernel-authenticated identity of a connected unix-socket peer.
-// Token is the zero value where the platform has no audit token.
+// On linux Token carries the peer pid alone and is never Valid: the platform
+// has no audit token, so no Requirement can be judged against it.
 type Peer struct {
 	UID   int
 	Token proc.AuditToken

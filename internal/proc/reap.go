@@ -109,10 +109,16 @@ func (s *ladder) reapIdentityWithGrace(ctx context.Context, id identity, session
 	if id.unsafe() {
 		return reapUndetermined, fmt.Errorf("refusing unsafe process identity %d", id.pid)
 	}
-	info, err := s.prober.probe(id.pid)
 	if session != 0 {
+		info, err := s.prober.probe(id.pid)
 		return s.reapSession(ctx, id, session, info, err, boot, termGrace)
 	}
+	target, err := s.signaler.hold(id.pid)
+	if err != nil {
+		return reapUndetermined, fmt.Errorf("hold process %d: %w", id.pid, err)
+	}
+	defer target.release()
+	info, err := s.prober.probe(id.pid)
 	switch {
 	case errors.Is(err, errNoProc):
 		return ReapAbsent, nil
@@ -123,14 +129,14 @@ func (s *ladder) reapIdentityWithGrace(ctx context.Context, id identity, session
 	case info.zombie:
 		return ReapAbsent, nil
 	}
-	return s.reapOrphan(ctx, id, boot)
+	return s.reapOrphan(ctx, id, boot, target)
 }
 
 // reapOrphan delivers SIGTERM, re-verifies identity through every poll of the
 // grace share, then SIGKILLs and settles on observed absence. ESRCH anywhere
 // is success; a PID reused during grace is never SIGKILLed.
-func (s *ladder) reapOrphan(ctx context.Context, id identity, boot uint64) (Reap, error) {
-	gone, err := s.signalGone(id.pid, syscall.SIGTERM)
+func (s *ladder) reapOrphan(ctx context.Context, id identity, boot uint64, target held) (Reap, error) {
+	gone, err := heldGone(target, syscall.SIGTERM)
 	if err != nil {
 		return reapUndetermined, err
 	}
@@ -160,7 +166,7 @@ func (s *ladder) reapOrphan(ctx context.Context, id identity, boot uint64) (Reap
 			break
 		}
 	}
-	gone, err = s.signalGone(id.pid, syscall.SIGKILL)
+	gone, err = heldGone(target, syscall.SIGKILL)
 	if err != nil {
 		return reapUndetermined, err
 	}
@@ -379,6 +385,18 @@ func (s *ladder) signalSessionGroups(
 // signalGone delivers sig to pid, mapping ESRCH (already gone) to gone=true.
 func (s *ladder) signalGone(pid int, sig syscall.Signal) (bool, error) {
 	if err := s.signaler.signal(pid, sig); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return true, nil
+		}
+		return false, err
+	}
+	return false, nil
+}
+
+// heldGone delivers sig through target, mapping ESRCH (already gone) to
+// gone=true.
+func heldGone(target held, sig syscall.Signal) (bool, error) {
+	if err := target.signal(sig); err != nil {
 		if errors.Is(err, syscall.ESRCH) {
 			return true, nil
 		}

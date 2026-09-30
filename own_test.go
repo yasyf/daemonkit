@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -325,8 +326,6 @@ func TestOwnedCloseSettlesEverythingItOwns(t *testing.T) {
 		t.Fatalf("Close() = %v", err)
 	}
 }
-
-func alive(pid int) bool { return syscall.Kill(pid, 0) == nil }
 
 // TestServeSettlesChildrenSpawnedThroughCtx is StageChildren's guarantee: the
 // product spawns and never stops, and Serve's own ladder is what proves the
@@ -1356,10 +1355,14 @@ func adoptHelpers(t *testing.T, count int, marker string) []int {
 // durable record of a process the caller was just told it does not own: Close
 // settles only what it tracks and answers nil over it, and the next generation
 // reclaims the record by terminating a process nothing in this API ever
-// admitted. A burst of adoptions is what saturates the writer, so the shape is
-// reached on an ordinary deadline rather than a contrived one.
+// admitted. A burst of adoptions is what saturates the writer, and the budgets
+// sweep from nothing to 60ms so some expire mid-write however fast the disk
+// syncs.
 func TestARefusedVerbLeavesNoDurableRecord(t *testing.T) {
-	const burst = 32
+	const (
+		burst  = 32
+		budget = 60 * time.Millisecond
+	)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "daemon.records")
 	owned := ownedScopeAt(t, path)
@@ -1374,7 +1377,7 @@ func TestARefusedVerbLeavesNoDurableRecord(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(i)*budget/(burst-1))
 			defer cancel()
 			_, errs[i] = owned.Adopt(ctx, helpers[i])
 		}()
@@ -1392,13 +1395,13 @@ func TestARefusedVerbLeavesNoDurableRecord(t *testing.T) {
 			continue
 		}
 		refused++
-		if strings.Contains(string(blob), strconv.Itoa(helpers[i])) {
+		if regexp.MustCompile(`"pid":\s*` + strconv.Itoa(helpers[i]) + `\b`).Match(blob) {
 			t.Errorf("Adopt(%d) = %v, yet the record store still names that pid; a refusal that records is a process nobody admitted",
 				helpers[i], errs[i])
 		}
 	}
 	if refused == 0 {
-		t.Fatalf("every one of %d concurrent Adopts landed inside its 60ms budget; the burst is what saturates the store's one writer, and a run where none expires exercises no refusal at all", burst)
+		t.Fatalf("every one of %d concurrent Adopts landed inside its budget, the expired one included; a run where none is refused exercises no refusal at all", burst)
 	}
 	closeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	closeErr := owned.Close(closeCtx)
@@ -1415,5 +1418,5 @@ func TestARefusedVerbLeavesNoDurableRecord(t *testing.T) {
 			t.Errorf("helper %d was terminated by a generation that had told the caller Adopt(%d) failed", helpers[i], helpers[i])
 		}
 	}
-	t.Logf("%d of %d concurrent Adopts were refused by the 60ms budget; none left a record", refused, burst)
+	t.Logf("%d of %d concurrent Adopts were refused by budgets up to %v; none left a record", refused, burst, budget)
 }

@@ -313,6 +313,38 @@ func TestVerifiedPeerAcquiresLaneSlotOnlyAfterVerification(t *testing.T) {
 	}
 }
 
+func TestGoAwayAcknowledgementFollowsTheLaneSlotRelease(t *testing.T) {
+	server := mustServer(t, stubRuntime{phase: PhaseReady}, Config{})
+	sock := startServing(t, server)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client, err := NewClient(ctx, ClientConfig{
+		Dial:      UnixDialer(sock),
+		Authorize: authorizeTestServer,
+		Lane:      LaneControl,
+	})
+	if err != nil {
+		t.Fatalf("NewClient() = %v", err)
+	}
+	if _, err := client.Health(ctx); err != nil {
+		t.Fatalf("Health() = %v", err)
+	}
+	if got := len(server.controlSlot); got != 1 {
+		t.Fatalf("control slots after admission = %d, want 1", got)
+	}
+
+	server.mu.Lock()
+	closeErr := client.Close(ctx)
+	held := len(server.controlSlot)
+	server.mu.Unlock()
+	if closeErr != nil {
+		t.Fatalf("Close() = %v", closeErr)
+	}
+	if held != 0 {
+		t.Fatalf("control slots when Close() returned = %d, want 0: the next attach would be refused for capacity", held)
+	}
+}
+
 func frozenDrainPreamble(t *testing.T) []byte {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join("..", "..", "ci", "mixedera", "testdata", "frozen", "drain-preamble.hex"))

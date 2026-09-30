@@ -60,11 +60,6 @@ func TestDaemonValidateForServe(t *testing.T) {
 		{"saturated idle", Daemon{Label: "x", Idle: Grace(math.MaxInt64)}, "Idle"},
 		{"negative idle", Daemon{Label: "x", Idle: Grace(-1)}, "Idle"},
 		{"nil business set", Daemon{Label: "x"}, ""},
-		{
-			"business set naming two bundles",
-			Daemon{Label: "x", Trust: Trust{Business: Requirements{{TeamID: "T", SigningIdentifier: "a"}, {TeamID: "T", SigningIdentifier: "b"}}}},
-			"",
-		},
 		{"business set stated but empty", Daemon{Label: "x", Trust: Trust{Business: Requirements{}}}, "Trust.Business"},
 	}
 	for _, tt := range tests {
@@ -95,22 +90,12 @@ func TestDaemonValidateForClient(t *testing.T) {
 		wantErr string
 	}{
 		{"same-user waiver", Daemon{Label: "x", Trust: stated}, ""},
-		{
-			"signed posture",
-			Daemon{Label: "x", Trust: Trust{Serving: ServingSigned(Requirement{TeamID: "T", SigningIdentifier: "com.example.app"})}},
-			"",
-		},
 		{"unstated serving", Daemon{Label: "x"}, "Trust.Serving"},
 		{"no label", Daemon{Trust: stated}, "not canonical"},
 		{"label escaping the state root", Daemon{Label: "../../evil", Trust: stated}, "not canonical"},
 		{"overlong shutdown", Daemon{Label: "x", Trust: stated, Shutdown: Grace(24*time.Hour + 1)}, "Shutdown"},
 		{"negative shutdown", Daemon{Label: "x", Trust: stated, Shutdown: Grace(-time.Second)}, "Shutdown"},
 		{"handshake is the serving half", Daemon{Label: "x", Trust: stated, Handshake: Grace(math.MaxInt64)}, ""},
-		{
-			"serving requirement that admits nobody",
-			Daemon{Label: "x", Trust: Trust{Serving: ServingSigned(Requirement{TeamID: "T"})}},
-			"Trust.Serving",
-		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

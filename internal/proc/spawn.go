@@ -79,6 +79,37 @@ func (s *Store) Spawn(ctx context.Context, c Cmd, stderr io.Writer) (*Child, err
 	return child, nil
 }
 
+// SpawnLogged starts one owned child whose stdout and stderr both append to
+// the file at logPath. The descriptors are the child's own, so its output needs
+// no copy in this process and outlives it. A logPath that names a symlink, or
+// anything but a regular file this user owns, is refused.
+func (s *Store) SpawnLogged(ctx context.Context, c Cmd, logPath string) (*Child, error) {
+	if err := validateCmd(c); err != nil {
+		return nil, err
+	}
+	out, err := os.OpenFile(logPath, os.O_WRONLY|os.O_APPEND|os.O_CREATE|syscall.O_NOFOLLOW, 0o600) //nolint:gosec // the caller's exact log path
+	if err != nil {
+		return nil, fmt.Errorf("proc: open log %q: %w", logPath, err)
+	}
+	info, err := out.Stat()
+	if err != nil {
+		_ = out.Close()
+		return nil, fmt.Errorf("proc: stat log %q: %w", logPath, err)
+	}
+	if stat, ok := info.Sys().(*syscall.Stat_t); !ok || !info.Mode().IsRegular() || int64(stat.Uid) != int64(os.Geteuid()) {
+		_ = out.Close()
+		return nil, fmt.Errorf("proc: log %q is not a regular file this user owns", logPath)
+	}
+	fd, err := syscall.Dup(int(out.Fd()))
+	if err != nil {
+		_ = out.Close()
+		return nil, fmt.Errorf("proc: duplicate log descriptor: %w", err)
+	}
+	syscall.CloseOnExec(fd)
+	errOut := os.NewFile(uintptr(fd), logPath)
+	return s.spawn(ctx, c, out, errOut)
+}
+
 func (s *Store) spawn(ctx context.Context, c Cmd, childOut, childErr *os.File) (*Child, error) {
 	if err := validateCmd(c); err != nil {
 		return nil, err
