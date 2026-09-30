@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/daemonkit/durable"
 	"github.com/yasyf/daemonkit/internal/proc"
 	"github.com/yasyf/daemonkit/internal/realhome"
 	"golang.org/x/sys/unix"
@@ -738,6 +739,37 @@ func TestAnExitThatCannotProveTheReapEndsTheSupervisor(t *testing.T) {
 	time.Sleep(4 * testThrottle)
 	if recorded := starts(t, pids, 1); len(recorded) != 1 {
 		t.Fatalf("the service started %d times, want only the first", len(recorded))
+	}
+}
+
+// TestASupervisorThatCannotReclaimThePreviousChildStartsNothing is the restart
+// half of the ownership rule. The record a previous supervisor left names this
+// test process, which no reap ladder will settle, so the next supervisor must
+// return before it starts the applied service beside that record.
+func TestASupervisorThatCannotReclaimThePreviousChildStartsNothing(t *testing.T) {
+	testHome(t)
+	const name = "com.example.unreclaimed"
+	previous := unsupervised(t, name)
+	if _, err := previous.store.Adopt(bounded(t, proc.SettleGrace), os.Getpid()); err != nil {
+		t.Fatalf("Adopt() = %v", err)
+	}
+	if err := previous.store.Close(); err != nil {
+		t.Fatalf("Close() = %v", err)
+	}
+	program, pids := script(t, "exec sleep 600")
+	data, err := durable.Marshal(service(t, name, program, RestartAlways))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := durable.WriteFile(previous.where.spec(), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := run(bounded(t, 30*time.Second), name, testThrottle); err == nil || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a supervisor over an unreclaimed record returned %v, want a refusal", err)
+	}
+	if started, err := os.ReadFile(pids); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the service started beside the unreclaimed record: pids %q, %v", started, err)
 	}
 }
 
