@@ -6,6 +6,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.1] - 2026-09-30
+
+### Fixed
+
+- A daemon launched by launchd no longer loses the ability to spawn once the
+  user's process count grows. Every macOS spawn lowers `RLIMIT_NPROC` for the
+  fork and then restores it. launchd hands agents a hard limit of 16000, but
+  the kernel clamps a non-root hard limit to `kern.maxprocperuid` (10666) on
+  the first `setrlimit`, so restoring the original pair asked to raise the
+  hard limit and failed with `EPERM`. The failure was discarded, so the soft
+  limit stayed at the first spawn's cap, the process count at that moment
+  plus 400, for the life of the process. Once the user's processes passed that
+  ceiling, every later spawn failed with `EAGAIN` until the daemon restarted.
+  The restore now keeps the hard limit the kernel applied, and a restore that
+  still fails panics instead of leaving the limit lowered.
+- The spawn cap counts the user's processes by real UID, the ID the kernel
+  charges a fork to, instead of by effective UID, which undercounted by about
+  150 on a busy machine and cut into the headroom.
+
+### Known limits
+
+- A child still keeps the cap it inherited at spawn, its spawn-time process
+  count plus 400, for its whole life. A long-lived child's own forks fail with
+  `EAGAIN` once the user's other processes grow past that.
+
 ## [0.32.0] - 2026-09-30
 
 ### Added
@@ -1672,7 +1697,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.32.0...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.32.1...HEAD
+[0.32.1]: https://github.com/yasyf/daemonkit/compare/v0.32.0...v0.32.1
 [0.32.0]: https://github.com/yasyf/daemonkit/compare/v0.31.1...v0.32.0
 [0.31.1]: https://github.com/yasyf/daemonkit/compare/v0.31.0...v0.31.1
 [0.31.0]: https://github.com/yasyf/daemonkit/compare/v0.30.1...v0.31.0
