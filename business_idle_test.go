@@ -26,14 +26,19 @@ func TestBusinessReattachesPastAnIdleReclaimedSession(t *testing.T) {
 	product := &countingProduct{}
 	sock := serveBusinessProduct(t, wire.Config{Schemas: wire.Schemas{businessSchema}, Idle: businessIdle}, product)
 	var attaches atomic.Int32
+	var first atomic.Pointer[wire.Client]
 	lane := capacityLane(t, func(ctx context.Context) (*wire.Client, error) {
 		attaches.Add(1)
-		return wire.NewClient(ctx, wire.ClientConfig{
+		session, err := wire.NewClient(ctx, wire.ClientConfig{
 			Dial:      wire.UnixDialer(sock),
 			Authorize: wiretest.AuthorizeTestServer,
 			Lane:      wire.LaneBusiness,
 			Schema:    businessSchema,
 		})
+		if err == nil {
+			first.CompareAndSwap(nil, session)
+		}
+		return session, err
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -46,12 +51,8 @@ func TestBusinessReattachesPastAnIdleReclaimedSession(t *testing.T) {
 	if _, err := lane.Call(ctx, echoOp, []byte("before")); err != nil {
 		t.Fatalf("Call() = %v, want a reply", err)
 	}
-	reclaimed, err := lane.acquire(ctx)
-	if err != nil {
-		t.Fatalf("acquire() = %v, want the retained session", err)
-	}
 	deadline := time.Now().Add(5 * time.Second)
-	for reclaimed.Failure() == nil {
+	for first.Load().Failure() == nil {
 		if time.Now().After(deadline) {
 			t.Fatal("the daemon never reclaimed the idle session")
 		}
