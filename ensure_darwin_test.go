@@ -252,12 +252,3 @@ func signRunnable(t *testing.T, program string) {
 		t.Fatalf("codesign %q: %v\n%s", program, err, out)
 	}
 }
-
-func programPath(t *testing.T, d Daemon) string {
-	t.Helper()
-	path, err := d.Program.path(mustElement(t, d.Label))
-	if err != nil {
-		t.Fatalf("Program.path() error = %v", err)
-	}
-	return path
-}
