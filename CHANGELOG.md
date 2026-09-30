@@ -18,6 +18,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   points and never silently downgrade to same-user trust. macOS code-signing
   trust is unchanged.
 
+### Fixed
+
+- A session closed with `Control.Close` or `Business.Close` now has its lane
+  slot back before the close returns. The daemon acknowledged the close first
+  and freed the slot afterwards, so an attach made right after a close could
+  arrive in between and be refused with `ErrSessionCapacity`. The control lane
+  holds one session, and `Client.Ensure` closes its observing session and
+  attaches another to drain the incumbent, so an upgrade could fail with
+  `wire: session capacity exhausted` against a daemon nobody else was
+  attached to. The daemon now frees the slot and then acknowledges.
+
 ## [0.31.1] - 2026-09-16
 
 ### Fixed

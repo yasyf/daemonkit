@@ -451,7 +451,7 @@ func (s *Server) serveSession(
 		releaseOnce()
 		s.sessionWG.Done()
 	}()
-	err := s.runSession(ctx, conn, codec, hello.Lane, hello.Schema, peer, generation)
+	err := s.runSession(ctx, conn, codec, hello.Lane, hello.Schema, peer, generation, releaseOnce)
 	if err != nil && !isDisconnect(err) {
 		s.log.Debug("wire: session ended", "err", err)
 	}
@@ -465,6 +465,7 @@ func (s *Server) runSession(
 	schema string,
 	peer trust.Peer,
 	generation []byte,
+	release func(),
 ) error {
 	stopContext := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stopContext()
@@ -481,6 +482,7 @@ func (s *Server) runSession(
 		lane:         lane,
 		schema:       schema,
 		generation:   generation,
+		release:      release,
 		outbound:     make(chan sessionOutbound, 4*s.concurrency),
 		requestsDone: make(chan struct{}),
 		writerDone:   make(chan struct{}),
