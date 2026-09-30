@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Linux runtime support on amd64 and arm64, including process identity from
+  `/proc`, pidfd signalling, suspended spawn through ptrace, and same-UID peer
+  credentials. The Linux-only `supervise` package and `daemonkit.Supervise`
+  run one foreground supervisor per label without root or systemd, persist
+  the applied service across supervisor restarts, and serve the existing
+  `Client.Ensure` and `Client.Stop` calls. Linux accepts `ServingSameUser()`;
+  signed policies fail with `ErrNoVerifier` at validation and runtime entry
+  points and never silently downgrade to same-user trust. macOS code-signing
+  trust is unchanged.
+
 ## [0.31.1] - 2026-09-16
 
 ### Fixed
