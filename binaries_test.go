@@ -2,11 +2,13 @@ package daemonkit
 
 import (
 	"go/ast"
+	"go/build/constraint"
 	"go/parser"
 	"go/token"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -66,9 +68,12 @@ func TestEverySystemBinaryNamedByATestExists(t *testing.T) {
 		if !strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
-		parsed, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
+		parsed, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution|parser.ParseComments)
 		if err != nil {
 			return err
+		}
+		if !buildsHere(path, parsed) {
+			return nil
 		}
 		ast.Inspect(parsed, func(node ast.Node) bool {
 			literal, ok := node.(*ast.BasicLit)
@@ -89,6 +94,45 @@ func TestEverySystemBinaryNamedByATestExists(t *testing.T) {
 	if walkErr != nil {
 		t.Fatalf("walk the module's test sources: %v", walkErr)
 	}
+}
+
+// buildsHere reports whether a test file can compile for this operating system
+// at all. A file another platform owns names that platform's binaries, and
+// holding them against this machine would fail the guard on a file it never
+// builds. Only the operating system decides: every other tag is tried both
+// ways, so a file behind an opt-in tag is still walked.
+func buildsHere(path string, file *ast.File) bool {
+	name := strings.TrimSuffix(filepath.Base(path), "_test.go")
+	for _, system := range []string{"darwin", "linux"} {
+		if strings.HasSuffix(name, "_"+system) && system != runtime.GOOS {
+			return false
+		}
+	}
+	for _, group := range file.Comments {
+		if group.Pos() > file.Package {
+			break
+		}
+		for _, comment := range group.List {
+			if !constraint.IsGoBuild(comment.Text) {
+				continue
+			}
+			expr, err := constraint.Parse(comment.Text)
+			if err != nil {
+				return true
+			}
+			satisfiable := false
+			for _, other := range []bool{true, false} {
+				satisfiable = satisfiable || expr.Eval(func(tag string) bool {
+					if tag == "darwin" || tag == "linux" {
+						return tag == runtime.GOOS
+					}
+					return other
+				})
+			}
+			return satisfiable
+		}
+	}
+	return true
 }
 
 func namesASystemBinary(value string) bool {

@@ -125,7 +125,6 @@ func TestCmdAcceptsTheShapesEachVerbOwns(t *testing.T) {
 		{"run with a cap", "Run", ChannelNone, Cmd{Path: "/bin/echo", Exec: ServingSameUser(), MaxOutput: 16}},
 		{"handoff with limits", "Spawn", ChannelHandoff, Cmd{Path: "/bin/echo", Exec: ServingSameUser(), Limits: Limits{MaxFrame: 1 << 20, Concurrency: 4}}},
 		{"stdio with stderr only", "Spawn", ChannelStdio, Cmd{Path: "/bin/echo", Exec: ServingSameUser()}},
-		{"signed posture", "Spawn", ChannelNone, Cmd{Path: "/bin/echo", Exec: ServingSigned(Requirement{TeamID: "T", SigningIdentifier: "id"})}},
 		{"session on spawn", "Spawn", ChannelNone, Cmd{Path: "/bin/echo", Exec: ServingSameUser(), Session: true}},
 		{"nil env inherits", "Run", ChannelNone, Cmd{Path: "/bin/echo", Exec: ServingSameUser(), Env: nil}},
 	}

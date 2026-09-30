@@ -330,7 +330,7 @@ func TestServeChannelServesTheSpawnSuspendedIdentityAfterSettlement(t *testing.T
 	if exit.Code != 0 || exit.Signal != 0 {
 		t.Fatalf("child exit = %+v, want clean", exit)
 	}
-	if !child.token.Valid() || child.token.PID() != child.PID() {
+	if !pinsSpawned(child.token, child.PID()) {
 		t.Fatalf("pinned token = pid %d valid %t, want the spawned pid %d",
 			child.token.PID(), child.token.Valid(), child.PID())
 	}

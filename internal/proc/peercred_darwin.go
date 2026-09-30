@@ -2,11 +2,6 @@ package proc
 
 import "golang.org/x/sys/unix"
 
-type peerCreds struct {
-	pid int
-	uid int
-}
-
 func peerCredentials(fd int) (peerCreds, error) {
 	pid, err := unix.GetsockoptInt(fd, unix.SOL_LOCAL, unix.LOCAL_PEERPID)
 	if err != nil {

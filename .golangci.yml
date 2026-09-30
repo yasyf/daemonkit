@@ -48,6 +48,11 @@ linters:
       - linters: [gosec]
         text: "G703"
         path: ^internal/wiregen/
+      # supervise joins its socket and state paths from a label the label rule
+      # accepted, inside the state directory that label names.
+      - linters: [gosec]
+        text: "G703"
+        path: ^supervise/
       # Same teardown idiom; exclude-functions can't name every concrete Close.
       - linters: [errcheck]
         text: 'Error return value of `.*\.Close` is not checked'

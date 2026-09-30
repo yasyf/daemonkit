@@ -13,6 +13,7 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/yasyf/daemonkit/internal/label"
 	"github.com/yasyf/daemonkit/internal/realhome"
 )
 
@@ -292,17 +293,9 @@ func validBundleIdentifier(value string) bool {
 // every path daemonkit joins a Label into is joined past: exactly one path
 // component, no leading or trailing dot, no "..", and nothing outside
 // [A-Za-z0-9.-].
-func ValidateLabel(label string) error {
-	if label == "" || filepath.Base(label) != label || label == "." || label == ".." ||
-		strings.HasPrefix(label, ".") || strings.HasSuffix(label, ".") || strings.Contains(label, "..") {
-		return fmt.Errorf("launchd: launch agent label %q is not canonical", label)
-	}
-	for _, value := range label {
-		if (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') ||
-			(value >= '0' && value <= '9') || value == '.' || value == '-' {
-			continue
-		}
-		return fmt.Errorf("launchd: launch agent label %q is not canonical", label)
+func ValidateLabel(name string) error {
+	if err := label.Validate(name); err != nil {
+		return fmt.Errorf("launchd: launch agent %w", err)
 	}
 	return nil
 }

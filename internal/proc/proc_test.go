@@ -81,6 +81,17 @@ func (s *funcSignaler) signal(pid int, sig syscall.Signal) error {
 	return s.fn(pid, sig)
 }
 
+func (s *funcSignaler) hold(pid int) (held, error) { return funcHold{signaler: s, pid: pid}, nil }
+
+type funcHold struct {
+	signaler *funcSignaler
+	pid      int
+}
+
+func (h funcHold) signal(sig syscall.Signal) error { return h.signaler.signal(h.pid, sig) }
+
+func (funcHold) release() {}
+
 func (s *funcSignaler) signals() []sentSignal {
 	s.mu.Lock()
 	defer s.mu.Unlock()

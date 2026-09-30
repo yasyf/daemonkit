@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"slices"
 	"strings"
 	"time"
@@ -14,7 +13,6 @@ import (
 	"github.com/yasyf/daemonkit/internal/flock"
 	"github.com/yasyf/daemonkit/internal/proc"
 	"github.com/yasyf/daemonkit/internal/wire"
-	"github.com/yasyf/daemonkit/launchd"
 )
 
 const (
@@ -156,7 +154,7 @@ func moved(err error) bool {
 	return errors.Is(err, ErrWrongIncumbent) || errors.Is(err, errPinMoved)
 }
 
-func (c *Client) ensureOnce(ctx context.Context, want string, agent launchd.Agent, replaced bool) (Ensured, error) {
+func (c *Client) ensureOnce(ctx context.Context, want string, agent service, replaced bool) (Ensured, error) {
 	world, action, err := c.settle(ctx, want, agent)
 	if err != nil {
 		return Ensured{}, err
@@ -175,7 +173,7 @@ func (c *Client) ensureOnce(ctx context.Context, want string, agent launchd.Agen
 	} else if err := c.proveRecorded(ctx, world); err != nil {
 		return Ensured{}, err
 	}
-	if err := launchd.Apply(ctx, c.launchctl, agent); err != nil {
+	if err := c.applyService(ctx, agent); err != nil {
 		return Ensured{}, fmt.Errorf("daemonkit: apply %q: %w", agent.Label, err)
 	}
 	after, err := c.WaitReady(ctx)
@@ -200,7 +198,7 @@ func (c *Client) ensureOnce(ctx context.Context, want string, agent launchd.Agen
 // all: it is classified before absence, because a dial that never left this
 // process must never read as nothing serving and start a second daemon over a
 // live one.
-func (c *Client) settle(ctx context.Context, want string, agent launchd.Agent) (converge.World, Action, error) {
+func (c *Client) settle(ctx context.Context, want string, agent service) (converge.World, Action, error) {
 	observing := Grace(left(ctx)).mint("ensure").Share("observe", observeShare)
 	timer := time.NewTimer(attachCadence(ctx))
 	defer timer.Stop()
@@ -235,20 +233,6 @@ func (c *Client) settle(ctx context.Context, want string, agent launchd.Agent) (
 		case <-timer.C:
 		}
 	}
-}
-
-func (c *Client) observeWorld(ctx context.Context, agent launchd.Agent) (converge.World, error) {
-	record, err := c.record()
-	if err != nil {
-		return converge.World{}, err
-	}
-	return converge.Observe(ctx, converge.Sources{
-		Serving:    c.servedHealth,
-		Recorded:   proc.ReadOwner,
-		RecordPath: record,
-		Agent:      agent,
-		Launchctl:  c.launchctl,
-	})
 }
 
 // servedHealth attaches the control lane, reads the pinned incumbent's report,
@@ -497,46 +481,6 @@ func (c *Client) inventoryClear(observed proc.Identity) error {
 	return fmt.Errorf("%w: live process(es) remain: %s", ErrUnsettled, strings.Join(names, ", "))
 }
 
-// AgentPath is the PATH every daemonkit LaunchAgent runs under. launchd's own
-// default omits the Homebrew prefixes, so a daemon that execs `git` reaches the
-// Xcode shim at /usr/bin/git, which re-execs Xcode's binary and pays a second
-// endpoint-security exec check on every call; a per-machine `launchctl config
-// user path` only applies after a reboot, and a job started before it keeps the
-// bare default. Rendering the value into the plist makes the daemon's PATH a
-// fact of the spec rather than of when the job was bootstrapped.
-const AgentPath = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-
-// agent is the LaunchAgent that runs this daemon. Every field is already on
-// the Daemon, so nothing about the job is declared twice; an unset Log sinks
-// to the state directory's daemon.log.
-func (d Daemon) agent() (launchd.Agent, error) {
-	el, err := d.Label.element()
-	if err != nil {
-		return launchd.Agent{}, err
-	}
-	program, err := d.Program.path(el)
-	if err != nil {
-		return launchd.Agent{}, err
-	}
-	restart, err := d.Restart.launchd()
-	if err != nil {
-		return launchd.Agent{}, err
-	}
-	log := d.Log
-	if log == "" {
-		log = el.state().LogPath()
-	}
-	return launchd.Agent{
-		Label:         el.label,
-		Program:       program,
-		Args:          d.Args,
-		LogPath:       log,
-		Env:           map[string]string{"PATH": AgentPath},
-		RestartPolicy: restart,
-		ExitTimeOut:   d.exitTimeOut(),
-	}, nil
-}
-
 // exitTimeOut is Shutdown as launchd's own ExitTimeOut key: the SIGKILL that
 // backstops a drain which wedges past the budget the daemon was promised.
 // launchd counts it in whole seconds and kills the instant they elapse, so a
@@ -548,36 +492,6 @@ func (d Daemon) exitTimeOut() time.Duration {
 		return grace + time.Second - remainder
 	}
 	return grace
-}
-
-func (r Restart) launchd() (launchd.RestartPolicy, error) {
-	switch r {
-	case RestartNever:
-		return launchd.NoRestart, nil
-	case RestartOnFailure:
-		return launchd.RestartOnFailure, nil
-	case RestartAlways:
-		return launchd.RestartAlways, nil
-	default:
-		return 0, fmt.Errorf("daemonkit: unknown restart policy %d", r)
-	}
-}
-
-// launchctl runs one /bin/launchctl invocation to completion. An exit code is
-// an answer, not a failure: only a launchctl that could not be run at all is
-// an error, which is the boundary launchd's single outcome classifier reads. A
-// launchctl that never ran carries no status either: reporting one as zero had
-// the classifier prescribe decoding a status launchd never returned.
-func launchctl(ctx context.Context, path string, args ...string) (string, int, error) {
-	out, err := exec.CommandContext(ctx, path, args...).CombinedOutput()
-	var exit *exec.ExitError
-	if errors.As(err, &exit) {
-		return string(out), exit.ExitCode(), nil
-	}
-	if err != nil {
-		return string(out), -1, err
-	}
-	return string(out), 0, nil
 }
 
 func left(ctx context.Context) time.Duration {

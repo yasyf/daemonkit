@@ -10,7 +10,6 @@ import (
 	"sync"
 
 	"github.com/yasyf/daemonkit/internal/proc"
-	"github.com/yasyf/daemonkit/internal/trust"
 )
 
 // spawnNonceBytes is the attach nonce's fixed width, the one the spawned wire
@@ -208,12 +207,9 @@ func (o *Owned) Spawn(ctx context.Context, c Cmd, channel Channel, stderr io.Wri
 		if err := verify(pid); err != nil {
 			return err
 		}
-		minted, err := trust.ProcessToken(pid)
+		minted, err := suspendedToken(pid)
 		if err != nil {
-			return fmt.Errorf("daemonkit: read the suspended child's audit token: %w", err)
-		}
-		if !minted.Valid() || minted.PID() != pid {
-			return fmt.Errorf("daemonkit: suspended child audit token names pid %d, want %d", minted.PID(), pid)
+			return err
 		}
 		token = minted
 		return nil

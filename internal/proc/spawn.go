@@ -79,6 +79,25 @@ func (s *Store) Spawn(ctx context.Context, c Cmd, stderr io.Writer) (*Child, err
 	return child, nil
 }
 
+// SpawnLogged starts one owned child whose stdout and stderr both append to
+// the file at logPath. The descriptors are the child's own, so its output needs
+// no copy in this process and outlives it.
+func (s *Store) SpawnLogged(ctx context.Context, c Cmd, logPath string) (*Child, error) {
+	if err := validateCmd(c); err != nil {
+		return nil, err
+	}
+	out, err := os.OpenFile(logPath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600) //nolint:gosec // the caller's exact log path
+	if err != nil {
+		return nil, fmt.Errorf("proc: open log %q: %w", logPath, err)
+	}
+	errOut, err := os.OpenFile(logPath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600) //nolint:gosec // the caller's exact log path
+	if err != nil {
+		_ = out.Close()
+		return nil, fmt.Errorf("proc: open log %q: %w", logPath, err)
+	}
+	return s.spawn(ctx, c, out, errOut)
+}
+
 func (s *Store) spawn(ctx context.Context, c Cmd, childOut, childErr *os.File) (*Child, error) {
 	if err := validateCmd(c); err != nil {
 		return nil, err

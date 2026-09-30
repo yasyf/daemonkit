@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/internal/wire"
-	"github.com/yasyf/daemonkit/launchd"
 	"github.com/yasyf/daemonkit/paths"
 )
 
@@ -43,12 +42,12 @@ type Label string
 type element struct{ label string }
 
 // element refuses a Label that is not a launchd job label. The rule lives in
-// launchd and is read from there rather than copied: the Label names a
-// LaunchAgent before it names anything else, so the strictest reading of it is
-// the only one, and a second rule at any of the paths that derive from it is a
-// rule that disagrees.
+// the platform's service layer and is read from there rather than copied: the
+// Label names a service before it names anything else, so the strictest
+// reading of it is the only one, and a second rule at any of the paths that
+// derive from it is a rule that disagrees.
 func (l Label) element() (element, error) {
-	if err := launchd.ValidateLabel(string(l)); err != nil {
+	if err := validateLabel(string(l)); err != nil {
 		return element{}, fmt.Errorf("daemonkit: %w", err)
 	}
 	return element{label: string(l)}, nil
@@ -141,6 +140,16 @@ func (d Daemon) ValidateForServe() error {
 	}
 	if d.Trust.Business != nil && len(d.Trust.Business) == 0 {
 		return errors.New("daemonkit: Trust.Business is stated but empty; leave it nil for the same-EUID floor alone")
+	}
+	if d.Trust.Control != nil {
+		if err := requirementVerifiable("Trust.Control"); err != nil {
+			return err
+		}
+	}
+	if d.Trust.Business != nil {
+		if err := requirementVerifiable("Trust.Business"); err != nil {
+			return err
+		}
 	}
 	return nil
 }

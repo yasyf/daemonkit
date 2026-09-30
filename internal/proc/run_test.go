@@ -46,7 +46,7 @@ func TestRunTruncationIsDataNotError(t *testing.T) {
 	s, _ := newTestStore(t)
 	result, err := s.Run(runContext(t, 10*time.Second), Cmd{
 		Path:      "/bin/sh",
-		Args:      []string{"-c", "printf 0123456789abcdef"},
+		Args:      []string{"-c", "trap '' TERM; printf 0123456789abcdef"},
 		MaxOutput: 8,
 	}, unheld)
 	if err != nil {

@@ -9,7 +9,6 @@ import (
 	"github.com/yasyf/daemonkit/internal/converge"
 	"github.com/yasyf/daemonkit/internal/flock"
 	"github.com/yasyf/daemonkit/internal/proc"
-	"github.com/yasyf/daemonkit/launchd"
 )
 
 // Stop makes nothing serve at this client's label and removes the label's
@@ -133,7 +132,7 @@ func (c *Client) observeRuntime(ctx context.Context) (converge.World, error) {
 
 // removeAgent takes the label's LaunchAgent down once departure is proven.
 func (c *Client) removeAgent(ctx context.Context, label string) error {
-	if err := launchd.Remove(ctx, c.launchctl, label); err != nil {
+	if err := c.removeService(ctx, label); err != nil {
 		return fmt.Errorf("daemonkit: remove agent %q: %w", label, err)
 	}
 	return nil

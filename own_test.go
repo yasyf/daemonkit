@@ -326,8 +326,6 @@ func TestOwnedCloseSettlesEverythingItOwns(t *testing.T) {
 	}
 }
 
-func alive(pid int) bool { return syscall.Kill(pid, 0) == nil }
-
 // TestServeSettlesChildrenSpawnedThroughCtx is StageChildren's guarantee: the
 // product spawns and never stops, and Serve's own ladder is what proves the
 // child gone before the process leaves.

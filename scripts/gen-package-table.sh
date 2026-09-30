@@ -13,10 +13,10 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
-# The docs job runs on ubuntu, and a darwin-tagged package drops out of
-# `go list ./...` entirely under any other GOOS — launchd would silently
-# vanish from the rendered table.
-export GOOS=darwin
+# A package tagged for one GOOS drops out of `go list ./...` entirely under
+# the other — launchd on a linux runner, supervise on a mac — so the table is
+# the union of both listings, whichever host renders it.
+platforms=(darwin linux)
 
 targets=(
   "README.md"
@@ -31,7 +31,9 @@ table() {
   module="$(go list -m)"
   echo "| Package | Owns | Files | Lines |"
   echo "|---|---|---|---|"
-  go list -e -f '{{.ImportPath}}	{{.Name}}	{{.Dir}}	{{.Doc}}' ./... |
+  for goos in "${platforms[@]}"; do
+    GOOS="$goos" go list -e -f '{{.ImportPath}}	{{.Name}}	{{.Dir}}	{{.Doc}}' ./...
+  done | sort -u -t $'\t' -k1,1 |
     while IFS=$'\t' read -r path name dir doc; do
       rel="${path#"$module"}"
       rel="${rel#/}"

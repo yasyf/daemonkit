@@ -2,6 +2,7 @@ package daemonkit
 
 import (
 	"fmt"
+	"runtime"
 
 	"github.com/yasyf/daemonkit/internal/trust"
 )
@@ -59,10 +60,28 @@ func (s Serving) validate(field string) error {
 	if req == nil {
 		return nil
 	}
+	if err := requirementVerifiable(field); err != nil {
+		return err
+	}
 	if err := wireRequirement(req).Validate(); err != nil {
 		return fmt.Errorf("daemonkit: %s: %w", field, err)
 	}
 	return nil
+}
+
+// requirementVerifiable refuses a stated code-signing requirement on a platform
+// with no code identity to judge it against. The verifier denies every peer
+// there anyway; refusing at the config boundary names the field instead of
+// leaving a daemon up that admits nobody, and nothing reads the requirement as
+// the same-user floor.
+func requirementVerifiable(field string) error {
+	if trust.CodeIdentity {
+		return nil
+	}
+	return fmt.Errorf(
+		"daemonkit: %s states a code-signing requirement, and %s has no code identity to verify it against (state ServingSameUser or leave the lane nil): %w",
+		field, runtime.GOOS, ErrNoVerifier,
+	)
 }
 
 // verifyProcess runs the posture against a live process, which may be a child
@@ -74,7 +93,7 @@ func (s Serving) verifyProcess(pid int) error {
 	if req == nil {
 		return nil
 	}
-	if err := trust.VerifyProcess(pid, *wireRequirement(req)); err != nil {
+	if err := trust.VerifyProcess(pid, *wireRequirement(req)); err != nil { //nolint:staticcheck // linux denies every requirement, so there the verdict is never nil
 		return fmt.Errorf("%w: pid %d: %w", ErrUntrusted, pid, err)
 	}
 	return nil
