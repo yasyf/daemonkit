@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/durable"
+	"github.com/yasyf/daemonkit/internal/flock"
+	"github.com/yasyf/daemonkit/internal/proc"
 )
 
 func preservingOwned(t *testing.T) (*Owned, string) {
@@ -276,7 +278,8 @@ func TestPreserveCloseTimeoutRetainsOwnershipLock(t *testing.T) {
 	if err := o.Close(bounded(t, 25*time.Millisecond)); !errors.Is(err, ErrUnsettled) {
 		t.Fatalf("Close() = %v", err)
 	}
-	if _, err := OwnProcesses(bounded(t, 25*time.Millisecond), path); !errors.Is(err, durable.ErrLockBusy) {
+	ownership := flock.Spec{Path: proc.LockPath(path), Mode: flock.Exclusive, Deadline: time.Nanosecond}
+	if _, err := ownership.TryAcquire(); !errors.Is(err, durable.ErrLockBusy) {
 		t.Fatalf("timed out preservation released ownership: %v", err)
 	}
 	observation, err := child.Observe(bounded(t, time.Second))

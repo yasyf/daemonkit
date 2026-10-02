@@ -68,7 +68,10 @@ func (h *Handle) Close() error {
 }
 
 // Acquire waits for ownership until the earlier of ctx cancellation and the
-// spec's explicit Deadline.
+// spec's explicit Deadline. A budget that ends returns the context error; it
+// is joined with ErrLockBusy only when at least one attempt found the lock
+// held, so a context that expires before the first attempt never reports
+// contention.
 func (s Spec) Acquire(ctx context.Context) (*Handle, error) {
 	if err := s.validate(); err != nil {
 		return nil, err
@@ -89,7 +92,8 @@ func (s Spec) Acquire(ctx context.Context) (*Handle, error) {
 }
 
 // AcquireExisting waits for ownership of an already-created exact lock file.
-// It never creates directories or files and never repairs permissions.
+// It never creates directories or files and never repairs permissions, and
+// classifies an ended budget exactly as Acquire does.
 func (s Spec) AcquireExisting(ctx context.Context) (*Handle, error) {
 	if err := s.validate(); err != nil {
 		return nil, err
@@ -152,9 +156,13 @@ func (s Spec) validate() error {
 }
 
 func fileLockPoll(ctx context.Context, f *os.File, path string, mode Mode) (*Handle, error) {
+	contended := false
 	for {
 		if err := ctx.Err(); err != nil {
 			_ = f.Close()
+			if contended {
+				return nil, fmt.Errorf("flock %s: %w after observed contention: %w", path, err, ErrLockBusy)
+			}
 			return nil, fmt.Errorf("flock %s: %w", path, err)
 		}
 		err := tryFileLock(f, mode)
@@ -165,10 +173,9 @@ func fileLockPoll(ctx context.Context, f *os.File, path string, mode Mode) (*Han
 			_ = f.Close()
 			return nil, fmt.Errorf("flock %s: %w", path, err)
 		}
+		contended = true
 		select {
 		case <-ctx.Done():
-			_ = f.Close()
-			return nil, fmt.Errorf("flock %s: %w", path, ctx.Err())
 		case <-time.After(flockPollInterval):
 		}
 	}

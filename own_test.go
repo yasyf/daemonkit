@@ -48,6 +48,25 @@ func bounded(t *testing.T, d time.Duration) context.Context {
 	return ctx
 }
 
+func contendForRecord(t *testing.T, recordPath string) (*Owned, error) {
+	t.Helper()
+	ctx := bounded(t, 30*time.Second)
+	for {
+		round, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+		scope, err := OwnProcesses(round, recordPath)
+		cancel()
+		if err == nil || errors.Is(err, durable.ErrLockBusy) {
+			return scope, err
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("contended OwnProcesses() = %v, want durable.ErrLockBusy", err)
+		}
+		if ctx.Err() != nil {
+			t.Fatal("no bounded OwnProcesses() observed the held record lock within 30s")
+		}
+	}
+}
+
 // TestOwnProcessesExcludesASecondScope is D3's first half: the lock identity is
 // the record path, so a second owner of one record cannot open and cannot then
 // reclaim the first owner's children.
@@ -55,9 +74,7 @@ func TestOwnProcessesExcludesASecondScope(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "daemon.records")
 	first := ownedScopeAt(t, path)
 
-	busy, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
-	defer cancel()
-	_, err := OwnProcesses(busy, path)
+	_, err := contendForRecord(t, path)
 	if !errors.Is(err, durable.ErrLockBusy) {
 		t.Fatalf("second OwnProcesses() = %v, want durable.ErrLockBusy", err)
 	}
@@ -93,14 +110,11 @@ func TestOwnProcessesAgainstAServingDaemonIsRefused(t *testing.T) {
 		t.Fatalf("Socket: %v", err)
 	}
 	session := awaitControlSession(t, socket)
-	ctx := bounded(t, 20*time.Second)
-	if err := session.WaitReady(ctx); err != nil {
+	if err := session.WaitReady(bounded(t, 20*time.Second)); err != nil {
 		t.Fatalf("WaitReady() = %v", err)
 	}
 
-	busy, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	scope, err := OwnProcesses(busy, d.RecordPath())
+	scope, err := contendForRecord(t, d.RecordPath())
 	if err == nil {
 		closeCtx, cancelClose := context.WithTimeout(context.Background(), 5*time.Second)
 		_ = scope.Close(closeCtx)
@@ -111,7 +125,7 @@ func TestOwnProcessesAgainstAServingDaemonIsRefused(t *testing.T) {
 		t.Fatalf("OwnProcesses() = %v, want durable.ErrLockBusy", err)
 	}
 
-	if _, err := session.Drain(ctx); err != nil {
+	if _, err := session.Drain(bounded(t, 20*time.Second)); err != nil {
 		t.Fatalf("Drain() = %v", err)
 	}
 	select {
