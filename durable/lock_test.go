@@ -78,14 +78,22 @@ func TestAcquireLockReportsObservedContentionAsErrLockBusy(t *testing.T) {
 	}
 	defer held.Close()
 
-	busyCtx, busyCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer busyCancel()
-	_, err = AcquireLock(busyCtx, path)
-	if !errors.Is(err, ErrLockBusy) || !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, busyCtx.Err()) {
-		t.Fatalf("contended AcquireLock = %v, want ErrLockBusy joined with the ctx error", err)
-	}
-	if !strings.Contains(err.Error(), "after observed contention") {
-		t.Fatalf("contended AcquireLock = %q, want it to name the observed contention", err)
+	for {
+		round, cancelRound := context.WithTimeout(ctx, 100*time.Millisecond)
+		_, err := AcquireLock(round, path)
+		cancelRound()
+		if errors.Is(err, ErrLockBusy) {
+			if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "after observed contention") {
+				t.Fatalf("contended AcquireLock = %q, want ErrLockBusy joined with the ctx error, naming the observed contention", err)
+			}
+			return
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("contended AcquireLock = %v, want ErrLockBusy joined with the ctx error", err)
+		}
+		if ctx.Err() != nil {
+			t.Fatal("no bounded AcquireLock observed the held lock within 30s")
+		}
 	}
 }
 

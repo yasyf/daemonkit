@@ -470,9 +470,13 @@ func TestFileLockPollClassifiesASpentContextByObservedContention(t *testing.T) {
 			if tt.held && observed != 2 {
 				t.Fatalf("poll observed the context %d times, want 2: once before the one attempt, once after", observed)
 			}
-			if got := openDescriptors(t); got != descriptors {
-				t.Fatalf("open descriptors = %d after a failed poll, want %d: the lock fd leaked", got, descriptors)
+			if _, err := f.Stat(); !errors.Is(err, os.ErrClosed) {
+				t.Fatalf("Stat on the lock fd after a failed poll = %v, want os.ErrClosed", err)
 			}
+			if got := openDescriptors(t); got != descriptors {
+				t.Fatalf("open descriptors = %d after a failed poll, want %d", got, descriptors)
+			}
+			runtime.KeepAlive(f)
 			if err := release(); err != nil {
 				t.Fatal(err)
 			}
@@ -503,6 +507,7 @@ func TestFileLockAcquireReleasesItsDescriptorOnClose(t *testing.T) {
 	if got := openDescriptors(t); got != descriptors {
 		t.Fatalf("open descriptors after Close = %d, want %d", got, descriptors)
 	}
+	runtime.KeepAlive(h)
 	again, err := spec.Acquire(t.Context())
 	if err != nil {
 		t.Fatalf("re-acquire after Close = %v", err)

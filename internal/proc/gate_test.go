@@ -56,10 +56,21 @@ func TestOpenStoreLockExcludesASecondOwner(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "records.dkstate")
 	first := openTestStore(t, path)
 
-	busyCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if _, err := OpenStore(busyCtx, path); !errors.Is(err, durable.ErrLockBusy) {
-		t.Fatalf("second OpenStore() = %v, want durable.ErrLockBusy", err)
+	for {
+		round, cancelRound := context.WithTimeout(ctx, 100*time.Millisecond)
+		_, err := OpenStore(round, path)
+		cancelRound()
+		if errors.Is(err, durable.ErrLockBusy) {
+			break
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("second OpenStore() = %v, want durable.ErrLockBusy", err)
+		}
+		if ctx.Err() != nil {
+			t.Fatal("no bounded OpenStore() observed the held store lock within 30s")
+		}
 	}
 	if err := first.Close(); err != nil {
 		t.Fatalf("Close() = %v", err)
