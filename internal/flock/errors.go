@@ -2,8 +2,10 @@ package flock
 
 import "errors"
 
-// ErrLockBusy means Spec.TryAcquire found the lock held by another owner;
-// consumers alias it and match with errors.Is.
+// ErrLockBusy means an attempt found the lock held by another owner: the one
+// attempt Spec.TryAcquire makes, or an attempt within a bounded Acquire whose
+// budget then ended, where it is joined with the context error. Consumers
+// alias it and match with errors.Is.
 var ErrLockBusy = errors.New("durable: lock held by another owner")
 
 // ErrInvalidFileLock means a file-lock specification is incomplete or unsafe.

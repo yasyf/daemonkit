@@ -276,7 +276,7 @@ func TestPreserveCloseTimeoutRetainsOwnershipLock(t *testing.T) {
 	if err := o.Close(bounded(t, 25*time.Millisecond)); !errors.Is(err, ErrUnsettled) {
 		t.Fatalf("Close() = %v", err)
 	}
-	if _, err := OwnProcesses(bounded(t, 25*time.Millisecond), path); !errors.Is(err, durable.ErrLockBusy) {
+	if _, err := OwnProcesses(bounded(t, 250*time.Millisecond), path); !errors.Is(err, durable.ErrLockBusy) {
 		t.Fatalf("timed out preservation released ownership: %v", err)
 	}
 	observation, err := child.Observe(bounded(t, time.Second))

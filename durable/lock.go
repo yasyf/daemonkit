@@ -2,7 +2,6 @@ package durable
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -10,20 +9,19 @@ import (
 	"github.com/yasyf/daemonkit/internal/flock"
 )
 
-// ErrLockBusy means the lock was held by another owner for the caller's whole
-// deadline. It is the one identity the fleet aliases and matches with
-// errors.Is; it is declared exactly once (aliased here from daemonkit's
-// internal flock, per STYLEGUIDE.md § Sentinel identity is load-bearing).
+// ErrLockBusy means an acquisition attempt found the lock held by another
+// owner. It is the one identity the fleet aliases and matches with errors.Is,
+// declared once (STYLEGUIDE.md § Sentinel identity is load-bearing).
 var ErrLockBusy = flock.ErrLockBusy
 
 // AcquireLock takes exclusive ownership of the lock file at path, bounded by
-// ctx, which must carry a deadline. Exclusion covers goroutines as well as
-// processes, and by one mechanism rather than two: flock(2) binds ownership to
-// the open file description, and every acquisition opens its own, so two
-// goroutines contending in one process exclude each other exactly as two
-// processes do. A caller needs no in-process mutex beside this lock. A
-// deadline that expires with the lock still held returns ErrLockBusy joined
-// with ctx.Err().
+// ctx, which must carry a deadline. flock(2) binds ownership to the open file
+// description and every acquisition opens its own, so goroutines in one
+// process exclude each other exactly as processes do, with no mutex beside it.
+//
+// An ended budget returns ctx.Err(), joined with ErrLockBusy only when an
+// attempt within it found the lock held; a context spent before the first
+// attempt is the context error alone, never contention.
 //
 // The lock is not reentrant. A scope that mutates several files under one
 // lock holds one Lock over all of them and orders nested locks itself —
@@ -40,9 +38,6 @@ func AcquireLock(ctx context.Context, path string) (*Lock, error) {
 		Deadline: max(time.Until(deadline), time.Nanosecond),
 	}).Acquire(ctx)
 	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
-			return nil, errors.Join(ErrLockBusy, ctxErr)
-		}
 		return nil, err
 	}
 	return &Lock{handle: handle}, nil

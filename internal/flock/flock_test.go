@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -337,20 +338,177 @@ func TestFileLockSpecValidation(t *testing.T) {
 	}
 }
 
-func TestFileLockAcquireHonorsPreCanceledContext(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+func expiredContext(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	t.Cleanup(cancel)
+	return ctx
+}
+
+func cancelledContext(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	cancel()
-	path := filepath.Join(t.TempDir(), "canceled.lock")
-	_, err := (Spec{
-		Path:     path,
-		Mode:     Exclusive,
-		Deadline: time.Second,
-	}).Acquire(ctx)
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Acquire err = %v, want context.Canceled", err)
+	return ctx
+}
+
+func TestFileLockAcquireSpentContextIsOnlyTheContextError(t *testing.T) {
+	tests := []struct {
+		name string
+		ctx  func(t *testing.T) context.Context
+		want error
+	}{
+		{"expired", expiredContext, context.DeadlineExceeded},
+		{"cancelled", cancelledContext, context.Canceled},
 	}
-	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("pre-canceled Acquire created lock file: %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "spent.lock")
+			spec := Spec{Path: path, Mode: Exclusive, Deadline: time.Second}
+			ctx := tt.ctx(t)
+			_, err := spec.Acquire(ctx)
+			if !errors.Is(err, tt.want) || !errors.Is(err, ctx.Err()) {
+				t.Fatalf("Acquire err = %v, want %v", err, tt.want)
+			}
+			if errors.Is(err, ErrLockBusy) {
+				t.Fatalf("Acquire err = %v reports contention on a lock nobody held", err)
+			}
+			if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("spent Acquire created lock file: %v", err)
+			}
+			h, err := spec.TryAcquire()
+			if err != nil {
+				t.Fatalf("TryAcquire after a spent Acquire = %v, want the free lock", err)
+			}
+			if err := h.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// spentAfterFirstCheck reports err from its second Err call on, so a poll
+// attempts flock exactly once before observing the spent context.
+type spentAfterFirstCheck struct {
+	context.Context
+	err    error
+	checks atomic.Int32
+}
+
+func (c *spentAfterFirstCheck) Done() <-chan struct{} {
+	done := make(chan struct{})
+	close(done)
+	return done
+}
+
+func (c *spentAfterFirstCheck) Err() error {
+	if c.checks.Add(1) == 1 {
+		return nil
+	}
+	return c.err
+}
+
+func openDescriptors(t *testing.T) int {
+	t.Helper()
+	entries, err := os.ReadDir("/dev/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(entries)
+}
+
+func TestFileLockPollClassifiesASpentContextByObservedContention(t *testing.T) {
+	tests := []struct {
+		name     string
+		held     bool
+		ctxErr   error
+		wantBusy bool
+	}{
+		{"free lock, deadline passed before the first attempt", false, context.DeadlineExceeded, false},
+		{"free lock, cancelled before the first attempt", false, context.Canceled, false},
+		{"held lock, deadline passed after observed contention", true, context.DeadlineExceeded, true},
+		{"held lock, cancelled after observed contention", true, context.Canceled, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "poll.lock")
+			spec := Spec{Path: path, Mode: Exclusive, Deadline: time.Second}
+			release := func() error { return nil }
+			if tt.held {
+				holder, err := spec.TryAcquire()
+				if err != nil {
+					t.Fatal(err)
+				}
+				release = holder.Close
+			}
+			var ctx context.Context
+			spent := &spentAfterFirstCheck{Context: context.Background(), err: tt.ctxErr}
+			switch {
+			case tt.held:
+				ctx = spent
+			case errors.Is(tt.ctxErr, context.Canceled):
+				ctx = cancelledContext(t)
+			default:
+				ctx = expiredContext(t)
+			}
+			descriptors := openDescriptors(t)
+			f, err := openFileLock(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = fileLockPoll(ctx, f, path, Exclusive)
+			observed := spent.checks.Load()
+			if !errors.Is(err, tt.ctxErr) || !errors.Is(err, ctx.Err()) {
+				t.Fatalf("fileLockPoll err = %v, want %v", err, tt.ctxErr)
+			}
+			if got := errors.Is(err, ErrLockBusy); got != tt.wantBusy {
+				t.Fatalf("errors.Is(err, ErrLockBusy) = %t, want %t: %v", got, tt.wantBusy, err)
+			}
+			if got := strings.Contains(err.Error(), "after observed contention"); got != tt.wantBusy {
+				t.Fatalf("err = %q names observed contention = %t, want %t", err, got, tt.wantBusy)
+			}
+			if tt.held && observed != 2 {
+				t.Fatalf("poll observed the context %d times, want 2: once before the one attempt, once after", observed)
+			}
+			if got := openDescriptors(t); got != descriptors {
+				t.Fatalf("open descriptors = %d after a failed poll, want %d: the lock fd leaked", got, descriptors)
+			}
+			if err := release(); err != nil {
+				t.Fatal(err)
+			}
+			h, err := spec.TryAcquire()
+			if err != nil {
+				t.Fatalf("TryAcquire after the failed poll = %v, want the free lock", err)
+			}
+			if err := h.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestFileLockAcquireReleasesItsDescriptorOnClose(t *testing.T) {
+	spec := Spec{Path: filepath.Join(t.TempDir(), "held.lock"), Mode: Exclusive, Deadline: time.Second}
+	descriptors := openDescriptors(t)
+	h, err := spec.Acquire(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := openDescriptors(t); got != descriptors+1 {
+		t.Fatalf("open descriptors while held = %d, want %d", got, descriptors+1)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := openDescriptors(t); got != descriptors {
+		t.Fatalf("open descriptors after Close = %d, want %d", got, descriptors)
+	}
+	again, err := spec.Acquire(t.Context())
+	if err != nil {
+		t.Fatalf("re-acquire after Close = %v", err)
+	}
+	if err := again.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

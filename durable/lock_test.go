@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -67,7 +68,7 @@ func TestAcquireLockExcludesGoroutines(t *testing.T) {
 	}
 }
 
-func TestAcquireLockReportsContentionAsErrLockBusy(t *testing.T) {
+func TestAcquireLockReportsObservedContentionAsErrLockBusy(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.lock")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -77,11 +78,54 @@ func TestAcquireLockReportsContentionAsErrLockBusy(t *testing.T) {
 	}
 	defer held.Close()
 
-	busyCtx, busyCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	busyCtx, busyCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer busyCancel()
-	if _, err := AcquireLock(busyCtx, path); !errors.Is(err, ErrLockBusy) ||
-		!errors.Is(err, context.DeadlineExceeded) {
+	_, err = AcquireLock(busyCtx, path)
+	if !errors.Is(err, ErrLockBusy) || !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, busyCtx.Err()) {
 		t.Fatalf("contended AcquireLock = %v, want ErrLockBusy joined with the ctx error", err)
+	}
+	if !strings.Contains(err.Error(), "after observed contention") {
+		t.Fatalf("contended AcquireLock = %q, want it to name the observed contention", err)
+	}
+}
+
+func TestAcquireLockSpentContextIsOnlyTheContextError(t *testing.T) {
+	tests := []struct {
+		name string
+		ctx  func() (context.Context, context.CancelFunc)
+		want error
+	}{
+		{"expired", func() (context.Context, context.CancelFunc) {
+			return context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		}, context.DeadlineExceeded},
+		{"cancelled", func() (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			cancel()
+			return ctx, cancel
+		}, context.Canceled},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "state.lock")
+			ctx, cancel := tt.ctx()
+			defer cancel()
+			_, err := AcquireLock(ctx, path)
+			if !errors.Is(err, tt.want) || !errors.Is(err, ctx.Err()) {
+				t.Fatalf("AcquireLock = %v, want %v", err, tt.want)
+			}
+			if errors.Is(err, ErrLockBusy) {
+				t.Fatalf("AcquireLock = %v reports contention on a lock nobody held", err)
+			}
+			fresh, freshCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer freshCancel()
+			lock, err := AcquireLock(fresh, path)
+			if err != nil {
+				t.Fatalf("AcquireLock after a spent context = %v, want the free lock", err)
+			}
+			if err := lock.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
@@ -104,9 +148,9 @@ func TestErrLockBusyKeepsOneIdentity(t *testing.T) {
 }
 
 // TestAcquireLockDoesNotReportAConfigErrorAsContention pins the one condition
-// §3.1 names: ErrLockBusy means the deadline expired with the lock still held.
-// A caller retries on contention, so masking an unusable lock path as
-// contention turns a permanent refusal into an infinite retry.
+// §3.1 names: ErrLockBusy means an attempt found the lock held. A caller
+// retries on contention, so masking an unusable lock path as contention turns
+// a permanent refusal into an infinite retry.
 func TestAcquireLockDoesNotReportAConfigErrorAsContention(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
