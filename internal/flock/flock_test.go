@@ -444,6 +444,7 @@ func TestFileLockPollClassifiesASpentContextByObservedContention(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				t.Cleanup(func() { _ = holder.Close() })
 				release = holder.Close
 			}
 			var ctx context.Context
@@ -461,6 +462,7 @@ func TestFileLockPollClassifiesASpentContextByObservedContention(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			t.Cleanup(func() { _ = f.Close() })
 			_, err = fileLockPoll(ctx, f, path, Exclusive)
 			observed := spent.checks.Load()
 			if !errors.Is(err, tt.ctxErr) || !errors.Is(err, ctx.Err()) {
@@ -503,6 +505,7 @@ func TestFileLockAcquireReleasesItsDescriptorOnClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = h.Close() })
 	if got := openDescriptors(t); got != descriptors+1 {
 		t.Fatalf("open descriptors while held = %d, want %d", got, descriptors+1)
 	}

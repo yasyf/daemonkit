@@ -110,8 +110,7 @@ func TestOwnProcessesAgainstAServingDaemonIsRefused(t *testing.T) {
 		t.Fatalf("Socket: %v", err)
 	}
 	session := awaitControlSession(t, socket)
-	ctx := bounded(t, 20*time.Second)
-	if err := session.WaitReady(ctx); err != nil {
+	if err := session.WaitReady(bounded(t, 20*time.Second)); err != nil {
 		t.Fatalf("WaitReady() = %v", err)
 	}
 
@@ -126,7 +125,7 @@ func TestOwnProcessesAgainstAServingDaemonIsRefused(t *testing.T) {
 		t.Fatalf("OwnProcesses() = %v, want durable.ErrLockBusy", err)
 	}
 
-	if _, err := session.Drain(ctx); err != nil {
+	if _, err := session.Drain(bounded(t, 20*time.Second)); err != nil {
 		t.Fatalf("Drain() = %v", err)
 	}
 	select {
