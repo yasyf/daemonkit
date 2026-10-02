@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `durable.AcquireLock` joins `ErrLockBusy` with a timeout or cancellation
+  only after an acquisition attempt observed the lock held by another owner.
+  A context that ends before the first attempt now returns the context error
+  without `ErrLockBusy`; previously, even a timeout preparing a free lock
+  reported contention. This changes the exported `errors.Is` classification
+  consumed by `github.com/yasyf/cc-context`: after a dependency update, its
+  `internal/cleanup/agent.claim()` propagates these timeouts instead of
+  treating them as “another daemon started first” and waiting for readiness.
+  The sentinel retains its identity and establishes observed contention,
+  without asserting that the owner held the lock for the entire budget.
+
 ## [0.32.2] - 2026-09-30
 
 ### Fixed
