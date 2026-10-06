@@ -13,7 +13,10 @@ public struct AgentPaths: Sendable {
         self.init(home: RealHome.directory(), label: label)
     }
 
-    init(home: URL, label: String) {
+    /// The layout under `home` instead of the invoking user's home, for a
+    /// process that dials another user's daemon, such as a root process
+    /// reaching the console user's agent.
+    public init(home: URL, label: String) {
         self.home = home
         self.label = label
     }
