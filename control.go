@@ -97,7 +97,9 @@ type Control struct {
 // same-EUID floor runs regardless and cannot be turned off). ErrAbsent on a
 // proven no-listener; ErrDraining when the incumbent answers with the frozen
 // drain preamble; ErrUntrusted on a trust refusal. Both ErrAbsent and
-// ErrDraining leave settlement to Settle, which needs no session.
+// ErrDraining leave settlement to Settle, which needs no session. The lane has
+// one slot, so an attach that finds it held waits for it and returns
+// ErrSessionCapacity only once ctx's deadline passes with the slot still held.
 //
 // Authorization runs in both directions. The daemon judges the attaching
 // client against Trust.Control; the client judges the process accepting for
@@ -120,17 +122,26 @@ func (c *Client) Control(ctx context.Context) (*Control, error) {
 		return nil, fmt.Errorf("daemonkit: derive socket path: %w", err)
 	}
 	var servingPID int
-	session, err := wire.NewClient(ctx, wire.ClientConfig{
-		Dial: wire.UnixDialer(socket), Lane: wire.LaneControl, MaxFrame: int(c.daemon.MaxFrame),
-		Authorize: func(conn net.Conn) error {
-			pid, err := authorizeServer(conn.(*net.UnixConn), c.daemon.Trust.Serving)
-			if err != nil {
-				return err
-			}
-			servingPID = pid
-			return nil
-		},
-	})
+	attach := func() (*wire.Client, error) {
+		return wire.NewClient(ctx, wire.ClientConfig{
+			Dial: wire.UnixDialer(socket), Lane: wire.LaneControl, MaxFrame: int(c.daemon.MaxFrame),
+			Authorize: func(conn net.Conn) error {
+				pid, err := authorizeServer(conn.(*net.UnixConn), c.daemon.Trust.Serving)
+				if err != nil {
+					return err
+				}
+				servingPID = pid
+				return nil
+			},
+		})
+	}
+	session, err := attach()
+	for backoff := capacityBackoff; errors.Is(err, wire.ErrSessionCapacity); backoff = min(2*backoff, controlCapacityCeiling) {
+		if !sleepUntil(ctx, backoff) {
+			break
+		}
+		session, err = attach()
+	}
 	if err != nil {
 		return nil, classifyWire(err)
 	}
