@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   incumbent before `Ensure`, as cc-interact's launcher does, failed whenever
   another command was probing at the same moment.
 
+### Security
+
+- Builds with Go 1.26.9, which fixes GO-2026-6617 in `net/http`.
+
 ## [0.33.0] - 2026-10-06
 
 ### Added
