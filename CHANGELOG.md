@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.33.1] - 2026-10-12
+
+### Fixed
+
+- `Client.Control` waits for the control lane's one slot when another attach
+  holds it, retrying with a backoff that doubles from 25ms to 400ms until its
+  context deadline, and returns `ErrSessionCapacity` only once that deadline
+  passes. It used to fail on the first refusal, so two overlapping control
+  attaches on one daemon failed the later one. A consumer that probes the
+  incumbent before `Ensure`, as cc-interact's launcher does, failed whenever
+  another command was probing at the same moment.
+
 ## [0.33.0] - 2026-10-06
 
 ### Added
@@ -1739,7 +1751,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.33.0...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.33.1...HEAD
+[0.33.1]: https://github.com/yasyf/daemonkit/compare/v0.33.0...v0.33.1
 [0.33.0]: https://github.com/yasyf/daemonkit/compare/v0.32.3...v0.33.0
 [0.32.3]: https://github.com/yasyf/daemonkit/compare/v0.32.2...v0.32.3
 [0.32.2]: https://github.com/yasyf/daemonkit/compare/v0.32.1...v0.32.2

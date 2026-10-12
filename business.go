@@ -89,10 +89,14 @@ func (e *ProductError) Error() string {
 // attachAttempts bounds two transient refusals: a serving peer whose execution
 // generation ends mid-attach, and a momentarily full slot table. Capacity waits
 // capacityBackoff between tries; a peer freeing a slot is what ends the wait,
-// so a caller starved past the bound is told rather than held.
+// so a caller starved past the bound is told rather than held. The control
+// lane has one slot that every holder releases when its verb ends, so Control
+// waits it out until the caller's deadline instead, doubling the wait up to
+// controlCapacityCeiling.
 const (
-	attachAttempts  = 3
-	capacityBackoff = 25 * time.Millisecond
+	attachAttempts         = 3
+	capacityBackoff        = 25 * time.Millisecond
+	controlCapacityCeiling = 400 * time.Millisecond
 )
 
 // businessEnvelope is one terminal on the business lane. A product failure is

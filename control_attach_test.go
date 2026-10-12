@@ -125,3 +125,51 @@ func awaitControl(ctx context.Context, t *testing.T, client *Client) *Control {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+func TestControlWaitsForTheHeldSlot(t *testing.T) {
+	shortHome(t)
+	d := Daemon{Label: "dkslot", Schemas: []Schema{"test.v1"}, Shutdown: Grace(5 * time.Second)}
+	startControlChild(t, string(d.Label))
+	client := openClient(t, d)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	holder := awaitControl(ctx, t, client)
+	const hold = 300 * time.Millisecond
+	heldUntil := time.Now().Add(hold)
+	go func() {
+		time.Sleep(hold)
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer closeCancel()
+		_ = holder.Close(closeCtx)
+	}()
+
+	attachCtx, attachCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer attachCancel()
+	second, err := client.Control(attachCtx)
+	if err != nil {
+		t.Fatalf("Control() while another attach held the slot = %v, want it to wait for the release", err)
+	}
+	defer func() { _ = second.Close(ctx) }()
+	if time.Now().Before(heldUntil) {
+		t.Fatal("Control() attached while the holder still had the lane's one slot")
+	}
+}
+
+func TestControlGivesUpOnTheHeldSlotAtItsDeadline(t *testing.T) {
+	shortHome(t)
+	d := Daemon{Label: "dkheld", Schemas: []Schema{"test.v1"}, Shutdown: Grace(5 * time.Second)}
+	startControlChild(t, string(d.Label))
+	client := openClient(t, d)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	holder := awaitControl(ctx, t, client)
+	defer func() { _ = holder.Close(ctx) }()
+
+	attachCtx, attachCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer attachCancel()
+	if _, err := client.Control(attachCtx); !errors.Is(err, ErrSessionCapacity) {
+		t.Fatalf("Control() against a slot held past its deadline = %v, want ErrSessionCapacity", err)
+	}
+}
