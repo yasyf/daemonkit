@@ -269,7 +269,7 @@ func TestConsumerGatedAdoptionOverAPidTheCallerWaits(t *testing.T) {
 		waited := make(chan error, 1)
 		go func() { waited <- cmd.Wait() }()
 		select {
-		case <-waited: //nolint:errcheck // only that the caller's Wait returned matters, not its status.
+		case <-waited:
 		case <-time.After(10 * time.Second):
 			t.Fatal("the caller's own Wait never returned; daemonkit took the reap")
 		}

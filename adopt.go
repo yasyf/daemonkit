@@ -125,7 +125,7 @@ func (g *Gate) Ready(ctx context.Context) error {
 	case err = <-signalled:
 	case <-ctx.Done():
 		g.closeReady()
-		<-signalled //nolint:errcheck // ctx's error wins once it fired; this only waits out the reader.
+		<-signalled
 		err = ctx.Err()
 	}
 	g.closeReady()

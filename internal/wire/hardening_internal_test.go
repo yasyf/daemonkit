@@ -252,7 +252,7 @@ func TestThePreambleStrandsNoDescriptor(t *testing.T) {
 			canary := sendWithDescriptor(t, clientConn, drainPreamble[:])
 			done := make(chan error, 1)
 			go func() { done <- server.startConnection(context.Background(), serverConn) }()
-			<-done //nolint:errcheck // the drain outcome is asserted through rt.drained below.
+			<-done
 			drained := false
 			select {
 			case <-rt.drained:
