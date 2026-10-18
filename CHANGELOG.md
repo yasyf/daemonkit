@@ -6,6 +6,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `deploy.Deployment.InstallFresh` installs and activates the first
+  generation of a deployment that was never installed, all under one hold of
+  the deployment lock. Before it stages anything, it refuses with the new
+  `deploy.ErrNotFresh` if it finds any trace of an earlier deployment. The
+  traces are a swap, activation, services, or removal record, a generation in
+  any slot, a staging tree, the daemon's owner record, a daemon answering its
+  socket, a live process on its executables, and an agent plist or loaded
+  label. A check
+  that cannot answer refuses the same way, and so does a deployment lock
+  another writer holds past the grace period. `InstallFresh` never recovers
+  an outstanding swap, never quiesces, drains, or terminates a process, and
+  never boots a job out of launchd. A label that launchd reports held after
+  the candidate lands is also `ErrNotFresh`; the landed bytes stay installed
+  and any agent started before it keeps running.
+- `deploy.Deployment.Fresh` runs the same predicate read-only, without taking
+  the lock or creating a directory or record, so a caller's pre-flight
+  decides on exactly what `InstallFresh` refuses on.
+- `launchd.ApplyFresh` publishes an agent's plist create-only, then runs
+  enable, bootstrap, and kickstart without `-k`. It refuses with the new
+  `launchd.ErrPresent`, and never issues a bootout, when a plist already sits
+  at the label's path, when launchd reports the label loaded, or when a
+  bootstrap fails and launchd then reports the label loaded.
+  `launchd.RequireAbsent` runs the same presence check without installing
+  anything.
+- Every existing verb behaves exactly as before: `Install`, `Supersede`,
+  `Activate`, `Uninstall`, `Reset`, `Quiesce`, `launchd.Apply`,
+  `launchd.Verify`, and `launchd.Remove`.
+
 ## [0.33.1] - 2026-10-12
 
 ### Fixed

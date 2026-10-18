@@ -36,6 +36,12 @@ var ownerMarkerKey = []byte("<key>" + OwnerEnvKey + "</key>")
 // holds there is a third party's to stop.
 var ErrNotOwned = errors.New("launchd: agent plist carries no " + OwnerEnvKey + " ownership marker")
 
+// ErrPresent means ApplyFresh found the agent's label already held: a plist at
+// daemonkit's path for it, or launchd reporting it loaded. ApplyFresh refuses
+// without booting anything out, since a first install has no claim on a job
+// something else put there.
+var ErrPresent = errors.New("launchd: agent already present")
+
 // Runner runs one command to completion and returns its combined stdout and
 // stderr, its exit code, and any error that prevented it from running. Apply and
 // Remove drive /bin/launchctl through a Runner so the process boundary stays
@@ -67,6 +73,45 @@ func Apply(ctx context.Context, run Runner, agent Agent) error {
 	}
 	c := applier{run: run, wait: waitRetry}
 	return c.apply(ctx, desired)
+}
+
+// ApplyFresh installs exactly the one named agent onto a label nothing holds,
+// and refuses with [ErrPresent] when something does: a plist at daemonkit's path
+// for the label, whoever wrote it, or launchd reporting the label loaded. It is
+// [Apply] for a first install with every step that takes something away left
+// out: it never boots a job out, archives a plist, or writes over one, and its
+// kickstart starts a job without killing one.
+//
+// The [RequireAbsent] checks run before anything is written, and two atomic
+// ones stand behind them. The plist is published create-only, so one that
+// appeared after the checks is left byte-for-byte as it is and refused with
+// ErrPresent before any launchctl verb runs. A bootstrap that fails while
+// launchd then reports the label loaded is ErrPresent too rather than a
+// bootout; the plist this call wrote stays at the label.
+func ApplyFresh(ctx context.Context, run Runner, agent Agent) error {
+	if run == nil {
+		return errors.New("launchd: apply runner is required")
+	}
+	desired, err := canonicalAgent(agent)
+	if err != nil {
+		return err
+	}
+	c := applier{run: run, wait: waitRetry}
+	return c.applyFresh(ctx, desired)
+}
+
+// RequireAbsent is [ApplyFresh]'s refusal observed without mutating anything:
+// nil when daemonkit's path for label carries no plist and launchd reports the
+// label not loaded, [ErrPresent] when either is there. A launchd that could not
+// be asked is an error of its own, never an absence.
+func RequireAbsent(ctx context.Context, run Runner, label string) error {
+	if run == nil {
+		return errors.New("launchd: require-absent runner is required")
+	}
+	if err := ValidateLabel(label); err != nil {
+		return err
+	}
+	return applier{run: run, wait: waitRetry}.requireAbsent(ctx, label)
 }
 
 // Verify reports whether the one named agent is already exactly applied: a
@@ -126,6 +171,41 @@ func (c applier) apply(ctx context.Context, agent Agent) error {
 		return fmt.Errorf("launchd: install agent %q: %w", agent.Label, err)
 	}
 	return nil
+}
+
+func (c applier) applyFresh(ctx context.Context, agent Agent) error {
+	if err := c.requireAbsent(ctx, agent.Label); err != nil {
+		return err
+	}
+	path, err := agent.PlistPath()
+	if err != nil {
+		return err
+	}
+	if err := c.installFresh(ctx, agent, path); err != nil {
+		return fmt.Errorf("launchd: install agent %q: %w", agent.Label, err)
+	}
+	return nil
+}
+
+func (c applier) requireAbsent(ctx context.Context, label string) error {
+	path, err := plistPath(label)
+	if err != nil {
+		return err
+	}
+	switch _, err := os.Lstat(path); {
+	case err == nil:
+		return fmt.Errorf("%w: %q holds a plist", ErrPresent, path)
+	case !errors.Is(err, os.ErrNotExist):
+		return fmt.Errorf("launchd: inspect agent plist %q: %w", path, err)
+	}
+	switch outcome := c.launchctl(ctx, "print", serviceTarget(label)); outcome.kind {
+	case launchctlNotLoaded:
+		return nil
+	case launchctlLoaded:
+		return fmt.Errorf("%w: launchd reports %q loaded", ErrPresent, label)
+	default:
+		return fmt.Errorf("launchd: ask launchd about %q: %w", label, outcome.fail())
+	}
 }
 
 func (c applier) remove(ctx context.Context, label string) error {
@@ -221,6 +301,45 @@ func (c applier) install(ctx context.Context, agent Agent) error {
 	return c.reload(ctx, agent, path)
 }
 
+func (c applier) installFresh(ctx context.Context, agent Agent, path string) error {
+	if err := validateProgramTree(agent); err != nil {
+		return err
+	}
+	plist, err := agent.Plist()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(agent.LogPath), 0o700); err != nil {
+		return fmt.Errorf("launchd: create log directory: %w", err)
+	}
+	if err := durable.Mkdir(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("launchd: create LaunchAgents directory: %w", err)
+	}
+	if err := publishNew(path, plist); err != nil {
+		return err
+	}
+	if err := c.bootstrapFresh(ctx, agent, path); err != nil {
+		return err
+	}
+	return c.kickstart(ctx, agent.Label)
+}
+
+func (c applier) bootstrapFresh(ctx context.Context, agent Agent, path string) error {
+	err := c.settle(ctx, fmt.Sprintf("bootstrapping %q", path), func() launchctlResult {
+		if enable := c.launchctl(ctx, "enable", serviceTarget(agent.Label)); enable.fail() != nil {
+			return enable
+		}
+		return c.launchctl(ctx, "bootstrap", domainTarget(), path)
+	})
+	if err == nil {
+		return nil
+	}
+	if c.launchctl(ctx, "print", serviceTarget(agent.Label)).kind == launchctlLoaded {
+		return fmt.Errorf("%w: launchd reports %q loaded after a failed bootstrap: %w", ErrPresent, agent.Label, err)
+	}
+	return err
+}
+
 func (c applier) reload(ctx context.Context, agent Agent, path string) error {
 	return c.settle(ctx, fmt.Sprintf("bootstrapping %q", path), func() launchctlResult {
 		return c.loadOnce(ctx, agent, path)
@@ -281,6 +400,34 @@ func (c applier) loadOnce(ctx context.Context, agent Agent, path string) launchc
 func (c applier) launchctl(ctx context.Context, args ...string) launchctlResult {
 	out, code, err := c.run(ctx, launchctlPath, args...)
 	return launchctlOutcome(args[0], out, code, err)
+}
+
+// publishNew lands plist at path only while nothing is there. The bytes are
+// written and fsynced into a temp beside path and hard-linked into place,
+// because link refuses an existing name where the rename every other write
+// publishes through replaces it: a plist that appeared after the presence check
+// stays exactly as it is.
+func publishNew(path string, plist []byte) error {
+	dir := filepath.Dir(path)
+	temp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*")
+	if err != nil {
+		return fmt.Errorf("launchd: stage agent plist: %w", err)
+	}
+	_, writeErr := temp.Write(plist)
+	if err := errors.Join(writeErr, temp.Chmod(0o600), temp.Sync(), temp.Close()); err != nil {
+		return errors.Join(fmt.Errorf("launchd: stage agent plist: %w", err), os.Remove(temp.Name()))
+	}
+	linkErr := os.Link(temp.Name(), path)
+	removeErr := os.Remove(temp.Name())
+	switch {
+	case errors.Is(linkErr, fs.ErrExist):
+		return errors.Join(fmt.Errorf("%w: a plist appeared at %q", ErrPresent, path), removeErr)
+	case linkErr != nil:
+		return errors.Join(fmt.Errorf("launchd: publish agent plist: %w", linkErr), removeErr)
+	case removeErr != nil:
+		return fmt.Errorf("launchd: discard staged agent plist: %w", removeErr)
+	}
+	return durable.SyncDir(dir)
 }
 
 // archiveForeignPlist renames aside any existing plist at path that does not

@@ -405,7 +405,9 @@ deploy	field	Config.Executables	darwin
 deploy	field	Config.Requirement	darwin
 deploy	type	Deployment	darwin
 deploy	method	Deployment.Activate	darwin
+deploy	method	Deployment.Fresh	darwin
 deploy	method	Deployment.Install	darwin
+deploy	method	Deployment.InstallFresh	darwin
 deploy	method	Deployment.Quiesce	darwin
 deploy	method	Deployment.Reset	darwin
 deploy	method	Deployment.Supersede	darwin
@@ -414,6 +416,7 @@ deploy	func	DigestEntitlements	darwin
 deploy	var	ErrConfig	darwin
 deploy	var	ErrConflict	darwin
 deploy	var	ErrLive	darwin
+deploy	var	ErrNotFresh	darwin
 deploy	var	ErrRestored	darwin
 deploy	var	ErrState	darwin
 deploy	var	ErrUntrusted	darwin
@@ -505,6 +508,7 @@ launchd	field	Agent.StartCalendarInterval	darwin
 launchd	field	Agent.StartInterval	darwin
 launchd	field	Agent.WatchPaths	darwin
 launchd	func	Apply	darwin
+launchd	func	ApplyFresh	darwin
 launchd	type	CalendarInterval	darwin
 launchd	field	CalendarInterval.Day	darwin
 launchd	field	CalendarInterval.Hour	darwin
@@ -513,6 +517,7 @@ launchd	field	CalendarInterval.Month	darwin
 launchd	field	CalendarInterval.Weekday	darwin
 launchd	func	Daily	darwin
 launchd	var	ErrNotOwned	darwin
+launchd	var	ErrPresent	darwin
 launchd	func	NewPlan	darwin
 launchd	const	NoRestart	darwin
 launchd	const	OwnerEnvKey	darwin
@@ -527,6 +532,7 @@ launchd	const	ProcessTypeBackground	darwin
 launchd	const	ProcessTypeInteractive	darwin
 launchd	const	ProcessTypeStandard	darwin
 launchd	func	Remove	darwin
+launchd	func	RequireAbsent	darwin
 launchd	const	RestartAlways	darwin
 launchd	const	RestartOnFailure	darwin
 launchd	type	RestartPolicy	darwin

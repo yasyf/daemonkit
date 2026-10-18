@@ -563,6 +563,14 @@ func TestApplyAndRemoveRequireARunner(t *testing.T) {
 		!strings.Contains(err.Error(), "runner is required") {
 		t.Fatalf("Remove with nil runner = %v, want a runner-required error", err)
 	}
+	if err := ApplyFresh(context.Background(), nil, Agent{}); err == nil ||
+		!strings.Contains(err.Error(), "runner is required") {
+		t.Fatalf("ApplyFresh with nil runner = %v, want a runner-required error", err)
+	}
+	if err := RequireAbsent(context.Background(), nil, "com.example.worker"); err == nil ||
+		!strings.Contains(err.Error(), "runner is required") {
+		t.Fatalf("RequireAbsent with nil runner = %v, want a runner-required error", err)
+	}
 }
 
 func TestRemoveRequiresACanonicalLabel(t *testing.T) {
@@ -603,5 +611,296 @@ func TestApplyInstallsIntoAnAbsentLaunchAgentsDirectory(t *testing.T) {
 	}
 	if string(got) != string(want) {
 		t.Fatalf("installed plist is not the rendered plist\n%s", got)
+	}
+}
+
+// TestRequireAbsent pins the read-only probe ApplyFresh refuses on and a
+// fresh-only deploy gates on: a plist at the label answers before launchd is
+// asked anything, a loaded label is ErrPresent, and a launchd that could not
+// answer is an error that is never mistaken for an absence.
+func TestRequireAbsent(t *testing.T) {
+	tests := []struct {
+		name        string
+		plist       bool
+		rec         *recorder
+		wantPresent bool
+		wantErr     string
+		verbs       []string
+	}{
+		{name: "nothing at the label", rec: &recorder{}, verbs: []string{"print"}},
+		{name: "a plist at the label", plist: true, rec: &recorder{}, wantPresent: true},
+		{name: "launchd reports the label loaded", rec: &recorder{loaded: true}, wantPresent: true, verbs: []string{"print"}},
+		{name: "launchd refuses to answer", rec: &recorder{refuse: true}, wantErr: "launchd refused", verbs: []string{"print"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := launchAgentsDir(t)
+			agent := applyAgent(t, "com.example.absent")
+			if test.plist {
+				installPlist(t, dir, agent)
+			}
+
+			err := RequireAbsent(context.Background(), test.rec.run, agent.Label)
+
+			if errors.Is(err, ErrPresent) != test.wantPresent {
+				t.Fatalf("RequireAbsent = %v, want ErrPresent=%t", err, test.wantPresent)
+			}
+			if test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)) {
+				t.Fatalf("RequireAbsent = %v, want it to contain %q", err, test.wantErr)
+			}
+			if !test.wantPresent && test.wantErr == "" && err != nil {
+				t.Fatalf("RequireAbsent = %v, want nil", err)
+			}
+			if !slices.Equal(test.rec.verbs, test.verbs) {
+				t.Fatalf("verbs = %v, want %v", test.rec.verbs, test.verbs)
+			}
+		})
+	}
+	if err := RequireAbsent(context.Background(), okRunner, "../escape"); err == nil ||
+		!strings.Contains(err.Error(), "not canonical") {
+		t.Fatalf("RequireAbsent of a traversing label = %v, want a canonical-label refusal", err)
+	}
+}
+
+// TestApplyFreshNeverBootsOut is the whole of what a bootstrap-only apply asks
+// of launchd: whether the label is loaded, then enable, bootstrap, and a
+// kickstart that starts the job without killing one. The plist it publishes is
+// the rendered one at 0600, and the temp it was staged through is gone.
+func TestApplyFreshNeverBootsOut(t *testing.T) {
+	dir := launchAgentsDir(t)
+	agent := applyAgent(t, "com.example.fresh")
+	var argv [][]string
+	run := func(_ context.Context, _ string, args ...string) (string, int, error) {
+		argv = append(argv, args)
+		if args[0] == "print" {
+			return "Could not find service", launchctlNotFoundExit, nil
+		}
+		return "", 0, nil
+	}
+
+	if err := ApplyFresh(context.Background(), run, agent); err != nil {
+		t.Fatalf("ApplyFresh: %v", err)
+	}
+
+	want := [][]string{
+		{"print", serviceTarget(agent.Label)},
+		{"enable", serviceTarget(agent.Label)},
+		{"bootstrap", domainTarget(), filepath.Join(dir, agent.Label+".plist")},
+		{"kickstart", serviceTarget(agent.Label)},
+	}
+	if !slices.EqualFunc(argv, want, slices.Equal[[]string]) {
+		t.Fatalf("launchctl argv = %q, want %q", argv, want)
+	}
+	path := filepath.Join(dir, agent.Label+".plist")
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("agent plist not published: %v", err)
+	}
+	rendered, err := agent.Plist()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(rendered) {
+		t.Fatalf("published plist is not the rendered plist\n%s", got)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("published plist mode = %#o, want 0600", info.Mode().Perm())
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("LaunchAgents holds %d entries, want only the published plist", len(entries))
+	}
+}
+
+// TestApplyFreshRefusesAPresentAgent holds the refusal to leaving the label
+// exactly as it was found: no plist written, archived, or rewritten, and no
+// launchctl verb that changes anything.
+func TestApplyFreshRefusesAPresentAgent(t *testing.T) {
+	foreign := "<?xml version=\"1.0\"?>\n<plist><dict><key>Label</key><string>com.example.present</string></dict></plist>\n"
+	tests := []struct {
+		name   string
+		plist  func(t *testing.T, dir string, agent Agent)
+		loaded bool
+		verbs  []string
+	}{
+		{
+			name:  "a daemonkit plist at the label",
+			plist: func(t *testing.T, dir string, agent Agent) { installPlist(t, dir, agent) },
+		},
+		{
+			name: "a foreign plist at the label",
+			plist: func(t *testing.T, dir string, agent Agent) {
+				if err := os.WriteFile(filepath.Join(dir, agent.Label+".plist"), []byte(foreign), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:   "launchd reports the label loaded",
+			loaded: true,
+			verbs:  []string{"print"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := launchAgentsDir(t)
+			agent := applyAgent(t, "com.example.present")
+			path := filepath.Join(dir, agent.Label+".plist")
+			if test.plist != nil {
+				test.plist(t, dir, agent)
+			}
+			before, beforeErr := os.ReadFile(path)
+			rec := &recorder{loaded: test.loaded}
+
+			err := ApplyFresh(context.Background(), rec.run, agent)
+
+			if !errors.Is(err, ErrPresent) {
+				t.Fatalf("ApplyFresh = %v, want ErrPresent", err)
+			}
+			if !slices.Equal(rec.verbs, test.verbs) {
+				t.Fatalf("verbs = %v, want %v", rec.verbs, test.verbs)
+			}
+			after, afterErr := os.ReadFile(path)
+			if string(after) != string(before) || errors.Is(beforeErr, os.ErrNotExist) != errors.Is(afterErr, os.ErrNotExist) {
+				t.Fatalf("plist at the label = %q (err %v), want it as found: %q (err %v)", after, afterErr, before, beforeErr)
+			}
+			backups, err := filepath.Glob(path + ".daemonkit-archived-*")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(backups) != 0 {
+				t.Fatalf("ApplyFresh archived a plist aside: %v", backups)
+			}
+		})
+	}
+}
+
+// TestApplyFreshRefusesALabelLoadedMidway is the race the checks cannot close
+// on their own: launchd takes the label between the print and the bootstrap,
+// and its own bootstrap refusal is the atomic check. That refusal is
+// ErrPresent with the job left loaded — never a bootout to make room, and never
+// a kickstart of a job this call did not load. A bootstrap refused with the
+// label still unloaded is launchd's own refusal, not a presence.
+func TestApplyFreshRefusesALabelLoadedMidway(t *testing.T) {
+	tests := []struct {
+		name        string
+		out         string
+		code        int
+		loads       bool
+		wantPresent bool
+		bootstraps  int
+	}{
+		{
+			name: "launchd answers its batch status", out: "Bootstrap failed: 5: Input/output error",
+			code: launchctlAggregateExit, loads: true, wantPresent: true, bootstraps: 1,
+		},
+		{
+			name: "launchd reports the bootstrap already in progress", out: "Bootstrap failed: 37: Operation already in progress",
+			code: launchctlAlreadyExit, loads: true, wantPresent: true, bootstraps: bootstrapAttempts,
+		},
+		{
+			name: "launchd refuses with the label still unloaded", out: "Bootstrap failed: 1: Operation not permitted",
+			code: 1, bootstraps: 1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			launchAgentsDir(t)
+			agent := applyAgent(t, "com.example.raced")
+			var verbs []string
+			loaded := false
+			run := func(_ context.Context, _ string, args ...string) (string, int, error) {
+				verbs = append(verbs, args[0])
+				switch args[0] {
+				case "print":
+					if !loaded {
+						return "Could not find service", launchctlNotFoundExit, nil
+					}
+				case "bootstrap":
+					loaded = test.loads
+					return test.out, test.code, nil
+				}
+				return "", 0, nil
+			}
+
+			err := applier{run: run, wait: noWait}.applyFresh(context.Background(), agent)
+
+			if err == nil {
+				t.Fatal("applyFresh = nil, want the bootstrap's refusal")
+			}
+			if errors.Is(err, ErrPresent) != test.wantPresent {
+				t.Fatalf("applyFresh = %v, want ErrPresent=%t", err, test.wantPresent)
+			}
+			if slices.Contains(verbs, "bootout") || slices.Contains(verbs, "kickstart") {
+				t.Fatalf("verbs = %v, want no bootout and no kickstart", verbs)
+			}
+			bootstraps := 0
+			for _, verb := range verbs {
+				if verb == "bootstrap" {
+					bootstraps++
+				}
+			}
+			if bootstraps != test.bootstraps {
+				t.Fatalf("bootstrap attempts = %d, want %d", bootstraps, test.bootstraps)
+			}
+		})
+	}
+}
+
+// TestApplyFreshLeavesARacedForeignPlistUntouched is the race on the plist
+// itself: another actor publishes one at the label after the presence check
+// found none. The create-only publication refuses the occupied name, so those
+// bytes stay exactly as written and launchd is never asked to do anything.
+func TestApplyFreshLeavesARacedForeignPlistUntouched(t *testing.T) {
+	dir := launchAgentsDir(t)
+	agent := applyAgent(t, "com.example.raced")
+	path := filepath.Join(dir, agent.Label+".plist")
+	foreign := []byte("<?xml version=\"1.0\"?>\n<plist><dict><key>Label</key><string>com.example.raced</string></dict></plist>\n")
+	var verbs []string
+	run := func(_ context.Context, _ string, args ...string) (string, int, error) {
+		verbs = append(verbs, args[0])
+		if args[0] == "print" {
+			if err := os.WriteFile(path, foreign, 0o644); err != nil {
+				t.Errorf("plant the raced plist: %v", err)
+			}
+			return "Could not find service", launchctlNotFoundExit, nil
+		}
+		return "", 0, nil
+	}
+
+	if err := ApplyFresh(context.Background(), run, agent); !errors.Is(err, ErrPresent) {
+		t.Fatalf("ApplyFresh = %v, want ErrPresent", err)
+	}
+
+	if want := []string{"print"}; !slices.Equal(verbs, want) {
+		t.Fatalf("verbs = %v, want %v and no enable, bootstrap, kickstart, or bootout", verbs, want)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(foreign) {
+		t.Fatalf("the raced plist was rewritten\n%s", got)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o644 {
+		t.Fatalf("the raced plist mode = %#o, want its own 0644", info.Mode().Perm())
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("LaunchAgents holds %d entries, want only the raced plist and no staged temp", len(entries))
 	}
 }
