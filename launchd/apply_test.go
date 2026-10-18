@@ -787,7 +787,8 @@ func TestApplyFreshRefusesAPresentAgent(t *testing.T) {
 // and its own bootstrap refusal is the atomic check. That refusal is
 // ErrPresent with the job left loaded — never a bootout to make room, and never
 // a kickstart of a job this call did not load. A bootstrap refused with the
-// label still unloaded is launchd's own refusal, not a presence.
+// label still unloaded is launchd's own refusal, not a presence. Either way the
+// plist this call published is gone.
 func TestApplyFreshRefusesALabelLoadedMidway(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -812,7 +813,7 @@ func TestApplyFreshRefusesALabelLoadedMidway(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			launchAgentsDir(t)
+			dir := launchAgentsDir(t)
 			agent := applyAgent(t, "com.example.raced")
 			var verbs []string
 			loaded := false
@@ -850,14 +851,136 @@ func TestApplyFreshRefusesALabelLoadedMidway(t *testing.T) {
 			if bootstraps != test.bootstraps {
 				t.Fatalf("bootstrap attempts = %d, want %d", bootstraps, test.bootstraps)
 			}
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("LaunchAgents holds %d entries, want the published plist removed", len(entries))
+			}
 		})
+	}
+}
+
+// TestApplyFreshRemovesOnlyThePlistItPublished is a refused bootstrap after
+// another actor renamed its own plist over the label: the file there is no
+// longer the one this call published. The removal sets it aside, finds it is
+// not this call's, and renames it back, so the same file — inode, mode, and
+// bytes — is at the label afterwards, nothing is left at an aside path, and
+// nothing is booted out.
+func TestApplyFreshRemovesOnlyThePlistItPublished(t *testing.T) {
+	dir := launchAgentsDir(t)
+	agent := applyAgent(t, "com.example.replaced")
+	path := filepath.Join(dir, agent.Label+".plist")
+	foreign := []byte("<?xml version=\"1.0\"?>\n<plist><dict><key>Label</key><string>com.example.replaced</string></dict></plist>\n")
+	var verbs []string
+	var planted os.FileInfo
+	run := func(_ context.Context, _ string, args ...string) (string, int, error) {
+		verbs = append(verbs, args[0])
+		switch args[0] {
+		case "print":
+			return "Could not find service", launchctlNotFoundExit, nil
+		case "bootstrap":
+			staged := path + ".foreign"
+			if err := os.WriteFile(staged, foreign, 0o644); err != nil {
+				t.Errorf("stage the foreign plist: %v", err)
+			}
+			if err := os.Rename(staged, path); err != nil {
+				t.Errorf("publish the foreign plist: %v", err)
+			}
+			info, err := os.Lstat(path)
+			if err != nil {
+				t.Errorf("inspect the foreign plist: %v", err)
+			}
+			planted = info
+			return "Bootstrap failed: 1: Operation not permitted", 1, nil
+		}
+		return "", 0, nil
+	}
+
+	err := ApplyFresh(context.Background(), run, agent)
+
+	if err == nil || errors.Is(err, ErrPresent) {
+		t.Fatalf("ApplyFresh = %v, want launchd's own bootstrap refusal", err)
+	}
+	if want := []string{"print", "enable", "bootstrap", "print"}; !slices.Equal(verbs, want) {
+		t.Fatalf("verbs = %v, want %v and no bootout", verbs, want)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("the foreign plist is gone: %v", err)
+	}
+	if string(got) != string(foreign) {
+		t.Fatalf("the foreign plist was rewritten\n%s", got)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(planted, info) || info.Mode().Perm() != 0o644 {
+		t.Fatalf("the label holds another file than the one planted there, mode %#o", info.Mode().Perm())
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("LaunchAgents holds %d entries, want only the foreign plist and nothing set aside", len(entries))
+	}
+}
+
+// TestApplyFreshKeepsThePlistOfAJobItBootstrapped is a kickstart launchd
+// refuses after the bootstrap loaded the job. The job is launchd's now, so the
+// failure is returned as itself, the plist it was loaded from stays at the
+// label exactly as published, and nothing is booted out.
+func TestApplyFreshKeepsThePlistOfAJobItBootstrapped(t *testing.T) {
+	dir := launchAgentsDir(t)
+	agent := applyAgent(t, "com.example.unstarted")
+	var verbs []string
+	run := func(_ context.Context, _ string, args ...string) (string, int, error) {
+		verbs = append(verbs, args[0])
+		switch args[0] {
+		case "print":
+			return "Could not find service", launchctlNotFoundExit, nil
+		case "kickstart":
+			return "Kickstart failed: 1: Operation not permitted", 1, nil
+		}
+		return "", 0, nil
+	}
+
+	err := ApplyFresh(context.Background(), run, agent)
+
+	if err == nil || errors.Is(err, ErrPresent) || !strings.Contains(err.Error(), "launchctl kickstart") {
+		t.Fatalf("ApplyFresh = %v, want launchd's own kickstart refusal", err)
+	}
+	if want := []string{"print", "enable", "bootstrap", "kickstart"}; !slices.Equal(verbs, want) {
+		t.Fatalf("verbs = %v, want %v and no bootout", verbs, want)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, agent.Label+".plist"))
+	if err != nil {
+		t.Fatalf("the bootstrapped job's plist is gone: %v", err)
+	}
+	rendered, err := agent.Plist()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(rendered) {
+		t.Fatalf("the bootstrapped job's plist is not the one published\n%s", got)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("LaunchAgents holds %d entries, want only the published plist", len(entries))
 	}
 }
 
 // TestApplyFreshLeavesARacedForeignPlistUntouched is the race on the plist
 // itself: another actor publishes one at the label after the presence check
-// found none. The create-only publication refuses the occupied name, so those
-// bytes stay exactly as written and launchd is never asked to do anything.
+// found none. durable.WriteFileNew's RENAME_EXCL rename refuses the occupied
+// name, so the refusal is ErrPresent over os.ErrExist, those bytes stay exactly
+// as written, and launchd is never asked to do anything.
 func TestApplyFreshLeavesARacedForeignPlistUntouched(t *testing.T) {
 	dir := launchAgentsDir(t)
 	agent := applyAgent(t, "com.example.raced")
@@ -875,8 +998,8 @@ func TestApplyFreshLeavesARacedForeignPlistUntouched(t *testing.T) {
 		return "", 0, nil
 	}
 
-	if err := ApplyFresh(context.Background(), run, agent); !errors.Is(err, ErrPresent) {
-		t.Fatalf("ApplyFresh = %v, want ErrPresent", err)
+	if err := ApplyFresh(context.Background(), run, agent); !errors.Is(err, ErrPresent) || !errors.Is(err, os.ErrExist) {
+		t.Fatalf("ApplyFresh = %v, want ErrPresent over os.ErrExist", err)
 	}
 
 	if want := []string{"print"}; !slices.Equal(verbs, want) {

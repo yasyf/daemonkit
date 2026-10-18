@@ -83,11 +83,23 @@ func Apply(ctx context.Context, run Runner, agent Agent) error {
 // kickstart starts a job without killing one.
 //
 // The [RequireAbsent] checks run before anything is written, and two atomic
-// ones stand behind them. The plist is published create-only, so one that
+// ones stand behind them. The plist is published through
+// [durable.WriteFileNew], whose rename never replaces a file, so one that
 // appeared after the checks is left byte-for-byte as it is and refused with
 // ErrPresent before any launchctl verb runs. A bootstrap that fails while
 // launchd then reports the label loaded is ErrPresent too rather than a
-// bootout; the plist this call wrote stays at the label.
+// bootout.
+//
+// A refused or failed bootstrap removes the plist this call published, and so
+// does a publish whose directory fsync failed, but only while the file at the
+// label is still the very one this call published. The file is renamed aside
+// with RENAME_EXCL and compared there with [os.SameFile], so the file removed
+// is the file compared: a plist something else put at the label is renamed
+// back, and if yet another took the label meanwhile it is left at the aside
+// path the error names, never deleted. A kickstart that fails after a
+// successful bootstrap is returned as itself with the plist left in place,
+// since launchd holds the job it names. Nothing is booted out, so a job
+// launchd already loaded stays loaded.
 func ApplyFresh(ctx context.Context, run Runner, agent Agent) error {
 	if run == nil {
 		return errors.New("launchd: apply runner is required")
@@ -315,13 +327,46 @@ func (c applier) installFresh(ctx context.Context, agent Agent, path string) err
 	if err := durable.Mkdir(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("launchd: create LaunchAgents directory: %w", err)
 	}
-	if err := publishNew(path, plist); err != nil {
-		return err
+	published, err := durable.WriteFileNew(path, plist, 0o600)
+	switch {
+	case errors.Is(err, os.ErrExist):
+		return fmt.Errorf("%w: a plist appeared at %q: %w", ErrPresent, path, err)
+	case published != nil && err != nil:
+		return errors.Join(fmt.Errorf("launchd: publish agent plist: %w", err), removePublished(path, published))
+	case err != nil:
+		return fmt.Errorf("launchd: publish agent plist: %w", err)
 	}
 	if err := c.bootstrapFresh(ctx, agent, path); err != nil {
-		return err
+		return errors.Join(err, removePublished(path, published))
 	}
 	return c.kickstart(ctx, agent.Label)
+}
+
+func removePublished(path string, published os.FileInfo) error {
+	aside := path + ".daemonkit-removing-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	switch err := durable.RenameNew(path, aside); {
+	case errors.Is(err, os.ErrNotExist):
+		return nil
+	case err != nil:
+		return fmt.Errorf("launchd: set published plist %q aside at %q: %w", path, aside, err)
+	}
+	current, err := os.Lstat(aside)
+	if err != nil {
+		return fmt.Errorf("launchd: inspect the plist set aside from %q at %q: %w", path, aside, err)
+	}
+	if os.SameFile(current, published) {
+		if err := durable.Remove(aside); err != nil {
+			return fmt.Errorf("launchd: remove published plist set aside at %q: %w", aside, err)
+		}
+		return nil
+	}
+	switch err := durable.RenameNew(aside, path); {
+	case errors.Is(err, os.ErrExist):
+		return fmt.Errorf("launchd: a plist appeared at %q while another actor's was set aside; that one is left at %q: %w", path, aside, err)
+	case err != nil:
+		return fmt.Errorf("launchd: restore another actor's plist from %q to %q: %w", aside, path, err)
+	}
+	return nil
 }
 
 func (c applier) bootstrapFresh(ctx context.Context, agent Agent, path string) error {
@@ -400,34 +445,6 @@ func (c applier) loadOnce(ctx context.Context, agent Agent, path string) launchc
 func (c applier) launchctl(ctx context.Context, args ...string) launchctlResult {
 	out, code, err := c.run(ctx, launchctlPath, args...)
 	return launchctlOutcome(args[0], out, code, err)
-}
-
-// publishNew lands plist at path only while nothing is there. The bytes are
-// written and fsynced into a temp beside path and hard-linked into place,
-// because link refuses an existing name where the rename every other write
-// publishes through replaces it: a plist that appeared after the presence check
-// stays exactly as it is.
-func publishNew(path string, plist []byte) error {
-	dir := filepath.Dir(path)
-	temp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*")
-	if err != nil {
-		return fmt.Errorf("launchd: stage agent plist: %w", err)
-	}
-	_, writeErr := temp.Write(plist)
-	if err := errors.Join(writeErr, temp.Chmod(0o600), temp.Sync(), temp.Close()); err != nil {
-		return errors.Join(fmt.Errorf("launchd: stage agent plist: %w", err), os.Remove(temp.Name()))
-	}
-	linkErr := os.Link(temp.Name(), path)
-	removeErr := os.Remove(temp.Name())
-	switch {
-	case errors.Is(linkErr, fs.ErrExist):
-		return errors.Join(fmt.Errorf("%w: a plist appeared at %q", ErrPresent, path), removeErr)
-	case linkErr != nil:
-		return errors.Join(fmt.Errorf("launchd: publish agent plist: %w", linkErr), removeErr)
-	case removeErr != nil:
-		return fmt.Errorf("launchd: discard staged agent plist: %w", removeErr)
-	}
-	return durable.SyncDir(dir)
 }
 
 // archiveForeignPlist renames aside any existing plist at path that does not

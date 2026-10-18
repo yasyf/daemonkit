@@ -5,14 +5,18 @@ package deploy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/yasyf/daemonkit/durable"
 	"github.com/yasyf/daemonkit/launchd"
 )
 
@@ -507,9 +511,9 @@ func TestFreshVerbsRequireAContextDeadline(t *testing.T) {
 // both gates: launchd takes the agent's label between the second gate and the
 // bootstrap, and its own bootstrap refusal is the atomic check. That is
 // ErrNotFresh over launchd.ErrPresent with nothing booted out and no kickstart;
-// the landed generation stays installed, no activation is sealed, and the
-// services record still names the label, recorded before launchd was asked to
-// load it.
+// the landed generation stays installed, no activation is sealed, the plist
+// ApplyFresh published is gone, and the services record, which named the label
+// before launchd was asked to load it, is rolled back to no label at all.
 func TestInstallFreshRefusesWhenALabelAppearsBeforeActivation(t *testing.T) {
 	f := newFixture(t)
 	candidate := f.candidate("Source", "3.0", "three")
@@ -540,24 +544,29 @@ func TestInstallFreshRefusesWhenALabelAppearsBeforeActivation(t *testing.T) {
 	if fileExists(f.deploy.layout.activation) {
 		t.Fatal("InstallFresh sealed an activation for a label it never got")
 	}
-	applied, err := f.deploy.appliedServices()
-	if err != nil || !slices.Equal(applied, []string{f.agent.Label}) {
-		t.Fatalf("applied services = %v, %v; want [%q]", applied, err, f.agent.Label)
+	if fileExists(f.deploy.layout.services) {
+		t.Fatal("InstallFresh kept a services record naming a label it never got")
+	}
+	if fileExists(filepath.Join(f.agentsDir, f.agent.Label+".plist")) {
+		t.Fatal("InstallFresh left the plist it published at a label it never got")
 	}
 }
 
 // TestInstallFreshRefusesOnlyBeforeLaunchdChangesAnything draws the line
 // between a refusal and a failure inside ApplyFresh. Its own presence check
 // failing to answer comes before launchd is asked to change anything, so it is
-// uncertain and therefore not fresh. A kickstart launchd refuses after the
-// bootstrap loaded the job is a failure of an activation already under way,
-// and is reported as itself.
+// uncertain and therefore not fresh, and the services record is rolled back
+// with no plist of this call's at the label. A kickstart launchd refuses after
+// the bootstrap loaded the job is a failure of an activation already under
+// way, and is reported as itself: the job stays loaded, so its plist stays at
+// the label, the services record keeps naming it, and nothing is booted out.
 func TestInstallFreshRefusesOnlyBeforeLaunchdChangesAnything(t *testing.T) {
 	tests := []struct {
 		name      string
 		answer    func(args []string, prints int) (string, int, error)
 		verbs     []string
 		wantFresh bool
+		recorded  bool
 	}{
 		{
 			name: "ApplyFresh's own presence check cannot answer",
@@ -584,7 +593,8 @@ func TestInstallFreshRefusesOnlyBeforeLaunchdChangesAnything(t *testing.T) {
 				}
 				return "", 0, nil
 			},
-			verbs: []string{"print", "print", "print", "enable", "bootstrap", "kickstart"},
+			verbs:    []string{"print", "print", "print", "enable", "bootstrap", "kickstart"},
+			recorded: true,
 		},
 	}
 	for _, tt := range tests {
@@ -614,7 +624,163 @@ func TestInstallFreshRefusesOnlyBeforeLaunchdChangesAnything(t *testing.T) {
 			if fileExists(f.deploy.layout.activation) {
 				t.Fatal("InstallFresh sealed an activation it never proved")
 			}
+			var recorded []string
+			if tt.recorded {
+				recorded = []string{f.agent.Label}
+			}
+			applied, err := f.deploy.appliedServices()
+			if err != nil || !slices.Equal(applied, recorded) {
+				t.Fatalf("applied services = %v, %v; want %v", applied, err, recorded)
+			}
+			if got := fileExists(filepath.Join(f.agentsDir, f.agent.Label+".plist")); got != tt.recorded {
+				t.Fatalf("plist at the label = %t, want %t", got, tt.recorded)
+			}
 		})
+	}
+}
+
+// TestInstallFreshRefusesACandidateSlotThatAppearsAfterTheGate is a writer
+// outside the hold — a legacy-lock install sharing the slot path — publishing
+// another generation into the candidate slot once the first gate's filesystem
+// half has passed; the gate's own launchd print is where it lands. Staging's
+// up-front check refuses it at gate stage, naming the slot that exists, rather
+// than discarding it: every file under the install root and the home, the
+// foreign slot among them, is byte-identical after, and launchd was asked
+// nothing but the gate's print.
+func TestInstallFreshRefusesACandidateSlotThatAppearsAfterTheGate(t *testing.T) {
+	f := newFixture(t)
+	candidate := f.candidate("Source", "3.0", "three")
+	foreign := f.bundle("Foreign", "2.0", "two")
+	var before map[string]string
+	f.deploy.run = func(_ context.Context, _ string, args ...string) (string, int, error) {
+		f.launchctls = append(f.launchctls, args)
+		if args[0] == "print" && before == nil {
+			rename(f.t, foreign, f.deploy.layout.candidate)
+			before = f.snapshot()
+		}
+		return "Could not find service", launchctlUnknownLabel, nil
+	}
+
+	_, err := f.deploy.InstallFresh(f.ctx(), candidate)
+
+	exists := fmt.Sprintf("gate stage: %v: %q exists", ErrNotFresh, f.deploy.layout.candidate)
+	if !errors.Is(err, ErrNotFresh) || !strings.Contains(err.Error(), exists) {
+		t.Fatalf("InstallFresh err = %v, want ErrNotFresh at gate stage reading %q", err, exists)
+	}
+	if before == nil {
+		t.Fatal("the gate never asked launchd, so no slot appeared")
+	}
+	f.unchanged(before)
+	if want := []string{"print"}; !slices.Equal(f.verbs(), want) {
+		t.Fatalf("launchctl verbs = %v, want %v", f.verbs(), want)
+	}
+}
+
+// TestStageFreshRefusesACandidateSlotThatAppearsAtPublish is the same writer
+// landing later: past staging's up-front check, while this call's copy sits
+// staged and ready to publish. The create-only publish refuses the occupied
+// slot at gate stage, the foreign generation stays byte-identical in the slot,
+// the staging tree this call made is gone, and nothing else changes.
+func TestStageFreshRefusesACandidateSlotThatAppearsAtPublish(t *testing.T) {
+	f := newFixture(t)
+	if err := f.deploy.layout.ensureMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	candidate := f.candidate("Source", "3.0", "three")
+	foreign := f.bundle("Foreign", "2.0", "two")
+	var staged string
+	var before map[string]string
+	publish := func(from, to string) error {
+		rename(f.t, foreign, to)
+		staged, before = from, f.snapshot()
+		maps.DeleteFunc(before, func(path, _ string) bool {
+			return path == from || strings.HasPrefix(path, from+string(filepath.Separator))
+		})
+		return durable.RenameNew(from, to)
+	}
+
+	_, err := f.deploy.stageFresh(f.ctx(), candidate, publish)
+
+	if !errors.Is(err, ErrNotFresh) || !errors.Is(err, os.ErrExist) ||
+		!strings.Contains(err.Error(), "gate stage") || !strings.Contains(err.Error(), "a candidate slot appeared") {
+		t.Fatalf("stageFresh err = %v, want ErrNotFresh over os.ErrExist at gate stage's publish", err)
+	}
+	if before == nil {
+		t.Fatal("stageFresh never reached its publish, so no slot appeared there")
+	}
+	if fileExists(staged) {
+		t.Fatalf("the staging tree %q outlived the refusal", staged)
+	}
+	f.unchanged(before)
+}
+
+// TestInstallFreshRollsBackARefusedSecondAgent is the second of two agents
+// refused at its bootstrap, with launchd then reporting its label loaded. Each
+// label joins the services record just before its own bootstrap, and the
+// refusal rolls the record back to the first label alone: the first agent
+// stays bootstrapped with its plist in place, the second's plist is gone, and
+// nothing is booted out.
+func TestInstallFreshRollsBackARefusedSecondAgent(t *testing.T) {
+	f := newFixture(t)
+	second := f.agent
+	second.Label = f.agent.Label + ".second"
+	f.deploy.config.Agents = append(f.deploy.config.Agents, second)
+	candidate := f.candidate("Source", "3.0", "three")
+	loaded := map[string]bool{}
+	recorded := map[string][]string{}
+	f.deploy.run = func(_ context.Context, _ string, args ...string) (string, int, error) {
+		f.launchctls = append(f.launchctls, args)
+		label := strings.TrimSuffix(filepath.Base(args[len(args)-1]), ".plist")
+		switch args[0] {
+		case "print":
+			if !loaded[label] {
+				return "Could not find service", launchctlUnknownLabel, nil
+			}
+		case "bootstrap":
+			applied, err := f.deploy.appliedServices()
+			if err != nil {
+				t.Errorf("read the services record at %q's bootstrap: %v", label, err)
+			}
+			recorded[label] = applied
+			loaded[label] = true
+			if label == second.Label {
+				return "Bootstrap failed: 5: Input/output error", 5, nil
+			}
+		}
+		return "", 0, nil
+	}
+
+	_, err := f.deploy.InstallFresh(f.ctx(), candidate)
+
+	if !errors.Is(err, ErrNotFresh) || !errors.Is(err, launchd.ErrPresent) {
+		t.Fatalf("InstallFresh err = %v, want ErrNotFresh over launchd.ErrPresent", err)
+	}
+	want := []string{
+		"print", "print", "print", "print",
+		"print", "enable", "bootstrap", "kickstart",
+		"print", "enable", "bootstrap", "print",
+	}
+	if !slices.Equal(f.verbs(), want) {
+		t.Fatalf("launchctl verbs = %v, want %v and never bootout", f.verbs(), want)
+	}
+	if got := recorded[f.agent.Label]; !slices.Equal(got, []string{f.agent.Label}) {
+		t.Fatalf("services at the first bootstrap = %v, want [%q]", got, f.agent.Label)
+	}
+	if got := recorded[second.Label]; !slices.Equal(got, []string{f.agent.Label, second.Label}) {
+		t.Fatalf("services at the second bootstrap = %v, want [%q %q]", got, f.agent.Label, second.Label)
+	}
+	applied, err := f.deploy.appliedServices()
+	if err != nil || !slices.Equal(applied, []string{f.agent.Label}) {
+		t.Fatalf("applied services = %v, %v; want [%q]", applied, err, f.agent.Label)
+	}
+	if !fileExists(filepath.Join(f.agentsDir, f.agent.Label+".plist")) {
+		t.Fatal("the rollback took the bootstrapped first agent's plist")
+	}
+	if fileExists(filepath.Join(f.agentsDir, second.Label+".plist")) {
+		t.Fatal("the refused second agent's plist is still at its label")
+	}
+	if fileExists(f.deploy.layout.activation) {
+		t.Fatal("InstallFresh sealed an activation for an agent it never got")
 	}
 }
 

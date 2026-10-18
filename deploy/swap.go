@@ -224,7 +224,7 @@ func (d *Deployment) stage(ctx context.Context, candidate Candidate) (Generation
 	if err != nil {
 		return Generation{}, fmt.Errorf("deploy: create candidate stage: %w", err)
 	}
-	staged, stageErr := d.copyIntoStage(ctx, candidate, source, stagePath)
+	staged, stageErr := d.copyIntoStage(ctx, candidate, source, stagePath, durable.Rename)
 	if stageErr != nil {
 		return Generation{}, errors.Join(stageErr, durable.RemoveTree(stagePath))
 	}
@@ -318,6 +318,7 @@ func (d *Deployment) copyIntoStage(
 	candidate Candidate,
 	source Generation,
 	stagePath string,
+	publish func(from, to string) error,
 ) (Generation, error) {
 	if err := copyBundleTree(candidate.Source, stagePath); err != nil {
 		return Generation{}, err
@@ -335,7 +336,7 @@ func (d *Deployment) copyIntoStage(
 	if !copied.sameBytes(source) {
 		return Generation{}, fmt.Errorf("%w: staged copy differs from its source", ErrConflict)
 	}
-	if err := durable.Rename(stagePath, d.layout.candidate); err != nil {
+	if err := publish(stagePath, d.layout.candidate); err != nil {
 		return Generation{}, fmt.Errorf("deploy: publish private candidate: %w", err)
 	}
 	published, err := d.inspect(ctx, d.layout.candidate)

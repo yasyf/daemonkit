@@ -470,11 +470,13 @@ durable	func	ReadFile	all
 durable	func	Remove	all
 durable	func	RemoveTree	all
 durable	func	Rename	all
+durable	func	RenameNew	darwin
 durable	func	SyncDir	all
 durable	func	Unmarshal	all
 durable	type	Validating	all
 durable	method	Validating.Validate	all
 durable	func	WriteFile	all
+durable	func	WriteFileNew	darwin
 durable	type	Writer	all
 durable	method	Writer.Close	all
 durable	method	Writer.Commit	all
