@@ -1,1 +1,1 @@
-{"v":1,"lamport":5,"session":"7250b991-7e86-44e8-90fa-1e16cd24276c","ops":[{"kind":"add_comment","body":"028e919 CI green (35/35). Awaiting root S1/S2 (stale owner record/removal.json) before Sol reviews."}]}
+{"v":1,"lamport":6,"session":"7250b991-7e86-44e8-90fa-1e16cd24276c","ops":[{"kind":"add_comment","body":"Either-verdict deltas + finder fixes shipped as 3c0d683 (RenameNew/WriteFileNew create-only, no-discard stageFresh, per-label services rollback, rename-aside plist removal). CI running; freeze in capt-tier1-optionB-sdk-review-ready.json; S1/S2 pending."}]}
