@@ -57,6 +57,12 @@ var (
 	// ErrState means a durable deployment record is corrupt or inexact.
 	ErrState = errors.New("deploy: durable deployment state is invalid")
 
+	// ErrNotFresh means a fresh-only verb found this deployment already
+	// present — a record, a generation, an owner record, a daemon answering
+	// its socket, a live process on its executables, or an agent launchd
+	// holds — or could not prove that nothing is. It wraps the evidence.
+	ErrNotFresh = errors.New("deploy: deployment is not fresh")
+
 	// ErrRestored is joined to an aborted supersede's error when the prior
 	// generation was proved serving after the abort: its services re-applied
 	// and its daemon proved ready, or that daemon found still ready. It is

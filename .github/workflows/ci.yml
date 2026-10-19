@@ -134,7 +134,7 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
+          version: v2.14.0
 
   vuln:
     name: vuln (${{ matrix.goos }})
