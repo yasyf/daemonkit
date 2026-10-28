@@ -2,6 +2,7 @@ package daemonkit
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/yasyf/daemonkit/internal/maintenance"
 	"github.com/yasyf/daemonkit/internal/proc"
@@ -90,3 +91,21 @@ func (e *RemoteError) Error() string { return e.Message }
 
 // Unwrap returns Err, nil when the response code classified nothing.
 func (e *RemoteError) Unwrap() error { return e.Err }
+
+// ForeignProtocolError is ErrProtocolMismatch as an attach to the daemon's
+// socket observed it: the wire protocol the answering daemon's frames carry
+// and the PID the kernel reported for that peer. It is the one thing a build
+// of one era can learn about a daemon of another, enough to tell an older
+// incumbent from a newer one and to reach the newer one's executable.
+type ForeignProtocolError struct {
+	Protocol uint16
+	PID      int
+	err      error
+}
+
+func (e *ForeignProtocolError) Error() string { return fmt.Sprintf("%v (daemon pid %d)", e.err, e.PID) }
+
+func (e *ForeignProtocolError) Unwrap() error { return e.err }
+
+// Newer reports whether the daemon speaks a later wire protocol than this build.
+func (e *ForeignProtocolError) Newer() bool { return e.Protocol > wire.ProtocolVersion }

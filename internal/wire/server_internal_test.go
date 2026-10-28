@@ -420,8 +420,9 @@ func TestOldEraPeersGetProtocolMismatch(t *testing.T) {
 		}()
 		codec := NewCodec(clientConn)
 		_, err := clientHandshake(codec, helloIdentity{Protocol: ProtocolVersion, Schema: "test.v1"})
-		if !errors.Is(err, ErrProtocolVersion) {
-			t.Fatalf("clientHandshake() against an old-era server = %v, want ErrProtocolVersion", err)
+		var mismatch *ProtocolMismatchError
+		if !errors.As(err, &mismatch) || mismatch.Theirs != 1 || mismatch.Ours != ProtocolVersion {
+			t.Fatalf("clientHandshake() against an old-era server = %v, want ProtocolMismatchError{1, %d}", err, ProtocolVersion)
 		}
 	})
 }

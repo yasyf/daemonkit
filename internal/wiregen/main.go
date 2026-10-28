@@ -359,7 +359,7 @@ func goSource(s *schema) ([]byte, error) {
 	p("	}")
 	p("	version := binary.BigEndian.Uint16(%s)", goRange(s.field("version", "")))
 	p("	if version != ProtocolVersion {")
-	p(`	return Frame{}, fmt.Errorf("%%w: got %%d, want %%d", ErrProtocolVersion, version, ProtocolVersion)`)
+	p(`	return Frame{}, &ProtocolMismatchError{Theirs: version, Ours: ProtocolVersion}`)
 	p("	}")
 	p("	kind := FrameKind(body[%d])", s.field("frameKind", "").offset)
 	p("	if !kind.valid() {")
