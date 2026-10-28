@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-10-27
+
 ### Removed
 
 - Every per-connection security check. Any process that can open a daemon's
@@ -1859,7 +1861,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.34.0...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.35.0...HEAD
+[0.35.0]: https://github.com/yasyf/daemonkit/compare/v0.34.0...v0.35.0
 [0.34.0]: https://github.com/yasyf/daemonkit/compare/v0.33.1...v0.34.0
 [0.33.1]: https://github.com/yasyf/daemonkit/compare/v0.33.0...v0.33.1
 [0.33.0]: https://github.com/yasyf/daemonkit/compare/v0.32.3...v0.33.0
