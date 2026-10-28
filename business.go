@@ -135,6 +135,9 @@ func (c *Client) Business() *Business {
 	return &Business{
 		contract: contract,
 		attach: func(ctx context.Context) (*wire.Client, int, error) {
+			if err := contract.validate(); err != nil {
+				return nil, 0, err
+			}
 			if session, peer, ok := c.link.surrender(); ok {
 				return session, peer, nil
 			}
@@ -260,9 +263,6 @@ func BusinessOverConn(ctx context.Context, conn net.Conn, contract Contract) (*B
 func (b *Business) Call(ctx context.Context, op string, body []byte) (Reply, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		return Reply{}, errors.New("daemonkit: Call requires a context deadline")
-	}
-	if err := b.contract.validate(); err != nil {
-		return Reply{}, refused(err)
 	}
 	if limit := maxFramedBytes(b.contract.MaxFrame); Bytes(len(body)) > limit {
 		return Reply{}, refused(fmt.Errorf("%w: %d bytes over the %d the session carries", ErrOversize, len(body), limit))

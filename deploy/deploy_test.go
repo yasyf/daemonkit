@@ -3,6 +3,7 @@
 package deploy
 
 import (
+	"cmp"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -29,6 +30,7 @@ const (
 	daemonChildLabel = "DAEMONKIT_DEPLOY_DAEMON_CHILD_LABEL"
 	daemonChildDelay = "DAEMONKIT_DEPLOY_DAEMON_CHILD_DELAY"
 	daemonChildPark  = "DAEMONKIT_DEPLOY_DAEMON_CHILD_PARK"
+	daemonChildBuild = "DAEMONKIT_DEPLOY_DAEMON_CHILD_BUILD"
 	huskChildEnv     = "DAEMONKIT_DEPLOY_HUSK_CHILD"
 	huskChildRecord  = "DAEMONKIT_DEPLOY_HUSK_CHILD_RECORD"
 )
@@ -62,7 +64,7 @@ func serveDaemonChild() {
 	if os.Getenv(daemonChildPark) == "1" {
 		product = parkedProduct{}
 	}
-	program, err := daemonkit.Stable("deploy.test")
+	program, err := daemonkit.Stable(cmp.Or(os.Getenv(daemonChildBuild), "deploy.test"))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "deploy daemon child: %v\n", err)
 		os.Exit(70)
@@ -1154,7 +1156,7 @@ func TestSupersedeAbortDoesNotCertifyAnotherBuild(t *testing.T) {
 			return "", 0, nil
 		}
 		child := exec.Command(other)
-		child.Env = append(os.Environ(), daemonChildEnv+"=1", daemonChildLabel+"="+string(f.deploy.config.Daemon.Label), daemonChildDelay+"=0s", daemonChildPark+"=0")
+		child.Env = append(os.Environ(), daemonChildEnv+"=1", daemonChildLabel+"="+string(f.deploy.config.Daemon.Label), daemonChildDelay+"=0s", daemonChildPark+"=0", daemonChildBuild+"=other.build")
 		child.Stderr = os.Stderr
 		if err := child.Start(); err != nil {
 			t.Fatalf("start other build: %v", err)

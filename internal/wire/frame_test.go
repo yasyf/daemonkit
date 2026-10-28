@@ -57,8 +57,8 @@ func frozenPrefix(t *testing.T, name string) []byte {
 	return prefix
 }
 
-func TestGoldenV2Packet(t *testing.T) {
-	want := goldenPacket(t, filepath.Join("testdata", "frame-v2.json"))
+func TestGoldenV3Packet(t *testing.T) {
+	want := goldenPacket(t, filepath.Join("testdata", "frame-v3.json"))
 	got, err := EncodePacket(goldenFrame())
 	if err != nil {
 		t.Fatalf("EncodePacket: %v", err)
@@ -77,21 +77,21 @@ func TestGoldenV2Packet(t *testing.T) {
 
 func TestGoldenV1ShapeSurvivesTheVersionBump(t *testing.T) {
 	v1 := goldenPacket(t, filepath.Join("testdata", "frame-v1.json"))
-	v2 := goldenPacket(t, filepath.Join("testdata", "frame-v2.json"))
-	if len(v1) != len(v2) {
-		t.Fatalf("golden lengths %d and %d differ", len(v1), len(v2))
+	v3 := goldenPacket(t, filepath.Join("testdata", "frame-v3.json"))
+	if len(v1) != len(v3) {
+		t.Fatalf("golden lengths %d and %d differ", len(v1), len(v3))
 	}
 	versionAt := framePrefixSize + 4
-	for i := range v2 {
-		if v1[i] != v2[i] && (i < versionAt || i >= versionAt+2) {
+	for i := range v3 {
+		if v1[i] != v3[i] && (i < versionAt || i >= versionAt+2) {
 			t.Fatalf("goldens differ at packet byte %d, outside body[4:6]", i)
 		}
 	}
 	if binary.BigEndian.Uint16(v1[versionAt:versionAt+2]) != 1 {
 		t.Fatalf("v1 golden carries version %x", v1[versionAt:versionAt+2])
 	}
-	if binary.BigEndian.Uint16(v2[versionAt:versionAt+2]) != 2 {
-		t.Fatalf("v2 golden carries version %x", v2[versionAt:versionAt+2])
+	if binary.BigEndian.Uint16(v3[versionAt:versionAt+2]) != 3 {
+		t.Fatalf("v3 golden carries version %x", v3[versionAt:versionAt+2])
 	}
 	packet, err := EncodePacket(goldenFrame())
 	if err != nil {
@@ -109,7 +109,7 @@ func TestFrozenEraPrefixes(t *testing.T) {
 		t.Fatalf("EncodeFrame: %v", err)
 	}
 	if cut := frozenPrefix(t, "frame-prefix-cut.hex"); !bytes.Equal(body[:len(cut)], cut) {
-		t.Fatalf("v2 body opens %x, want the frozen cut prefix %x", body[:len(cut)], cut)
+		t.Fatalf("v3 body opens %x, want the frozen cut prefix %x", body[:len(cut)], cut)
 	}
 	v1 := goldenPacket(t, filepath.Join("testdata", "frame-v1.json"))
 	precut := frozenPrefix(t, "frame-prefix-precut.hex")
@@ -178,7 +178,7 @@ func TestDecodeFrameRejects(t *testing.T) {
 }
 
 func TestDecodePacketRejects(t *testing.T) {
-	golden := goldenPacket(t, filepath.Join("testdata", "frame-v2.json"))
+	golden := goldenPacket(t, filepath.Join("testdata", "frame-v3.json"))
 	oversized := make([]byte, framePrefixSize)
 	binary.BigEndian.PutUint32(oversized, DefaultMaxFrame+1)
 	tests := []struct {

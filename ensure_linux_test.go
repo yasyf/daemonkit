@@ -132,14 +132,15 @@ func TestDaemonAgent(t *testing.T) {
 
 // TestEnsureRefusesWithNoSupervisorBeforeTouchingTheDaemon is the
 // workspace-owned contract at the verb a launcher calls. With no supervisor to
-// start a replacement, Ensure must not evict what is serving: it refuses at its
-// first observation and the live daemon keeps serving.
+// start a replacement, Ensure must not evict a daemon serving an older build:
+// it refuses before acting and the live daemon keeps serving.
 func TestEnsureRefusesWithNoSupervisorBeforeTouchingTheDaemon(t *testing.T) {
-	d, _ := supervisedDaemon(t, "dknosup")
+	d, program := supervisedDaemon(t, "dknosup")
 	child := startControlChild(t, string(d.Label))
 	ctx := bounded(t, 60*time.Second)
 	client := openClient(t, d)
 	awaitServing(ctx, t, client)
+	versionBundle(t, filepath.Join(filepath.Dir(program), "Daemon.app"), "2.0.0")
 
 	if _, err := client.Ensure(bounded(t, 10*time.Second)); !errors.Is(err, supervise.ErrNoSupervisor) {
 		t.Fatalf("Ensure() with no supervisor = %v, want supervise.ErrNoSupervisor", err)
