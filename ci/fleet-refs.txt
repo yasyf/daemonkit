@@ -34,17 +34,17 @@
 # subset, so its leg builds both and a linux-only break stops being invisible.
 # Every entry in the set names a platform: the script refuses an empty one,
 # which would leave a leg building nothing and reporting the pass it starts at.
-synckit                 main
+synckit                 drop-trust-checks
 fusekit                 main
 reposync                main
 captain-hook            main
 cc-notes                main
 cc-patch                main
 cc-orchestrate          main
-cc-interact             main
+cc-interact             drop-trust-checks
 binrun                  main    darwin,linux
-cc-present              main
-cc-review               main
+cc-present              drop-trust-checks
+cc-review               drop-trust-checks
 cc-pool                 main
 cookiesync              main
 cc-skills:plugins/codex main
