@@ -43,8 +43,8 @@ cc-patch                main
 cc-orchestrate          main
 cc-interact             main
 binrun                  main    darwin,linux
-cc-present              drop-trust-checks
-cc-review               drop-trust-checks
+cc-present              main
+cc-review               main
 cc-pool                 main
 cookiesync              main
 cc-skills:plugins/codex main
