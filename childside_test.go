@@ -52,6 +52,9 @@ func runChildRole(role string) int {
 		return childSpawnChannelClient()
 	case "exit-clean":
 		return 0
+	case "sleep":
+		time.Sleep(10 * time.Minute)
+		return 0
 	}
 	fmt.Fprintf(os.Stderr, "child: unknown role %q\n", role)
 	return 64
