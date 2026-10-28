@@ -128,7 +128,7 @@ func DecodeFrame(body []byte) (Frame, error) {
 	}
 	version := binary.BigEndian.Uint16(body[4:6])
 	if version != ProtocolVersion {
-		return Frame{}, fmt.Errorf("%w: got %d, want %d", ErrProtocolVersion, version, ProtocolVersion)
+		return Frame{}, &ProtocolMismatchError{Theirs: version, Ours: ProtocolVersion}
 	}
 	kind := FrameKind(body[6])
 	if !kind.valid() {

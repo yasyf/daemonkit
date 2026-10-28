@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-10-28
+
+### Added
+
+- `ForeignProtocolError`: a client whose attach reaches a daemon of another
+  wire protocol now gets the protocol that daemon's frames carry and the PID
+  the socket reported for it, with `Newer` saying whether the daemon is the
+  later era. It still matches `ErrProtocolMismatch`. A consumer can tell an
+  older incumbent, which it should replace, from a newer one, which it should
+  hand off to, and reach the newer one's executable through its PID. Before,
+  a frame of another protocol failed as an untyped "got N, want M" error, so
+  an older client could neither tell the two apart nor find the daemon.
+
 ## [0.35.4] - 2026-10-28
 
 ### Fixed
@@ -1899,7 +1912,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.35.4...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.36.0...HEAD
+[0.36.0]: https://github.com/yasyf/daemonkit/compare/v0.35.4...v0.36.0
 [0.35.4]: https://github.com/yasyf/daemonkit/compare/v0.35.3...v0.35.4
 [0.35.3]: https://github.com/yasyf/daemonkit/compare/v0.35.2...v0.35.3
 [0.35.2]: https://github.com/yasyf/daemonkit/compare/v0.35.1...v0.35.2
