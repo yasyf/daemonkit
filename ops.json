@@ -1,1 +1,1 @@
-{"v":1,"lamport":5,"session":"0a63ac1e-6d69-45a8-9706-5891cf8b9dd4","ops":[{"kind":"set_title","title":"Flaky on CI: fixed wall-clock deadline assertions across three Swift suites (Deadline, Readiness, SnapshotWatcher)"},{"kind":"add_anchor","anchor":{"kind":"path","value":"Tests/DaemonKitTests/SnapshotWatcherTests.swift"}}]}
+{"v":1,"lamport":6,"session":"f83679ca-3fa0-4ce8-ad00-8ac9f16462df","ops":[{"kind":"set_branch","branch":"go-1.26.10"}]}
