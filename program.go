@@ -21,9 +21,9 @@ import (
 type Program struct{ policy placement }
 
 // placement is one Program's whole policy: where launchd runs the executable
-// from, which build that is, and what putting it there takes. Its two
-// implementations are Program's two constructors, and nothing outside this
-// file can write a third.
+// from, which build that is, and what putting it there takes. Its three
+// implementations are Program's three constructors, and nothing outside this
+// file can write a fourth.
 type placement interface {
 	// path is where the plist's Program key points. It answers before anything
 	// is written, so the LaunchAgent can be declared and the process table
@@ -106,12 +106,27 @@ func InBundle(app, rel string) (Program, error) {
 	return Program{policy: bundled{app: app, file: path}}, nil
 }
 
+// Installed names an executable a package manager keeps at a stable path,
+// such as a Homebrew bin link into a versioned app bundle, and never copies it:
+// the link survives the upgrade that replaces what it points at, and an
+// executable run through it keeps its bundle's identity. build is the version
+// string the executable reports for itself, the same one Stable takes.
+func Installed(path, build string) (Program, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return Program{}, fmt.Errorf("daemonkit: installed program %q is not exact and absolute", path)
+	}
+	if build == "" {
+		return Program{}, errors.New("daemonkit: Installed requires the executable's build version")
+	}
+	return Program{policy: installed{file: path, version: build}}, nil
+}
+
 // build is the build Ensure converges on, and the last point at which a Daemon
 // whose Program no constructor built is still nameable as the cause: every
 // step past here holds an empty path and reports it as one.
 func (p Program) build() (string, error) {
 	if p.policy == nil {
-		return "", errors.New("daemonkit: Daemon.Program is unset: build one with Stable or InBundle")
+		return "", errors.New("daemonkit: Daemon.Program is unset: build one with Stable, InBundle, or Installed")
 	}
 	return p.policy.build()
 }
@@ -252,3 +267,14 @@ func placedBuild(path, record string) (string, error) {
 	}
 	return string(data), nil
 }
+
+type installed struct {
+	file    string
+	version string
+}
+
+func (i installed) build() (string, error) { return i.version, nil }
+
+func (i installed) path(element) (string, error) { return i.file, nil }
+
+func (i installed) place(element) (bool, error) { return false, nil }

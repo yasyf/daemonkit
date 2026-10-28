@@ -417,6 +417,43 @@ func TestInBundlePlacesNothing(t *testing.T) {
 	}
 }
 
+func TestInstalledNamesItsPathAndBuildAndPlacesNothing(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv(realhome.EnvOverride, home)
+	link := "/opt/homebrew/bin/fake"
+
+	program, err := Installed(link, "1.2.3")
+	if err != nil {
+		t.Fatalf("Installed() error = %v", err)
+	}
+	el := placedElement(t)
+	if path, err := program.path(el); err != nil || path != link {
+		t.Fatalf("path() = %q, %v, want %q", path, err, link)
+	}
+	if build, err := program.build(); err != nil || build != "1.2.3" {
+		t.Fatalf("build() = %q, %v, want 1.2.3", build, err)
+	}
+	replaced, err := program.place(el)
+	if err != nil || replaced {
+		t.Fatalf("place() = %t, %v, want no write", replaced, err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".daemonkit")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("stat the program root = %v, want an installed program to have made none", err)
+	}
+}
+
+func TestInstalledRefusesAnInexactPathOrAnUnnamedBuild(t *testing.T) {
+	for _, tc := range []struct{ path, build string }{
+		{"bin/fake", "1.2.3"},
+		{"/opt/homebrew/bin/../bin/fake", "1.2.3"},
+		{"/opt/homebrew/bin/fake", ""},
+	} {
+		if _, err := Installed(tc.path, tc.build); err == nil {
+			t.Errorf("Installed(%q, %q) succeeded, want a refusal", tc.path, tc.build)
+		}
+	}
+}
+
 func TestInBundleSymlinkEscape(t *testing.T) {
 	root := t.TempDir()
 	app := filepath.Join(root, "Fake.app")

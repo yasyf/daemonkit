@@ -136,6 +136,7 @@
 .	field	Health.Phase	all
 .	field	Health.Protocol	all
 .	func	InBundle	all
+.	func	Installed	all
 .	type	Label	all
 .	type	Limits	all
 .	field	Limits.Concurrency	all
