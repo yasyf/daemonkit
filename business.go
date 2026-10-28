@@ -181,7 +181,7 @@ func attachSocket(ctx context.Context, d Daemon) (*wire.Client, int, error) {
 	})
 	var mismatch *wire.ProtocolMismatchError
 	if errors.As(err, &mismatch) {
-		return nil, 0, &ForeignProtocolError{Protocol: mismatch.Theirs, PID: peer, err: err}
+		return nil, 0, &ForeignProtocolError{Protocol: mismatch.Theirs, PID: peer, Err: err}
 	}
 	if err != nil {
 		return nil, 0, err

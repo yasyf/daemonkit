@@ -100,12 +100,12 @@ func (e *RemoteError) Unwrap() error { return e.Err }
 type ForeignProtocolError struct {
 	Protocol uint16
 	PID      int
-	err      error
+	Err      error
 }
 
-func (e *ForeignProtocolError) Error() string { return fmt.Sprintf("%v (daemon pid %d)", e.err, e.PID) }
+func (e *ForeignProtocolError) Error() string { return fmt.Sprintf("%v (daemon pid %d)", e.Err, e.PID) }
 
-func (e *ForeignProtocolError) Unwrap() error { return e.err }
+func (e *ForeignProtocolError) Unwrap() error { return e.Err }
 
 // Newer reports whether the daemon speaks a later wire protocol than this build.
 func (e *ForeignProtocolError) Newer() bool { return e.Protocol > wire.ProtocolVersion }

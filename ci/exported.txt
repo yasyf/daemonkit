@@ -121,6 +121,7 @@
 .	field	Expect.Build	all
 .	field	Expect.Generation	all
 .	type	ForeignProtocolError	all
+.	field	ForeignProtocolError.Err	all
 .	method	ForeignProtocolError.Error	all
 .	method	ForeignProtocolError.Newer	all
 .	field	ForeignProtocolError.PID	all
