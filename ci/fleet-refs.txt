@@ -36,17 +36,17 @@
 # which would leave a leg building nothing and reporting the pass it starts at.
 synckit                 main
 fusekit                 main
-reposync                drop-trust-checks
-captain-hook            drop-trust-checks
-cc-notes                drop-trust-checks
+reposync                main
+captain-hook            main
+cc-notes                main
 cc-patch                main
-cc-orchestrate          drop-trust-checks
+cc-orchestrate          main
 cc-interact             main
 binrun                  main    darwin,linux
 cc-present              drop-trust-checks
 cc-review               drop-trust-checks
-cc-pool                 drop-trust-checks
+cc-pool                 main
 cookiesync              main
 cc-skills:plugins/codex main
-cc-runtime              drop-trust-checks
+cc-runtime              main
 cc-squash:go            main
