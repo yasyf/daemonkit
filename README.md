@@ -85,7 +85,7 @@ disappears cannot leave a stale row behind.
 | `deploy` | owns sealed installation, activation, supersession, and removal of one fixed signed application. | 17 | 7623 |
 | `durable` | makes filesystem state survive crashes: atomic, fsynced publication of files and directory mutations, a strict validated JSON codec, and one bounded cross-process lock. | 11 | 1433 |
 | `ghrelease` | queries GitHub for a repository's latest published release. | 2 | 170 |
-| `launchd` | is the value-type model for one exact macOS user LaunchAgent and the stateless primitives that apply it. | 12 | 2996 |
+| `launchd` | is the value-type model for one exact macOS user LaunchAgent and the stateless primitives that apply it. | 12 | 2989 |
 | `paths` | owns the canonical state-directory layout under the user's home directory, resolved through the passwd database — never the caller's HOME or CLAUDE_CONFIG_DIR — so a sandboxed environment cannot relocate state. | 4 | 278 |
 | `supervise` | is the service layer for a linux host with no init system to register with: the value-type model for one exact supervised service and the foreground supervisor that runs it. | 5 | 1709 |
 | `templates` | — | 2 | 218 |

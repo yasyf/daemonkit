@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.35.3] - 2026-10-28
+
+### Changed
+
+- `launchd.Apply`, `Verify`, and `NewPlan` accept an `Agent.Program` reached
+  through a symlink. The program must still be an exact absolute path that
+  resolves to a regular executable file. Before, any symlinked component was
+  refused, so a consumer could not name a stable Homebrew path such as
+  `/opt/homebrew/bin/cookiesync`. It had to name the versioned Caskroom bundle
+  instead, which `brew upgrade` deletes.
+
 ## [0.35.2] - 2026-10-27
 
 ### Fixed

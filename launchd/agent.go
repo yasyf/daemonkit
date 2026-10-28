@@ -105,7 +105,7 @@ type Agent struct {
 	// Label is the LaunchAgent label / reverse-DNS identifier naming the plist
 	// and the launchctl service target. Required.
 	Label string
-	// Program is the exact non-symlinked absolute path launchd execs. Required.
+	// Program is the exact absolute path launchd execs. Required.
 	Program string
 	// Args are the arguments passed after Program (e.g. {"daemon"}).
 	Args []string

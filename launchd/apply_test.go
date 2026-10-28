@@ -554,6 +554,23 @@ func TestVerify(t *testing.T) {
 	}
 }
 
+func TestVerifyFollowsASymlinkedProgram(t *testing.T) {
+	dir := launchAgentsDir(t)
+	agent := applyAgent(t, "com.example.symlinked")
+	agent.Program = filepath.Join(t.TempDir(), "worker")
+	if err := os.Symlink("/usr/bin/true", agent.Program); err != nil {
+		t.Fatal(err)
+	}
+	installPlist(t, dir, agent)
+	rec := &recorder{loaded: true}
+
+	got, err := Verify(context.Background(), rec.run, agent)
+
+	if err != nil || !got {
+		t.Fatalf("Verify = %t, %v, want true", got, err)
+	}
+}
+
 func TestApplyAndRemoveRequireARunner(t *testing.T) {
 	if err := Apply(context.Background(), nil, Agent{}); err == nil ||
 		!strings.Contains(err.Error(), "runner is required") {
