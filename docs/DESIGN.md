@@ -6,12 +6,20 @@ written to that decision — the earlier `/v2` module path, its sentinel alias l
 open-ended overlap window are not built. Elsewhere "v1" means the pre-cut release line and
 "the cut" means this design's release.
 
+**Trust removal (yasyf, 2026-10-27, cc-notes answer `0cfb108`).** The owner ruled that the
+per-connection security checks go and that processes are trusted implicitly. Any process that can
+open the socket in the user's 0700 state directory is trusted. The ruling removed the same-EUID floor, the kernel-only code-signature verifier (`internal/trust`,
+`internal/csposture`), `Requirement`/`Requirements`/`PolicyDigest`/`Trust`/`Serving`,
+`Cmd.Exec`, the separate control lane, the SHA-256 build digest, and `Ensure`'s `launchctl print`
+on every call. This document describes the system after it. The one signature check left is
+`deploy`'s install-time `codesign` verification of the app bundle.
+
 Synthesized from four independent clean-slate designs (invariant-first, consumer-first,
 failure-first, ownership-first) and three judgements (structural, failure-replay, adoptability).
 Base: **consumer-first's surface** (winner on two lenses, second on the third), rebuilt on
 **invariant-first's lifecycle body** (winner on failure-replay), with the grafts every judge
 independently named: failure-first's observed Converge, unexported comparable identity, and
-evidence-gated retry; ownership-first's protocol-blind-but-trust-gated drain admission and
+evidence-gated retry; ownership-first's protocol-blind drain admission and
 observe-free/affect-gated readiness split.
 
 Baseline read at `0e60747`. Every cite to current code is a migration anchor, never a shape to
@@ -36,10 +44,10 @@ Daemon      one value. Both halves of a consumer read it; no fact is stated twic
 Serve       host it.   ctx + Daemon + Start → Drained. The ladder is one function body.
 Open        reach it.  Daemon → *Client.
   .Ensure   make the running daemon be this exact build and ready → Ensured.
-  .Call     talk to it → (Reply, Outcome).
-  .Health   ask what is there — floor-only, answerable during drain.
+  .Business the product lane, a distinct type → Call → Reply.
+  .Health   ask what is there — below dispatch, answerable during drain.
   .WaitReady  observe readiness — free, a subscription, no authority needed.
-  .Control  the lifecycle lane, a distinct type → Drain / Reload.
+  .Drain    evict the incumbent pinned on the client's session → Stopped.
 ```
 
 **Device 1 — `Budget` replaces every duration.** A `Budget` is a deadline being spent. Its
@@ -68,28 +76,30 @@ is a bounded-share handoff to the store's single-writer loop, and its non-confir
 edge.
 
 **Device 3 — outcomes are observed, not claimed.** The four operations that can partially
-succeed (`Serve`, `Ensure`, `Control.Drain`, child exit) return closed outcome values whose zero
+succeed (`Serve`, `Ensure`, `Client.Drain`, child exit) return closed outcome values whose zero
 is never returned. `RecordRemoved` is constructible only from a post-write re-read of the store;
 launchd convergence derives every `Action` from its own before/after observations of the world,
 so an adapter's return value can only become a `Reason`; retry is constructible only from
 launchd's own in-progress exits (36/37) or `Evidence` read out of launchd's log. `FileStore.Remove`
 returning nil while skipping a claimed record (`proc/filestore.go:793-795`) has no analogue.
 
-**Device 4 — the repair channel sits below every gate it might repair.** Transport admission
-reads `{Protocol, Lane}` — no build or schema field exists to gate on; schema is checked at
-business-lane attach by **set membership** (a build spanning an upgrade lists both eras), so
-synckit's pre-dispatch rejection contract survives *with* an upgrade path. The always-works
-drain is SIGTERM — a POSIX signal with no compatibility axis — and the wire Drain verb is the
-fast path, admitted below the protocol gate (a frozen two-byte preamble, like the frame magic)
-but **above the trust gate**, so a new-era successor reaches an old-era incumbent and K48's
-authorization is never widened. The 18,999-handshake wedge has no site to occur at, twice over.
+**Device 4 — the repair channel sits below every gate it might repair.** There is one session
+kind (wire protocol 3), and transport admission reads `Protocol` alone. The hello is
+`{protocol, schema, nonce}`, but the schema gates product dispatch, never admission. A product
+request on a session whose schema is outside `Schemas` is answered `build_mismatch`, checked by
+**set membership** (a build spanning an upgrade lists both eras). synckit's pre-dispatch
+rejection contract survives *with* an upgrade path, and a successor of another schema era still
+reads health and drains. The always-works drain is SIGTERM — a POSIX signal with no
+compatibility axis — and the wire Drain verb is the fast path, admitted unconditionally below the
+protocol gate (a frozen two-byte preamble, like the frame magic), so a new-era successor reaches
+an old-era incumbent. A daemon speaking another protocol answers `ErrProtocolMismatch`, and
+`Ensure` and `Stop` settle it by SIGTERM at its owner-record identity. The 18,999-handshake wedge
+has no site to occur at, twice over.
 
-The verifier child dies — and so does Security.framework, which the synthesis had kept.
-Verification is **kernel-only**: five `csops_audittoken` reads against the audit token — the
-status word handed unmodified to `csposture.Check`, validation category, team identifier, signing
-identifier, DER entitlements. No Security.framework call on the handshake path, no cache, no
-budget share, ~µs, load-independent. That takes `os.Executable()` out of the trust path, the
-fork-bomb primitive out of every consumer binary, and all three A1 blockers with it. bbolt dies
+The verifier child dies, and so does every per-connection check after it. No peer is judged:
+no code signature, team, entitlement, or UID is read from a connecting process or a spawned
+child, and nothing runs on the handshake path but the hello. That takes the fork-bomb primitive
+out of every consumer binary, and all three A1 blockers with it. bbolt dies
 (one fsynced JSON record file with a **frozen identity core** any future era can extract — so
 archive-aside repairs without amnesia). The health route dies four times (a native transport
 verb; the payload is a daemonkit envelope plus product bytes, so no consumer's frozen JSON
@@ -104,7 +114,7 @@ unchanged (`artifact`, `bundle`, `ghrelease`, `version`, `paths`), ~7.2k core li
 ## 2. Core types
 
 ```go
-// Package daemonkit hosts and reaches one detached, code-signed daemon.
+// Package daemonkit hosts and reaches one detached daemon.
 // Module github.com/yasyf/daemonkit — path unchanged across the cut.
 package daemonkit
 
@@ -119,7 +129,6 @@ type Daemon struct {
 	Program     Program  // the executable launchd runs
 	Args        []string
 	Schemas     []Schema // [0] is what this build speaks; the rest are prior eras still accepted
-	Trust       Trust    // lane requirements; the same-EUID floor is not here and cannot be turned off
 	Restart     Restart
 	Shutdown    Grace  // the whole drain budget AND the plist's ExitTimeOut; 30s when zero
 	Handshake   Grace  // the whole admission budget; 10s when zero (ptyhost: 500ms)
@@ -147,31 +156,17 @@ type Program struct{ policy placement }
 // ~/.daemonkit/bin/<Label>: outside any versioned install directory, so a
 // package upgrade cannot delete the running program, and fixed across
 // upgrades, so the plist's Program key stays put and path-keyed TCC grants
-// survive. It reads the executable only to learn which build it is; Ensure
-// makes the copy.
-func Stable() (Program, error)
+// survive. build is the version string the executable already reports, and
+// must change on every rebuild (version.Running keys a dev build by its
+// modification time); it is the whole build identity: Ensure makes the copy and records the build
+// at ~/.daemonkit/builds/<Label>, and copies again only when that differs.
+func Stable(build string) (Program, error)
 
 // InBundle names an executable inside a signed .app and never copies it:
-// macOS keys TCC and notification grants to identifier, team, and path.
+// macOS keys TCC and notification grants to identifier, team, and path. Its
+// build is the bundle's CFBundleShortVersionString plus its executable's
+// modification time, so a rebuild at the same version is a new build.
 func InBundle(app, rel string) (Program, error)
-
-// Requirement pins both halves of a designated requirement, Developer ID
-// anchored. Parent-safe: it carries no signed-only literal (K26, A5).
-type Requirement struct{ TeamID, SigningIdentifier string }
-
-// Digest is the opaque policy digest a daemon-facing binary may carry.
-func (r Requirement) Digest() PolicyDigest
-
-type PolicyDigest string
-
-// Trust names what each lane must additionally prove. The same-EUID floor
-// runs unconditionally in the acceptor before Trust is consulted; no Trust
-// value can express its absence.
-type Trust struct {
-	Control  *Requirement // nil: floor alone. Gates Control and the wire Drain verb.
-	Business Requirements  // nil: floor alone. Any element admits; captain-hook sets both.
-	Serving  Serving       // what the process answering on the socket must prove.
-}
 
 type Restart uint8
 
@@ -288,22 +283,22 @@ func (s Session) Done() <-chan struct{}
 
 // ── reaching ────────────────────────────────────────────────────────────────
 
-// Open prepares a client and performs no I/O beyond validation: an unstated
-// Trust.Serving or a malformed Daemon fails here, not at first Call. Every call
-// refuses a context without a deadline: all stall bounds derive from it.
+// Open prepares a client and performs no I/O beyond validation: a malformed
+// Daemon fails here, not at first Call. Every call refuses a context without a
+// deadline: all stall bounds derive from it. Health, Drain, WaitReady, and
+// Ensure's observation ride the client's one session; the first Business lane
+// takes it over, so a command that converges and then calls opens one
+// connection.
 func Open(d Daemon) (*Client, error)
 func (Daemon) ValidateForClient() error
 
-func (*Client) Call(ctx context.Context, req Request) (Reply, Outcome, error)
-func (*Client) Health(ctx context.Context) (Health, error) // floor-only; answers during drain
-func (*Client) Probe(ctx context.Context) error            // ErrAbsent on a proven no-listener
+func (*Client) Business() *Business // no I/O; the session is acquired on first Call
+func (*Client) Health(ctx context.Context) (Health, error) // below dispatch and the schema gate; answers during drain
 func (*Client) WaitReady(ctx context.Context) (Health, error) // a subscription, never a poll; no authority
 func (*Client) Ensure(ctx context.Context) (Ensured, error)
-func (*Client) Control(ctx context.Context) (*Control, error) // exists only past Trust.Control
-func (*Client) Close(ctx context.Context) error
+func (*Client) Drain(ctx context.Context, e Expect) (Stopped, error) // refuses an incumbent e does not name
 
-func (*Control) Drain(ctx context.Context) (Stopped, error)
-func (*Control) Reload(ctx context.Context) error
+func (*Business) Call(ctx context.Context, op string, body []byte) (Reply, error)
 
 // ── outcomes: nothing reports success without saying what it did ────────────
 
@@ -395,7 +390,8 @@ const (
 )
 
 // Health is the envelope daemonkit owns plus the product bytes it does not.
-// Build is diagnostic and compared nowhere. Detail carries the product's
+// Build is the version string the serving Program reports; Ensure's decide
+// step compares it, and no wire gate does. Detail carries the product's
 // Report bytes verbatim — every consumer's frozen health JSON lives there.
 type Health struct {
 	Phase      Phase
@@ -478,8 +474,9 @@ const (
 ```
 
 `daemonkit/deploy` (sealed `Install` / `Activate` / `Supersede` / `Uninstall` / `Reset` of one
-signed app over `artifact`, one swap receipt, CDHash as generation identity) completes the
-public surface; its shape follows failure-first's vocabulary and closes P2 `c1997af` with
+signed app over `artifact`, each generation checked by `codesign --verify` against a
+`deploy.Requirement{TeamID, SigningIdentifier}` before it lands, one swap receipt, CDHash as
+generation identity) completes the public surface; its shape follows failure-first's vocabulary and closes P2 `c1997af` with
 `Reset`.
 
 ---
@@ -504,31 +501,24 @@ residue is quarantined below the table, not dressed as invariants.
 | I10 | One live daemon per socket; recovery cannot race a healthy incumbent | Program order inside `Serve`: flock (inode-identified, never unlinked) is acquired *before* the store opens and recovery runs, and the listener binds after. The listener is a local of `Serve`'s frame; no API returns it and no second bind site exists. |
 | I11 | Ready is published exactly once, exactly when the product exists | Ready is `Start`'s return inside `Serve`. There is no publish call to invoke early, twice, or never. |
 | I12 | The listener and lock release only after the product's close is proven or named | Program order; `Product.Close`'s result is recorded in `Drained` before release, and a non-empty `Abandoned` retains the flock. The plist's `ExitTimeOut` renders from the same `Shutdown` field `Serve` spends: one fact, two readers. |
-| I13 | An application schema never gates the transport or the repair | Admission reads `{Protocol, Lane}` — no schema or build field exists in the hello. `Schemas` is in scope only at business-lane attach, checked by set membership; `Health`, `WaitReady`, and `Drain` never see it. |
-| I14 | The repair channel has no compatibility axis | SIGTERM is the drain mechanism of record — a POSIX signal has no protocol version. The wire Drain verb is the fast path, admitted on a frozen two-byte preamble *below* the protocol gate and *above* the trust gate: protocol-blind, still authorized by `Trust.Control` (K48 intact). |
-| I15 | The same-EUID floor is unconditional, both languages | The floor runs in the acceptor before `Trust` is consulted; no `Trust` value can express its absence. Swift mirrors with the non-optional `serviceOwnerUserID: uid_t` (`SocketServer.swift:558`, verified). |
+| I13 | An application schema never gates the transport or the repair | Admission reads `Protocol` alone. The hello carries the client's schema, but `Schemas` is checked only at product dispatch, by set membership, answering `build_mismatch`; `Health`, `WaitReady`, and `Drain` never see it, so a successor of another schema era still reads health and drains. |
+| I14 | The repair channel has no compatibility axis | SIGTERM is the drain mechanism of record — a POSIX signal has no protocol version. The wire Drain verb is the fast path, admitted unconditionally on a frozen two-byte preamble *below* the protocol gate: protocol-blind, and granting nothing SIGTERM does not already grant the process that can open the socket. |
 | I16 | Broken-era durable state never blocks the release that fixes it — and cannot orphan children | `Open` has no failed-schema path. The record file's envelope — the schema int and each record's `{pid, start, boot, generation}` identity core — is frozen forever, additive-only beyond it. An unknown-schema file yields its identity cores for the reap sweep, then archives aside; `Drained.Archived` / `Ctx.Reclaimed` name what happened. Repair without amnesia. |
-| I17 | The business lane cannot spell a lifecycle request | `Client` and `Control` are distinct types with disjoint method sets; server-side, control verbs are frame kinds dispatched before the op mux, and handlers receive `Caller` — identity as data, no methods. |
+| I17 | The business lane cannot spell a lifecycle request | `Business` carries only `Call` and `Close`; `Health` and `Drain` are `Client` methods. Server-side, lifecycle verbs are frame kinds dispatched before the op mux, and handlers receive `Caller` — identity as data, no methods. |
 | I18 | `Delivered` never replays | `Outcome` is closed; the client's replay predicate admits exactly `NotSent`. captain-hook's "rejected before dispatch" mislabel of `Unproven` has no site: the outcome is returned, not interpreted. |
-| I19 | A test binary cannot fork-bomb the machine | There is no self-exec verb to intercept: nothing in the module execs `os.Executable()`, and no argv-dispatched child mode exists for a test binary to re-enter. (`os.Executable()` survives only as a read: `Stable()` and `Serve`'s build digest hash the bytes at that path, and `version.Running` stats it for a dev build's mtime — nothing execs it, and the copy `Ensure` places is written, never run, by this module. The earlier wording claimed the symbol appears nowhere, which is false and was caught by the phase-0 build.) `scripts/test.sh` stays as CI hygiene — the rule outlives the hazard. |
-| I23 | The trust path cannot block | Every read is a `csops_audittoken` against kernel memory: no file opened, no daemon contacted, no CoreFoundation object built. There is no abandonment path, no leaked M, and no verification budget to subdivide — so the hang the verifier child existed to survive has no site to occur at. |
-| I24 | The status word is interpreted in exactly one place | `internal/trust` hands the kernel's word to `csposture.Check` unmodified; no verifier owns a bit table. A clause added there reaches every caller, so the two-verifier divergence (P0 `7059185`) cannot re-form by transcription. |
-| I25 | An unverified peer cannot consume a protected role's capacity | Session capacity is acquired only after the peer's role is verified (`wire/server.go:501` stays after `:463`). The per-role capacity-1 reservation is what keeps the trust-gated Drain verb reachable under flood; anything acquired earlier is a denial primitive an unverified peer can hold, and `identity.Role` is peer-supplied. |
+| I19 | A test binary cannot fork-bomb the machine | There is no self-exec verb to intercept: nothing in the module execs `os.Executable()`, and no argv-dispatched child mode exists for a test binary to re-enter. (`os.Executable()` survives only as a read: `Stable` resolves the path `Ensure` copies from, and `version.Running` stats it for a dev build's mtime — nothing execs it, and the copy `Ensure` places is written, never run, by this module. The earlier wording claimed the symbol appears nowhere, which is false and was caught by the phase-0 build.) `scripts/test.sh` stays as CI hygiene — the rule outlives the hazard. |
 | I20 | A permanent refusal cannot be retried; exit 5 is never specific | One internal launchctl boundary returns a closed outcome; no `error` crosses it, so there is no second classifier and no fixture for a type production never emits. Retryable is constructible only from exits 36/37 or from `Evidence` read out of launchd's own log. |
-| I21 | Convergence cannot report an effect it did not have | The internal generic `Converge` derives every `Action` from its own before/after `Observe` calls; adapter returns become `Reason` only. Load-bearing for launchd agents, the record sweep, and deploy alike. |
-| I22 | Eviction is an explicit caller act | `Serve` refuses a live incumbent with `ErrBusy` — there is no takeover option on the serving side. The only evictors are `Ensure` (whose pure decide step chose upgrade/restart) and `Control.Drain` — both deliberate calls by the consumer. |
+| I21 | Convergence cannot report an effect it did not have | `Ensure` derives its `Action` from its own observations of the socket and the owner record (`internal/converge.Observe`), before and after; nothing it stored is read back as fact. launchd is read only by the step that applies the LaunchAgent, which runs only when `Ensure` installs or restarts. |
+| I22 | Eviction is an explicit caller act | `Serve` refuses a live incumbent with `ErrBusy` — there is no takeover option on the serving side. The only evictors are `Ensure` (whose pure decide step chose upgrade/restart) and `Client.Drain` — both deliberate calls by the consumer. |
 
 **Named non-structural residue** — the honest limits, quarantined here rather than dressed as
 invariants: (1) `context.WithTimeout` exists in the language; a determined in-module contributor
 can thread a literal around `Budget`. The structure makes it signature-less and grep-visible,
 not impossible. (2) `RecordFate` is forgeable *within* `internal/proc`; the re-read discipline
-is one package's single implementation. (3) `internal/trust` reads undocumented `csops`
-op numbers and their output ABI (`sys/codesign.h` is absent from the SDK). The reads are
-structurally guarded — entitlements by magic `0xfade7172`, strings by an 8-byte length header,
-status by `CS_VALID` — and fail closed, but the pin is per-macOS-release (§9, G2). (4) Non-darwin `Spawn` has a microsecond
-record-before-run window (CI-only platform; darwin is structural). (5) A record file corrupt
+is one package's single implementation. (3) Non-darwin `Spawn` has a microsecond
+record-before-run window (CI-only platform; darwin is structural). (4) A record file corrupt
 beyond its frozen envelope loses identities; the loss is named in `Drained.Archived`, not
-silent. (6) `internal/state`'s `File[T]` has a legally constructible zero value, and no Go
+silent. (5) `internal/state`'s `File[T]` has a legally constructible zero value, and no Go
 device removes it: a method set attaches to a type rather than to the values its constructor
 produced, and every nameable type has a zero — unexporting `File` would take the zero value and
 the consumer's field declaration with it. So the unbound file is refused, not unrepresentable:
@@ -544,19 +534,19 @@ is a returned error, one deliberate in-package conversion away, exactly as in (1
 
 | Package | Owns | ≈ lines |
 |---|---|---|
-| `daemonkit` (root) | `Daemon`, `Budget`, `Serve`, `Open`/`Client`/`Control`, `Product`, `Ctx`, `Child`, `Run`, every outcome type, `Requirement`/`Trust`/`PolicyDigest`, sentinels. The entire lifecycle API. | 800 |
+| `daemonkit` (root) | `Daemon`, `Budget`, `Serve`, `Open`/`Client`/`Business`, `Product`, `Ctx`, `Child`, `Run`, every outcome type, sentinels. The entire lifecycle API. | 800 |
 | `daemonkit/launchd` | `Agent`, `Converge`, `Convergence`, `Refusal`, plist render, `Daily`/`CalendarInterval`/`PlistPath`/`NoRestart`. Public: cc-patch, cc-present, cc-orchestrate converge agents for processes daemonkit does not serve. | 700 |
-| `daemonkit/deploy` | sealed `Install`/`Activate`/`Supersede`/`Uninstall`/`Reset` of one signed app over `artifact`; one swap receipt; CDHash as generation identity. | 900 |
-| `daemonkit/internal/wire` | frame v1 byte-identical (K27), session, lanes, hello/ack (ack carries `Phase`), the frozen Drain preamble, FrameAck (K32), SCM_RIGHTS + single-use nonce (K30/K31), phase stream, server. | 2,000 |
+| `daemonkit/deploy` | sealed `Install`/`Activate`/`Supersede`/`Uninstall`/`Reset` of one signed app over `artifact`; install-time `codesign --verify` against `deploy.Requirement`; one swap receipt; CDHash as generation identity. | 900 |
+| `daemonkit/internal/wire` | frame v1 byte-identical (K27), one session kind (protocol 3), hello `{protocol, schema, nonce}`/ack (ack carries `Phase`), the frozen Drain preamble, FrameAck (K32), SCM_RIGHTS + single-use nonce (K30/K31), phase stream, server. | 2,000 |
 | `daemonkit/internal/proc` | unexported comparable identity, suspended spawn, the driver, the record store (frozen identity core, single-writer loop), flock, the reap ladder, the one comparison site. | 1,400 |
-| `daemonkit/internal/trust` | the floor, plus one kernel-only verifier — `csops_audittoken` reads of status (into `csposture.Check(…, RequireLibraryValidation)`), validation category, team identifier, signing identifier, and DER entitlements (stdlib `encoding/asn1`; the six injection rejections unconditional, plus `RequiredEntitlements`/`RequiredAppGroup`). No Security.framework, no cache. One verifier. | 550 |
-| `daemonkit/internal/converge` | the generic observed `Converge` + `World`; adapters: launchd agents, record sweep, deploy swap. | 200 |
+| `daemonkit/internal/converge` | `World` and `Observe`: one observation of the socket and the owner record, re-derived at read time. launchd is not part of it. | 200 |
 | `daemonkit/internal/state` | write-temp → fsync → rename → fsync-dir; frozen-envelope extraction; archive-aside. | 250 |
 | `artifact` `bundle` `ghrelease` `version` `paths` | unchanged; `paths` gains `Socket(name)` with a typed error on overlong socket paths (K34/K51). | — |
 | `Sources/DaemonKit` | the client mirror and the fd bridge only (§5.4). | 2,500 |
 
 Deleted as packages: `daemon`, `wire` (public), `proc` (public), `worker`, `trust` (public),
-`service`, `codeidentity`, `peer`, `templates`, `wire/wiretest`. `internal/` is the point:
+`service`, `codeidentity`, `peer`, `templates`, `wire/wiretest`, and, by the 2026-10-27 ruling,
+`internal/trust` and `internal/csposture`. `internal/` is the point:
 "the packages ARE the deliberate public API" is root cause RC5 stated as a principle, and
 inverting it is the single largest reduction available — a consumer cannot rebuild a serve
 ladder from parts that are not exported.
@@ -574,9 +564,9 @@ ladder from parts that are not exported.
 | 3 | **recover** — open the record file; extract identity cores (frozen envelope, any era); for each prior-generation record: probe → TERM → grace (a `Share`) → probe → KILL → retire on observed absence. Undetermined keeps the record. Collect `[]Reclaimed`; archive an unknown-schema remainder aside. | |
 | 4 | **bind** — unlink the stale socket file under the flock, listen. Health and phase answer immediately (`PhaseStarting`). | |
 | 5 | **start** — the consumer's `Start(Ctx)`. An error tears down through steps 7–9 with business never opened. | |
-| 6 | **ready** — `PhaseReady`; business admission opens; every handshake ack carries the phase; the phase stream wakes every `WaitReady`. | |
-| 7 | **serve** — accept → floor (unconditional) → first frame: the frozen Drain preamble dispatches to the trust-gated drain path; anything else is the hello → protocol gate → lane attach (business attach checks `Schemas` membership and, when `Trust.Business` is set, the peer's signature) — all under `Handshake`'s budget, verification as a `Share` that is zero when `Trust` is all-nil, ack as `Reserve`'s tail. Dispatch: slot → `Product.Handle` under the client's conveyed deadline; terminal → FrameAck. | |
-| 8 | **drain** — triggered by ctx, signal, `Ctx.Stop`, `Control.Drain`, or the wire verb: one path, five triggers. | |
+| 6 | **ready** — `PhaseReady`; business admission opens; every handshake ack carries the phase; the phase stream wakes every `WaitReady`. `Health.Build` is `Daemon.Program`'s build, so `Serve` needs a `Program`. | |
+| 7 | **serve** — accept → first frame: the frozen Drain preamble dispatches to the drain path unconditionally; anything else is the hello → protocol gate → session ack, under `Handshake`'s budget with the ack as `Reserve`'s tail. No peer is judged. Dispatch: a product request on a session whose schema is outside `Schemas` is answered `build_mismatch`; otherwise, slot → `Product.Handle` under the client's conveyed deadline; terminal → FrameAck. | |
+| 8 | **drain** — triggered by ctx, signal, `Ctx.Stop`, or the wire Drain verb `Client.Drain` sends: one path, four triggers. | |
 | 9 | **release** — listener closed, flock released **iff** `Drained.Abandoned` is empty; otherwise deliberately retained until launchd's `ExitTimeOut` (same field) SIGKILLs. | |
 
 The drain budget is minted from `Shutdown` once:
@@ -588,17 +578,25 @@ expiry names its `Stage` in `Abandoned`.
 
 ### 5.2 `Ensure` — the seven-step ladder, shipped once
 
-lock (two `Ensure`s serialize) → observe `Health` → **decide** — a pure function
-`(Health, Daemon) Action`, cc-interact's `runtimeAction` (`launcher.go:212-240`) promoted
-verbatim: newer-build refusal, incomplete-identity refusal, upgrade, drain-observe,
-failed→restart, healthy→noop; I/O-free and table-testable → `launchd.Converge` → when required:
-`Control.Drain`, observe the process leave (`Stopped.Reap`) → `WaitReady` for the exact build —
-a subscription that deletes all four fleet poll loops (25ms cc-interact, 10ms ptyhost, 100ms
-captain-hook, 100ms cc-notes) → re-observe → `Ensured{Before, Did, After}`.
+lock (two `Ensure`s serialize) → **place** — `Stable` copies the executable only when the build
+recorded at `~/.daemonkit/builds/<Label>` differs → observe `Health` on the client's session and
+the owner record → **decide** — a pure function `(Health, build) Action`, cc-interact's
+`runtimeAction` (`launcher.go:212-240`) promoted verbatim: newer-build refusal,
+incomplete-identity refusal, upgrade, drain-observe, failed→restart, healthy→noop; I/O-free and
+table-testable. A daemon already serving the wanted build is `ActionNothing`, and launchd is not
+asked → otherwise `Client.Drain` pinned to the observed build and generation, or SIGTERM at the
+owner-record identity for a daemon speaking another protocol; observe the process leave
+(`Stopped.Reap`) → apply the LaunchAgent (rewritten and reloaded when drifted, kickstarted always) → `WaitReady` for the
+exact build — a subscription that deletes all four fleet poll loops (25ms cc-interact, 10ms
+ptyhost, 100ms captain-hook, 100ms cc-notes) → re-observe → `Ensured{Before, Did, After}`. A
+plist that drifted under a daemon already at the wanted build stays until that daemon is next
+replaced.
 
 ### 5.3 `Call` — the four hand-rolled clients, unified
 
-One live session behind a mutex, single-flight dial, generation-tagged retire, waiter-refcounted
+One live session per `Client`, shared by `Health`, `Drain`, `WaitReady`, and `Ensure`'s
+observation until the first `Business` lane takes it over, so a command that converges and then
+calls opens one connection. Behind it: a mutex, single-flight dial, generation-tagged retire, waiter-refcounted
 teardown, graceful `Close`. Two rules the consumers each got half of: **retire only on transport
 failure** (a `NotReady`/`Draining` rejection proves the session healthy; retry in-session on a
 share of the caller's deadline — ptyhost's L1 preserved without the redial-per-poll); **replay
@@ -610,7 +608,7 @@ deadline is choosing a product policy.
 
 The client half and the fd bridge, never the server half: the v1 frame byte-exact (one generated
 schema, one shared golden, a CI no-op gate — restoring what `7ec51bc` deleted), the
-non-optional floor (already landed, verified), `{Protocol, Lane}` and the phase-carrying ack,
+protocol-3 hello `{protocol, schema, nonce}` and the phase-carrying ack,
 the frozen Drain preamble, `Outcome` semantics (`Delivered` never replays), FrameAck, and the
 SCM_RIGHTS handoff with its single-use nonce, plus the `~/.daemonkit/a/<label>` state layout a
 client needs to find the socket it dials (`AgentPaths`, pinned to `paths.Agent` by one shared
@@ -629,22 +627,27 @@ Default answer: nothing survives. Deleted, with why nothing needs it:
 | `RecoveryCapability` / `.Consume()` / recovery receipts | Reclamation is a value — `Ctx.Reclaimed` — inside `Serve`, before `Start`; no consumer-visible recovery step remains to authorize. fusekit's six passes and ptyhost's 47-line reconcile become a slice read. |
 | Three capability-token registries (`fenceauth`, `runtimeauth`, `spawnedsession`) | Lanes are types; capabilities are closure locals and unexported fields. A registry exists to pass authority through code that shouldn't hold it; no such code remains. |
 | Three stacked lifecycle machines + four persisted phase machines (`Activation`, `Stage`, `CommitReady`, `ClaimProductSettlement`, both enums) | One in-memory `Phase`; ready is `Start`'s return; order is program order. Durable state records observations, never phases. |
-| Stop authorities, prepared-stop ceremony, `internal/stopcontrol`, the 8 stop-control `Record` fields (`proc/reaper.go:91-100`) | Stop is a trust-gated verb or a POSIX signal; authorization is the lane type, not a durable time window (K13 honored by vacancy). |
+| Stop authorities, prepared-stop ceremony, `internal/stopcontrol`, the 8 stop-control `Record` fields (`proc/reaper.go:91-100`) | Stop is the wire Drain verb or a POSIX signal, and neither needs an authority: any process that can open the socket may send either (K13 honored by vacancy). |
 | The `go/ast` settlement guard + `settledUntrack*` + `//nolint:contextcheck` | The authority is a closure local; nothing remains for a walker to forbid. |
-| The trust verifier child (`RunVerifierChild`, self-probe, `trustProbeTimeout` `daemon/runtime.go:29`, `VerifierWorkerBudgets`, the `/bin/sh` spawn gate + `trap ':' TERM`) | Kernel-only verification, ~µs, no budget share. Deletes the fork-bomb primitive from every consumer binary, the 15 `main` dispatch sites, and all three A1 blockers; the 1.78–2.69s "verifier cost" was host fork/exec latency (A1). And because the replacement never touches the filesystem or trustd, the VFS-hang and CF-crash properties the child bought are not traded away but **deleted** — a same-EUID process can copy the shipped signed binary onto a filesystem it controls and satisfy the full DR (measured), so an in-process `SecCode` call would have handed it an unkillable wedge on a serialized accept loop. |
-| `SecCodeCopyGuestWithAttributes` / `SecRequirementCreateWithString` / `SecCodeCheckValidityWithErrors` / `SecCodeCopySigningInformation` and the whole purego Security.framework binding (`loadSecurity`, ~19 symbols) | Replaced by five `csops_audittoken` reads. The kernel holds every input both verifiers used — including the entitlements blob (measured `0xfade7171` XML / `0xfade7172` DER, matching `codesign -d --entitlements -` exactly). |
-| `codeidentity` as a second verifier | One verifier in `internal/trust`; the fork-divergence generator (P0 `7059185`) is a second implementation, and there is none. `Requirement` and `PolicyDigest` survive as root value types. |
+| The trust verifier child (`RunVerifierChild`, self-probe, `trustProbeTimeout` `daemon/runtime.go:29`, `VerifierWorkerBudgets`, the `/bin/sh` spawn gate + `trap ':' TERM`) | No peer is verified. Deletes the fork-bomb primitive from every consumer binary, the 15 `main` dispatch sites, and all three A1 blockers; the 1.78–2.69s "verifier cost" was host fork/exec latency (A1). The VFS-hang and CF-crash properties the child bought are **deleted** with the verification they protected. |
+| `SecCodeCopyGuestWithAttributes` / `SecRequirementCreateWithString` / `SecCodeCheckValidityWithErrors` / `SecCodeCopySigningInformation` and the whole purego Security.framework binding (`loadSecurity`, ~19 symbols) | Nothing replaces them: no peer is verified. |
+| `codeidentity` as a second verifier | No verifier remains to be second to; the fork-divergence generator (P0 `7059185`) has no implementation to diverge from. `deploy`'s install check takes its own `deploy.Requirement`. |
+| The same-EUID floor, the kernel-only `csops_audittoken` verifier, `internal/trust`, `internal/csposture`, and the `daemonkit_unsigned` build tag (2026-10-27) | The socket sits in the user's 0700 state directory, and any process that can open it is trusted. No code signature, team, entitlement, designated requirement, or UID is checked on a connecting process or a spawned child. |
+| `Requirement`, `Requirements`, `EntitlementMatch`/`EntitlementRequirement`, `PolicyDigest`, `Serving`/`ServingSigned`/`ServingSameUser`, `Trust` and `Daemon.Trust`, `Cmd.Exec`, `ErrUntrusted`, `ErrPeerGone`, `ErrNoVerifier` (2026-10-27) | Nothing is pinned, so nothing names a pin or reports one failing. |
+| The separate control connection: `Control`, `Client.Control`, the lane field in the hello (2026-10-27) | One session kind (wire protocol 3). `Client.Health` and `Client.Drain(ctx, Expect)` ride the client's one session, and the first `Business` lane takes it over. |
+| The SHA-256 build digest of the executable (2026-10-27) | The build is the version string the tool already reports: `Stable(build)`, `InBundle`'s `CFBundleShortVersionString` plus executable mtime, published by `Serve` from `Program`. Placement compares the record at `~/.daemonkit/builds/<Label>`. |
+| `Ensure`'s `launchctl print` on every call, `converge.World.Applied` (2026-10-27) | A daemon already serving the wanted build is `ActionNothing` without asking launchd; the apply step reads launchd when it installs or restarts. |
 | `worker` as a package (pool claims, `ClaimRuntime`→`Recover`→`Activate` dance, 15 nil-receiver guards) | `Ctx.Run` is one bounded command; capacity is the caller's semaphore (synckit already keeps one). Two consumers build 1-byte degenerate pools purely to satisfy `RuntimeConfig.Workers`; the field is gone. |
 | Credit/ack flow control, observation slots, per-frame build re-checks, `writerStateMu`/`beginWriterDrain`/the writer-identity panic | Backpressure is the `Concurrency` group plus the socket buffer; the writer owns the fd; observation is a native verb, not a slotted lane. FrameAck survives as terminal-reached-peer proof (K32) — a different mechanism. |
-| Seven version axes → two; five schema fingerprints; nine build gates | The wire `Protocol` and the store schema int. `Schemas` is set membership at business attach — synckit's pre-dispatch contract kept, with an upgrade path. `Build` is diagnostic on `Health` and compared nowhere. |
+| Seven version axes → two; five schema fingerprints; nine build gates | The wire `Protocol` and the store schema int. `Schemas` is set membership at product dispatch — synckit's pre-dispatch contract kept, with an upgrade path. `Build` gates nothing on the wire; only `Ensure`'s decide step compares it. |
 | bbolt + open-per-operation flock | One fsynced JSON record file behind one owner with a frozen identity envelope; the measured 16-writer 5.003s contention was the open-per-op pattern. |
 | `PeerVerificationTimeout`, `HandshakeTimeout`-as-wire-field, `NoProgressTimeout`, `ListenerWait`, `MaxSessions`, `Backlog`, `InboundQueue`, `OutboundQueue`, `StreamQueue`, reaper `Grace`/`Settlement` | Derived from `Concurrency` or subdivided from `Shutdown`/`Handshake`/caller deadlines. captain-hook's 10s clamp and its apology comment die with the field. |
 | The route registry (`HandlerSpec`, `Register`, `ObservationRoute`, `MaxResponseBytes`, ladder rungs) + four independently-written health routes | `Product.Handle` owns dispatch; health is a native verb answered pre-dispatch, drain included. |
 | `reconcileMode`, `NewController`'s open-time replay and its four wedge doors (`002e2e9a`) | Converge reads the world; there is no stored intent to replay, and partial success has a return path (`Convergence`). |
 | Two disagreeing launchctl classifiers + `launchctlEIOExit` retry + `bootstrapAttempts = 3` + `LimitLoadToSessionType`/`SessionType` | One boundary returning a closed outcome (I20); the field that re-acquires exit-5 EIO does not exist. |
-| `ServiceClient` spanning two lanes + the four hand-rolled clients + the 10ms/25ms/100ms polls | `Client`/`Control` + the phase-stream subscription. |
+| `ServiceClient` spanning two lanes + the four hand-rolled clients + the 10ms/25ms/100ms polls | One `Client` session, taken over by the first `Business` lane, + the phase-stream subscription. |
 | `daemon.State` as a daemonkit-owned wire value; `IdleExit`, `ActivityLease`, `Strikes`/`Backoff`/`Ladder`, `FileStamp`, `Nice`, `MonotonicUptime`, `EmbeddedProcess`, `Takeover`, `EnsureCurrent` (as exported machinery) | Health strings are product data in `Detail`; the rest are zero-consumer orphans (census DROPPED). The respawn-gate question is re-filed in §12, not silently lost. |
-| The husk-removal band-aid in `cask.rb.tmpl` + four embedded homebrew-tap SHAs in `release.yml.tmpl` | An uninstall runs `Control.Drain` and asserts `Stopped.Reap`; a husk is prevented, not deleted after the fact. |
+| The husk-removal band-aid in `cask.rb.tmpl` + four embedded homebrew-tap SHAs in `release.yml.tmpl` | An uninstall runs `Client.Drain` and asserts `Stopped.Reap`; a husk is prevented, not deleted after the fact. |
 
 **Survivors, named because the default is none:** the v1 frame layout (K27); FrameAck (K32);
 the SCM_RIGHTS handoff and its single-use nonce (K30/K31 — captain-hook's signed `.app` depends
@@ -663,15 +666,15 @@ judge's source checks (cc-patch, cc-present, cc-review, binrun import daemonkit 
 
 | Repo | Adopts | Deletes | Keeps / gains |
 |---|---|---|---|
-| **cc-interact** | `Serve` (MaxFrame 64MiB), `Client`/`Control`, `Ensure` (its `runtimeAction` promoted verbatim) | the Serve ladder (`server.go:260-306`), `client.go` (345), most of `launcher.go` (333), the degenerate 1-slot pool, the health route, the 25ms poll, ladder-rung arithmetic | `operationContext` and `handleTimeout` at its own boundary; `CallError` from `Outcome`+`Reply`. Net ≈ −700. |
-| **cc-present** | one `daemonkit.Daemon` value + `launchd` | `daemonRoles`, the `trust.NewTrustPolicy` role-map builder (`app.go:73-82`), five constants, launcher plumbing — a source change, not a version bump: it imports `paths`×6, `trust`×4, `service`, `wire`, `daemon` directly | `Trust.Control` pinned to its signed DR (StopRoles preserved). Net ≈ −90. |
+| **cc-interact** | `Serve` (MaxFrame 64MiB), `Client`/`Business`, `Ensure` (its `runtimeAction` promoted verbatim) | the Serve ladder (`server.go:260-306`), `client.go` (345), most of `launcher.go` (333), the degenerate 1-slot pool, the health route, the 25ms poll, ladder-rung arithmetic | `operationContext` and `handleTimeout` at its own boundary; `CallError` from `Outcome`+`Reply`. Net ≈ −700. |
+| **cc-present** | one `daemonkit.Daemon` value + `launchd` | `daemonRoles`, the `trust.NewTrustPolicy` role-map builder (`app.go:73-82`), five constants, launcher plumbing — a source change, not a version bump: it imports `paths`×6, `trust`×4, `service`, `wire`, `daemon` directly | its own network token for LAN and tailnet HTTP clients; daemonkit pins nothing on its socket. Net ≈ −90. |
 | **cc-review** | same | `internal/runtimeconfig/runtime.go` (52); direct `trust`/`version`/`service`/`proc`/`paths` imports | ≈ 12 lines of `Daemon`. Net ≈ −40. |
 | **cc-orchestrate (ptyhost)** | `Serve` (Shutdown 5s, Handshake **500ms** — both real needs, both expressible) | `recoverPTYChild` (47), the 3-way select, signal arming, `Reaper.Grace: 500ms` (hand-computed share), the 10ms NotReady spin, `MaxSessions: 8` | `OnChildExit` → `Ctx.Stop(nil)`; SIGHUP drains gracefully in 5s; in-session NotReady retry preserved (B4 L1). Net ≈ −280. |
 | **synckit** | `Serve` (MaxFrame 16MiB); `Schemas` set membership **preserves** the WireBuild pre-dispatch contract with an upgrade path; 12-min Touch ID run = `context.WithTimeout` at its boundary + its own semaphore | the serve ladder + two dropped close errors (`serve.go:167-168`), `helperruntime` (146), `withOwner` (~80), `rpc/client.go` session mgmt | **gains product settlement — a fixed latent bug** (no `ClaimProductSettlement` today, listener released without proof); SIGHUP reloads via `Reloader`; `TransportError` from `Outcome`. Net ≈ −350. |
 | **reposync** | through synckit; `Daemon.Shutdown` | helperruntime types, its 30s restatement | Net ≈ −40. |
-| **captain-hook** | `Serve` (Concurrency 64, MaxFrame 64MiB, `Trust.Business` set — its protected business role preserved) | the Stage-first ladder, inline health route, `PeerVerificationTimeout: 10s` + comment, `Backlog: 192`/`InboundQueue: 256` arithmetic, the 204-line client, the errno mapping, `runDeploymentTool` dance, the 100ms poll | **gains signal handling it has nowhere today**; install hint via `ErrAbsent` (errno preserved under `errors.Join`); the OQ4 mislabel has no site; broker fd handoff untouched. Net ≈ −420. |
+| **captain-hook** | `Serve` (Concurrency 64, MaxFrame 64MiB) | the Stage-first ladder, inline health route, `PeerVerificationTimeout: 10s` + comment, `Backlog: 192`/`InboundQueue: 256` arithmetic, the 204-line client, the errno mapping, `runDeploymentTool` dance, the 100ms poll | **gains signal handling it has nowhere today**; install hint via `ErrAbsent` (errno preserved under `errors.Join`); the OQ4 mislabel has no site; broker fd handoff untouched. Net ≈ −420. |
 | **fusekit** | `Serve`; six recovery passes → `Ctx.Reclaimed`; `Signals` seam → `Serve` arms; readiness triple 30/30/65 → one ctx deadline | the 2-way select, `mountservice.RuntimeHealthObservation`, `defaultWorkerLimit` | the closest fit of the six; loses nothing. |
-| **cc-notes** | `Ensure` + `Control.Drain`; `deployment` proofs (~41 usages of `RuntimeProof`/`ReadinessProof`/`RuntimeStopper`) migrate to `Control` + `deploy` | the 100ms poll, `RuntimeShutdownTimeout`, the proof plumbing | `PolicyDigest` survives as a root type. **Named cost:** its source-text contract test greps daemonkit literals (`release_contract_test.go`) and is rewritten in the same change. Net ≈ −250. |
+| **cc-notes** | `Ensure` + `Client.Drain`; `deployment` proofs (~41 usages of `RuntimeProof`/`ReadinessProof`/`RuntimeStopper`) migrate to `Client.Drain` + `deploy` | the 100ms poll, `RuntimeShutdownTimeout`, the proof plumbing, its policy digest | **Named cost:** its source-text contract test greps daemonkit literals (`release_contract_test.go`) and is rewritten in the same change. Net ≈ −250. |
 | **cc-patch** | `launchd` as a leaf | — | `Agent`, `Daily`/`CalendarInterval`, `PlistPath()`, `NoRestart` all survive by name — it imports daemonkit directly (go.mod, no cc-interact). |
 | **claude-pool / cc-pool** | repin; broker path bit-identical | leaked-process cleanup workarounds | — |
 | **cookiesync** | repin | — | health JSON decodes from `Health.Detail` verbatim. |
@@ -689,14 +692,14 @@ Settlement claimed? — **bug**; `Serve` always joins `Product.Close`. `Shutdown
 
 Surviving fields, each citing its consumer: `MaxFrame` (cc-interact + captain-hook 64MiB,
 synckit 16MiB), `Concurrency` (captain-hook 64), `Shutdown` (ptyhost 5s), `Handshake` (ptyhost
-500ms), `Trust.Control` (cc-present, cc-review, cc-notes, captain-hook), `Trust.Business`
-(captain-hook), `Restart`, `Schemas` (synckit), `Label`/`Program`/`Args`/`Log` (all).
+500ms), `Restart`, `Schemas` (synckit), `Label`/`Program`/`Args`/`Log` (all).
 
 Died as restated defaults: `ShutdownTimeout: 30s`×3, `MaxSessions: 64`, `Reaper.Settlement: 2s`,
 children capacity 64×3. As hand-derived arithmetic: `Reaper.Grace: 500ms`, `Backlog: 192`,
 `InboundQueue: 256`, `MaxTotalRun = ShutdownTimeout`, ladder rungs, `handleTimeout + 1s`. As
 preference: `MaxSessions: 8`, children capacity 1. With their mechanism: `PeerVerificationTimeout`,
-`Workers`, the whole `worker.Config`, the readiness triple.
+`Workers`, the whole `worker.Config`, the readiness triple, and on 2026-10-27 `Trust.Control`,
+`Trust.Business`, and `Trust.Serving`.
 
 ---
 
@@ -751,7 +754,7 @@ produced three incompatible schema epochs in two days. Hence the gates below, no
    release but an open migration: its fleet-build leg stays red, and fleet-build joins the
    release gate only when every leg is green.
 6. **Bundle identity is untouched** — labels, teams, signing identifiers, install paths
-   unchanged; no TCC or notification grant resets. `Stable()`'s Label-keyed program path —
+   unchanged; no TCC or notification grant resets. `Stable`'s Label-keyed program path —
    `~/.daemonkit/bin/<Label>`, fixed across upgrades — is a plist change per consumer and needs
    one real-machine re-bootstrap test before the cut (§12).
 
@@ -759,26 +762,13 @@ produced three incompatible schema epochs in two days. Hence the gates below, no
 
 ## 9. Weakest point — answered honestly
 
-**The weakest point is no longer placement — it is the one delegated certificate clause.** The
-child died for measured reasons (a ~190× process tax on ~1.4 ms of work; a fork-bomb primitive in
-15 binaries), and in-process `SecCode` died for a measured reason too: a same-EUID process with
-**no signing capability at all** can `cp` the shipped signed app onto a filesystem it controls and
-satisfy the full designated requirement — verified on a real machine against daemonkit's exact DR
-string, which carries no path predicate (`codeidentity/identity.go:52-56`) — so
-`SecCodeCopyGuestWithAttributes`'s file open becomes an unkillable wedge on a serialized accept
-loop. The kernel path has no such call.
-
-What it delegates is `certificate leaf[subject.OU] = <team>`: AMFI's exec-time binding of the
-CodeDirectory team identifier to the leaf certificate's OU. Apple's own `defaultDeveloperIDLWCR`
-is `{ValidationCategory, SigningIdentifier, TeamIdentifier}`, and library validation is
-implemented by comparing team identifiers in-kernel, so the binding is near-certain — but it is
-**not proven**, and it is the design's one gating measurement (**G1**, BUILD-ORDER phase 0).
-Fallback if it fails: a `cdhash`-memoized, singleflight, off-handshake-path chain check supplying
-only that clause; copies share a cdhash, so it cannot be amplified. The long-lived helper is
-**removed from the design** — a helper forbidden from self-exec'ing must exec *something*, and
-the only candidate is a new signed, versioned artifact per consumer: a third version axis (§11
-forbids one), a second `deploy` surface, and a bootstrapping paradox where the process that
-verifies peers must itself be verified.
+**The weakest point is trust, by decision.** Since 2026-10-27 the socket's only gate is the
+user's 0700 state directory. Any process running as that user can open it, call every product
+operation, and drain the daemon, and the owner record beside it is just as writable. The ruling
+takes that trade. A process running as the user could already signal the daemon, rewrite its
+plist, or replace the copy at `~/.daemonkit/bin/<Label>`, so a per-connection check bought little
+against its cost. A consumer that serves clients beyond the user's own processes keeps its own
+credential at that boundary, as cc-present does for LAN and tailnet HTTP.
 
 Second: **the drain's `requests` share is the only thing between a slow product and a retained
 socket.** `Handle`'s ctx is the client's deadline, so a context-honoring handler cannot outlive
@@ -789,9 +779,9 @@ budgets is arguing for the six restated bounds to come back; the trade is taken 
 
 Third: **the `deploy` boundary is the least-verified line drawn.** The claim that cc-notes' and
 captain-hook's runtime-proof/readiness-proof/stop machinery (~41 usages) migrates cleanly to
-`Control` rests on reading call sites, not the semantics of `RuntimeProof`'s role binding. If
-those proofs carry an authorization property `Control` does not reproduce, that is understated
-scope — carried forward verbatim from consumer-first's admission because no lane verified it
+`Client.Drain` rests on reading call sites, not the semantics of `RuntimeProof`'s role binding.
+If those proofs carry a property beyond "this exact incumbent left the process table", that is
+understated scope — carried forward verbatim from consumer-first's admission because no lane verified it
 since.
 
 Fourth: **ready = `Start` returned is opinionated.** A product wanting pre-ready business
@@ -808,7 +798,7 @@ F = failure-replay, A = adoptability.)
 | # | Judge → design | Fatal | Disposition |
 |---|---|---|---|
 | 1 | S → consumer | server hello read has no bound; hidden literal | **Fixed**: `Daemon.Handshake` is the second `Grace` field — a named config boundary bounding a disjoint operation, ptyhost's 500ms home; inner shares/ack derive from it. |
-| 2 | S → consumer | false Swift-floor premise | **Fixed**: premise dropped; floor verified unconditional at `SocketServer.swift:558`; the mirror keeps the non-optional shape. |
+| 2 | S → consumer | false Swift-floor premise | **Moot**: no floor exists in either language since 2026-10-27; no peer is judged. |
 | 3 | S → consumer | I13 "reads as deliberate at review" is discipline | **Fixed**: no such invariant row; non-structural residue is quarantined below the table, named as residue. |
 | 4 | S → consumer | `Child.Wait` undefined; Health redundant-axes bools | **Fixed**: types coherent (`Done() <-chan Exit` only); `Health` is envelope + `Detail` bytes — the redundant bools live in consumer-owned JSON, not the API. |
 | 5 | S → invariant | `budget.Enter(d)` exported; `Reserve(tail duration)` | **Does not apply**: `Budget` has unexported fields in root, no duration constructor anywhere; `Reserve` takes a fraction. |
@@ -816,12 +806,12 @@ F = failure-replay, A = adoptability.)
 | 7 | S → invariant | `proc.ID` fields exported | **Fixed**: identity is unexported and comparable in `internal/proc`; no public ID or kill API at all — stronger than any of the four. |
 | 8 | S → invariant | public `wire` server core reopens the ladder vector | **Fixed**: everything mechanical is `internal/`; ~80 public symbols total. |
 | 9 | S → ownership | `Child.rec` field + comment; in-package reachability | **Does not apply**: closure-local settlement; no record-typed field exists. |
-| 10 | S → ownership | one client type spans lanes | **Does not apply**: `Client`/`Control` distinct types. |
-| 11 | S → ownership | `Peer{lifecycle bool}` mode flag | **Does not apply**: lanes are client types; server control verbs are frame kinds pre-mux; handlers get `Caller` (data, no methods). |
+| 10 | S → ownership | one client type spans lanes | **Does not apply**: `Business` carries only `Call`/`Close`; lifecycle verbs are `Client` methods. |
+| 11 | S → ownership | `Peer{lifecycle bool}` mode flag | **Does not apply**: `Business` and `Client` are distinct types; server lifecycle verbs are frame kinds pre-mux; handlers get `Caller` (data, no methods). |
 | 12 | S → ownership | config sibling pair + SIGHUP two owners | **Fixed**: no handler knob; `Serve` arms all signals; SIGHUP forks on `Reloader`. |
 | 13 | S/A → failure | consumer re-owns signals/drain sequencing (captain-hook's bug survives) | **Does not apply**: `Serve` owns both; the ladder is one function body. |
 | 14 | S/F → failure | holdable `Live` breaks revalidate-before-signal | **Does not apply**: no public probe/signal; revalidation is inside the one internal signal site, immediately before delivery. |
-| 15 | S/A → failure | `Business` embeds `Control`: unsigned same-UID drain, K48 collision | **Does not apply**: repair = SIGTERM (no widening) + a Drain verb that is protocol-blind but **trust-gated** (`Trust.Control`) — ownership-first's factoring proves the widening was never forced. |
+| 15 | S/A → failure | `Business` embeds `Control`: unsigned same-UID drain, K48 collision | **Accepted by ruling** (2026-10-27): any process that can open the socket may drain, which grants nothing SIGTERM does not; repair = SIGTERM + the protocol-blind Drain verb. |
 | 16 | S → failure | "zero duration constants" with no admission bound | **Fixed** as #1. |
 | 17 | S → failure | stale premises at 0e60747 | **Fixed**: every carried cite re-verified this pass or marked; stale claims dropped. |
 | 18 | F → invariant | archive-aside = supersession-by-amnesia (orphans children) | **Fixed**: the record file's identity core (`{pid, start, boot, gen}` + schema int) is frozen forever; an unknown-schema open extracts cores, reaps, then archives the remainder. Corrupt-beyond-envelope is named residue, reported in `Drained.Archived`. |
@@ -843,10 +833,10 @@ F = failure-replay, A = adoptability.)
 | 34 | A → consumer | `Cmd{Session:true}` understates synckit's spawned kind | **Accepted as open question** (§12) with the one-function replacement named; gated on synckit confirming live users. |
 | 35 | A → invariant | `deployment` missing entirely (~60 cc-notes call sites) | **Fixed**: `deploy` is a public package, budgeted (~900 lines), verbs named; the proof-migration residual carried in §9. |
 | 36 | A → invariant/ownership/failure | cc-present/cc-review recorded as version bumps | **Fixed**: both rows are source changes with the exact imports named. |
-| 37 | A → invariant | `codeidentity` silently dropped (`PolicyDigest` users) | **Fixed**: `Requirement` + `PolicyDigest` survive as root value types; cc-notes' digest recomputed once, named in its row. |
+| 37 | A → invariant | `codeidentity` silently dropped (`PolicyDigest` users) | **Moot**: `Requirement` and `PolicyDigest` were deleted on 2026-10-27 with every peer check; cc-notes drops its digest, named in its row. |
 | 38 | A → ownership | no `Ensure`/upgrade verb ⇒ least deletion | **Does not apply**: `Ensure` ships with the pure decide step promoted verbatim. |
 | 39 | A → ownership | forever `compat.go` aliases = the forbidden compat layer | **Does not apply, and more strongly than the synthesis claimed**: the flag-day cut keeps one module path, so no alias layer exists at all — a deleted sentinel is a compile error at each consumer, not a silent `errors.Is` miss. |
-| 40 | A → ownership | below-protocol Drain widens same-EUID on unprotected daemons | **Accepted, bounded**: on a `Trust.Control == nil` daemon the verb grants what SIGTERM already grants same-EUID — convenience, not capability; on protected daemons it is signature-gated. Named in §11. |
+| 40 | A → ownership | below-protocol Drain widens same-EUID on unprotected daemons | **Accepted**: every daemon is unprotected since 2026-10-27, and the verb grants what SIGTERM already grants the same user — convenience, not capability. Named in §11. |
 | 41 | A → failure | four B1 real-need knobs have no field | **Fixed**: `MaxFrame`, `Concurrency`, `Handshake` are fields; handler deadline is inherited by design. |
 | 42 | A → failure | `Start` arms nothing | **Does not apply**: `Serve` arms first. |
 | 43 | A → failure | four consumer rows factually wrong | **Fixed**: table rebuilt from the verified import lists. |
@@ -861,30 +851,20 @@ Deliberately absent, so the next agent does not re-add the cruft:
 - **No per-op route table, per-op budgets, or `MaxResponseBytes`.** That is the six restated
   bounds asking to come back. The product owns dispatch; the client owns the deadline.
 - **No server-side takeover/eviction option.** `Serve` refuses a live incumbent, always.
-  Eviction is `Ensure`'s decide step or an explicit `Control.Drain` — a caller's deliberate act
+  Eviction is `Ensure`'s decide step or an explicit `Client.Drain` — a caller's deliberate act
   (K48). Do not add `AcquireOptions.Takeover`.
-- **No second verifier, ever.** The P0 fork-divergence generator was a second implementation.
-  Policy travels as `PolicyDigest`; daemon-facing binaries carry no signed-only literal.
-- **No Security.framework on the handshake path.** Its first call resolves `proc_pidpath` and
-  opens a file whose location the peer chose; its second makes timeout-free synchronous XPC to
-  trustd; no `kSecCS*` flag suppresses either, and a blocked purego call pins its M forever. Do
-  not "just add a flag", and do not re-add `kSecGuestAttributeDynamicCode` — it relocates the
-  read into a shared system daemon behind another timeout-free XPC.
-- **No verification cache.** At microseconds there is nothing to buy, and `{pid, start_time}` is
-  measured unsound — `execve` preserves both while bumping pidversion.
-- **No second policy rendering.** `csposture.Check` owns the status word; `Requirement` owns
-  identity and entitlements. No verifier writes its own bit table or its own DR-equivalent clause
-  list; transcription is how the P0 divergence formed the first time.
-- **The `Requirement` entitlement escape may relax `allow-jit` and
-  `allow-unsigned-executable-memory` and nothing else.** `get-task-allow`,
-  `disable-library-validation`, and `allow-dyld-environment-variables` void the posture floor
-  rather than widening it.
+- **No per-connection checks.** No code-signature, team, entitlement, designated-requirement,
+  or UID verification of a connecting process or a spawned child (2026-10-27). The 0700 state
+  directory is the boundary. Do not re-add a verifier, a cache, or a policy digest to the
+  handshake path; a consumer that needs a credential for remote clients owns it at its own
+  network boundary.
 - **No persisted phases, receipts, claims, or capability registries.** Durable state is
   evidence — live child records and the converged agent set. If you feel the need for a receipt,
   the record's absence already asserts it.
 - **No third version axis.** `Protocol` (wire, exact) and the store schema int. Build strings
-  are diagnostic; comparing one anywhere is the 18,999-failure bug. Schema is set membership at
-  business attach and nowhere else.
+  never gate the wire; gating admission on one is the 18,999-failure bug. Only `Ensure`'s decide
+  step compares a build, to choose whether to replace the incumbent. Schema is set membership at
+  product dispatch and nowhere else.
 - **No health enum owned by daemonkit.** `healthy`/`degraded`/`failed` are consumer JSON inside
   `Detail`. Owning the enum re-freezes every consumer's protocol to daemonkit's release cadence.
 - **No readiness authority.** Observation is free (phase in every ack, stream on every session).
@@ -899,10 +879,8 @@ Deliberately absent, so the next agent does not re-add the cruft:
   module path makes a deleted symbol a compile error, and that *is* the migration mechanism —
   re-adding aliases to soften it re-creates the silent-`errors.Is` hazard the cut removes. A
   shim without a deletion date is a second mechanism.
-- **No widening of the Drain verb's admission.** It stays trust-gated below the protocol gate.
-  On floor-only daemons this grants same-EUID convenience equal to SIGTERM's existing authority
-  — accepted; do not "fix" it by dropping the trust gate (K48) or by gating it on protocol
-  (RC3's self-wedge).
+- **No protocol gate on the Drain verb.** It is admitted unconditionally below the protocol
+  gate and grants nothing SIGTERM does not; gating it on protocol re-creates RC3's self-wedge.
 - **No degraded-ready or pre-ready business traffic.** Ready is `Start`'s return. If a consumer
   genuinely needs it, bend the shape here deliberately — do not add a phase.
 
@@ -910,25 +888,14 @@ Deliberately absent, so the next agent does not re-add the cruft:
 
 ## 12. Open questions
 
-1. **The AMFI team-identifier binding measurement** (§9 / G1) — the one gating open measurement.
-   Falsifies or confirms the sole clause delegated to the kernel. Fallback named. It replaces the
-   SecCode saturation measurement, which is moot: `SecCodeCopyGuestWithAttributes` is not called.
-2. **synckit's `spawned` service kind**: live users? If yes, `Cmd` gains a handoff option
+1. **synckit's `spawned` service kind**: live users? If yes, `Cmd` gains a handoff option
    carrying K16's dup-then-prove fd rule — one function, not a subsystem. If no, it stays dead.
-3. **authkit and cc-pool ladders are unaudited** — either could carry a sixth divergence axis.
-4. **`Stable()`'s plist `Program` change** is a live launchd re-bootstrap per consumer — needs
+2. **authkit and cc-pool ladders are unaudited** — either could carry a sixth divergence axis.
+3. **`Stable`'s plist `Program` change** is a live launchd re-bootstrap per consumer — needs
    one real-machine test before wave 1.
-5. **The observe payload's final field set** — `Health` as specced; confirm cookiesync/reposync
+4. **The observe payload's final field set** — `Health` as specced; confirm cookiesync/reposync
    decode `Detail` without a wrapper change.
-6. **Per-message audit-token binding** (`db24393`) — explicitly *not* absorbed here. Admission is
-   a query-time property of the pidversion generation: a peer that hands its socket fd to another
-   process is not re-judged. Pre-existing and pinned by `TestPolicyCheckAcceptsSubstitutedPeer_TF1`.
-7. **A non-terminal wire response code for infrastructure failure.** Today `wire/server.go:466`
-   sends `ResponseCodePeerUntrusted` — documented terminal (`wire/envelope.go:46`) — for every
-   verification error, including one that is not the peer's fault. Under kernel-only verification
-   there is almost no infrastructure failure left (`csops` returns `ESRCH`, `ENOENT`, or `EPERM`),
-   so this is recorded, not built.
-8. **Task `72313e5`** (pre-main `_dyld_start` provenance hang) stays open — it is pre-main, so not
+5. **Task `72313e5`** (pre-main `_dyld_start` provenance hang) stays open — it is pre-main, so not
    a property of verifier placement, though deleting the Security.framework binding may resolve it
    incidentally.
 
@@ -937,16 +904,16 @@ Deliberately absent, so the next agent does not re-add the cruft:
 Established while building phase 0, and recorded here because a later phase would otherwise have
 to re-derive or silently contradict them.
 
-- **The cut bumps `ProtocolVersion` 1 → 2.** §8.4 requires an old client meeting a new daemon to
-  get a crisp typed `ErrProtocolMismatch`; with both eras at protocol 1 the hellos differ in shape
-  only and there is nothing to reject on.
+- **The cut bumped `ProtocolVersion` 1 → 2, and the single-session change bumped it to 3**
+  (2026-10-27). §8.4 requires an old client meeting a new daemon to get a crisp typed
+  `ErrProtocolMismatch`; with both eras at one protocol the hellos differ in shape only and there
+  is nothing to reject on.
 - **The frozen drain preamble is `0x4452` ("DR").** Chosen so it can never open a frame: a frame
   begins with a big-endian `uint32` body length, so `0x4452….` implies a body over 1 GiB — above
   every `MaxFrame` ceiling (4 / 16 / 64 MiB).
 - **P1 against the shipped tree, independent of this design.** `wire/server.go:405-418` calls
   `startConnection` inline in the accept loop, and `:445-449` block for up to
-  `defaultHandshakeTimeout` (10s) in `readClientHello` — *before* `PeerFromConn` and any trust
-  check. A process that connects and sends nothing stops every other accept for 10 seconds; a loop
-  of them stops the daemon accepting anyone. Unauthenticated, and live today. The cut fixes it
-  (`go s.startConnection(...)` plus the W3 pre-verification cap), but the shipped tree carries it
-  until then.
+  `defaultHandshakeTimeout` (10s) in `readClientHello`. A process that connects and sends nothing
+  stops every other accept for 10 seconds; a loop of them stops the daemon accepting anyone. The
+  cut fixed it: handshakes run off the accept goroutine (`go s.startConnection(...)`), and pending
+  connections draw from a bounded pool and are dropped without a write past it.

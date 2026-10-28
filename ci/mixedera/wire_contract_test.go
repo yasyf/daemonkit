@@ -90,7 +90,7 @@ func TestFrozenFixturesMatchRealWire(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), refuseBound)
 		defer cancel()
 		_, err := wire.NewClient(ctx, wire.ClientConfig{
-			Dial: wire.UnixDialer(sock), Authorize: wiretest.AuthorizeTestServer, Lane: wire.LaneBusiness, Schema: contractSchema,
+			Dial: wire.UnixDialer(sock), Schema: contractSchema,
 		})
 		var mismatch *wire.ProtocolMismatchError
 		if !errors.As(err, &mismatch) || mismatch.Theirs != 1 || mismatch.Ours != wire.ProtocolVersion {
@@ -163,7 +163,7 @@ func oldEraAckServer(t *testing.T, advertised uint16) string {
 
 func helloPacket(t *testing.T, advertised uint16) []byte {
 	t.Helper()
-	payload := []byte(fmt.Sprintf(`{"protocol":%d,"lane":"business","schema":%q}`, advertised, contractSchema))
+	payload := []byte(fmt.Sprintf(`{"protocol":%d,"schema":%q}`, advertised, contractSchema))
 	packet, err := wire.EncodePacket(wire.Frame{Kind: wire.FrameHello, Flags: wire.FlagEnd, Payload: payload})
 	if err != nil {
 		t.Fatalf("encode hello: %v", err)

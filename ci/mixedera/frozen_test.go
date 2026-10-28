@@ -25,19 +25,18 @@ const (
 	precutEra = coverage.PrecutEra
 	cutEra    = coverage.CutEra
 
-	mechanismFrame            = "frame-v1"
-	mechanismGate             = "protocol-gate"
-	mechanismSession          = "session"
-	mechanismSigterm          = "drain-sigterm"
-	mechanismPreamble         = "drain-preamble"
-	mechanismPreambleEmitted  = "drain-preamble-emitted"
-	mechanismTrustGate        = "drain-preamble-trust-gate"
-	mechanismControlTrustGate = "drain-control-trust-gate"
+	mechanismFrame           = "frame-v1"
+	mechanismGate            = "protocol-gate"
+	mechanismSession         = "session"
+	mechanismSigterm         = "drain-sigterm"
+	mechanismPreamble        = "drain-preamble"
+	mechanismPreambleEmitted = "drain-preamble-emitted"
+	mechanismSchemaGate      = "schema-gate"
 
 	framePrefixOffset = 4
 	framePrefixBytes  = 6
 	precutProtocol    = 1
-	cutProtocol       = 2
+	cutProtocol       = 3
 
 	preambleFrameBody = 1146224640
 

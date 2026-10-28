@@ -8,7 +8,6 @@ struct SessionPublicBoundsTests {
             _ = try await SocketClient(
                 path: "/tmp/never-connect.sock",
                 schema: "suite.v1",
-                lane: .business,
                 configuration: .init(maximumFrameBytes: 0)
             )
         }
@@ -16,22 +15,7 @@ struct SessionPublicBoundsTests {
             _ = try await SocketClient(
                 path: "/tmp/never-connect.sock",
                 schema: "suite.v1",
-                lane: .business,
                 configuration: .init(handshakeTimeout: .infinity)
-            )
-        }
-        await #expect(throws: SessionTransportError.self) {
-            _ = try await SocketClient(
-                path: "/tmp/never-connect.sock",
-                schema: "",
-                lane: .business
-            )
-        }
-        await #expect(throws: SessionTransportError.self) {
-            _ = try await SocketClient(
-                path: "/tmp/never-connect.sock",
-                schema: "control-carries-schema",
-                lane: .control
             )
         }
     }

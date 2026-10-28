@@ -211,7 +211,7 @@ func TestNaturalDrainRejectsForeignProducer(t *testing.T) {
 
 func TestPreserveOwnedRefusesDisposableRun(t *testing.T) {
 	o, _ := preservingOwned(t)
-	_, err := o.Run(bounded(t, time.Second), Cmd{Path: "/bin/cat", Exec: ServingSameUser()})
+	_, err := o.Run(bounded(t, time.Second), Cmd{Path: "/bin/cat"})
 	if err == nil || !strings.Contains(err.Error(), "Spawn and WaitNatural") {
 		t.Fatalf("Run() = %v", err)
 	}
@@ -223,7 +223,7 @@ func TestPreserveOwnedRefusesDisposableRun(t *testing.T) {
 
 func TestPreserveProducerStaysAliveThroughProof(t *testing.T) {
 	o, _ := preservingOwned(t)
-	child, err := o.Spawn(bounded(t, 5*time.Second), Cmd{Path: "/bin/cat", Exec: ServingSameUser(), Session: true}, ChannelStdio, nil)
+	child, err := o.Spawn(bounded(t, 5*time.Second), Cmd{Path: "/bin/cat", Session: true}, ChannelStdio, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,7 +263,7 @@ func TestPreserveProducerStaysAliveThroughProof(t *testing.T) {
 
 func TestPreserveCloseTimeoutRetainsOwnershipLock(t *testing.T) {
 	o, path := preservingOwned(t)
-	child, err := o.Spawn(bounded(t, 5*time.Second), Cmd{Path: "/bin/cat", Exec: ServingSameUser(), Session: true}, ChannelStdio, nil)
+	child, err := o.Spawn(bounded(t, 5*time.Second), Cmd{Path: "/bin/cat", Session: true}, ChannelStdio, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

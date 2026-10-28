@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"os/signal"
 
-	"github.com/yasyf/daemonkit/internal/converge"
-	"github.com/yasyf/daemonkit/internal/proc"
 	"github.com/yasyf/daemonkit/supervise"
 )
 
@@ -30,17 +28,12 @@ func (serviceLayer) removeService(ctx context.Context, label string) error {
 	return supervise.Remove(ctx, label)
 }
 
-func (c *Client) observeWorld(ctx context.Context, agent service) (converge.World, error) {
-	record, err := c.record()
-	if err != nil {
-		return converge.World{}, err
-	}
-	return converge.Observe(ctx, converge.Sources{
-		Serving:    c.servedHealth,
-		Recorded:   proc.ReadOwner,
-		RecordPath: record,
-		Service:    agent,
-	})
+// reachService refuses with supervise.ErrNoSupervisor when no supervisor
+// answers for the service: replacing a running daemon needs one there to
+// start the next.
+func (serviceLayer) reachService(ctx context.Context, agent service) error {
+	_, err := supervise.Verify(ctx, agent)
+	return err
 }
 
 // agent is the supervised service that runs this daemon. Every field is

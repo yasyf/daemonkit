@@ -29,15 +29,20 @@ func supervisedDaemon(t *testing.T, label Label) (Daemon, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	program := filepath.Join(realPath(t, t.TempDir()), "daemon")
+	root := realPath(t, t.TempDir())
+	program := filepath.Join(root, "daemon")
 	if err := os.WriteFile(program, body, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	app := filepath.Join(root, "Daemon.app")
+	versionBundle(t, app, "1.0.0")
 	t.Setenv(controlChildEnv, "1")
 	t.Setenv(controlChildLabel, string(label))
+	t.Setenv(controlChildApp, app)
+	t.Setenv(controlChildFile, program)
 	return Daemon{
 		Label:    label,
-		Program:  Program{policy: bundled{file: program}},
+		Program:  Program{policy: bundled{app: app, file: program}},
 		Schemas:  []Schema{"test.v1"},
 		Shutdown: Grace(5 * time.Second),
 		Restart:  RestartOnFailure,
@@ -128,27 +133,24 @@ func TestDaemonAgent(t *testing.T) {
 
 // TestEnsureRefusesWithNoSupervisorBeforeTouchingTheDaemon is the
 // workspace-owned contract at the verb a launcher calls. With no supervisor to
-// start a replacement, Ensure must not evict what is serving: it refuses at its
-// first observation and the live daemon keeps serving.
+// start a replacement, Ensure must not evict a daemon serving an older build:
+// it refuses before acting and the live daemon keeps serving.
 func TestEnsureRefusesWithNoSupervisorBeforeTouchingTheDaemon(t *testing.T) {
-	d, _ := supervisedDaemon(t, "dknosup")
+	d, program := supervisedDaemon(t, "dknosup")
 	child := startControlChild(t, string(d.Label))
 	ctx := bounded(t, 60*time.Second)
 	client := openClient(t, d)
-	warmup := awaitControl(ctx, t, client)
-	if err := warmup.Close(ctx); err != nil {
-		t.Fatalf("Close() = %v", err)
-	}
+	awaitServing(ctx, t, client)
+	versionBundle(t, filepath.Join(filepath.Dir(program), "Daemon.app"), "2.0.0")
 
 	if _, err := client.Ensure(bounded(t, 10*time.Second)); !errors.Is(err, supervise.ErrNoSupervisor) {
 		t.Fatalf("Ensure() with no supervisor = %v, want supervise.ErrNoSupervisor", err)
 	}
-	control := awaitControl(ctx, t, client)
-	health, err := control.Health(ctx)
+	health, err := client.Health(ctx)
 	if err != nil || health.PID != child.Process.Pid || health.Phase != PhaseReady {
 		t.Fatalf("Health() after the refused Ensure = %+v, %v, want the same daemon still ready", health, err)
 	}
-	if _, err := control.Drain(ctx, Expect{}); err != nil {
+	if _, err := client.Drain(ctx, Expect{}); err != nil {
 		t.Fatalf("Drain() = %v", err)
 	}
 }
@@ -196,6 +198,7 @@ func TestEnsureAndStopConvergeThroughTheSupervisor(t *testing.T) {
 	if err := durable.WriteFile(program, append(body, "upgraded"...), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	versionBundle(t, d.Program.policy.(bundled).app, "1.0.1")
 	next, err := d.Program.build()
 	if err != nil {
 		t.Fatalf("build() = %v", err)
@@ -214,8 +217,8 @@ func TestEnsureAndStopConvergeThroughTheSupervisor(t *testing.T) {
 	if err := client.Stop(bounded(t, 60*time.Second)); err != nil {
 		t.Fatalf("Stop() = %v", err)
 	}
-	if _, err := client.Control(bounded(t, 5*time.Second)); !errors.Is(err, ErrAbsent) {
-		t.Fatalf("Control() after Stop = %v, want ErrAbsent", err)
+	if _, err := client.Health(bounded(t, 5*time.Second)); !errors.Is(err, ErrAbsent) {
+		t.Fatalf("Health() after Stop = %v, want ErrAbsent", err)
 	}
 	if alive(upgraded.After.PID) {
 		t.Fatalf("the stopped daemon %d is still running", upgraded.After.PID)
@@ -236,5 +239,19 @@ func TestSuperviseRefusesALabelNoPathMayBeJoinedFrom(t *testing.T) {
 		if err := Supervise(bounded(t, 5*time.Second), label); err == nil {
 			t.Errorf("Supervise(%q) ran", label)
 		}
+	}
+}
+
+// versionBundle writes app's Info.plist declaring version, the build a
+// bundled Program reports.
+func versionBundle(t *testing.T, app, version string) {
+	t.Helper()
+	contents := filepath.Join(app, "Contents")
+	if err := os.MkdirAll(contents, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	info := "<plist><dict><key>CFBundleShortVersionString</key><string>" + version + "</string></dict></plist>"
+	if err := os.WriteFile(filepath.Join(contents, "Info.plist"), []byte(info), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }

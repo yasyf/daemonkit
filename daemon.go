@@ -1,7 +1,6 @@
 package daemonkit
 
 import (
-	"errors"
 	"fmt"
 	"path/filepath"
 	"time"
@@ -19,7 +18,6 @@ type Daemon struct {
 	Program     Program // the executable launchd runs; Ensure places it
 	Args        []string
 	Schemas     []Schema // [0] is what this build speaks; the rest are prior eras still accepted
-	Trust       Trust    // lane requirements; the same-EUID floor is not here and cannot be turned off
 	Restart     Restart
 	Shutdown    Grace  // the whole drain budget AND the plist's ExitTimeOut; 30s when zero
 	Handshake   Grace  // the whole admission budget; 10s when zero
@@ -85,8 +83,8 @@ func (d Daemon) ShutdownGrace() Grace {
 }
 
 // ownSchema is the application protocol this build speaks, empty when the
-// daemon declares none; the business lane refuses that at its config boundary
-// rather than attaching under a schema no daemon accepts.
+// daemon declares none; a session refuses that at its config boundary rather
+// than attaching under a schema no daemon accepts.
 func (d Daemon) ownSchema() Schema {
 	if len(d.Schemas) == 0 {
 		return ""
@@ -122,9 +120,6 @@ const maxGrace = Grace(24 * time.Hour)
 // socket, and job name is joined from it; every Grace must lie in (0, 24h],
 // zero meaning its documented default. Rejecting the range here is what keeps
 // every deadline downstream of mint within budget arithmetic's exact domain.
-// Trust.Business, when stated at all, must name at least one requirement: a
-// disjunction over nothing admits nobody, and reading as the unset field
-// instead would open the lane to every same-UID peer.
 func (d Daemon) ValidateForServe() error {
 	if _, err := d.Label.element(); err != nil {
 		return err
@@ -135,38 +130,19 @@ func (d Daemon) ValidateForServe() error {
 	if err := d.Handshake.validate("Handshake"); err != nil {
 		return err
 	}
-	if err := d.Idle.validate("Idle"); err != nil {
-		return err
-	}
-	if d.Trust.Business != nil && len(d.Trust.Business) == 0 {
-		return errors.New("daemonkit: Trust.Business is stated but empty; leave it nil for the same-EUID floor alone")
-	}
-	if d.Trust.Control != nil {
-		if err := requirementVerifiable("Trust.Control"); err != nil {
-			return err
-		}
-	}
-	if d.Trust.Business != nil {
-		if err := requirementVerifiable("Trust.Business"); err != nil {
-			return err
-		}
-	}
-	return nil
+	return d.Idle.validate("Idle")
 }
 
 // ValidateForClient is the config-boundary check Open runs once: every Grace a
-// client consumes lies in (0, 24h], Label is present, and Trust.Serving is
-// stated. It mirrors ValidateForServe on the client's half of the Daemon
-// value — Handshake bounds admission on the serving side and no client verb
-// reads it, so it is not judged here.
+// client consumes lies in (0, 24h] and Label is present. It mirrors
+// ValidateForServe on the client's half of the Daemon value — Handshake bounds
+// admission on the serving side and no client verb reads it, so it is not
+// judged here.
 func (d Daemon) ValidateForClient() error {
 	if _, err := d.Label.element(); err != nil {
 		return err
 	}
-	if err := d.Shutdown.validate("Shutdown"); err != nil {
-		return err
-	}
-	return d.Trust.Serving.validate("Trust.Serving")
+	return d.Shutdown.validate("Shutdown")
 }
 
 func (g Grace) validate(field string) error {
@@ -174,17 +150,6 @@ func (g Grace) validate(field string) error {
 		return fmt.Errorf("daemonkit: %s grace %v is outside (0, 24h]", field, time.Duration(g))
 	}
 	return nil
-}
-
-// Trust names what each lane must additionally prove. The same-EUID floor
-// runs unconditionally on both ends before Trust is consulted; no Trust value
-// can express its absence.
-type Trust struct {
-	Control  *Requirement // nil: floor alone. Gates Control and the wire Drain verb.
-	Business Requirements // nil: floor alone. Any element admits.
-	// Serving is what the process answering on the socket must prove to a
-	// client attaching to it; the daemon never reads it.
-	Serving Serving
 }
 
 // Restart is launchd's relaunch policy for the daemon's job.

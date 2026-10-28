@@ -2,7 +2,7 @@
 
 // This file is daemonkit's real-machine launchd coverage: it bootstraps
 // genuine user LaunchAgents into gui/<uid>, lets launchd exec and supervise a
-// real daemon, and drives Ensure, Control.Drain, and the shutdown ladder
+// real daemon, and drives Ensure, Drain, and the shutdown ladder
 // against them. The suite replaces /bin/launchctl with a double, so nothing in
 // it observes launchd's own behaviour: the exit-code classifier, Verify's
 // idempotence claim, the abandoned-stage park, and the ExitTimeOut SIGKILL
@@ -104,7 +104,6 @@ func newLane(t *testing.T, label string, shutdown time.Duration, restart daemonk
 		Program:  program,
 		Args:     []string{home, label},
 		Schemas:  []daemonkit.Schema{"daemonkit.e2e.v1"},
-		Trust:    daemonkit.Trust{Serving: daemonkit.ServingSameUser()},
 		Shutdown: daemonkit.Grace(shutdown),
 		Restart:  restart,
 	}
@@ -117,10 +116,15 @@ func newLane(t *testing.T, label string, shutdown time.Duration, restart daemonk
 	return l
 }
 
-// buildHelper compiles internal/e2ehelper into the bundle, stamping variant so
-// two builds of the same source differ in every byte a digest reads.
+// buildHelper compiles internal/e2ehelper into the bundle and declares variant
+// as the bundle's CFBundleShortVersionString, the build both the launcher and
+// the helper read.
 func (l *lane) buildHelper(variant string) string {
 	l.t.Helper()
+	info := "<plist><dict><key>CFBundleShortVersionString</key><string>" + variant + "</string></dict></plist>"
+	if err := os.WriteFile(filepath.Join(l.app, "Contents", "Info.plist"), []byte(info), 0o600); err != nil {
+		l.t.Fatalf("version helper %q: %v", variant, err)
+	}
 	target := filepath.Join(l.app, helperRel)
 	build := exec.Command(
 		"go", "build",
@@ -346,7 +350,7 @@ func awaitDeparture(pid int, within time.Duration) (time.Duration, bool) {
 
 // TestE2ELaunchdEnsureLadder is items 1 and 3: a real LaunchAgent converges, a
 // second pass is a proven no-op against launchd's own view, a rebuilt program
-// upgrades, and Control.Drain against the live daemon is followed by the
+// upgrades, and Drain against the live daemon is followed by the
 // daemon's actual departure from the process table.
 func TestE2ELaunchdEnsureLadder(t *testing.T) {
 	l := newLane(t, e2eLabelPrefix+"ladder", 6*time.Second, daemonkit.RestartNever)
@@ -436,7 +440,7 @@ func TestE2ELaunchdEnsureLadder(t *testing.T) {
 		t.Errorf("Ensure #3 Did = %s, want upgraded", third.Did)
 	}
 	if third.After.Build == first.After.Build {
-		t.Errorf("Ensure #3 Build = %s, want the rebuilt program's digest", short(third.After.Build))
+		t.Errorf("Ensure #3 Build = %s, want the rebuilt program's build", short(third.After.Build))
 	}
 	if third.After.PID == first.After.PID {
 		t.Errorf("Ensure #3 kept pid %d; an upgrade must replace the process", first.After.PID)
@@ -445,31 +449,26 @@ func TestE2ELaunchdEnsureLadder(t *testing.T) {
 		t.Errorf("the upgraded-away daemon %d is still in the process table", first.After.PID)
 	}
 
-	// Control.Drain against the live daemon, then its real departure.
+	// Drain against the live daemon, then its real departure.
 	ctx := l.ctx(60 * time.Second)
-	control, err := client.Control(ctx)
-	if err != nil {
-		t.Fatalf("Control() = %v", err)
-	}
-	health, err := control.Health(ctx)
+	health, err := client.Health(ctx)
 	if err != nil {
 		t.Fatalf("Health() = %v", err)
 	}
 	drainStart := time.Now()
-	stopped, err := control.Drain(ctx, daemonkit.Expect{Build: health.Build, Generation: health.Generation})
+	stopped, err := client.Drain(ctx, daemonkit.Expect{Build: health.Build, Generation: health.Generation})
 	drainTook := time.Since(drainStart)
 	if err != nil {
 		l.logEvents()
 		t.Fatalf("Drain() = %v", err)
 	}
-	t.Logf("Control.Drain: reap=%d before.pid=%d took=%s", stopped.Reap, stopped.Before.PID, drainTook.Round(time.Millisecond))
+	t.Logf("Drain: reap=%d before.pid=%d took=%s", stopped.Reap, stopped.Before.PID, drainTook.Round(time.Millisecond))
 	if stopped.Reap != daemonkit.ReapAbsent {
 		t.Errorf("Drain Reap = %d, want ReapAbsent", stopped.Reap)
 	}
 	if pidAlive(third.After.PID) {
 		t.Errorf("drained daemon %d is still in the process table", third.After.PID)
 	}
-	_ = control.Close(l.ctx(10 * time.Second))
 	l.logEvents()
 
 	t.Logf("TIMINGS ladder: start=%s noop=%s upgrade=%s drain=%s",
@@ -676,12 +675,7 @@ func TestE2ELaunchdSuccessorRecoversAfterAKillMidDrain(t *testing.T) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		control, err := client.Control(ctx)
-		if err != nil {
-			return
-		}
-		defer func() { _ = control.Close(ctx) }()
-		_, _ = control.Drain(ctx, daemonkit.Expect{})
+		_, _ = client.Drain(ctx, daemonkit.Expect{})
 	}()
 	if _, ok := l.awaitEvent("drain.enter", 30*time.Second); !ok {
 		l.logEvents()

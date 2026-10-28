@@ -37,9 +37,9 @@ struct SessionFrameCodecTests {
         return encoded
     }
 
-    @Test func frameV2MatchesSharedGoGolden() throws {
+    @Test func frameV3MatchesSharedGoGolden() throws {
         let encoded = try Self.goldenPacket()
-        let hex = try Self.goldenHex("internal/wire/testdata/frame-v2.json")
+        let hex = try Self.goldenHex("internal/wire/testdata/frame-v3.json")
         #expect(encoded.map { String(format: "%02x", $0) }.joined() == hex)
     }
 

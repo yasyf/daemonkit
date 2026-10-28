@@ -36,8 +36,7 @@ struct ServiceSocketClientTests {
         defer { server.shutdown() }
         let client = try await SocketClient(
             path: server.socketPath,
-            schema: GoWireServer.schema,
-            lane: .business
+            schema: GoWireServer.schema
         )
         defer { client.abort() }
 
@@ -59,7 +58,6 @@ struct ServiceSocketClientTests {
         let client = try await SocketClient(
             path: server.socketPath,
             schema: GoWireServer.schema,
-            lane: .business,
             onPhase: { observed.record($0.phase) }
         )
         defer { client.abort() }
@@ -97,8 +95,7 @@ struct ServiceSocketClientTests {
         defer { server.shutdown() }
         let client = try await SocketClient(
             path: server.socketPath,
-            schema: GoWireServer.schema,
-            lane: .business
+            schema: GoWireServer.schema
         )
         defer { client.abort() }
         try await client.waitReady(deadline: deadline())
@@ -122,8 +119,7 @@ struct ServiceSocketClientTests {
         defer { server.shutdown() }
         let client = try await SocketClient(
             path: server.socketPath,
-            schema: GoWireServer.schema,
-            lane: .business
+            schema: GoWireServer.schema
         )
         defer { client.abort() }
         try await client.waitReady(deadline: deadline())
@@ -151,8 +147,7 @@ struct ServiceSocketClientTests {
         defer { server.shutdown() }
         let client = try await SocketClient(
             path: server.socketPath,
-            schema: GoWireServer.schema,
-            lane: .business
+            schema: GoWireServer.schema
         )
         defer { client.abort() }
         try await client.waitReady(deadline: deadline())
@@ -178,8 +173,7 @@ struct ServiceSocketClientTests {
         defer { server.shutdown() }
         let client = try await SocketClient(
             path: server.socketPath,
-            schema: GoWireServer.schema,
-            lane: .business
+            schema: GoWireServer.schema
         )
         defer { client.abort() }
         try await client.waitReady(deadline: deadline())
@@ -205,32 +199,63 @@ struct ServiceSocketClientTests {
         await #expect(throws: SessionDrainingError.self) {
             _ = try await SocketClient(
                 path: server.socketPath,
-                schema: GoWireServer.schema,
-                lane: .business
+                schema: GoWireServer.schema
             )
         }
     }
 
-    @Test func unacceptedSchemaRejectsThroughHandshake() async throws {
+    @Test func unacceptedSchemaAttachesButProductRequestsReject() async throws {
         let server = try GoWireServer()
         defer { server.shutdown() }
+        let client = try await SocketClient(
+            path: server.socketPath,
+            schema: "other.v1"
+        )
+        defer { client.abort() }
+
+        #expect(client.peerSchema == GoWireServer.schema)
+        let product = try await client.call(operation: "test.echo.v1", deadline: deadline())
+        #expect(product.rejected)
+        #expect(product.code == .buildMismatch)
+        let health = try await client.call(operation: "daemon.health", deadline: deadline())
+        #expect(!health.rejected)
+        #expect(health.error == nil)
+    }
+
+    @Test func unacceptedSchemaTerminatesServiceClient() async throws {
+        let server = try GoWireServer()
+        defer { server.shutdown() }
+        let client = try ServiceSocketClient(path: server.socketPath, schema: "other.v1")
+        defer { Task { await client.close() } }
+
         do {
-            _ = try await SocketClient(
-                path: server.socketPath,
-                schema: "other.v1",
-                lane: .business
-            )
+            _ = try await client.call(genericServiceCall(operation: "test.echo.v1", deadline: deadline()))
             Issue.record("expected a build-mismatch rejection")
-        } catch let rejection as SocketHandshakeRejectionError {
+        } catch let rejection as ServiceSocketRejectionError {
             #expect(rejection.code == .buildMismatch)
         }
+        await #expect(throws: ServiceSocketRejectionError.self) {
+            _ = try await client.call(genericServiceCall(operation: "test.echo.v1", deadline: deadline()))
+        }
+    }
+
+    @Test func schemalessSessionAnswersDaemonVerbs() async throws {
+        let server = try GoWireServer()
+        defer { server.shutdown() }
+        let client = try await SocketClient(path: server.socketPath, schema: "")
+        defer { client.abort() }
+
+        let health = try await client.call(operation: "daemon.health", deadline: deadline())
+        #expect(!health.rejected)
+        let reserved = try await client.call(operation: "daemon.unknown", deadline: deadline())
+        #expect(reserved.rejected)
+        #expect(reserved.code == .permissionDenied)
     }
 
     @Test func noListenerDeadlineExpires() async throws {
         let client = try ServiceSocketClient(
             path: "/tmp/daemonkit-absent-\(getpid()).sock",
-            schema: GoWireServer.schema,
-            lane: .business
+            schema: GoWireServer.schema
         )
         defer { Task { await client.close() } }
         await #expect(throws: ServiceSocketClientError.deadlineExceeded) {

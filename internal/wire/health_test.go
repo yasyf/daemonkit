@@ -11,12 +11,12 @@ import (
 	"github.com/yasyf/daemonkit/internal/wire/wiretest"
 )
 
-func dialControl(t *testing.T, sock string) *wire.Client {
+func dialSchema(t *testing.T, sock, schema string) *wire.Client {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	client, err := wire.NewClient(ctx, wire.ClientConfig{
-		Dial: wire.UnixDialer(sock), Authorize: wiretest.AuthorizeTestServer, Lane: wire.LaneControl,
+		Dial: wire.UnixDialer(sock), Schema: schema,
 	})
 	if err != nil {
 		t.Fatalf("NewClient() = %v", err)
@@ -25,7 +25,7 @@ func dialControl(t *testing.T, sock string) *wire.Client {
 	return client
 }
 
-func TestHealthVerbBothLanesAllPhases(t *testing.T) {
+func TestHealthVerbAnswersEverySchemaInEveryPhase(t *testing.T) {
 	serving := wire.Serving{
 		PID:        4242,
 		Build:      "build-digest",
@@ -33,27 +33,22 @@ func TestHealthVerbBothLanesAllPhases(t *testing.T) {
 		Detail:     func() []byte { return []byte("product-detail") },
 	}
 	tests := []struct {
-		name  string
-		lane  wire.Lane
-		phase wire.Phase
+		name   string
+		schema string
+		phase  wire.Phase
 	}{
-		{"control while starting", wire.LaneControl, wire.PhaseStarting},
-		{"control while ready", wire.LaneControl, wire.PhaseReady},
-		{"control while draining", wire.LaneControl, wire.PhaseDraining},
-		{"business while starting", wire.LaneBusiness, wire.PhaseStarting},
-		{"business while ready", wire.LaneBusiness, wire.PhaseReady},
-		{"business while draining", wire.LaneBusiness, wire.PhaseDraining},
+		{"own schema while starting", testSchema, wire.PhaseStarting},
+		{"own schema while ready", testSchema, wire.PhaseReady},
+		{"own schema while draining", testSchema, wire.PhaseDraining},
+		{"foreign schema while starting", "foreign.v9", wire.PhaseStarting},
+		{"foreign schema while ready", "foreign.v9", wire.PhaseReady},
+		{"foreign schema while draining", "foreign.v9", wire.PhaseDraining},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			rt := wiretest.NewStubRuntime()
 			sock, _ := startServer(t, rt, wire.Config{Serving: serving})
-			var client *wire.Client
-			if tt.lane == wire.LaneControl {
-				client = dialControl(t, sock)
-			} else {
-				client = dialBusiness(t, sock)
-			}
+			client := dialSchema(t, sock, tt.schema)
 			// The draining case must answer on the established session, so the
 			// phase moves only after attach.
 			rt.SetPhase(tt.phase, nil)
@@ -111,7 +106,7 @@ func (pastConveyedDeadline) Deadline() (time.Time, bool) { return time.Now().Add
 func TestHealthVerbCarriesTheServingSidesTerminalVerdict(t *testing.T) {
 	rt := wiretest.NewStubRuntime()
 	sock, _ := startServer(t, rt, wire.Config{Serving: wire.Serving{PID: 1, Generation: 1}})
-	client := dialControl(t, sock)
+	client := dialBusiness(t, sock)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

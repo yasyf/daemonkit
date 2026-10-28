@@ -66,21 +66,24 @@ type Ensured struct {
 // is not the one the new bytes produce, so it restarts rather than answering
 // from a report the old image wrote.
 //
-// The world is re-derived from the socket, the durable owner record, and
-// launchd's own view of the LaunchAgent — never from stored intent. A pure
-// decision reads the observed Health (decide). An incumbent that decision
-// replaces is evicted through Control.Drain, pinned to the build and generation
-// just observed so a replacement that raced in is refused rather than stopped,
-// and proven out of the process table. The daemon's own LaunchAgent is then
-// applied, and readiness is a subscription on the new daemon's phase stream
-// rather than a poll.
+// The world is re-derived from the socket and the durable owner record — never
+// from stored intent. A pure decision reads the observed Health (decide): a
+// daemon already serving the wanted build is the whole answer, and launchd is
+// not asked about it. An incumbent that decision replaces is evicted through
+// Drain, pinned to the build and generation just observed so a replacement
+// that raced in is refused rather than stopped, and proven out of the process
+// table; one speaking another wire protocol is signalled at its recorded
+// identity instead. The daemon's own LaunchAgent is then applied, and
+// readiness is a subscription on the new daemon's phase stream rather than a
+// poll. The observation rides the client's own session, which the first
+// business lane then takes over.
 //
 // Applying rewrites a drifted plist and re-bootstraps the job, which boots a
-// live incumbent out — so an incumbent is always drained first, and a daemon
-// that is already the wanted build but whose LaunchAgent has drifted is
-// therefore restarted, not repaired underneath.
+// live incumbent out — so an incumbent is always drained first. A LaunchAgent
+// that drifted under a daemon already serving the wanted build is left as it
+// is until that daemon is next replaced.
 //
-// Ensure and an explicit Control.Drain are the only evictors; Serve refuses a
+// Ensure and an explicit Drain are the only evictors; Serve refuses a
 // live incumbent with ErrBusy. Eviction proves exactly one pinned identity
 // left the process table: a caller gating an irreversible action on absence
 // needs the executable-scoped inventory besides (see Stopped). Every eviction
@@ -144,34 +147,41 @@ func (c *Client) Ensure(ctx context.Context) (Ensured, error) {
 	}
 }
 
-// moved names the two benign races that mean the incumbent changed between an
+// moved names the benign race that means the incumbent changed between an
 // observation and the verb aimed at it: a non-zero Expect the pinned runtime
-// disagreed with, and a session whose peer is no longer the process the attach
-// pinned. Neither stopped anything and neither is the caller's error — the
-// whole repair is to observe again and decide again, which the ladder does on
-// its own re-observation cadence rather than as fast as the race can be lost.
-func moved(err error) bool {
-	return errors.Is(err, ErrWrongIncumbent) || errors.Is(err, errPinMoved)
-}
+// disagreed with. It stopped nothing and is not the caller's error — the whole
+// repair is to observe again and decide again, which the ladder does on its
+// own re-observation cadence rather than as fast as the race can be lost.
+func moved(err error) bool { return errors.Is(err, ErrWrongIncumbent) }
 
 func (c *Client) ensureOnce(ctx context.Context, want string, agent service, replaced bool) (Ensured, error) {
-	world, action, err := c.settle(ctx, want, agent)
+	world, action, err := c.settle(ctx, want)
 	if err != nil {
 		return Ensured{}, err
 	}
 	before := healthFromReport(world.Health)
-	if action == ActionNothing && world.Applied && !replaced {
+	if action == ActionNothing && !replaced {
 		return Ensured{Before: before, Did: ActionNothing, After: before}, nil
 	}
-	if world.Serving() {
+	if err := c.reachService(ctx, agent); err != nil {
+		return Ensured{}, err
+	}
+	switch {
+	case world.Serving():
 		if action == ActionNothing {
 			action = ActionRestarted
 		}
 		if err := c.evict(ctx, before, world.Observed()); err != nil {
 			return Ensured{}, err
 		}
-	} else if err := c.proveRecorded(ctx, world); err != nil {
-		return Ensured{}, err
+	case errors.Is(world.Attach, ErrProtocolMismatch):
+		if err := c.terminateRecorded(ctx, world); err != nil {
+			return Ensured{}, err
+		}
+	default:
+		if err := c.proveRecorded(ctx, world); err != nil {
+			return Ensured{}, err
+		}
 	}
 	if err := c.applyService(ctx, agent); err != nil {
 		return Ensured{}, fmt.Errorf("daemonkit: apply %q: %w", agent.Label, err)
@@ -198,12 +208,12 @@ func (c *Client) ensureOnce(ctx context.Context, want string, agent service, rep
 // all: it is classified before absence, because a dial that never left this
 // process must never read as nothing serving and start a second daemon over a
 // live one.
-func (c *Client) settle(ctx context.Context, want string, agent service) (converge.World, Action, error) {
+func (c *Client) settle(ctx context.Context, want string) (converge.World, Action, error) {
 	observing := Grace(left(ctx)).mint("ensure").Share("observe", observeShare)
 	timer := time.NewTimer(attachCadence(ctx))
 	defer timer.Stop()
 	for {
-		world, err := c.observeWorld(ctx, agent)
+		world, err := c.observe(ctx)
 		if err != nil {
 			return converge.World{}, actionInvalid, err
 		}
@@ -213,6 +223,9 @@ func (c *Client) settle(ctx context.Context, want string, agent service) (conver
 			}
 			if errors.Is(world.Attach, ErrAbsent) || errors.Is(world.Attach, ErrDraining) {
 				return world, ActionStarted, nil
+			}
+			if errors.Is(world.Attach, ErrProtocolMismatch) {
+				return world, ActionRestarted, nil
 			}
 			return converge.World{}, actionInvalid, world.Attach
 		}
@@ -235,26 +248,14 @@ func (c *Client) settle(ctx context.Context, want string, agent service) (conver
 	}
 }
 
-// servedHealth attaches the control lane, reads the pinned incumbent's report,
-// and lets the session go. The attach is what judges the serving process
-// against Trust.Serving and pins the kernel process the report describes, so
-// this observation names one instance rather than whatever answered — and that
-// pin outlives the session it was taken on, because it is what a later proof
-// correlates an unnameable process against.
+// servedHealth reads the incumbent's report on the client's session and pins
+// the kernel process the report describes, so this observation names one
+// instance rather than whatever answered — and that pin outlives the session
+// it was taken on, because it is what a later proof correlates an unnameable
+// process against.
 func (c *Client) servedHealth(ctx context.Context) (wire.HealthReport, proc.Identity, error) {
-	control, err := c.Control(ctx)
-	if err != nil {
-		return wire.HealthReport{}, proc.Identity{}, err
-	}
-	defer func() { _ = control.Close(ctx) }()
-	report, err := control.session.Health(ctx)
-	if err != nil {
-		return wire.HealthReport{}, proc.Identity{}, err
-	}
-	if err := control.pinnedBy(report); err != nil {
-		return wire.HealthReport{}, proc.Identity{}, err
-	}
-	return report, control.pinned, nil
+	_, pinned, report, err := c.link.pinned(ctx)
+	return report, pinned, err
 }
 
 // evict removes the observed incumbent and proves it left the process table.
@@ -268,12 +269,11 @@ func (c *Client) servedHealth(ctx context.Context) (wire.HealthReport, proc.Iden
 // falls to the record on what the whole eviction has left rather than being
 // reported as something the incumbent did.
 //
-// Whichever arm it takes, the eviction carries a pinned identity into the
-// proof: the peer this attach pinned when there was a session, and otherwise
-// observed — what the pass that reached here already named. It is the one thing
-// that says whose an unnameable process is when the record turns out to name
-// nobody, and a session this ladder held is exactly the evidence no record file
-// can forge.
+// Whichever arm it takes, the eviction carries observed into the proof: the
+// peer the observation pinned on its session, which the Expect generation
+// check proves is the one Drain addressed. It is the one thing that says whose
+// an unnameable process is when the record turns out to name nobody, and a
+// session this ladder held is exactly the evidence no record file can forge.
 func (c *Client) evict(ctx context.Context, before Health, observed proc.Identity) error {
 	target, err := pin(before.Build, before.Generation)
 	if err != nil {
@@ -281,30 +281,39 @@ func (c *Client) evict(ctx context.Context, before Health, observed proc.Identit
 	}
 	drainCtx, cancel := Grace(left(ctx)).mint("evict").Share("drain", evictDrainShare).Context(ctx)
 	defer cancel()
-	control, err := c.Control(drainCtx)
+	_, err = c.Drain(drainCtx, target.expect())
 	switch {
 	case err == nil:
-		defer func() { _ = control.Close(drainCtx) }()
-		_, drainErr := control.Drain(drainCtx, target.expect())
-		if drainErr == nil {
-			return nil
-		}
-		if !errors.Is(drainErr, ErrUnsettled) && !spent(drainCtx, drainErr) {
-			return drainErr
-		}
-		return c.prove(ctx, target, control.pinned)
-	case errors.Is(err, ErrAbsent), errors.Is(err, ErrDraining), spent(drainCtx, err):
+		return nil
+	case errors.Is(err, ErrAbsent), errors.Is(err, ErrDraining), errors.Is(err, ErrUnsettled), spent(drainCtx, err):
+		return c.prove(ctx, target, observed)
 	default:
 		return err
 	}
-	return c.prove(ctx, target, observed)
+}
+
+// terminateRecorded settles an incumbent speaking another wire protocol. No
+// session can read or drain it, so it is signalled at once at the identity its
+// owner record names — SIGTERM is the drain every daemonkit era honors — and
+// its departure observed. A foreign incumbent with no record names nobody to
+// signal, so absence falls to the executable-scoped inventory alone.
+func (c *Client) terminateRecorded(ctx context.Context, world converge.World) error {
+	if !world.Recorded {
+		return c.inventoryClear(world.Observed())
+	}
+	target, err := pin(world.Owner.Build, world.Owner.Generation)
+	if err != nil {
+		return err
+	}
+	_, err = c.Terminate(ctx, target.expect())
+	return err
 }
 
 // incumbent is one completely named runtime: the build stamp and the instance
 // generation both. It is the only thing daemonkit evicts, so no settlement and
 // no signal can run against a partial expectation — one whose empty fields
-// match whatever the same-UID-writable owner record happens to say at the
-// moment it is read.
+// match whatever the writable owner record happens to say at the moment it is
+// read.
 type incumbent struct {
 	build      string
 	generation uint64
@@ -347,8 +356,8 @@ func (c *Client) proveRecorded(ctx context.Context, world converge.World) error 
 // re-observes; a record still naming it and still live is a wedged daemon, and
 // Terminate's ladder goes out addressed to the recorded identity until
 // departure is observed. No record at all leaves absence
-// to the executable-scoped inventory, which reads the kernel and no
-// same-UID-writable record file can forge.
+// to the executable-scoped inventory, which reads the kernel and no record
+// file can forge.
 //
 // observed is what the ladder pinned on its way here — the session's peer, or
 // the identity the observation read out of the record — and it is the only
@@ -383,8 +392,8 @@ func (c *Client) prove(ctx context.Context, target incumbent, observed proc.Iden
 //
 // Two cross-checks stand between the record and every signal. expect must be
 // complete — build and generation both — and the record must still name it, so
-// a runtime the caller never observed is never signalled on a record it can
-// write itself; and the recorded {pid, start, boot} must still be the kernel's
+// a runtime the caller never observed is never signalled on a record anyone
+// can write; and the recorded {pid, start, boot} must still be the kernel's
 // answer for that PID, so a PID handed to a stranger is never signalled either.
 // The identity, not the number, is the address. No owner record is
 // ErrUnrecorded; a record naming another incumbent is ErrWrongIncumbent.

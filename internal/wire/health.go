@@ -19,7 +19,7 @@ type Serving struct {
 }
 
 // HealthReport is the daemon.health verb's terminal payload: one observation
-// of the serving daemon, answered on both lanes below product dispatch and
+// of the serving daemon, answered on every session below product dispatch and
 // outside the phase gate, so a starting or draining daemon still answers.
 //
 // The report is additive forever and decoded leniently: it rides inside the
@@ -85,7 +85,7 @@ func decodeHealthReport(payload []byte) (HealthReport, error) {
 	return report, nil
 }
 
-// Drain dispatches the trust-gated drain verb and returns the transport
+// Drain dispatches the drain verb and returns the transport
 // result so the caller can distinguish a typed refusal from a lost terminal.
 func (c *Client) Drain(ctx context.Context) (Result, error) {
 	return c.Call(ctx, drainControlOp, nil)

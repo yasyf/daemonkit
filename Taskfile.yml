@@ -28,10 +28,8 @@ tasks:
 
   vet:
     desc: Vet the module
-    # -unsafeptr=false: dlsym data-symbol FFI in trust/ (ccn 239201e); lockstep
-    # with .golangci.yml and ci.yml.
     cmds:
-      - go vet -unsafeptr=false ./...
+      - go vet ./...
 
   lint:
     desc: Lint with golangci-lint

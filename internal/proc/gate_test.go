@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -14,43 +13,6 @@ import (
 
 	"github.com/yasyf/daemonkit/durable"
 )
-
-func TestVerifyRefusalAbortsBeforeTheChildRuns(t *testing.T) {
-	s, path := newTestStore(t)
-	marker := filepath.Join(t.TempDir(), "ran")
-	refused := errors.New("posture refused")
-	var suspended int
-
-	_, err := s.Spawn(t.Context(), Cmd{
-		Path: "/bin/sh",
-		Args: []string{"-c", "touch " + marker},
-		Verify: func(pid int) error {
-			suspended = pid
-			info, probeErr := probeProc(pid)
-			if probeErr != nil {
-				t.Errorf("probe the gated child: %v", probeErr)
-			} else if !info.stopped {
-				t.Error("the verify gate ran against a released child")
-			}
-			return refused
-		},
-	}, nil)
-	if !errors.Is(err, refused) {
-		t.Fatalf("Spawn() = %v, want the verify refusal", err)
-	}
-	if suspended == 0 {
-		t.Fatal("the verify gate never ran")
-	}
-	if _, err := os.Stat(marker); !os.IsNotExist(err) {
-		t.Fatalf("the refused child executed an instruction: %v", err)
-	}
-	if _, err := probeProc(suspended); !errors.Is(err, errNoProc) {
-		t.Fatalf("probe refused pid %d = %v, want it reaped", suspended, err)
-	}
-	if storeHolds(t, path, identity{pid: suspended}) {
-		t.Fatal("the refused child's record survived the abort")
-	}
-}
 
 func TestOpenStoreLockExcludesASecondOwner(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "records.dkstate")

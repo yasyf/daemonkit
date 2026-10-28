@@ -25,13 +25,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/daemonkit/durable"
 	"github.com/yasyf/daemonkit/internal/flock"
 	"github.com/yasyf/daemonkit/internal/proc"
-	"github.com/yasyf/daemonkit/internal/trust"
 	"github.com/yasyf/daemonkit/launchd"
 )
 
@@ -87,25 +87,19 @@ type Config struct {
 	// Every path the deployment owns derives from it.
 	App string
 
-	// Requirement is the trusted-publisher policy every generation must
-	// satisfy, rendered to a designated requirement for static verification.
-	// It is the coarse gate; a generation's CDHash is the fine one.
-	Requirement daemonkit.Requirement
+	// Requirement is the trusted publisher every generation must be signed
+	// by, rendered to a designated requirement for static verification. It is
+	// the coarse gate; a generation's CDHash is the fine one.
+	Requirement Requirement
 
 	// Daemon names the daemon the application serves, so quiesce can reach it
-	// and readiness can be observed. Trust.Serving pins what the process
-	// answering on the socket must prove — under ServingSameUser an absence
-	// proof is forgeable by any same-UID process that binds the socket first.
-	//
-	// Naming that waiver is the caller's risk to take, and deploy takes it
-	// rather than refusing: no irreversible step here rests on that proof
-	// alone. Each one also requires the executable-scoped inventory, which
-	// reads the kernel's own process table and no same-UID process can forge,
-	// so a forged socket proof buys a swap or a removal nothing — it still has
-	// to be true that no process of this deployment is running. A ServingSigned
-	// posture is held to the same terms as Requirement: Open validates it once,
-	// so a policy that could admit nobody fails there rather than at the first
-	// attach.
+	// and readiness can be observed. Whatever process answers on its socket is
+	// believed, so an absence proof is forgeable by any process that binds the
+	// socket first — and no irreversible step here rests on that proof alone.
+	// Each one also requires the executable-scoped inventory, which reads the
+	// kernel's own process table and no process can forge, so a forged socket
+	// proof buys a swap or a removal nothing: it still has to be true that no
+	// process of this deployment is running.
 	Daemon daemonkit.Daemon
 
 	// Agents is the exact LaunchAgent set activation converges launchd to.
@@ -733,30 +727,35 @@ func (d *Deployment) hold(ctx context.Context) (func(), error) {
 	return func() { _ = lock.Close() }, nil
 }
 
-// designatedRequirement validates the whole publisher policy and renders the
-// static designated requirement from it. The entitlement clauses never reach
-// the rendered string — a signed image satisfies its own designated
-// requirement from any path an attacker can write to, so entitlements narrow
-// peer admission, never on-disk verification — but a policy that contradicts
-// itself is a configuration error wherever it is used.
-func designatedRequirement(r daemonkit.Requirement) (string, error) {
-	requirement := trust.Requirement{
-		TeamID:            r.TeamID,
-		SigningIdentifier: r.SigningIdentifier,
-		RequiredAppGroup:  r.RequiredAppGroup,
-		AllowJIT:          r.AllowJIT,
+// Requirement is the publisher every generation must be signed by: a
+// Developer ID team and the signing identifier it signs this application
+// under. SigningIdentifier is a team-scoped namespace, so every build the team
+// ever signed under it satisfies the requirement, old versions included; the
+// generation's CDHash is what pins one build.
+type Requirement struct {
+	TeamID            string
+	SigningIdentifier string
+}
+
+// designatedRequirement renders the static designated requirement for on-disk
+// bundle verification — the Developer ID anchor pinned to the quoted Team ID
+// and signing identifier, never a cdhash, which pins one build.
+func designatedRequirement(r Requirement) (string, error) {
+	if strings.TrimSpace(r.TeamID) == "" {
+		return "", errors.New("Requirement.TeamID is required")
 	}
-	if len(r.RequiredEntitlements) > 0 {
-		requirement.RequiredEntitlements = make(map[string]trust.EntitlementRequirement, len(r.RequiredEntitlements))
-		for key, entitlement := range r.RequiredEntitlements {
-			requirement.RequiredEntitlements[key] = trust.EntitlementRequirement{
-				Match:   trust.EntitlementMatch(entitlement.Match),
-				Boolean: entitlement.Boolean,
-				String:  entitlement.String,
-			}
-		}
+	if strings.TrimSpace(r.SigningIdentifier) == "" {
+		return "", errors.New("Requirement.SigningIdentifier is required (a TeamID-only requirement admits every app the team signs)")
 	}
-	return requirement.DRString()
+	if strings.ContainsAny(r.TeamID, `"\`) || strings.ContainsAny(r.SigningIdentifier, `"\`) {
+		return "", errors.New("Requirement fields must not contain quotes or backslashes")
+	}
+	return fmt.Sprintf(
+		`identifier "%s" and anchor apple generic and certificate leaf[subject.OU] = "%s" `+
+			`and certificate 1[field.1.2.840.113635.100.6.2.6] exists `+
+			`and certificate leaf[field.1.2.840.113635.100.6.1.13] exists`,
+		r.SigningIdentifier, r.TeamID,
+	), nil
 }
 
 func execRunner(ctx context.Context, path string, args ...string) (string, int, error) {

@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/yasyf/daemonkit/internal/trust"
+	"github.com/yasyf/daemonkit/internal/proc"
 )
 
 var (
@@ -18,7 +18,8 @@ var (
 	ErrHandshake = errors.New("wire: handshake failed")
 	// ErrServerStarted means Serve was called more than once.
 	ErrServerStarted = errors.New("wire: server already started")
-	// ErrBuildMismatch means a business hello presented a schema outside the accepted set.
+	// ErrBuildMismatch means a product request arrived on a session whose hello
+	// presented a schema outside the accepted set.
 	ErrBuildMismatch = errors.New("wire: client schema is not accepted by this server")
 	// ErrDraining means intake is closed and the request was not dispatched.
 	ErrDraining = errors.New("wire: server is draining")
@@ -26,14 +27,13 @@ var (
 	ErrDuplicateID = errors.New("wire: duplicate request id")
 	// ErrStreamOrder means stream chunks arrived out of sequence.
 	ErrStreamOrder = errors.New("wire: stream sequence violation")
-	// ErrSessionCapacity means the lane has no session slot.
+	// ErrSessionCapacity means the server has no session slot.
 	ErrSessionCapacity = errors.New("wire: session capacity exhausted")
-	// ErrHandoffReplay means a control session reused a handoff nonce.
+	// ErrHandoffReplay means a session reused a handoff nonce.
 	ErrHandoffReplay = errors.New("wire: broker handoff nonce replay")
-	// ErrUntrustedPeer means the accepted unix peer failed its lane's trust gate.
-	ErrUntrustedPeer = errors.New("wire: untrusted peer")
-	// ErrPermissionDenied means a session's lane lacks authority for the operation.
-	ErrPermissionDenied = errors.New("wire: control permission denied")
+	// ErrPermissionDenied means a request named a reserved daemon. op this
+	// server does not serve.
+	ErrPermissionDenied = errors.New("wire: reserved op denied")
 	// ErrNotReady means the runtime has not published PhaseReady.
 	ErrNotReady = errors.New("wire: runtime is starting")
 )
@@ -77,7 +77,7 @@ type Runtime interface {
 	Phase() PhaseSnapshot
 	WaitPhase(ctx context.Context, after uint64) (PhaseSnapshot, error)
 
-	// Drain is the trust-gated control verb's landing point. Idempotent. The
+	// Drain is the drain verb's landing point. Idempotent. The
 	// runtime closes product intake and drives Phase to PhaseDraining; the
 	// wire server observes the transition through the phase stream.
 	Drain()
@@ -100,13 +100,14 @@ const (
 	ResponseCodeRuntimeStarting ResponseCode = "runtime_starting"
 	// ResponseCodeRuntimeDraining identifies closed-intake non-dispatch.
 	ResponseCodeRuntimeDraining ResponseCode = "runtime_draining"
-	// ResponseCodeBuildMismatch identifies a schema-set attach rejection.
+	// ResponseCodeBuildMismatch identifies a product request from a session
+	// whose schema is outside the accepted set.
 	ResponseCodeBuildMismatch ResponseCode = "build_mismatch"
 	// ResponseCodeSessionCapacity identifies transient session saturation.
 	ResponseCodeSessionCapacity ResponseCode = "session_capacity"
-	// ResponseCodePeerUntrusted identifies terminal peer rejection.
-	ResponseCodePeerUntrusted ResponseCode = "peer_untrusted"
-	// ResponseCodePermissionDenied rejects an operation outside the session lane's authority.
+	// ResponseCodeHandshake identifies a hello the server refused.
+	ResponseCodeHandshake ResponseCode = "handshake_rejected"
+	// ResponseCodePermissionDenied rejects a reserved op the server does not serve.
 	ResponseCodePermissionDenied ResponseCode = "permission_denied"
 	// ResponseCodeHandoffReplay identifies a nonce already consumed by this session.
 	ResponseCodeHandoffReplay ResponseCode = "handoff_replay"
@@ -122,7 +123,7 @@ const (
 type Request struct {
 	ID      uint64
 	Op      Op
-	Peer    trust.Peer
+	Peer    proc.Peer
 	Schema  string
 	Payload []byte
 	Chunks  <-chan Chunk
@@ -183,8 +184,8 @@ func responseCodeCause(code ResponseCode) error {
 		return ErrBuildMismatch
 	case ResponseCodeSessionCapacity:
 		return ErrSessionCapacity
-	case ResponseCodePeerUntrusted:
-		return ErrUntrustedPeer
+	case ResponseCodeHandshake:
+		return ErrHandshake
 	case ResponseCodePermissionDenied:
 		return ErrPermissionDenied
 	case ResponseCodeHandoffReplay:

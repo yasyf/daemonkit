@@ -80,8 +80,8 @@ func (s Survivors) attributed(known ...proc.Identity) []LiveProcess {
 // instance around the identity snapshot, so a PID reused mid-inventory is
 // dropped rather than reported at its dead predecessor's pin.
 //
-// Another user's process is never one of this deployment's: the trust floor is
-// the same effective uid, and a root daemon that happens to run a queried path
+// Another user's process is never one of this deployment's: daemonkit's state
+// lives under one user's home, and a root daemon that happens to run a queried path
 // would otherwise refuse every irreversible step forever.
 //
 // An empty Inventory over a daemon's host and app executables is the absence
@@ -89,7 +89,7 @@ func (s Survivors) attributed(known ...proc.Identity) []LiveProcess {
 // absence proofs that reads the kernel's own process table directly. Stopped
 // proves that one pinned identity left and says nothing about an orphaned
 // child, a second instance, or the app half; Settle's identity comes out of a
-// same-UID-writable owner record that a hostile writer can point at a corpse.
+// writable owner record that a hostile writer can point at a corpse.
 // Neither can be substituted for this. Gate every irreversible step on both.
 //
 // Unnameable comes back beside the answer rather than folded into it. A

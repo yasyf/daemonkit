@@ -17,7 +17,6 @@ import (
 	"github.com/yasyf/daemonkit/durable"
 	"github.com/yasyf/daemonkit/internal/flock"
 	"github.com/yasyf/daemonkit/internal/proc"
-	"github.com/yasyf/daemonkit/internal/trust"
 )
 
 const (
@@ -204,13 +203,6 @@ func call(ctx context.Context, name string, verb request) (response, error) {
 	defer func() { _ = conn.Close() }()
 	if err := conn.SetDeadline(deadline); err != nil {
 		return response{}, fmt.Errorf("supervise: bound the supervisor exchange: %w", err)
-	}
-	peer, err := trust.PeerCredentials(conn.(*net.UnixConn))
-	if err != nil {
-		return response{}, err
-	}
-	if err := trust.Floor(peer.UID); err != nil {
-		return response{}, fmt.Errorf("supervise: the process answering for %q: %w", name, err)
 	}
 	if err := send(conn, verb); err != nil {
 		return response{}, err

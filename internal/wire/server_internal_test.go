@@ -14,11 +14,7 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/yasyf/daemonkit/internal/trust"
 )
-
-func authorizeTestServer(net.Conn) error { return nil }
 
 type stubRuntime struct{ phase Phase }
 
@@ -175,7 +171,7 @@ func TestSilentConnectionDoesNotBlockOtherAccepts(t *testing.T) {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	client, err := NewClient(ctx, ClientConfig{Dial: UnixDialer(sock), Authorize: authorizeTestServer, Lane: LaneBusiness, Schema: "test.v1"})
+	client, err := NewClient(ctx, ClientConfig{Dial: UnixDialer(sock), Schema: "test.v1"})
 	if err != nil {
 		t.Fatalf("NewClient() behind a silent connection = %v", err)
 	}
@@ -221,46 +217,33 @@ func TestPendingCapSaturationDropsWithoutWrite(t *testing.T) {
 	time.Sleep(700 * time.Millisecond)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	client, err := NewClient(ctx, ClientConfig{Dial: UnixDialer(sock), Authorize: authorizeTestServer, Lane: LaneBusiness, Schema: "test.v1"})
+	client, err := NewClient(ctx, ClientConfig{Dial: UnixDialer(sock), Schema: "test.v1"})
 	if err != nil {
 		t.Fatalf("NewClient() after pending slots recycled = %v", err)
 	}
 	_ = client.Abort(nil)
 }
 
-func TestUnverifiedPeerConsumesNoLaneSlot(t *testing.T) {
+func TestRejectedHelloConsumesNoSlot(t *testing.T) {
 	tests := []struct {
-		name     string
-		trust    Trust
-		hello    helloIdentity
-		wantCode ResponseCode
-		wantErr  error
+		name    string
+		hello   helloIdentity
+		wantErr error
 	}{
 		{
-			name:     "business schema outside the accepted set",
-			hello:    helloIdentity{Protocol: ProtocolVersion, Lane: LaneBusiness, Schema: "foreign.v9"},
-			wantCode: ResponseCodeBuildMismatch,
-			wantErr:  ErrBuildMismatch,
+			name:    "a nonce outside a spawned session",
+			hello:   helloIdentity{Protocol: ProtocolVersion, Schema: "test.v1", Nonce: make([]byte, 32)},
+			wantErr: ErrHandshake,
 		},
 		{
-			name: "control peer failing the trust requirement",
-			trust: Trust{Control: &trust.Requirement{
-				TeamID: "SXKCTF23Q2", SigningIdentifier: "com.yasyf.daemonkit.absent",
-			}},
-			hello:    helloIdentity{Protocol: ProtocolVersion, Lane: LaneControl},
-			wantCode: ResponseCodePeerUntrusted,
-			wantErr:  nil,
-		},
-		{
-			name:     "old-era protocol in the hello payload",
-			hello:    helloIdentity{Protocol: 1, Lane: LaneBusiness, Schema: "test.v1"},
-			wantCode: ResponseCodePeerUntrusted,
-			wantErr:  ErrProtocolVersion,
+			name:    "old-era protocol in the hello payload",
+			hello:   helloIdentity{Protocol: 1, Schema: "test.v1"},
+			wantErr: ErrProtocolVersion,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			server := mustServer(t, stubRuntime{phase: PhaseReady}, Config{Trust: tt.trust})
+			server := mustServer(t, stubRuntime{phase: PhaseReady}, Config{})
 			clientConn, serverConn := testPair(t)
 			done := make(chan error, 1)
 			go func() { done <- server.startConnection(context.Background(), serverConn) }()
@@ -268,34 +251,27 @@ func TestUnverifiedPeerConsumesNoLaneSlot(t *testing.T) {
 			codec := NewCodec(clientConn)
 			writeHello(t, codec, tt.hello)
 			ack := readAck(t, codec)
-			if !ack.Rejected || ack.Code != tt.wantCode {
-				t.Fatalf("ack = %+v, want rejection code %q", ack, tt.wantCode)
+			if !ack.Rejected || ack.Code != ResponseCodeHandshake {
+				t.Fatalf("ack = %+v, want rejection code %q", ack, ResponseCodeHandshake)
 			}
-			err := <-done
-			if err == nil {
-				t.Fatal("startConnection() = nil, want a rejection error")
-			}
-			if tt.wantErr != nil && !errors.Is(err, tt.wantErr) {
+			if err := <-done; !errors.Is(err, tt.wantErr) {
 				t.Fatalf("startConnection() = %v, want %v", err, tt.wantErr)
 			}
-			if got := len(server.businessSlots); got != 0 {
-				t.Fatalf("business slots held after rejection = %d, want 0", got)
-			}
-			if got := len(server.controlSlot); got != 0 {
-				t.Fatalf("control slot held after rejection = %d, want 0", got)
+			if got := len(server.sessionSlots); got != 0 {
+				t.Fatalf("session slots held after rejection = %d, want 0", got)
 			}
 		})
 	}
 }
 
-func TestVerifiedPeerAcquiresLaneSlotOnlyAfterVerification(t *testing.T) {
+func TestAdmittedPeerHoldsOneSlotUntilItLeaves(t *testing.T) {
 	server := mustServer(t, stubRuntime{phase: PhaseReady}, Config{})
 	clientConn, serverConn := testPair(t)
 	done := make(chan error, 1)
 	go func() { done <- server.startConnection(context.Background(), serverConn) }()
 
 	codec := NewCodec(clientConn)
-	writeHello(t, codec, helloIdentity{Protocol: ProtocolVersion, Lane: LaneBusiness, Schema: "test.v1"})
+	writeHello(t, codec, helloIdentity{Protocol: ProtocolVersion, Schema: "test.v1"})
 	ack := readAck(t, codec)
 	if ack.Rejected {
 		t.Fatalf("ack rejected: %+v", ack)
@@ -303,25 +279,24 @@ func TestVerifiedPeerAcquiresLaneSlotOnlyAfterVerification(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("startConnection() = %v", err)
 	}
-	if got := len(server.businessSlots); got != 1 {
-		t.Fatalf("business slots after admission = %d, want 1", got)
+	if got := len(server.sessionSlots); got != 1 {
+		t.Fatalf("session slots after admission = %d, want 1", got)
 	}
 	_ = clientConn.Close()
 	server.sessionWG.Wait()
-	if got := len(server.businessSlots); got != 0 {
-		t.Fatalf("business slots after disconnect = %d, want 0", got)
+	if got := len(server.sessionSlots); got != 0 {
+		t.Fatalf("session slots after disconnect = %d, want 0", got)
 	}
 }
 
-func TestGoAwayAcknowledgementFollowsTheLaneSlotRelease(t *testing.T) {
+func TestGoAwayAcknowledgementFollowsTheSlotRelease(t *testing.T) {
 	server := mustServer(t, stubRuntime{phase: PhaseReady}, Config{})
 	sock := startServing(t, server)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	client, err := NewClient(ctx, ClientConfig{
-		Dial:      UnixDialer(sock),
-		Authorize: authorizeTestServer,
-		Lane:      LaneControl,
+		Dial:   UnixDialer(sock),
+		Schema: "test.v1",
 	})
 	if err != nil {
 		t.Fatalf("NewClient() = %v", err)
@@ -329,19 +304,19 @@ func TestGoAwayAcknowledgementFollowsTheLaneSlotRelease(t *testing.T) {
 	if _, err := client.Health(ctx); err != nil {
 		t.Fatalf("Health() = %v", err)
 	}
-	if got := len(server.controlSlot); got != 1 {
-		t.Fatalf("control slots after admission = %d, want 1", got)
+	if got := len(server.sessionSlots); got != 1 {
+		t.Fatalf("session slots after admission = %d, want 1", got)
 	}
 
 	server.mu.Lock()
 	closeErr := client.Close(ctx)
-	held := len(server.controlSlot)
+	held := len(server.sessionSlots)
 	server.mu.Unlock()
 	if closeErr != nil {
 		t.Fatalf("Close() = %v", closeErr)
 	}
 	if held != 0 {
-		t.Fatalf("control slots when Close() returned = %d, want 0: the next attach would be refused for capacity", held)
+		t.Fatalf("session slots when Close() returned = %d, want 0: the next attach would be refused for capacity", held)
 	}
 }
 
@@ -369,7 +344,7 @@ func TestDrainingServerEmitsFrozenPreambleInsteadOfAck(t *testing.T) {
 	go func() { done <- server.startConnection(context.Background(), serverConn) }()
 
 	codec := NewCodec(clientConn)
-	writeHello(t, codec, helloIdentity{Protocol: ProtocolVersion, Lane: LaneBusiness, Schema: "test.v1"})
+	writeHello(t, codec, helloIdentity{Protocol: ProtocolVersion, Schema: "test.v1"})
 	if err := <-done; !errors.Is(err, ErrDraining) {
 		t.Fatalf("startConnection() = %v, want ErrDraining", err)
 	}
@@ -388,7 +363,7 @@ func TestClientHandshakeSeesTypedDrainOnPreamble(t *testing.T) {
 	go func() { _ = server.startConnection(context.Background(), serverConn) }()
 
 	codec := NewCodec(clientConn)
-	_, err := clientHandshake(codec, helloIdentity{Protocol: ProtocolVersion, Lane: LaneBusiness, Schema: "test.v1"})
+	_, err := clientHandshake(codec, helloIdentity{Protocol: ProtocolVersion, Schema: "test.v1"})
 	if !errors.Is(err, ErrDraining) {
 		t.Fatalf("clientHandshake() against a draining server = %v, want ErrDraining", err)
 	}
@@ -428,7 +403,7 @@ func TestOldEraPeersGetProtocolMismatch(t *testing.T) {
 		done := make(chan error, 1)
 		go func() { done <- server.startConnection(context.Background(), serverConn) }()
 		codec := NewCodec(clientConn)
-		writeHello(t, codec, helloIdentity{Protocol: 1, Lane: LaneBusiness, Schema: "test.v1"})
+		writeHello(t, codec, helloIdentity{Protocol: 1, Schema: "test.v1"})
 		err := <-done
 		var mismatch *ProtocolMismatchError
 		if !errors.As(err, &mismatch) || mismatch.Theirs != 1 || mismatch.Ours != ProtocolVersion {
@@ -444,7 +419,7 @@ func TestOldEraPeersGetProtocolMismatch(t *testing.T) {
 			_, _ = serverConn.Write(v1Ack)
 		}()
 		codec := NewCodec(clientConn)
-		_, err := clientHandshake(codec, helloIdentity{Protocol: ProtocolVersion, Lane: LaneBusiness, Schema: "test.v1"})
+		_, err := clientHandshake(codec, helloIdentity{Protocol: ProtocolVersion, Schema: "test.v1"})
 		if !errors.Is(err, ErrProtocolVersion) {
 			t.Fatalf("clientHandshake() against an old-era server = %v, want ErrProtocolVersion", err)
 		}

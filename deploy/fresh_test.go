@@ -281,7 +281,7 @@ func TestInstallFreshRefusesEveryRecordAndSlot(t *testing.T) {
 // TestInstallFreshRefusesALiveDaemon serves a daemon at the deployment's label
 // with no record of it anywhere: its owner record is removed, and its
 // executable is this test binary, which no inventory of the deployment names.
-// The control attach is the only check that can see it, and it refuses without
+// The health probe is the only check that can see it, and it refuses without
 // draining it — the same instance is still serving after.
 func TestInstallFreshRefusesALiveDaemon(t *testing.T) {
 	f := newFixture(t)

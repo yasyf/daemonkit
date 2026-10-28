@@ -98,7 +98,7 @@ func TestOwnProcessesExcludesASecondScope(t *testing.T) {
 // daemon's children unreachable.
 func TestOwnProcessesAgainstAServingDaemonIsRefused(t *testing.T) {
 	shortHome(t)
-	d := Daemon{Label: "dkown", Schemas: []Schema{"test.v1"}, Shutdown: Grace(5 * time.Second)}
+	d := Daemon{Label: "dkown", Program: testProgram, Schemas: []Schema{"test.v1"}, Shutdown: Grace(5 * time.Second)}
 	product := &stubProduct{}
 	done := make(chan error, 1)
 	go func() {
@@ -109,7 +109,7 @@ func TestOwnProcessesAgainstAServingDaemonIsRefused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Socket: %v", err)
 	}
-	session := awaitControlSession(t, socket)
+	session := awaitSession(t, socket)
 	if err := session.WaitReady(bounded(t, 20*time.Second)); err != nil {
 		t.Fatalf("WaitReady() = %v", err)
 	}
@@ -149,7 +149,6 @@ func TestOwnedRunReportsStreamsExitAndTruncation(t *testing.T) {
 		result, err := owned.Run(bounded(t, 20*time.Second), Cmd{
 			Path:  "/bin/cat",
 			Stdin: []byte("through the pipe"),
-			Exec:  ServingSameUser(),
 		})
 		if err != nil {
 			t.Fatalf("Run() = %v", err)
@@ -166,7 +165,6 @@ func TestOwnedRunReportsStreamsExitAndTruncation(t *testing.T) {
 		result, err := owned.Run(bounded(t, 20*time.Second), Cmd{
 			Path: "/bin/sh",
 			Args: []string{"-c", "echo out; echo err >&2; exit 3"},
-			Exec: ServingSameUser(),
 		})
 		var exitErr *ExitError
 		if !errors.As(err, &exitErr) {
@@ -185,7 +183,6 @@ func TestOwnedRunReportsStreamsExitAndTruncation(t *testing.T) {
 			Path:      "/bin/sh",
 			Args:      []string{"-c", "printf 0123456789abcdef"},
 			MaxOutput: 8,
-			Exec:      ServingSameUser(),
 		})
 		if !errors.Is(err, ErrTruncated) {
 			t.Fatalf("Run() = %v, want ErrTruncated", err)
@@ -199,7 +196,6 @@ func TestOwnedRunReportsStreamsExitAndTruncation(t *testing.T) {
 		result, err := owned.Run(bounded(t, 2*time.Second), Cmd{
 			Path: "/bin/sleep",
 			Args: []string{"60"},
-			Exec: ServingSameUser(),
 		})
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("Run() = %v, want an error matching context.DeadlineExceeded", err)
@@ -210,7 +206,7 @@ func TestOwnedRunReportsStreamsExitAndTruncation(t *testing.T) {
 	})
 
 	t.Run("no deadline is refused", func(t *testing.T) {
-		_, err := owned.Run(context.Background(), Cmd{Path: "/usr/bin/true", Exec: ServingSameUser()})
+		_, err := owned.Run(context.Background(), Cmd{Path: "/usr/bin/true"})
 		if err == nil {
 			t.Fatal("Run() accepted a context without a deadline")
 		}
@@ -222,7 +218,7 @@ func TestOwnedRunReportsStreamsExitAndTruncation(t *testing.T) {
 
 func TestOwnedRunRestatesTheBoundaryInThisPackagesRegister(t *testing.T) {
 	owned := ownedScope(t)
-	_, err := owned.Run(bounded(t, 5*time.Second), Cmd{Path: "bin/echo", Exec: ServingSameUser()})
+	_, err := owned.Run(bounded(t, 5*time.Second), Cmd{Path: "bin/echo"})
 	if err == nil {
 		t.Fatal("Run() accepted a relative path")
 	}
@@ -236,12 +232,12 @@ func TestSpawnAndAdoptRequireADeadline(t *testing.T) {
 	ctx := owned.Ctx(context.Background())
 	undeadlined := map[string]func() error{
 		"Owned.Spawn": func() error {
-			_, err := owned.Spawn(context.Background(), Cmd{Path: "/usr/bin/true", Exec: ServingSameUser()}, ChannelNone, nil)
+			_, err := owned.Spawn(context.Background(), Cmd{Path: "/usr/bin/true"}, ChannelNone, nil)
 			return err
 		},
 		"Owned.Adopt": func() error { _, err := owned.Adopt(context.Background(), os.Getpid()); return err },
 		"Ctx.Spawn": func() error {
-			_, err := ctx.Spawn(context.Background(), Cmd{Path: "/usr/bin/true", Exec: ServingSameUser()}, ChannelNone, nil)
+			_, err := ctx.Spawn(context.Background(), Cmd{Path: "/usr/bin/true"}, ChannelNone, nil)
 			return err
 		},
 		"Ctx.Adopt": func() error { _, err := ctx.Adopt(context.Background(), os.Getpid()); return err },
@@ -259,10 +255,10 @@ func TestSpawnAndAdoptRequireADeadline(t *testing.T) {
 
 func TestZeroCtxRefusesTheVerbs(t *testing.T) {
 	var zero Ctx
-	if _, err := zero.Run(bounded(t, time.Second), Cmd{Path: "/usr/bin/true", Exec: ServingSameUser()}); !errors.Is(err, errZeroCtx) {
+	if _, err := zero.Run(bounded(t, time.Second), Cmd{Path: "/usr/bin/true"}); !errors.Is(err, errZeroCtx) {
 		t.Fatalf("Ctx.Run() = %v, want the zero-Ctx refusal", err)
 	}
-	if _, err := zero.Spawn(bounded(t, time.Second), Cmd{Path: "/usr/bin/true", Exec: ServingSameUser()}, ChannelNone, nil); !errors.Is(err, errZeroCtx) {
+	if _, err := zero.Spawn(bounded(t, time.Second), Cmd{Path: "/usr/bin/true"}, ChannelNone, nil); !errors.Is(err, errZeroCtx) {
 		t.Fatalf("Ctx.Spawn() = %v, want the zero-Ctx refusal", err)
 	}
 	if _, err := zero.Adopt(bounded(t, time.Second), os.Getpid()); !errors.Is(err, errZeroCtx) {
@@ -283,7 +279,6 @@ func TestOwnedCtxRunsProductCodeUnchanged(t *testing.T) {
 	result, err := ctx.Run(bounded(t, 20*time.Second), Cmd{
 		Path: "/bin/echo",
 		Args: []string{"from a CLI scope"},
-		Exec: ServingSameUser(),
 	})
 	if err != nil {
 		t.Fatalf("Ctx.Run() = %v", err)
@@ -311,7 +306,6 @@ func TestOwnedCloseSettlesEverythingItOwns(t *testing.T) {
 	child, err := owned.Spawn(bounded(t, 20*time.Second), Cmd{
 		Path: "/bin/sleep",
 		Args: []string{"600"},
-		Exec: ServingSameUser(),
 	}, ChannelNone, nil)
 	if err != nil {
 		t.Fatalf("Spawn() = %v", err)
@@ -346,7 +340,7 @@ func TestOwnedCloseSettlesEverythingItOwns(t *testing.T) {
 // child gone before the process leaves.
 func TestServeSettlesChildrenSpawnedThroughCtx(t *testing.T) {
 	shortHome(t)
-	d := Daemon{Label: "dkctxspawn", Schemas: []Schema{"test.v1"}, Shutdown: Grace(10 * time.Second)}
+	d := Daemon{Label: "dkctxspawn", Program: testProgram, Schemas: []Schema{"test.v1"}, Shutdown: Grace(10 * time.Second)}
 	spawned := make(chan int, 1)
 	done := make(chan Drained, 1)
 	go func() {
@@ -354,7 +348,6 @@ func TestServeSettlesChildrenSpawnedThroughCtx(t *testing.T) {
 			child, err := x.Spawn(bounded(t, 20*time.Second), Cmd{
 				Path: "/bin/sleep",
 				Args: []string{"600"},
-				Exec: ServingSameUser(),
 			}, ChannelNone, nil)
 			if err != nil {
 				return nil, err
@@ -375,7 +368,7 @@ func TestServeSettlesChildrenSpawnedThroughCtx(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Socket: %v", err)
 	}
-	session := awaitControlSession(t, socket)
+	session := awaitSession(t, socket)
 	ctx := bounded(t, 20*time.Second)
 	if err := session.WaitReady(ctx); err != nil {
 		t.Fatalf("WaitReady() = %v", err)
@@ -402,7 +395,6 @@ func parkedRun(pidFile string) Cmd {
 	return Cmd{
 		Path: "/bin/sh",
 		Args: []string{"-c", "echo $$ > " + pidFile + "; exec sleep 600"},
-		Exec: ServingSameUser(),
 	}
 }
 
@@ -487,7 +479,6 @@ func runForksADescendant(pidFile, holderFile, marker string) Cmd {
 	return Cmd{
 		Path: "/bin/sh",
 		Args: []string{"-c", script},
-		Exec: ServingSameUser(),
 	}
 }
 
@@ -546,7 +537,6 @@ func forkedHolderRun(pidFile, holderFile, marker string) Cmd {
 	return Cmd{
 		Path: "/bin/sh",
 		Args: []string{"-c", script},
-		Exec: ServingSameUser(),
 	}
 }
 
@@ -604,7 +594,7 @@ func TestServeSettlesAnInFlightCtxRun(t *testing.T) {
 	shortHome(t)
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "run.pid")
-	d := Daemon{Label: "dkctxrun", Schemas: []Schema{"test.v1"}, Shutdown: Grace(10 * time.Second)}
+	d := Daemon{Label: "dkctxrun", Program: testProgram, Schemas: []Schema{"test.v1"}, Shutdown: Grace(10 * time.Second)}
 	ran := make(chan error, 1)
 	done := make(chan Drained, 1)
 	go func() {
@@ -624,7 +614,7 @@ func TestServeSettlesAnInFlightCtxRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Socket: %v", err)
 	}
-	session := awaitControlSession(t, socket)
+	session := awaitSession(t, socket)
 	ctx := bounded(t, 20*time.Second)
 	if err := session.WaitReady(ctx); err != nil {
 		t.Fatalf("WaitReady() = %v", err)
@@ -675,7 +665,6 @@ func TestOwnedCloseFaultsOnAChildWhoseExitWasNeverProven(t *testing.T) {
 		child, err := owned.Spawn(bounded(t, 20*time.Second), Cmd{
 			Path: "/bin/sleep",
 			Args: []string{"600"},
-			Exec: ServingSameUser(),
 		}, ChannelNone, nil)
 		if err != nil {
 			t.Fatalf("Spawn() attempt %d = %v", attempt, err)
@@ -709,7 +698,6 @@ func publishingRun(pidFile string) Cmd {
 	return Cmd{
 		Path: "/bin/sh",
 		Args: []string{"-c", "echo $$ > " + pidFile},
-		Exec: ServingSameUser(),
 	}
 }
 
@@ -837,11 +825,11 @@ func TestSpentContextIsRefusedInThisPackagesRegister(t *testing.T) {
 
 	verbs := map[string]func() error{
 		"Owned.Run": func() error {
-			_, err := owned.Run(spent, Cmd{Path: "/usr/bin/true", Exec: ServingSameUser()})
+			_, err := owned.Run(spent, Cmd{Path: "/usr/bin/true"})
 			return err
 		},
 		"Owned.Spawn": func() error {
-			_, err := owned.Spawn(spent, Cmd{Path: "/usr/bin/true", Exec: ServingSameUser()}, ChannelNone, nil)
+			_, err := owned.Spawn(spent, Cmd{Path: "/usr/bin/true"}, ChannelNone, nil)
 			return err
 		},
 		"Owned.Adopt":  func() error { _, err := owned.Adopt(spent, os.Getpid()); return err },
@@ -871,7 +859,6 @@ func sessionHolderCmd(dir string, attempt int) (c Cmd, pidFile, holderFile strin
 		Path:    "/bin/sh",
 		Args:    []string{"-c", "trap '' TERM; sleep 600 & " + publish(holderFile, "$!") + publish(pidFile, "$$") + "exec sleep 600"},
 		Session: true,
-		Exec:    ServingSameUser(),
 	}, pidFile, holderFile
 }
 
@@ -973,7 +960,7 @@ func TestServeProvesATermResistantSessionInsideItsChildrenTail(t *testing.T) {
 	defer signal.Stop(guard)
 
 	dir := t.TempDir()
-	d := Daemon{Label: "dkresist", Schemas: []Schema{"test.v1"}, Shutdown: Grace(30 * time.Second)}
+	d := Daemon{Label: "dkresist", Program: testProgram, Schemas: []Schema{"test.v1"}, Shutdown: Grace(30 * time.Second)}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	staged := make(chan int, 1)
@@ -1023,7 +1010,7 @@ func TestServeProvesATermResistantSessionInsideItsChildrenTail(t *testing.T) {
 func TestServeAbandonsChildrenItCouldNotProveGone(t *testing.T) {
 	shortHome(t)
 	dir := t.TempDir()
-	d := Daemon{Label: "dkunproven", Schemas: []Schema{"test.v1"}, Shutdown: Grace(10 * time.Second)}
+	d := Daemon{Label: "dkunproven", Program: testProgram, Schemas: []Schema{"test.v1"}, Shutdown: Grace(10 * time.Second)}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	staged := make(chan int, 1)
@@ -1073,91 +1060,6 @@ func TestServeAbandonsChildrenItCouldNotProveGone(t *testing.T) {
 	}
 }
 
-// gatedServing parks a verb inside its verification window: the exec posture
-// runs against the suspended child, after its durable record and before its
-// release, which is exactly the instant a process this scope started exists
-// and the verb has not yet registered it. Blocking there holds that instant
-// open for as long as a test needs it.
-type gatedServing struct {
-	entered chan struct{}
-	release chan struct{}
-	once    sync.Once
-}
-
-func (g *gatedServing) requirement() *Requirement {
-	g.once.Do(func() { close(g.entered) })
-	<-g.release
-	return nil
-}
-
-func newGatedServing() *gatedServing {
-	return &gatedServing{entered: make(chan struct{}), release: make(chan struct{})}
-}
-
-// TestOwnedCloseWaitsOutAVerbStillStartingAChild is the admission/registration
-// atomicity. A verb is admitted before it can spawn, so a Close whose snapshot
-// lands while that verb is mid-spawn observes the admission itself and waits
-// the verb out rather than answering nil over the process it already started.
-func TestOwnedCloseWaitsOutAVerbStillStartingAChild(t *testing.T) {
-	verbs := []struct {
-		name  string
-		start func(o *Owned, c Cmd) error
-	}{
-		{"Run", func(o *Owned, c Cmd) error {
-			_, err := o.Run(bounded(t, 120*time.Second), c)
-			return err
-		}},
-		{"Spawn", func(o *Owned, c Cmd) error {
-			_, err := o.Spawn(bounded(t, 120*time.Second), c, ChannelNone, nil)
-			return err
-		}},
-	}
-	for _, verb := range verbs {
-		t.Run(verb.name, func(t *testing.T) {
-			dir := t.TempDir()
-			path := filepath.Join(dir, "daemon.records")
-			owned, err := OwnProcesses(bounded(t, 30*time.Second), path)
-			if err != nil {
-				t.Fatalf("OwnProcesses() = %v", err)
-			}
-			gate := newGatedServing()
-			cmd := parkedRun(filepath.Join(dir, "child.pid"))
-			cmd.Exec = Serving{policy: gate}
-			started := make(chan error, 1)
-			go func() { started <- verb.start(owned, cmd) }()
-			<-gate.entered
-
-			closed := make(chan error, 1)
-			go func() {
-				closeCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-				defer cancel()
-				closed <- owned.Close(closeCtx)
-			}()
-			select {
-			case err := <-closed:
-				close(gate.release)
-				t.Fatalf("Close() = %v while %s was still starting a child that already exists", err, verb.name)
-			case <-time.After(time.Second):
-			}
-
-			close(gate.release)
-			if err := <-closed; err != nil {
-				t.Fatalf("Close() = %v, want the child the released %s registered settled", err, verb.name)
-			}
-			next := ownedScopeAt(t, path)
-			if left := next.Reclaimed(); len(left) != 0 {
-				t.Fatalf("the generation after a nil Close reclaimed %+v; the %s's child outlived the Close that answered over it", left, verb.name)
-			}
-			select {
-			case err := <-started:
-				t.Logf("%s returned %v", verb.name, err)
-			case <-time.After(60 * time.Second):
-				t.Fatalf("the settled %s never returned", verb.name)
-			}
-		})
-	}
-}
-
 // aliveAs is alive() made identity-safe. kill(pid, 0) succeeds on a zombie and
 // on whatever process inherited a recycled pid, so a survivor counts only when
 // the process table still shows that pid running the exact command this test
@@ -1185,12 +1087,12 @@ func racingRun(pidFile, holderFile, marker string) Cmd {
 	}
 	holder := "/bin/sh -c 'while :; do sleep 60; done # " + marker + "-descendant' & "
 	script := publish(pidFile, "$$") + holder + publish(holderFile, "$!") + "wait # " + marker + "-leader"
-	return Cmd{Path: "/bin/sh", Args: []string{"-c", script}, Exec: ServingSameUser()}
+	return Cmd{Path: "/bin/sh", Args: []string{"-c", script}}
 }
 
-// TestOwnedCloseNeverAnswersCleanOverAChildAVerbStarted is the same property
-// as TestOwnedCloseWaitsOutAVerbStillStartingAChild with nothing held open by
-// a test: real concurrent verbs, real spawn latency, and a Close whose
+// TestOwnedCloseNeverAnswersCleanOverAChildAVerbStarted is the
+// admission/registration atomicity with nothing held open by a test: real
+// concurrent verbs, real spawn latency, and a Close whose
 // snapshot lands wherever the scheduler puts it. The sweep walks the delay
 // across the spawn window, and a nil Close over any live leader or descendant
 // — or over a record the next generation still has to reclaim — is the defect.
@@ -1283,67 +1185,6 @@ func TestOwnedCloseNeverAnswersCleanOverAChildAVerbStarted(t *testing.T) {
 	t.Logf("clean closes = %d of %d attempts", clean, attempts)
 }
 
-// TestOwnedCloseReportsAVerbThatNeverFinishedStarting is the other half of
-// waiting a verb out: the wait is bounded by the caller's own deadline, and a
-// verb still starting when that runs out is a fault naming the verb rather
-// than a nil. Whatever it started is durably recorded before it can run, so
-// the honest report is that the next generation has it.
-func TestOwnedCloseReportsAVerbThatNeverFinishedStarting(t *testing.T) {
-	verbs := []struct {
-		name  string
-		start func(o *Owned, c Cmd) error
-	}{
-		{"Run", func(o *Owned, c Cmd) error {
-			_, err := o.Run(bounded(t, 120*time.Second), c)
-			return err
-		}},
-		{"Spawn", func(o *Owned, c Cmd) error {
-			_, err := o.Spawn(bounded(t, 120*time.Second), c, ChannelNone, nil)
-			return err
-		}},
-	}
-	for _, verb := range verbs {
-		t.Run(verb.name, func(t *testing.T) {
-			dir := t.TempDir()
-			path := filepath.Join(dir, "daemon.records")
-			owned, err := OwnProcesses(bounded(t, 30*time.Second), path)
-			if err != nil {
-				t.Fatalf("OwnProcesses() = %v", err)
-			}
-			gate := newGatedServing()
-			cmd := publishingRun(filepath.Join(dir, "child.pid"))
-			cmd.Exec = Serving{policy: gate}
-			started := make(chan error, 1)
-			go func() { started <- verb.start(owned, cmd) }()
-			<-gate.entered
-
-			closeCtx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-			closeErr := owned.Close(closeCtx)
-			cancel()
-			close(gate.release)
-			if !errors.Is(closeErr, ErrUnsettled) {
-				t.Fatalf("Close() = %v over a %s that never finished starting, want ErrUnsettled", closeErr, verb.name)
-			}
-			if !strings.Contains(closeErr.Error(), verb.name) {
-				t.Errorf("Close() = %q, want the fault to name the verb still starting", closeErr)
-			}
-
-			select {
-			case err := <-started:
-				t.Logf("%s returned %v", verb.name, err)
-			case <-time.After(60 * time.Second):
-				t.Fatalf("the %s never returned", verb.name)
-			}
-			next := ownedScopeAt(t, path)
-			if left := next.Reclaimed(); len(left) != 1 {
-				t.Fatalf("the next generation reclaimed %+v, want the one record the unfinished %s left it", left, verb.name)
-			}
-		})
-	}
-}
-
-// adoptHelpers starts count live processes outside this scope, each identifiable
-// by marker, for Adopt to name.
 func adoptHelpers(t *testing.T, count int, marker string) []int {
 	t.Helper()
 	pids := make([]int, count)

@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"os/exec"
 
-	"github.com/yasyf/daemonkit/internal/converge"
-	"github.com/yasyf/daemonkit/internal/proc"
 	"github.com/yasyf/daemonkit/launchd"
 )
 
@@ -30,19 +28,8 @@ func (l serviceLayer) removeService(ctx context.Context, label string) error {
 	return launchd.Remove(ctx, l.launchctl, label)
 }
 
-func (c *Client) observeWorld(ctx context.Context, agent launchd.Agent) (converge.World, error) {
-	record, err := c.record()
-	if err != nil {
-		return converge.World{}, err
-	}
-	return converge.Observe(ctx, converge.Sources{
-		Serving:    c.servedHealth,
-		Recorded:   proc.ReadOwner,
-		RecordPath: record,
-		Agent:      agent,
-		Launchctl:  c.launchctl,
-	})
-}
+// reachService is nil: launchd is always there to start the next daemon.
+func (serviceLayer) reachService(context.Context, service) error { return nil }
 
 // AgentPath is the PATH every daemonkit LaunchAgent runs under. launchd's own
 // default omits the Homebrew prefixes, so a daemon that execs `git` reaches the

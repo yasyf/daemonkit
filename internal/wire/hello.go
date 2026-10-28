@@ -9,24 +9,8 @@ import (
 
 const sessionGenerationBytes = 16
 
-// Lane names the two session kinds protocol 2 admits: the trust-gated control
-// lane and the schema-gated business lane.
-type Lane string
-
-const (
-	// LaneControl is the repair channel: drain and broker handoff, gated by
-	// Trust.Control, never by an application schema.
-	LaneControl Lane = "control"
-	// LaneBusiness is the product channel: schema set-membership at attach,
-	// Concurrency-bounded dispatch through Runtime.Handle.
-	LaneBusiness Lane = "business"
-)
-
-func (l Lane) valid() bool { return l == LaneControl || l == LaneBusiness }
-
 type helloIdentity struct {
 	Protocol uint16 `json:"protocol"`
-	Lane     Lane   `json:"lane"`
 	Schema   string `json:"schema,omitempty"`
 	Nonce    []byte `json:"nonce,omitempty"`
 }
@@ -111,15 +95,6 @@ func readClientHello(codec *Codec) (helloIdentity, error) {
 	if hello.Protocol != ProtocolVersion {
 		return helloIdentity{}, &ProtocolMismatchError{Theirs: hello.Protocol, Ours: ProtocolVersion}
 	}
-	if !hello.Lane.valid() {
-		return helloIdentity{}, fmt.Errorf("%w: lane %q", ErrHandshake, hello.Lane)
-	}
-	if hello.Lane == LaneControl && (hello.Schema != "" || len(hello.Nonce) != 0) {
-		return helloIdentity{}, fmt.Errorf("%w: control hello carries business fields", ErrHandshake)
-	}
-	if hello.Lane == LaneBusiness && hello.Schema == "" {
-		return helloIdentity{}, fmt.Errorf("%w: empty business schema", ErrHandshake)
-	}
 	return hello, nil
 }
 
@@ -163,7 +138,7 @@ func clientHandshake(codec *Codec, hello helloIdentity) (WireIdentity, error) {
 			return WireIdentity{}, fmt.Errorf("%w: invalid rejection", ErrHandshake)
 		}
 		switch ack.Code {
-		case ResponseCodeSessionCapacity, ResponseCodePeerUntrusted, ResponseCodeBuildMismatch:
+		case ResponseCodeSessionCapacity, ResponseCodeHandshake:
 		default:
 			return WireIdentity{}, fmt.Errorf("%w: invalid rejection code %q", ErrHandshake, ack.Code)
 		}

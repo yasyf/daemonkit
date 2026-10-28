@@ -13,7 +13,7 @@ import (
 
 // drainPreamble is the two bytes 0x4452 ("DR") a draining server emits instead
 // of a hello ack, and the protocol-blind drain request a server admits below
-// the protocol gate and above the trust gate. They can never open a frame:
+// the protocol gate. They can never open a frame:
 // read as the head of a length prefix they declare a body over 1 GiB, above
 // the maxFrameCeiling both constructors enforce.
 var drainPreamble = [2]byte{0x44, 0x52}

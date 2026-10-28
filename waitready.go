@@ -9,27 +9,6 @@ import (
 	"github.com/yasyf/daemonkit/internal/wire"
 )
 
-// WaitReady blocks until the pinned incumbent publishes PhaseReady and returns
-// the Health it then serves. It is a subscription on the session's own phase
-// stream — the daemon's publication wakes it — never a poll, and it costs the
-// daemon nothing while it waits.
-//
-// ErrDraining when the pinned incumbent leaves instead of becoming ready; the
-// runtime's terminal failure is returned verbatim, since only the product's
-// own Start error explains it.
-func (c *Control) WaitReady(ctx context.Context) (Health, error) {
-	if _, ok := ctx.Deadline(); !ok {
-		return Health{}, errors.New("daemonkit: WaitReady requires a context deadline")
-	}
-	if err := c.session.WaitReady(ctx); err != nil {
-		if errors.Is(err, wire.ErrDraining) {
-			return Health{}, fmt.Errorf("%w: %w", ErrDraining, err)
-		}
-		return Health{}, err
-	}
-	return c.Health(ctx)
-}
-
 // WaitReady attaches and waits for a daemon to publish PhaseReady, returning
 // the Health it serves. A daemon launchd has only just been asked to start has
 // no socket to subscribe to yet, and one still leaving answers the frozen drain
@@ -37,11 +16,10 @@ func (c *Control) WaitReady(ctx context.Context) (Health, error) {
 // cadence derived from the caller's own deadline, and the readiness itself is
 // still the daemon's own publication rather than a poll.
 //
-// Every other refusal is returned as it came: an untrusted server, an
-// incomplete pin, and a runtime that failed to start are all answers, not
-// states to wait out. An attach that only ran out of budget is none of them —
-// it is the caller's deadline, reported as the deadline joined with the timeout
-// net raised in its place.
+// Every other refusal is returned as it came: a foreign protocol and a
+// runtime that failed to start are answers, not states to wait out. An attach
+// that only ran out of budget is none of them — it is the caller's deadline,
+// reported as the deadline joined with the timeout net raised in its place.
 func (c *Client) WaitReady(ctx context.Context) (Health, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		return Health{}, errors.New("daemonkit: WaitReady requires a context deadline")
@@ -68,13 +46,30 @@ func (c *Client) WaitReady(ctx context.Context) (Health, error) {
 	}
 }
 
+// waitReadyOnce rides the phase stream of the client's session — the daemon's
+// publication wakes it — and costs the daemon nothing while it waits, then
+// reads Health on that same session, so the report is the ready daemon's. A
+// session whose peer leaves instead of becoming ready, or dies under it, is
+// retired and reported as the drain it was, for the loop to attach again.
 func (c *Client) waitReadyOnce(ctx context.Context) (Health, error) {
-	control, err := c.Control(ctx)
+	session, _, err := c.link.acquire(ctx)
 	if err != nil {
 		return Health{}, err
 	}
-	defer func() { _ = control.Close(ctx) }()
-	return control.WaitReady(ctx)
+	err = session.WaitReady(ctx)
+	var report wire.HealthReport
+	if err == nil {
+		report, err = session.Health(ctx)
+	}
+	if err == nil {
+		return healthFromReport(report), nil
+	}
+	broken := session.Failure() != nil
+	c.link.retire(session)
+	if errors.Is(err, wire.ErrDraining) || broken {
+		return Health{}, fmt.Errorf("%w: %w", ErrDraining, err)
+	}
+	return Health{}, err
 }
 
 // attachCadence derives the retry interval from the caller's own deadline, on

@@ -177,10 +177,7 @@ func TestStopDrainsTheLiveIncumbentAndRemovesItsAgent(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
-	warmup := awaitControl(ctx, t, client)
-	if err := warmup.Close(ctx); err != nil {
-		t.Fatalf("Close() = %v", err)
-	}
+	awaitServing(ctx, t, client)
 	rec := &launchctlRecorder{}
 	client.launchctl = rec.run
 
@@ -244,45 +241,6 @@ func TestStopSettlesTheRecordedIncumbent(t *testing.T) {
 	}
 	if len(rec.verbs) != 0 {
 		t.Fatalf("verbs = %v, want no agent to remove", rec.verbs)
-	}
-}
-
-// TestStopPropagatesAnUntrustedSocketHolder pins what Stop must never do:
-// classify a world it cannot trust as absence and take the LaunchAgent down
-// over it.
-func TestStopPropagatesAnUntrustedSocketHolder(t *testing.T) {
-	ladderHome(t)
-	d := Daemon{Label: "dkstoptrust", Schemas: []Schema{"test.v1"}, Shutdown: Grace(5 * time.Second), Program: unrunProgram(t)}
-	startControlChild(t, string(d.Label))
-	path := installedAgentPlist(t, d.Label)
-
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-	defer cancel()
-	warmup := awaitControl(ctx, t, openClient(t, d))
-	if err := warmup.Close(ctx); err != nil {
-		t.Fatalf("Close() = %v", err)
-	}
-
-	pinned := d
-	pinned.Trust.Serving = ServingSigned(Requirement{
-		TeamID:            "SXKCTF23Q2",
-		SigningIdentifier: "com.yasyf.daemonkit.not-this-binary",
-	})
-	client, err := Open(pinned)
-	if err != nil {
-		t.Fatalf("Open(pinned) = %v", err)
-	}
-	rec := &launchctlRecorder{}
-	client.launchctl = rec.run
-
-	if err := client.Stop(ctx); !errors.Is(err, ErrUntrusted) {
-		t.Fatalf("Stop() = %v, want ErrUntrusted for a peer that cannot prove the pinned identity", err)
-	}
-	if len(rec.verbs) != 0 {
-		t.Fatalf("verbs = %v, want nothing removed over an untrusted world", rec.verbs)
-	}
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("plist = %v, want it untouched", err)
 	}
 }
 

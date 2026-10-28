@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/internal/proc"
-	"github.com/yasyf/daemonkit/internal/trust"
 	"github.com/yasyf/daemonkit/internal/wire"
 )
 
@@ -79,8 +78,8 @@ func TestServeSpawnChannelMintsAPairAdmittedUnderAFreshNonce(t *testing.T) {
 	served := make(chan error, 1)
 	go func() {
 		served <- serveSpawnChannel(
-			t.Context(), parentEnd, spawnNonce, trust.Peer{UID: os.Getuid()},
-			func(conn *net.UnixConn, _ trust.Peer, nonce []byte) error {
+			t.Context(), parentEnd, spawnNonce, proc.Peer{UID: os.Getuid()},
+			func(conn *net.UnixConn, _ proc.Peer, nonce []byte) error {
 				admitted <- minted{conn: conn, nonce: append([]byte(nil), nonce...)}
 				return nil
 			},
@@ -145,8 +144,8 @@ func TestServeSpawnChannelDeliversAndAnswersAdoptions(t *testing.T) {
 	served := make(chan error, 1)
 	go func() {
 		served <- serveSpawnChannel(
-			t.Context(), parentEnd, spawnNonce, trust.Peer{UID: os.Getuid()},
-			func(conn *net.UnixConn, _ trust.Peer, _ []byte) error {
+			t.Context(), parentEnd, spawnNonce, proc.Peer{UID: os.Getuid()},
+			func(conn *net.UnixConn, _ proc.Peer, _ []byte) error {
 				_ = conn.Close()
 				return errors.New("unexpected mint")
 			},
@@ -264,8 +263,8 @@ func TestServeSpawnChannelClosesOnEveryProtocolViolation(t *testing.T) {
 			served := make(chan error, 1)
 			go func() {
 				served <- serveSpawnChannel(
-					t.Context(), parentEnd, spawnNonce, trust.Peer{UID: os.Getuid()},
-					func(conn *net.UnixConn, _ trust.Peer, _ []byte) error { _ = conn.Close(); return nil },
+					t.Context(), parentEnd, spawnNonce, proc.Peer{UID: os.Getuid()},
+					func(conn *net.UnixConn, _ proc.Peer, _ []byte) error { _ = conn.Close(); return nil },
 					func(conn *net.UnixConn) error { _ = conn.Close(); return nil },
 				)
 			}()
@@ -290,8 +289,8 @@ func TestServeSpawnChannelEndsWithItsContext(t *testing.T) {
 	served := make(chan error, 1)
 	go func() {
 		served <- serveSpawnChannel(
-			ctx, parentEnd, testSpawnNonce(t), trust.Peer{UID: os.Getuid()},
-			func(conn *net.UnixConn, _ trust.Peer, _ []byte) error { _ = conn.Close(); return nil },
+			ctx, parentEnd, testSpawnNonce(t), proc.Peer{UID: os.Getuid()},
+			func(conn *net.UnixConn, _ proc.Peer, _ []byte) error { _ = conn.Close(); return nil },
 			func(conn *net.UnixConn) error { _ = conn.Close(); return nil },
 		)
 	}()
@@ -301,7 +300,7 @@ func TestServeSpawnChannelEndsWithItsContext(t *testing.T) {
 	}
 }
 
-func TestServeChannelServesTheSpawnSuspendedIdentityAfterSettlement(t *testing.T) {
+func TestServeChannelServesAfterTheChildSettles(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	owned, err := OwnProcesses(ctx, filepath.Join(t.TempDir(), "daemon.records"))
@@ -321,7 +320,6 @@ func TestServeChannelServesTheSpawnSuspendedIdentityAfterSettlement(t *testing.T
 		Path:    executable,
 		Env:     append(os.Environ(), childRoleEnv+"=exit-clean"),
 		Session: true,
-		Exec:    ServingSameUser(),
 	}, ChannelHandoff, nil)
 	if err != nil {
 		t.Fatalf("Spawn() = %v", err)
@@ -330,14 +328,10 @@ func TestServeChannelServesTheSpawnSuspendedIdentityAfterSettlement(t *testing.T
 	if exit.Code != 0 || exit.Signal != 0 {
 		t.Fatalf("child exit = %+v, want clean", exit)
 	}
-	if !pinsSpawned(child.token, child.PID()) {
-		t.Fatalf("pinned token = pid %d valid %t, want the spawned pid %d",
-			child.token.PID(), child.token.Valid(), child.PID())
-	}
 	c := Ctx{
 		Context: ctx,
 		owner:   owned,
-		adoptMinted: func(conn *net.UnixConn, _ trust.Peer, _ []byte) error {
+		adoptMinted: func(conn *net.UnixConn, _ proc.Peer, _ []byte) error {
 			_ = conn.Close()
 			return nil
 		},
@@ -347,7 +341,7 @@ func TestServeChannelServesTheSpawnSuspendedIdentityAfterSettlement(t *testing.T
 		},
 	}
 	if err := c.ServeChannel(ctx, child); err != nil {
-		t.Fatalf("ServeChannel() = %v, want nil: identity was pinned at the suspended spawn, not read from the PID table", err)
+		t.Fatalf("ServeChannel() = %v, want nil: the child's identity is the spawn's, not a PID table read", err)
 	}
 }
 
@@ -362,6 +356,7 @@ func TestServeChannelMintsAndAdoptsForARealSpawnedChild(t *testing.T) {
 	shortHome(t)
 	d := Daemon{
 		Label:    "dkchan",
+		Program:  testProgram,
 		Schemas:  []Schema{spawnChannelSchema},
 		Shutdown: Grace(10 * time.Second),
 	}
@@ -381,7 +376,6 @@ func TestServeChannelMintsAndAdoptsForARealSpawnedChild(t *testing.T) {
 				Path:    executable,
 				Env:     append(os.Environ(), childRoleEnv+"=spawn-channel-client"),
 				Session: true,
-				Exec:    ServingSameUser(),
 			}, ChannelHandoff, stderr)
 			cancel()
 			if spawnErr != nil {
@@ -564,11 +558,9 @@ func childCallEcho(conn net.Conn, nonce []byte, lane string) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	client, err := wire.NewClient(ctx, wire.ClientConfig{
-		Dial:      func(context.Context) (net.Conn, error) { return conn, nil },
-		Authorize: func(net.Conn) error { return nil },
-		Lane:      wire.LaneBusiness,
-		Schema:    spawnChannelSchema,
-		Nonce:     nonce,
+		Dial:   func(context.Context) (net.Conn, error) { return conn, nil },
+		Schema: spawnChannelSchema,
+		Nonce:  nonce,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "child: %s attach: %v\n", lane, err)

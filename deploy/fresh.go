@@ -33,11 +33,11 @@ import (
 //   - the daemon's owner record does not exist;
 //   - [launchd.RequireAbsent] holds for every configured agent: no plist at its
 //     label, and launchd reporting the label not loaded;
-//   - the control attach proves nothing listening: a daemon serving, draining,
-//     untrusted, or silent until the deadline is not fresh;
+//   - a health probe proves nothing listening: a daemon serving, draining, or
+//     silent until the deadline is not fresh;
 //   - no live process runs any of the deployment's executables.
 //
-// Like every verb that reaches the control lane, Fresh requires a context
+// Like every verb that reaches the daemon's socket, Fresh requires a context
 // carrying a deadline.
 func (d *Deployment) Fresh(ctx context.Context) error {
 	if _, ok := ctx.Deadline(); !ok {
@@ -318,13 +318,12 @@ func (d *Deployment) bareMetadata() error {
 }
 
 func (d *Deployment) daemonAbsent(ctx context.Context) error {
-	control, err := d.client.Control(ctx)
+	_, err := d.client.Health(ctx)
 	switch {
 	case errors.Is(err, daemonkit.ErrAbsent):
 		return nil
 	case err != nil:
-		return fmt.Errorf("%w: the control attach proved no absence: %w", ErrNotFresh, err)
+		return fmt.Errorf("%w: the health probe proved no absence: %w", ErrNotFresh, err)
 	}
-	_ = control.Close(ctx)
 	return fmt.Errorf("%w: a daemon is serving %q", ErrNotFresh, d.config.Daemon.Label)
 }

@@ -9,24 +9,24 @@ import (
 	"github.com/yasyf/daemonkit/internal/wire"
 )
 
-func capacityLane(t *testing.T, attach func(context.Context) (*wire.Client, error)) *Business {
+func capacityLane(t *testing.T, attach func(context.Context) (*wire.Client, int, error)) *Business {
 	t.Helper()
 	return &Business{contract: Contract{Schema: "test.v1"}, attach: attach}
 }
 
 func TestAcquireRetriesSessionCapacity(t *testing.T) {
 	attempts := 0
-	lane := capacityLane(t, func(context.Context) (*wire.Client, error) {
+	lane := capacityLane(t, func(context.Context) (*wire.Client, int, error) {
 		attempts++
 		if attempts < attachAttempts {
-			return nil, wire.ErrSessionCapacity
+			return nil, 0, wire.ErrSessionCapacity
 		}
-		return nil, nil
+		return nil, 0, nil
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if _, err := lane.acquire(ctx); err != nil {
+	if _, _, err := lane.acquire(ctx); err != nil {
 		t.Fatalf("acquire() through a momentarily full slot table = %v, want success", err)
 	}
 	if attempts != attachAttempts {
@@ -36,14 +36,14 @@ func TestAcquireRetriesSessionCapacity(t *testing.T) {
 
 func TestAcquireGivesUpOnSustainedCapacity(t *testing.T) {
 	attempts := 0
-	lane := capacityLane(t, func(context.Context) (*wire.Client, error) {
+	lane := capacityLane(t, func(context.Context) (*wire.Client, int, error) {
 		attempts++
-		return nil, wire.ErrSessionCapacity
+		return nil, 0, wire.ErrSessionCapacity
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	_, err := lane.acquire(ctx)
+	_, _, err := lane.acquire(ctx)
 	if !errors.Is(err, ErrSessionCapacity) {
 		t.Fatalf("acquire() against a permanently full slot table = %v, want ErrSessionCapacity", err)
 	}
@@ -52,33 +52,33 @@ func TestAcquireGivesUpOnSustainedCapacity(t *testing.T) {
 	}
 }
 
-func TestAcquireDoesNotRetryATrustDenial(t *testing.T) {
+func TestAcquireDoesNotRetryAProtocolMismatch(t *testing.T) {
 	attempts := 0
-	lane := capacityLane(t, func(context.Context) (*wire.Client, error) {
+	lane := capacityLane(t, func(context.Context) (*wire.Client, int, error) {
 		attempts++
-		return nil, ErrUntrusted
+		return nil, 0, wire.ErrProtocolVersion
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if _, err := lane.acquire(ctx); !errors.Is(err, ErrUntrusted) {
-		t.Fatalf("acquire() = %v, want ErrUntrusted", err)
+	if _, _, err := lane.acquire(ctx); !errors.Is(err, ErrProtocolMismatch) {
+		t.Fatalf("acquire() = %v, want ErrProtocolMismatch", err)
 	}
 	if attempts != 1 {
-		t.Fatalf("attach attempts = %d, want 1; a trust denial is never retried", attempts)
+		t.Fatalf("attach attempts = %d, want 1; a foreign protocol is an answer, never retried", attempts)
 	}
 }
 
 func TestAcquireStopsRetryingWhenTheCallerGivesUp(t *testing.T) {
 	attempts := 0
-	lane := capacityLane(t, func(context.Context) (*wire.Client, error) {
+	lane := capacityLane(t, func(context.Context) (*wire.Client, int, error) {
 		attempts++
-		return nil, wire.ErrSessionCapacity
+		return nil, 0, wire.ErrSessionCapacity
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), capacityBackoff/2)
 	defer cancel()
 
-	if _, err := lane.acquire(ctx); !errors.Is(err, ErrSessionCapacity) {
+	if _, _, err := lane.acquire(ctx); !errors.Is(err, ErrSessionCapacity) {
 		t.Fatalf("acquire() = %v, want ErrSessionCapacity", err)
 	}
 	if attempts != 1 {

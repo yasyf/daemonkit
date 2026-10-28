@@ -14,7 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/yasyf/daemonkit/internal/trust"
+	"github.com/yasyf/daemonkit/internal/proc"
 )
 
 const (
@@ -24,22 +24,11 @@ const (
 	defaultWriteTimeout         = 10 * time.Second
 )
 
-// Trust holds the per-lane requirements. The same-EUID floor is unconditional
-// and not expressible here; a nil Control requirement and an empty Business
-// set are explicit UID-only trust. A business peer is admitted by any element
-// of the set, so one lane can name several genuinely different signed bundles.
-type Trust struct {
-	Control  *trust.Requirement
-	Business []trust.Requirement
-}
-
 // Config configures one Server. Every queue and cap derives from Concurrency.
 type Config struct {
 	// Schemas is required; index 0 is this build's own digest.
 	Schemas Schemas
-	// Trust holds the per-lane requirements over the unconditional EUID floor.
-	Trust Trust
-	// Concurrency bounds business sessions and in-flight Handles; 8 when zero.
+	// Concurrency bounds sessions and in-flight Handles; 8 when zero.
 	Concurrency int
 	// MaxFrame caps each encoded frame; DefaultMaxFrame when zero, and at
 	// most maxFrameCeiling so no legal length prefix reads as the drain
@@ -47,12 +36,12 @@ type Config struct {
 	MaxFrame int
 	// Handshake bounds the whole admission of one connection; 10s when zero.
 	Handshake time.Duration
-	// HandshakeRead bounds the pre-verification hello read alone, so a
-	// partial-hello slow-loris releases its pending slot fast; 2s when zero.
+	// HandshakeRead bounds the hello read alone, so a partial-hello slow-loris
+	// releases its pending slot fast; 2s when zero.
 	HandshakeRead time.Duration
 	// Write bounds each frame write; 10s when zero.
 	Write time.Duration
-	// Idle reclaims a session's lane slot after this long with no frame and
+	// Idle reclaims a session's slot after this long with no frame and
 	// no request in flight; never when zero. A quiet peer whose socket the
 	// kernel never tears down holds its slot until the daemon restarts.
 	Idle time.Duration
@@ -69,11 +58,10 @@ type Server struct {
 	cfg Config
 	log *slog.Logger
 
-	concurrency   int
-	pendingSlots  chan struct{}
-	controlSlot   chan struct{}
-	businessSlots chan struct{}
-	handleSem     chan struct{}
+	concurrency  int
+	pendingSlots chan struct{}
+	sessionSlots chan struct{}
+	handleSem    chan struct{}
 
 	admitted    atomic.Int64
 	lastSession atomic.Uint64
@@ -110,15 +98,14 @@ func NewServer(rt Runtime, cfg Config) (*Server, error) {
 		log = slog.Default()
 	}
 	return &Server{
-		rt:            rt,
-		cfg:           cfg,
-		log:           log,
-		concurrency:   concurrency,
-		pendingSlots:  make(chan struct{}, 2*concurrency+2),
-		controlSlot:   make(chan struct{}, 1),
-		businessSlots: make(chan struct{}, concurrency),
-		handleSem:     make(chan struct{}, concurrency),
-		sessions:      make(map[*session]struct{}),
+		rt:           rt,
+		cfg:          cfg,
+		log:          log,
+		concurrency:  concurrency,
+		pendingSlots: make(chan struct{}, 2*concurrency+2),
+		sessionSlots: make(chan struct{}, concurrency),
+		handleSem:    make(chan struct{}, concurrency),
+		sessions:     make(map[*session]struct{}),
 	}, nil
 }
 
@@ -184,9 +171,8 @@ func (s *Server) accept(ctx context.Context) error {
 }
 
 // AdoptHandoff admits a connected descriptor received over the broker-handoff
-// verb, taking ownership of conn. The adopted peer is unverified like any
-// other: it draws a pending slot and walks the same gate stack as an accepted
-// connection.
+// verb, taking ownership of conn. It draws a pending slot and walks the same
+// admission as an accepted connection.
 func (s *Server) AdoptHandoff(conn *net.UnixConn) error {
 	s.mu.Lock()
 	ctx := s.serveCtx
@@ -207,13 +193,11 @@ func (s *Server) AdoptHandoff(conn *net.UnixConn) error {
 	return s.startConnection(ctx, conn)
 }
 
-// AdoptMinted admits a parent-minted socketpair end as one business session
-// whose peer identity is pinned to the spawn-proven child: a socketpair's
-// kernel peer names its creator — this daemon — so the socket read that
-// identifies an accepted peer would lie here. The hello must present the
-// business lane and echo the per-mint nonce; the pinned peer still walks the
-// business trust gate.
-func (s *Server) AdoptMinted(conn *net.UnixConn, peer trust.Peer, nonce []byte) error {
+// AdoptMinted admits a parent-minted socketpair end as one session whose peer
+// is the spawned child: a socketpair's kernel peer names its creator — this
+// daemon — so the socket read that identifies an accepted peer would lie
+// here. The hello must echo the per-mint nonce.
+func (s *Server) AdoptMinted(conn *net.UnixConn, peer proc.Peer, nonce []byte) error {
 	if len(nonce) != spawnedNonceBytes {
 		_ = conn.Close()
 		return fmt.Errorf("wire: minted nonce must be %d bytes", spawnedNonceBytes)
@@ -240,7 +224,7 @@ func (s *Server) AdoptMinted(conn *net.UnixConn, peer trust.Peer, nonce []byte) 
 // startMinted is AdoptMinted's gate walk. It refuses the drain preamble
 // outright — a spawned peer holds no drain authority — and takes the pinned
 // peer where startConnection reads the socket.
-func (s *Server) startMinted(ctx context.Context, conn *net.UnixConn, peer trust.Peer, nonce []byte) error {
+func (s *Server) startMinted(ctx context.Context, conn *net.UnixConn, peer proc.Peer, nonce []byte) error {
 	start := time.Now()
 	codec := NewCodec(conn)
 	codec.MaxFrame = s.maxFrame()
@@ -259,17 +243,12 @@ func (s *Server) startMinted(ctx context.Context, conn *net.UnixConn, peer trust
 	}
 	hello, err := readClientHello(codec)
 	if err != nil {
-		s.rejectHandshake(conn, codec, ResponseCodePeerUntrusted, err)
-		return err
-	}
-	if hello.Lane != LaneBusiness {
-		err := fmt.Errorf("%w: minted session requires the business lane", ErrHandshake)
-		s.rejectHandshake(conn, codec, ResponseCodePeerUntrusted, err)
+		s.rejectHandshake(conn, codec, ResponseCodeHandshake, err)
 		return err
 	}
 	if subtle.ConstantTimeCompare(hello.Nonce, nonce) != 1 {
 		err := fmt.Errorf("%w: minted session nonce", ErrHandshake)
-		s.rejectHandshake(conn, codec, ResponseCodePeerUntrusted, err)
+		s.rejectHandshake(conn, codec, ResponseCodeHandshake, err)
 		return err
 	}
 	if err := codec.SetDeadline(earlierDeadline(ctx, start.Add(s.handshakeTimeout()))); err != nil {
@@ -281,26 +260,14 @@ func (s *Server) startMinted(ctx context.Context, conn *net.UnixConn, peer trust
 		_ = conn.Close()
 		return ErrDraining
 	}
-	if verified := trust.VerifyAny(peer, s.cfg.Trust.Business); verified != nil {
-		s.rejectHandshake(conn, codec, ResponseCodePeerUntrusted, ErrUntrustedPeer)
-		err := fmt.Errorf("wire: verify minted peer: %w", verified)
-		if !errors.Is(err, trust.ErrUntrustedPeer) && !errors.Is(err, trust.ErrPeerGone) {
-			s.log.Error("wire: peer verification infrastructure failure", "err", err)
-		}
-		return err
-	}
-	if !s.cfg.Schemas.Accepts(hello.Schema) {
-		s.rejectHandshake(conn, codec, ResponseCodeBuildMismatch, ErrBuildMismatch)
-		return ErrBuildMismatch
-	}
 	return s.admitSession(ctx, conn, codec, hello, peer)
 }
 
-// startConnection walks the admission gate stack in order: the inbound drain
-// preamble peek, hello read under the short pre-verification deadline, drain
-// preamble, trust, schema, lane capacity — capacity strictly after
-// verification, so nothing an unverified peer holds is lane state — then the
-// phase-carrying ack.
+// startConnection walks admission in order: the inbound drain preamble peek,
+// hello read under the short deadline, the outbound drain preamble, session
+// capacity, then the phase-carrying ack. The schema gates product dispatch,
+// never admission, so a successor of another era still reads and drains this
+// daemon.
 func (s *Server) startConnection(ctx context.Context, conn *net.UnixConn) error {
 	start := time.Now()
 	codec := NewCodec(conn)
@@ -319,12 +286,12 @@ func (s *Server) startConnection(ctx context.Context, conn *net.UnixConn) error 
 	}
 	hello, err := readClientHello(codec)
 	if err != nil {
-		s.rejectHandshake(conn, codec, ResponseCodePeerUntrusted, err)
+		s.rejectHandshake(conn, codec, ResponseCodeHandshake, err)
 		return err
 	}
-	if hello.Lane == LaneBusiness && len(hello.Nonce) != 0 {
+	if len(hello.Nonce) != 0 {
 		err := fmt.Errorf("%w: nonce outside a spawned session", ErrHandshake)
-		s.rejectHandshake(conn, codec, ResponseCodePeerUntrusted, err)
+		s.rejectHandshake(conn, codec, ResponseCodeHandshake, err)
 		return err
 	}
 	if err := codec.SetDeadline(earlierDeadline(ctx, start.Add(s.handshakeTimeout()))); err != nil {
@@ -336,44 +303,22 @@ func (s *Server) startConnection(ctx context.Context, conn *net.UnixConn) error 
 		_ = conn.Close()
 		return ErrDraining
 	}
-	peer, err := trust.PeerCredentials(conn)
+	peer, err := proc.PeerCredentials(conn)
 	if err != nil {
-		s.rejectHandshake(conn, codec, ResponseCodePeerUntrusted, ErrUntrustedPeer)
+		_ = conn.Close()
 		return fmt.Errorf("wire: identify peer: %w", err)
-	}
-	var verified error
-	if hello.Lane == LaneControl {
-		verified = trust.Verify(peer, s.cfg.Trust.Control)
-	} else {
-		verified = trust.VerifyAny(peer, s.cfg.Trust.Business)
-	}
-	if verified != nil {
-		s.rejectHandshake(conn, codec, ResponseCodePeerUntrusted, ErrUntrustedPeer)
-		err := fmt.Errorf("wire: verify peer: %w", verified)
-		// The peer sees only PeerUntrusted; an infrastructure failure is not a
-		// policy denial and must be loud on the daemon side. A peer that exited
-		// before verification completed is an expected per-connection outcome,
-		// not infrastructure — it stays on the quiet per-connection debug path.
-		if !errors.Is(err, trust.ErrUntrustedPeer) && !errors.Is(err, trust.ErrPeerGone) {
-			s.log.Error("wire: peer verification infrastructure failure", "err", err)
-		}
-		return err
-	}
-	if hello.Lane == LaneBusiness && !s.cfg.Schemas.Accepts(hello.Schema) {
-		s.rejectHandshake(conn, codec, ResponseCodeBuildMismatch, ErrBuildMismatch)
-		return ErrBuildMismatch
 	}
 	return s.admitSession(ctx, conn, codec, hello, peer)
 }
 
-// admitSession is the verified tail both admission paths share: lane
-// capacity strictly after verification, then the phase-carrying ack.
+// admitSession is the tail both admission paths share: session capacity,
+// then the phase-carrying ack.
 func (s *Server) admitSession(
 	ctx context.Context,
 	conn *net.UnixConn,
 	codec *Codec,
 	hello helloIdentity,
-	peer trust.Peer,
+	peer proc.Peer,
 ) error {
 	s.mu.Lock()
 	if s.intakeClosed {
@@ -382,7 +327,7 @@ func (s *Server) admitSession(
 		_ = conn.Close()
 		return ErrDraining
 	}
-	release, ok := s.acquireLaneSlot(hello.Lane)
+	release, ok := s.acquireSlot()
 	if ok {
 		s.sessionWG.Add(1)
 	}
@@ -411,24 +356,16 @@ func (s *Server) admitSession(
 
 // admitPreambleDrain is the repair channel's protocol-blind admission: the
 // frozen two-byte preamble sits below the protocol gate — no frame, no
-// version, no schema — and above the trust gate, so the drain it requests is
-// still authorized by Trust.Control and an untrusted peer's preamble leaves
-// the runtime serving. The connection is answered with nothing: the requester
-// observes the drain out of the process table, and the close is its cue.
+// version, no schema — so a successor speaking any protocol can drain this
+// daemon. The connection is answered with nothing: the requester observes the
+// drain out of the process table, and the close is its cue.
 func (s *Server) admitPreambleDrain(ctx context.Context, conn *net.UnixConn, start time.Time) error {
 	defer func() { _ = conn.Close() }()
-	peer, err := trust.PeerCredentials(conn)
+	peer, err := proc.PeerCredentials(conn)
 	if err != nil {
 		return fmt.Errorf("wire: identify draining peer: %w", err)
 	}
-	if err := trust.Verify(peer, s.cfg.Trust.Control); err != nil {
-		err = fmt.Errorf("wire: verify draining peer: %w", err)
-		if !errors.Is(err, trust.ErrUntrustedPeer) && !errors.Is(err, trust.ErrPeerGone) {
-			s.log.Error("wire: peer verification infrastructure failure", "err", err)
-		}
-		return err
-	}
-	s.log.Info("wire: drain admitted on the frozen preamble", "peer_pid", peer.Token.PID())
+	s.log.Info("wire: drain admitted on the frozen preamble", "peer_pid", peer.PID)
 	drainCtx, cancel := context.WithDeadline(ctx, start.Add(s.handshakeTimeout()))
 	defer cancel()
 	if _, err := s.executeDrain(drainCtx); err != nil {
@@ -442,7 +379,7 @@ func (s *Server) serveSession(
 	conn net.Conn,
 	codec *Codec,
 	hello helloIdentity,
-	peer trust.Peer,
+	peer proc.Peer,
 	generation []byte,
 	release func(),
 ) {
@@ -451,7 +388,7 @@ func (s *Server) serveSession(
 		releaseOnce()
 		s.sessionWG.Done()
 	}()
-	err := s.runSession(ctx, conn, codec, hello.Lane, hello.Schema, peer, generation, releaseOnce)
+	err := s.runSession(ctx, conn, codec, hello.Schema, peer, generation, releaseOnce)
 	if err != nil && !isDisconnect(err) {
 		s.log.Debug("wire: session ended", "err", err)
 	}
@@ -461,9 +398,8 @@ func (s *Server) runSession(
 	ctx context.Context,
 	conn net.Conn,
 	codec *Codec,
-	lane Lane,
 	schema string,
-	peer trust.Peer,
+	peer proc.Peer,
 	generation []byte,
 	release func(),
 ) error {
@@ -479,8 +415,8 @@ func (s *Server) runSession(
 		ctx:          sessCtx,
 		cancel:       cancel,
 		peer:         peer,
-		lane:         lane,
 		schema:       schema,
+		current:      s.cfg.Schemas.Accepts(schema),
 		generation:   generation,
 		release:      release,
 		outbound:     make(chan sessionOutbound, 4*s.concurrency),
@@ -521,8 +457,8 @@ func (s *Server) pumpPhase(sess *session) {
 	}
 }
 
-// CloseIntake prevents new connections and typed-rejects new business
-// requests. Accepted sessions stay alive so admitted work and control can
+// CloseIntake prevents new connections and typed-rejects new product
+// requests. Accepted sessions stay alive so admitted work and the drain can
 // settle.
 func (s *Server) CloseIntake() error {
 	s.mu.Lock()
@@ -591,14 +527,10 @@ func (s *Server) executeDrain(ctx context.Context) (any, error) {
 	return json.RawMessage("{}"), nil
 }
 
-func (s *Server) acquireLaneSlot(lane Lane) (func(), bool) {
-	slots := s.businessSlots
-	if lane == LaneControl {
-		slots = s.controlSlot
-	}
+func (s *Server) acquireSlot() (func(), bool) {
 	select {
-	case slots <- struct{}{}:
-		return func() { <-slots }, true
+	case s.sessionSlots <- struct{}{}:
+		return func() { <-s.sessionSlots }, true
 	default:
 		return nil, false
 	}

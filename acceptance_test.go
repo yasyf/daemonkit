@@ -82,7 +82,6 @@ func TestConsumerForeignExecutableOverStdio(t *testing.T) {
 	child, err := owned.Spawn(bounded(t, 30*time.Second), Cmd{
 		Path: "/bin/sh",
 		Args: []string{"-c", `while :; do printf 'x%.0s' $(seq 1 200) >&2; done & exec /bin/cat`},
-		Exec: ServingSameUser(),
 	}, ChannelStdio, stderr)
 	if err != nil {
 		t.Fatalf("Spawn() = %v", err)
@@ -183,7 +182,6 @@ func parksAs(marker string) Cmd {
 	return Cmd{
 		Path: "/bin/sh",
 		Args: []string{"-c", "while :; do sleep 60; done # " + marker},
-		Exec: ServingSameUser(),
 	}
 }
 

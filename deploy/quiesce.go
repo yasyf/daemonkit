@@ -17,7 +17,7 @@ import (
 
 // readinessReserve is the share of the readiness budget the wait gives up to
 // the attach that classifies its outcome. A quarter, because that attach is a
-// full dial, handshake, trust check and health self-attestation against a
+// full dial, handshake, and health self-attestation against a
 // daemon that may be busy starting — a sliver of the budget times out on a
 // daemon that is really there and reports it absent.
 const readinessReserve = 4
@@ -76,8 +76,8 @@ func (p ReadinessProof) Digest() SHA256 { return p.digest }
 
 // Quiesce proves this deployment's daemon gone and returns the evidence.
 //
-// The ladder observes before it acts. A live control session reads Health and
-// drains the pinned incumbent under an Expect derived from that read, so a
+// The ladder observes before it acts. A live session reads Health and drains
+// the pinned incumbent under an Expect derived from that read, so a
 // replacement that raced in between is refused rather than stopped. An
 // incumbent already leaving (ErrDraining) or a husk holding the lock with a
 // dead listener (ErrAbsent) has no session to pin, and settles from the
@@ -108,7 +108,7 @@ func (p ReadinessProof) Digest() SHA256 { return p.digest }
 // gate is not optional. It observes a recorded identity out of the table
 // directly, including one whose executable is gone.
 //
-// Like every verb that reaches the control lane, Quiesce requires a context
+// Like every verb that reaches the daemon's socket, Quiesce requires a context
 // carrying a deadline: it is the whole settlement budget, and every stall
 // bound inside derives from it.
 func (d *Deployment) Quiesce(ctx context.Context) (RuntimeProof, error) {
@@ -164,29 +164,31 @@ func (d *Deployment) stop(ctx context.Context) (daemonkit.Stopped, error) {
 }
 
 func (d *Deployment) drain(ctx context.Context) (daemonkit.Expect, daemonkit.Stopped, error) {
-	control, err := d.client.Control(ctx)
+	health, err := d.client.Health(ctx)
 	switch {
 	case errors.Is(err, daemonkit.ErrDraining), errors.Is(err, daemonkit.ErrAbsent):
-		return d.settle(ctx)
+		return d.recorded(ctx, d.client.Settle)
+	case errors.Is(err, daemonkit.ErrProtocolMismatch):
+		return d.recorded(ctx, d.client.Terminate)
 	case err != nil:
 		return daemonkit.Expect{}, daemonkit.Stopped{}, err
 	}
-	defer func() { _ = control.Close(ctx) }()
-	health, err := control.Health(ctx)
-	if err != nil {
-		return daemonkit.Expect{}, daemonkit.Stopped{}, err
-	}
 	expect := daemonkit.Expect{Build: health.Build, Generation: health.Generation}
-	stopped, err := control.Drain(ctx, expect)
+	stopped, err := d.client.Drain(ctx, expect)
 	return expect, stopped, err
 }
 
-// settle is the session-less arm. The owner record is what pins it: the build
-// and generation read here are what a later escalation must find the record
-// still naming. An unrecorded incumbent is the already-absent case: nothing of
-// this daemon ever named itself here, so there is no identity to observe out of
-// the table and absence rests entirely on the inventory gate Quiesce runs next.
-func (d *Deployment) settle(ctx context.Context) (daemonkit.Expect, daemonkit.Stopped, error) {
+// recorded is the session-less arm: settle an incumbent already leaving, or
+// signal one speaking another protocol, which no session can drain. The owner
+// record is what pins it: the build and generation read here are what a later
+// escalation must find the record still naming. An unrecorded incumbent is the
+// already-absent case: nothing of this daemon ever named itself here, so there
+// is no identity to act on and absence rests entirely on the inventory gate
+// Quiesce runs next.
+func (d *Deployment) recorded(
+	ctx context.Context,
+	act func(context.Context, daemonkit.Expect) (daemonkit.Stopped, error),
+) (daemonkit.Expect, daemonkit.Stopped, error) {
 	owner, recorded, err := proc.ReadOwner(d.config.Daemon.RecordPath())
 	if err != nil {
 		return daemonkit.Expect{}, daemonkit.Stopped{}, fmt.Errorf("deploy: read owner record: %w", err)
@@ -195,7 +197,7 @@ func (d *Deployment) settle(ctx context.Context) (daemonkit.Expect, daemonkit.St
 		return daemonkit.Expect{}, daemonkit.Stopped{Reap: daemonkit.ReapAbsent}, nil
 	}
 	expect := daemonkit.Expect{Build: owner.Build, Generation: owner.Generation}
-	stopped, err := d.client.Settle(ctx, expect)
+	stopped, err := act(ctx, expect)
 	return expect, stopped, err
 }
 
@@ -306,10 +308,9 @@ func (d *Deployment) awaitReady(ctx context.Context) (daemonkit.Health, error) {
 	}
 	attachCtx, cancelAttach := attachContext(ctx, grace)
 	defer cancelAttach()
-	control, attachErr := d.client.Control(attachCtx)
+	_, attachErr := d.client.Health(attachCtx)
 	switch {
 	case attachErr == nil:
-		_ = control.Close(attachCtx)
 		return daemonkit.Health{}, fmt.Errorf(
 			"%w: the daemon is listening but published no readiness within the budget", ErrConflict,
 		)
@@ -341,7 +342,7 @@ func attachContext(ctx context.Context, grace time.Duration) (context.Context, c
 
 // unanswered names the wait outcomes that say nothing about the daemon:
 // nothing was listening yet, the incumbent was still leaving, or a clock ran
-// out mid-attach. Every other refusal — an untrusted server, an incomplete
+// out mid-attach. Every other refusal — a foreign protocol, an incomplete
 // pin, a runtime that failed to start — is an answer, and an answer is never
 // asked again.
 func unanswered(err error) bool {

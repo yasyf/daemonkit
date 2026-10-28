@@ -44,11 +44,6 @@ type Cmd struct {
 	MaxOutput Bytes // Run only; 4 MiB when zero
 	Session   bool  // dedicated session+group; its id is durable kill identity
 	Channel   Channel
-	// Verify is the exec-posture gate. It runs against the suspended child
-	// between its durable record and its release, and a non-nil error aborts
-	// the spawn through the same path a failed record takes, so the child
-	// never executes an instruction.
-	Verify func(pid int) error
 }
 
 type spawnFiles struct {
@@ -146,15 +141,6 @@ func (s *Store) spawn(ctx context.Context, c Cmd, childOut, childErr *os.File) (
 	rec := record{PID: pid, Start: info.start, Boot: boot, Generation: s.generation, Session: session, Comm: info.comm, Policy: s.policy}
 	if err := s.add(ctx, rec); err != nil {
 		return nil, s.abortSpawn(pid, parentEnd, err)
-	}
-	if c.Verify != nil {
-		if err := c.Verify(pid); err != nil {
-			aborted := s.abortSpawn(pid, parentEnd, err)
-			if errors.Is(aborted, ErrUnsettled) {
-				return nil, aborted
-			}
-			return nil, errors.Join(aborted, s.rollbackRecord(ctx, id))
-		}
 	}
 	if err := releaseChild(pid); err != nil {
 		aborted := s.abortSpawn(pid, parentEnd, fmt.Errorf("release suspended pid %d: %w", pid, err))

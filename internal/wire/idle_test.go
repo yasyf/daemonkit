@@ -15,10 +15,8 @@ const testIdle = 300 * time.Millisecond
 
 func dialBusinessErr(ctx context.Context, sock string) (*wire.Client, error) {
 	return wire.NewClient(ctx, wire.ClientConfig{
-		Dial:      wire.UnixDialer(sock),
-		Authorize: wiretest.AuthorizeTestServer,
-		Lane:      wire.LaneBusiness,
-		Schema:    testSchema,
+		Dial:   wire.UnixDialer(sock),
+		Schema: testSchema,
 	})
 }
 

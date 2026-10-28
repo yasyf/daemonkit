@@ -512,7 +512,7 @@ func TestBusinessConfigBoundary(t *testing.T) {
 	t.Run("a lane with no schema refuses", func(t *testing.T) {
 		ctx, cancel := deadlined()
 		defer cancel()
-		client, err := Open(Daemon{Label: "com.yasyf.daemonkit.business", Trust: Trust{Serving: ServingSameUser()}})
+		client, err := Open(Daemon{Label: "com.yasyf.daemonkit.business"})
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
@@ -541,10 +541,10 @@ func TestUndispatchedReadsTheTransportsOwnOutcome(t *testing.T) {
 	}{
 		{"nil", nil, false},
 		{"a foreign error proves nothing", errors.New("something"), false},
-		{"a bare sentinel proves nothing", ErrUntrusted, false},
+		{"a bare sentinel proves nothing", ErrProtocolMismatch, false},
 		{"a bare sentinel the lane does return proves nothing", ErrLaneClosed, false},
 		{"never written", refused(ErrAbsent), true},
-		{"an untrusted peer no byte reached", refused(ErrUntrusted), true},
+		{"a foreign protocol no byte reached", refused(ErrProtocolMismatch), true},
 		{"rejected", &callError{outcome: wire.Rejected, err: ErrNotReady}, true},
 		{"delivered", &callError{outcome: wire.Delivered, err: &ProductError{Message: "no"}}, false},
 		{"sent, no terminal", &callError{outcome: wire.PostSendFailure, err: errors.New("lost")}, false},
@@ -564,7 +564,6 @@ func TestClientBusinessPerformsNoIO(t *testing.T) {
 	client, err := Open(Daemon{
 		Label:   "com.yasyf.daemonkit.business",
 		Schemas: []Schema{businessSchema},
-		Trust:   Trust{Serving: ServingSameUser()},
 	})
 	if err != nil {
 		t.Fatalf("Open: %v", err)

@@ -291,7 +291,7 @@ func TestChildBusinessRefusals(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	owned := ownedScope(t)
-	spawn := Cmd{Path: "/bin/cat", Exec: ServingSameUser()}
+	spawn := Cmd{Path: "/bin/cat"}
 
 	_, unestablished := owned.Spawn(bounded(t, 30*time.Second), spawn, channelLimit, nil)
 	if unestablished == nil {

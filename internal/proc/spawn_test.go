@@ -2,68 +2,9 @@ package proc
 
 import (
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
-
-	"github.com/yasyf/daemonkit/internal/state"
 )
-
-func TestSpawnRecordDurableBeforeFirstInstruction(t *testing.T) {
-	s, path := newTestStore(t)
-	marker := filepath.Join(t.TempDir(), "ran")
-	checked := false
-	verify := func(pid int) error {
-		checked = true
-		loaded, err := state.New[records](path, recordSchema).Load()
-		if err != nil {
-			t.Errorf("raw re-read before release: %v", err)
-			return nil
-		}
-		found := false
-		for _, rec := range loaded.Value.Live {
-			if rec.PID == pid && rec.Generation == s.generation && rec.Start != 0 && rec.Boot != 0 {
-				found = true
-			}
-		}
-		if !found {
-			t.Errorf("no durable record for pid %d before its release; live = %v", pid, loaded.Value.Live)
-		}
-		info, err := probeProc(pid)
-		if err != nil {
-			t.Errorf("probe suspended child: %v", err)
-			return nil
-		}
-		if !info.stopped {
-			t.Error("child is not SSTOP before its record's fsync returned")
-		}
-		if _, err := os.Stat(marker); !os.IsNotExist(err) {
-			t.Errorf("command side effect exists before release: %v", err)
-		}
-		return nil
-	}
-
-	child, err := s.Spawn(t.Context(), Cmd{Path: "/bin/sh", Args: []string{"-c", "touch " + marker}, Verify: verify}, nil)
-	if err != nil {
-		t.Fatalf("Spawn() = %v", err)
-	}
-	if !checked {
-		t.Fatal("release hook never ran")
-	}
-	exit := <-child.Done()
-	if exit.Code != 0 {
-		t.Fatalf("Exit.Code = %d, want 0", exit.Code)
-	}
-	if exit.Reap != ReapAbsent {
-		t.Fatalf("Exit.Reap = %d, want ReapAbsent for a natural exit", exit.Reap)
-	}
-	if exit.Record != RecordRemoved {
-		t.Fatalf("Exit.Record = %d, want RecordRemoved", exit.Record)
-	}
-	if _, err := os.Stat(marker); err != nil {
-		t.Fatalf("released command never ran: %v", err)
-	}
-}
 
 func TestRecoverSettlesSuspendedChildWithDurableRecord(t *testing.T) {
 	s, path := newTestStore(t)

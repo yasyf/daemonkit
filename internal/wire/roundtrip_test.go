@@ -47,7 +47,7 @@ func dialBusiness(t *testing.T, sock string) *wire.Client {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	client, err := wire.NewClient(ctx, wire.ClientConfig{
-		Dial: wire.UnixDialer(sock), Authorize: wiretest.AuthorizeTestServer, Lane: wire.LaneBusiness, Schema: testSchema,
+		Dial: wire.UnixDialer(sock), Schema: testSchema,
 	})
 	if err != nil {
 		t.Fatalf("NewClient() = %v", err)
@@ -169,7 +169,7 @@ func TestBidirectionalStreaming(t *testing.T) {
 	}
 }
 
-func TestSchemaAttachGateTypedRejection(t *testing.T) {
+func TestSchemaGatesProductDispatch(t *testing.T) {
 	tests := []struct {
 		name    string
 		schemas wire.Schemas
@@ -182,45 +182,40 @@ func TestSchemaAttachGateTypedRejection(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			sock, _ := startServer(t, wiretest.NewStubRuntime(), wire.Config{Schemas: tt.schemas})
+			rt := wiretest.NewStubRuntime()
+			rt.SetHandle(func(context.Context, wire.Request) (any, error) { return json.RawMessage("{}"), nil })
+			sock, _ := startServer(t, rt, wire.Config{Schemas: tt.schemas})
+			client := dialSchema(t, sock, tt.schema)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			client, err := wire.NewClient(ctx, wire.ClientConfig{
-				Dial: wire.UnixDialer(sock), Authorize: wiretest.AuthorizeTestServer, Lane: wire.LaneBusiness, Schema: tt.schema,
-			})
+			result, err := client.Call(ctx, "some.op", []byte("{}"))
+			if err != nil {
+				t.Fatalf("Call() = %v", err)
+			}
 			if tt.wantErr == nil {
-				if err != nil {
-					t.Fatalf("NewClient() = %v, want admission", err)
+				if result.Outcome != wire.Delivered {
+					t.Fatalf("Call() = %v %+v, want delivery", result.Outcome, result.Response)
 				}
-				_ = client.Abort(nil)
 				return
 			}
-			if !errors.Is(err, tt.wantErr) {
-				t.Fatalf("NewClient() = %v, want %v", err, tt.wantErr)
+			if result.Outcome != wire.Rejected || result.Response.Code != wire.ResponseCodeBuildMismatch {
+				t.Fatalf("Call() = %v %+v, want a build_mismatch rejection", result.Outcome, result.Response)
 			}
-			var rejection *wire.HandshakeRejectionError
-			if !errors.As(err, &rejection) || rejection.Code != wire.ResponseCodeBuildMismatch {
-				t.Fatalf("NewClient() = %v, want HandshakeRejectionError{build_mismatch}", err)
-			}
-			if ctx.Err() != nil {
-				t.Fatal("schema rejection consumed the whole deadline: a hang, not a typed rejection")
+			if !errors.Is(result.Rejection(), tt.wantErr) {
+				t.Fatalf("Rejection() = %v, want %v", result.Rejection(), tt.wantErr)
 			}
 		})
 	}
 }
 
-func TestControlDrainVerbAndDrainPreamble(t *testing.T) {
+func TestDrainVerbAnswersAForeignSchemaAndRaisesThePreamble(t *testing.T) {
 	rt := wiretest.NewStubRuntime()
 	sock, _ := startServer(t, rt, wire.Config{})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	control, err := wire.NewClient(ctx, wire.ClientConfig{Dial: wire.UnixDialer(sock), Authorize: wiretest.AuthorizeTestServer, Lane: wire.LaneControl})
-	if err != nil {
-		t.Fatalf("control NewClient() = %v", err)
-	}
-	defer func() { _ = control.Abort(nil) }()
+	successor := dialSchema(t, sock, "successor.v2")
 
-	result, err := control.Call(ctx, "daemon.control.drain", []byte("{}"))
+	result, err := successor.Call(ctx, "daemon.control.drain", []byte("{}"))
 	if err != nil {
 		t.Fatalf("drain Call() = %v", err)
 	}
@@ -233,61 +228,43 @@ func TestControlDrainVerbAndDrainPreamble(t *testing.T) {
 		t.Fatal("drain verb responded before Runtime.Drain ran")
 	}
 
-	_, err = wire.NewClient(ctx, wire.ClientConfig{Dial: wire.UnixDialer(sock), Authorize: wiretest.AuthorizeTestServer, Lane: wire.LaneBusiness, Schema: testSchema})
+	_, err = wire.NewClient(ctx, wire.ClientConfig{Dial: wire.UnixDialer(sock), Schema: testSchema})
 	if !errors.Is(err, wire.ErrDraining) {
 		t.Fatalf("NewClient() against a draining server = %v, want ErrDraining via the preamble", err)
 	}
 }
 
-func TestBusinessLaneCannotReachControlVerbs(t *testing.T) {
+func TestReservedOpsAreDenied(t *testing.T) {
 	rt := wiretest.NewStubRuntime()
 	sock, _ := startServer(t, rt, wire.Config{})
 	client := dialBusiness(t, sock)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	for _, op := range []wire.Op{"daemon.control.drain", "daemon.anything.else"} {
-		result, err := client.Call(ctx, op, []byte("{}"))
-		if err != nil {
-			t.Fatalf("Call(%q) = %v", op, err)
-		}
-		if result.Outcome != wire.Rejected || result.Response.Code != wire.ResponseCodePermissionDenied {
-			t.Fatalf("Call(%q) = %v %+v, want permission_denied rejection", op, result.Outcome, result.Response)
-		}
-		if !errors.Is(result.Rejection(), wire.ErrPermissionDenied) {
-			t.Fatalf("Rejection() = %v, want ErrPermissionDenied", result.Rejection())
-		}
+	result, err := client.Call(ctx, "daemon.anything.else", []byte("{}"))
+	if err != nil {
+		t.Fatalf("Call() = %v", err)
 	}
-	select {
-	case <-rt.Drained:
-		t.Fatal("a business session drained the runtime")
-	default:
+	if result.Outcome != wire.Rejected || result.Response.Code != wire.ResponseCodePermissionDenied {
+		t.Fatalf("Call() = %v %+v, want permission_denied rejection", result.Outcome, result.Response)
+	}
+	if !errors.Is(result.Rejection(), wire.ErrPermissionDenied) {
+		t.Fatalf("Rejection() = %v, want ErrPermissionDenied", result.Rejection())
 	}
 }
 
-func TestControlSlotSurvivesBusinessSaturation(t *testing.T) {
+func TestSessionCapacityIsConcurrency(t *testing.T) {
 	rt := wiretest.NewStubRuntime()
 	sock, _ := startServer(t, rt, wire.Config{Concurrency: 1})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	business := dialBusiness(t, sock)
-	defer func() { _ = business.Abort(nil) }()
+	held := dialBusiness(t, sock)
+	defer func() { _ = held.Abort(nil) }()
 	if _, err := wire.NewClient(ctx, wire.ClientConfig{
-		Dial: wire.UnixDialer(sock), Authorize: wiretest.AuthorizeTestServer, Lane: wire.LaneBusiness, Schema: testSchema,
+		Dial: wire.UnixDialer(sock), Schema: testSchema,
 	}); !errors.Is(err, wire.ErrSessionCapacity) {
-		t.Fatalf("second business NewClient() = %v, want ErrSessionCapacity", err)
-	}
-
-	control, err := wire.NewClient(ctx, wire.ClientConfig{Dial: wire.UnixDialer(sock), Authorize: wiretest.AuthorizeTestServer, Lane: wire.LaneControl})
-	if err != nil {
-		t.Fatalf("control NewClient() under business saturation = %v", err)
-	}
-	defer func() { _ = control.Abort(nil) }()
-
-	_, err = wire.NewClient(ctx, wire.ClientConfig{Dial: wire.UnixDialer(sock), Authorize: wiretest.AuthorizeTestServer, Lane: wire.LaneControl})
-	if !errors.Is(err, wire.ErrSessionCapacity) {
-		t.Fatalf("second control NewClient() = %v, want ErrSessionCapacity (capacity-1 slot)", err)
+		t.Fatalf("second NewClient() = %v, want ErrSessionCapacity", err)
 	}
 }
 

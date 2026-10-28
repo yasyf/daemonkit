@@ -15,7 +15,6 @@ import (
 	"github.com/yasyf/daemonkit/internal/flock"
 	"github.com/yasyf/daemonkit/internal/proc"
 	"github.com/yasyf/daemonkit/internal/wire"
-	"github.com/yasyf/daemonkit/internal/wire/wiretest"
 	"github.com/yasyf/daemonkit/paths"
 )
 
@@ -69,7 +68,7 @@ func serveInBackground(ctx context.Context, t *testing.T, d Daemon, start Start)
 
 func TestServeDrainReleasesBlockedStart(t *testing.T) {
 	shortHome(t)
-	d := Daemon{Label: "dkblock", Schemas: []Schema{"test.v1"}, Shutdown: Grace(5 * time.Second)}
+	d := Daemon{Label: "dkblock", Program: testProgram, Schemas: []Schema{"test.v1"}, Shutdown: Grace(5 * time.Second)}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	started := make(chan struct{})
@@ -103,6 +102,7 @@ func TestServeSettlesLargeReplyBeforeExit(t *testing.T) {
 	shortHome(t)
 	d := Daemon{
 		Label:    "dkbig",
+		Program:  testProgram,
 		Schemas:  []Schema{"test.v1"},
 		Shutdown: Grace(5 * time.Second),
 	}
@@ -164,7 +164,7 @@ func TestServeJoinsRequestsCancelledAtTheShare(t *testing.T) {
 	signal.Notify(guard, syscall.SIGTERM)
 	defer signal.Stop(guard)
 
-	d := Daemon{Label: "dkcancel", Schemas: []Schema{"test.v1"}, Shutdown: Grace(2 * time.Second)}
+	d := Daemon{Label: "dkcancel", Program: testProgram, Schemas: []Schema{"test.v1"}, Shutdown: Grace(2 * time.Second)}
 	product := &cancelledProduct{admitted: make(chan struct{})}
 	done := serveInBackground(context.Background(), t, d, func(Ctx) (Product, error) { return product, nil })
 
@@ -180,7 +180,7 @@ func TestServeJoinsRequestsCancelledAtTheShare(t *testing.T) {
 	}
 	go func() { _, _ = business.Call(ctx, "product.block.v1", nil) }()
 	<-product.admitted
-	control := awaitControlSession(t, socket)
+	control := awaitSession(t, socket)
 	if _, err := control.Drain(ctx); err != nil {
 		t.Fatalf("Drain() = %v", err)
 	}
@@ -202,7 +202,7 @@ func TestServeAbandonedStageParksUntilSignalled(t *testing.T) {
 	signal.Notify(guard, syscall.SIGTERM)
 	defer signal.Stop(guard)
 
-	d := Daemon{Label: "dkpark", Schemas: []Schema{"test.v1"}, Shutdown: Grace(time.Second)}
+	d := Daemon{Label: "dkpark", Program: testProgram, Schemas: []Schema{"test.v1"}, Shutdown: Grace(time.Second)}
 	release := make(chan struct{})
 	defer close(release)
 	product := &wedgedProduct{release: release}
@@ -212,7 +212,7 @@ func TestServeAbandonedStageParksUntilSignalled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Socket: %v", err)
 	}
-	session := awaitControlSession(t, socket)
+	session := awaitSession(t, socket)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := session.WaitReady(ctx); err != nil {
@@ -351,7 +351,7 @@ func awaitBusinessSession(t *testing.T, socket string, maxFrame int) *wire.Clien
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		session, err := wire.NewClient(ctx, wire.ClientConfig{
-			Dial: wire.UnixDialer(socket), Authorize: wiretest.AuthorizeTestServer, Lane: wire.LaneBusiness, Schema: "test.v1", MaxFrame: maxFrame,
+			Dial: wire.UnixDialer(socket), Schema: "test.v1", MaxFrame: maxFrame,
 		})
 		cancel()
 		if err == nil {

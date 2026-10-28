@@ -5,8 +5,6 @@ ci/exportcensus
 durable
 ghrelease
 internal/converge
-internal/csposture
-internal/csposture/csposturetest
 internal/duplexconn
 internal/e2ehelper
 internal/flock
@@ -15,8 +13,6 @@ internal/maintenance
 internal/proc
 internal/realhome
 internal/state
-internal/trust
-internal/trustfixture
 internal/wire
 internal/wire/testserver
 internal/wire/wiretest

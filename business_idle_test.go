@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/internal/wire"
-	"github.com/yasyf/daemonkit/internal/wire/wiretest"
 )
 
 const businessIdle = 100 * time.Millisecond
@@ -27,18 +26,16 @@ func TestBusinessReattachesPastAnIdleReclaimedSession(t *testing.T) {
 	sock := serveBusinessProduct(t, wire.Config{Schemas: wire.Schemas{businessSchema}, Idle: businessIdle}, product)
 	var attaches atomic.Int32
 	var first atomic.Pointer[wire.Client]
-	lane := capacityLane(t, func(ctx context.Context) (*wire.Client, error) {
+	lane := capacityLane(t, func(ctx context.Context) (*wire.Client, int, error) {
 		attaches.Add(1)
 		session, err := wire.NewClient(ctx, wire.ClientConfig{
-			Dial:      wire.UnixDialer(sock),
-			Authorize: wiretest.AuthorizeTestServer,
-			Lane:      wire.LaneBusiness,
-			Schema:    businessSchema,
+			Dial:   wire.UnixDialer(sock),
+			Schema: businessSchema,
 		})
 		if err == nil {
 			first.CompareAndSwap(nil, session)
 		}
-		return session, err
+		return session, 0, err
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

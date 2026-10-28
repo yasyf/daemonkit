@@ -3,6 +3,7 @@
 package deploy
 
 import (
+	"cmp"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -29,6 +30,7 @@ const (
 	daemonChildLabel = "DAEMONKIT_DEPLOY_DAEMON_CHILD_LABEL"
 	daemonChildDelay = "DAEMONKIT_DEPLOY_DAEMON_CHILD_DELAY"
 	daemonChildPark  = "DAEMONKIT_DEPLOY_DAEMON_CHILD_PARK"
+	daemonChildBuild = "DAEMONKIT_DEPLOY_DAEMON_CHILD_BUILD"
 	huskChildEnv     = "DAEMONKIT_DEPLOY_HUSK_CHILD"
 	huskChildRecord  = "DAEMONKIT_DEPLOY_HUSK_CHILD_RECORD"
 )
@@ -62,10 +64,16 @@ func serveDaemonChild() {
 	if os.Getenv(daemonChildPark) == "1" {
 		product = parkedProduct{}
 	}
+	program, err := daemonkit.Stable(cmp.Or(os.Getenv(daemonChildBuild), "deploy.test"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "deploy daemon child: %v\n", err)
+		os.Exit(70)
+	}
 	_, err = daemonkit.Serve(
 		context.Background(),
 		daemonkit.Daemon{
 			Label:    daemonkit.Label(os.Getenv(daemonChildLabel)),
+			Program:  program,
 			Schemas:  []daemonkit.Schema{"deploy.test.v1"},
 			Shutdown: daemonChildShutdown,
 		},
@@ -250,10 +258,9 @@ func newFixture(t *testing.T) *fixture {
 	f := &fixture{t: t, root: root, app: app, agentsDir: agentsDir, agent: agent}
 	deployment, err := Open(Config{
 		App:         app,
-		Requirement: daemonkit.Requirement{TeamID: testTeamID, SigningIdentifier: testSigning},
+		Requirement: Requirement{TeamID: testTeamID, SigningIdentifier: testSigning},
 		Daemon: daemonkit.Daemon{
 			Label:    daemonkit.Label("daemonkit-deploy-test-" + filepath.Base(root)),
-			Trust:    daemonkit.Trust{Serving: daemonkit.ServingSameUser()},
 			Shutdown: daemonChildShutdown,
 		},
 		Agents: []launchd.Agent{agent},
@@ -496,8 +503,8 @@ func (f *fixture) recordOwner(t *testing.T) proc.Identity {
 
 // startDaemonChild spawns a real daemon at this deployment's label, publishing
 // readiness delay after it binds. The daemon has to be another process: the
-// control attach refuses to pin os.Getpid(), so a daemon served in the test
-// process is one no client here can ever attach to.
+// drain pin refuses os.Getpid(), so a daemon served in the test process is
+// one no client here can ever drain.
 func (f *fixture) startDaemonChild(delay time.Duration) *exec.Cmd {
 	f.t.Helper()
 	return f.startDaemonChildEnv(delay, daemonChildPark+"=0")
@@ -1002,21 +1009,17 @@ func TestSupersedeEscalatesAParkedIncumbent(t *testing.T) {
 	}{
 		{"drained into the park by the deploy", func(*testing.T, *fixture) {}},
 		{"already parked and socketless", func(t *testing.T, f *fixture) {
-			control, err := f.deploy.client.Control(f.within(5 * time.Second))
-			if err != nil {
-				t.Fatalf("Control: %v", err)
-			}
-			if _, err := control.Drain(f.within(time.Second), daemonkit.Expect{}); !errors.Is(err, daemonkit.ErrUnsettled) {
+			if _, err := f.deploy.client.Drain(f.within(time.Second), daemonkit.Expect{}); !errors.Is(err, daemonkit.ErrUnsettled) {
 				t.Fatalf("Drain err = %v, want ErrUnsettled from a product that never drains", err)
 			}
 			deadline := time.Now().Add(20 * time.Second)
 			for {
-				_, err := f.deploy.client.Control(f.within(time.Second))
+				_, err := f.deploy.client.Health(f.within(time.Second))
 				if errors.Is(err, daemonkit.ErrAbsent) {
 					return
 				}
 				if time.Now().After(deadline) {
-					t.Fatalf("Control err = %v, want ErrAbsent once the parked incumbent closed its listener", err)
+					t.Fatalf("Health err = %v, want ErrAbsent once the parked incumbent closed its listener", err)
 				}
 				time.Sleep(50 * time.Millisecond)
 			}
@@ -1153,7 +1156,7 @@ func TestSupersedeAbortDoesNotCertifyAnotherBuild(t *testing.T) {
 			return "", 0, nil
 		}
 		child := exec.Command(other)
-		child.Env = append(os.Environ(), daemonChildEnv+"=1", daemonChildLabel+"="+string(f.deploy.config.Daemon.Label), daemonChildDelay+"=0s", daemonChildPark+"=0")
+		child.Env = append(os.Environ(), daemonChildEnv+"=1", daemonChildLabel+"="+string(f.deploy.config.Daemon.Label), daemonChildDelay+"=0s", daemonChildPark+"=0", daemonChildBuild+"=other.build")
 		child.Stderr = os.Stderr
 		if err := child.Start(); err != nil {
 			t.Fatalf("start other build: %v", err)
@@ -1888,10 +1891,9 @@ func (f *fixture) markedAgent(label string) string {
 func TestOpenRejectsInvalidConfig(t *testing.T) {
 	valid := Config{
 		App:         "/opt/Example.app",
-		Requirement: daemonkit.Requirement{TeamID: testTeamID, SigningIdentifier: testSigning},
+		Requirement: Requirement{TeamID: testTeamID, SigningIdentifier: testSigning},
 		Daemon: daemonkit.Daemon{
 			Label: "example",
-			Trust: daemonkit.Trust{Serving: daemonkit.ServingSameUser()},
 		},
 		Agents: []launchd.Agent{{Label: "l", Program: "/opt/Example.app/Contents/MacOS/x"}},
 	}
@@ -1921,13 +1923,8 @@ func TestOpenRejectsInvalidConfig(t *testing.T) {
 		{"program outside app", mutate(func(c *Config) { c.Agents[0].Program = "/usr/bin/true" })},
 		{"relative program", mutate(func(c *Config) { c.Agents[0].Program = "Contents/MacOS/x" })},
 		{"unclean program", mutate(func(c *Config) { c.Agents[0].Program = "/opt/Example.app/./Contents/MacOS/x" })},
-		{"serving requirement that admits nobody", mutate(func(c *Config) {
-			c.Daemon.Trust.Serving = daemonkit.ServingSigned(daemonkit.Requirement{TeamID: testTeamID})
-		})},
-		{"unstated serving posture", mutate(func(c *Config) { c.Daemon.Trust.Serving = daemonkit.Serving{} })},
-		{"business set stated but empty", mutate(func(c *Config) {
-			c.Daemon.Trust.Business = daemonkit.Requirements{}
-		})},
+		{"quoted team", mutate(func(c *Config) { c.Requirement.TeamID = `T"` })},
+		{"backslashed signing identifier", mutate(func(c *Config) { c.Requirement.SigningIdentifier = `id\` })},
 		{"relative executable", mutate(func(c *Config) { c.Executables = []string{"hookd"} })},
 		{"unclean executable", mutate(func(c *Config) { c.Executables = []string{"/usr/bin/../bin/true"} })},
 		{"absent executable", mutate(func(c *Config) { c.Executables = []string{"/usr/bin/daemonkit-absent"} })},
@@ -1941,12 +1938,6 @@ func TestOpenRejectsInvalidConfig(t *testing.T) {
 	}
 	if _, err := Open(valid); err != nil {
 		t.Fatalf("Open(valid): %v", err)
-	}
-	pinned := mutate(func(c *Config) {
-		c.Daemon.Trust.Serving = daemonkit.ServingSigned(daemonkit.Requirement{TeamID: testTeamID, SigningIdentifier: testSigning})
-	})
-	if _, err := Open(pinned); err != nil {
-		t.Fatalf("Open with a pinned serving requirement: %v", err)
 	}
 }
 
@@ -1996,10 +1987,9 @@ func TestOpenRefusesALabelWhoseRecordPathEscapesTheStateRoot(t *testing.T) {
 	app := filepath.Join(root, "Example.app")
 	deployment, err := Open(Config{
 		App:         app,
-		Requirement: daemonkit.Requirement{TeamID: testTeamID, SigningIdentifier: testSigning},
+		Requirement: Requirement{TeamID: testTeamID, SigningIdentifier: testSigning},
 		Daemon: daemonkit.Daemon{
 			Label: label,
-			Trust: daemonkit.Trust{Serving: daemonkit.ServingSameUser()},
 		},
 		Agents: []launchd.Agent{{Label: "l", Program: filepath.Join(app, "Contents", "MacOS", "x")}},
 	})
@@ -2038,10 +2028,9 @@ func TestOpenResolvesDeclaredExecutables(t *testing.T) {
 	app := filepath.Join(root, "Example.app")
 	deployment, err := Open(Config{
 		App:         app,
-		Requirement: daemonkit.Requirement{TeamID: testTeamID, SigningIdentifier: testSigning},
+		Requirement: Requirement{TeamID: testTeamID, SigningIdentifier: testSigning},
 		Daemon: daemonkit.Daemon{
 			Label: "example",
-			Trust: daemonkit.Trust{Serving: daemonkit.ServingSameUser()},
 		},
 		Agents:      []launchd.Agent{{Label: "l", Program: filepath.Join(app, "Contents", "MacOS", "x")}},
 		Executables: []string{link},

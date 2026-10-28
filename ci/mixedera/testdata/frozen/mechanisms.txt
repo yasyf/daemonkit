@@ -96,7 +96,7 @@
 #       handle: the witness is callable on a struct literal no daemon ever
 #       backed, no exit the OS reaped required, and it passes the branch audit
 #       precisely because it branches on that receiver;
-#     witnessVerdict and witnessControlTrustGate judge report values their
+#     witnessVerdict and witnessSchemaGate judge report values their
 #       caller decoded — or built;
 #     the conformance the proposition and disposition freezes bind is
 #       Declaration.JSON, a string the manifest's caller supplies. That each
@@ -174,15 +174,8 @@ mechanism drain-preamble-emitted
   era cut claimed
   proposition a daemon already draining answers a handshake it is still reading with exactly the frozen two-byte preamble and nothing else
 
-mechanism drain-preamble-trust-gate
-  witness process (*daemonProc).witnessPreambleTrustGate
+mechanism schema-gate
+  witness peer witnessSchemaGate
   era precut absent
   era cut claimed
-  entailed-by precut drain-preamble
-  proposition the drain an inbound frozen preamble admits is still authorized by Trust.Control, the preamble sitting above the trust gate, so an untrusted peer's preamble leaves the incumbent running
-
-mechanism drain-control-trust-gate
-  witness peer witnessControlTrustGate
-  era precut absent
-  era cut claimed
-  proposition a drain arriving on the control lane is authorized by Trust.Control: one peer's drain of a daemon whose control lane names a requirement that peer cannot prove is refused untrusted, that daemon still completes the same peer's session at one protocol on the socket it refused the drain from, and that same peer's drain of a daemon naming no control requirement is honoured, reaping the pid of the daemon it stopped
+  proposition the schema gates product dispatch and never admission: one peer presenting a schema the daemon does not accept completes the handshake and has its product op refused as a build mismatch on the socket it reached, and that same peer presenting that same schema drains the daemon, reaping the pid of the daemon it stopped

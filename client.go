@@ -6,18 +6,21 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/internal/proc"
+	"github.com/yasyf/daemonkit/internal/wire"
 )
 
 // Open prepares a client for d's daemon and performs no I/O beyond
-// validation: ValidateForClient runs here, so an unstated Trust.Serving or a
-// malformed Daemon fails at construction with a config error naming the
-// field — not at first Call inside a retry loop. Every verb refuses a context
-// without a deadline: all stall bounds derive from it.
+// validation: ValidateForClient runs here, so a malformed Daemon fails at
+// construction with a config error naming the field — not at first Call
+// inside a retry loop. Every verb refuses a context without a deadline: all
+// stall bounds derive from it.
 func Open(d Daemon) (*Client, error) {
 	if err := d.ValidateForClient(); err != nil {
 		return nil, err
 	}
-	return &Client{daemon: d, serviceLayer: openServiceLayer()}, nil
+	link := &Business{contract: d.contract()}
+	link.attach = func(ctx context.Context) (*wire.Client, int, error) { return attachSocket(ctx, d) }
+	return &Client{daemon: d, serviceLayer: openServiceLayer(), link: link}, nil
 }
 
 // Client reaches one daemon named by its Daemon identity. Every field past the
@@ -27,7 +30,16 @@ func Open(d Daemon) (*Client, error) {
 type Client struct {
 	daemon Daemon
 	serviceLayer
+	// link is the one session Health, Drain, WaitReady, and Ensure ride; the
+	// first business lane to attach takes it over.
+	link *Business
 }
+
+// Close releases the session the client's own Health, Drain, WaitReady, and
+// Ensure hold, and every later one of those verbs refuses with ErrLaneClosed.
+// A business lane that took the session over keeps it until its own Close.
+// Like every verb it refuses a context without a deadline.
+func (c *Client) Close(ctx context.Context) error { return c.link.Close(ctx) }
 
 // record is the durable owner record's path, derived past the Label rule
 // wherever a verb is about to read it. The rule runs at each derivation rather
@@ -46,7 +58,7 @@ func (c *Client) record() (string, error) {
 // Serve persists into the record file behind the flock before it binds — and
 // observes that exact identity out of the process table under ctx. It dials
 // nothing, sends nothing, and never signals: it works mid-drain (where
-// Control returns ErrDraining with no session to pin), against a husk (live
+// Drain returns ErrDraining with no session to pin), against a husk (live
 // flock-holder, dead listener, ErrAbsent), and after a caller crash.
 //
 // A non-zero Expect field disagreeing with the record refuses with
@@ -56,9 +68,9 @@ func (c *Client) record() (string, error) {
 // anti-PID-reuse proof Drain returns. ErrUnsettled (joined with ctx.Err())
 // when the recorded identity was still present at ctx end.
 //
-// The record file is same-UID writable, so the proof is no stronger than it.
+// The record file is writable, so the proof is no stronger than it.
 // A record missing any field an observation keys on is refused outright, but
-// a same-UID writer that copies the live incumbent's Build and Generation and
+// a writer that copies the live incumbent's Build and Generation and
 // repoints {pid, start, boot} at a dead instance is answered with a true
 // ReapAbsent for a daemon still running. Expect cannot backstop that — it
 // compares against the same record. A caller gating an irreversible action —
