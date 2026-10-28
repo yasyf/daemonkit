@@ -327,8 +327,7 @@ final class SocketClientCore: @unchecked Sendable {
             do {
                 while true {
                     let frame = try await readQueue.performIO { try codec.read() }
-                    guard let client = self else { return }
-                    guard try await client.receive(frame) else { return }
+                    guard let client = self, try await client.receive(frame) else { return }
                 }
             } catch {
                 self?.fail(error)
@@ -547,8 +546,7 @@ extension SocketClientCore {
         guard frame.id != 0, frame.operation.isEmpty, frame.tenant.isEmpty else {
             throw SessionTransportError.invalidFrame("response stream")
         }
-        guard let state = pendingState(frame.id) else { return }
-        guard let chunk = try state.receive(frame) else { return }
+        guard let state = pendingState(frame.id), let chunk = try state.receive(frame) else { return }
         await receiveStreamOfferHook?()
         let accepted = await state.chunkChannel.offer(chunk)
         if !accepted {
@@ -872,10 +870,7 @@ private extension SocketClientCore {
 
     private static func configureNonblocking(_ descriptor: Int32) throws {
         let flags = fcntl(descriptor, F_GETFL)
-        guard flags >= 0 else {
-            throw SessionTransportError.systemCall(operation: "fcntl", errno: errno)
-        }
-        guard fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else {
+        guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else {
             throw SessionTransportError.systemCall(operation: "fcntl", errno: errno)
         }
     }
