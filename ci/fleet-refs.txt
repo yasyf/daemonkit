@@ -34,19 +34,19 @@
 # subset, so its leg builds both and a linux-only break stops being invisible.
 # Every entry in the set names a platform: the script refuses an empty one,
 # which would leave a leg building nothing and reporting the pass it starts at.
-synckit                 drop-trust-checks
-fusekit                 drop-trust-checks
+synckit                 main
+fusekit                 main
 reposync                drop-trust-checks
 captain-hook            drop-trust-checks
 cc-notes                drop-trust-checks
 cc-patch                main
 cc-orchestrate          drop-trust-checks
-cc-interact             drop-trust-checks
+cc-interact             main
 binrun                  main    darwin,linux
 cc-present              drop-trust-checks
 cc-review               drop-trust-checks
 cc-pool                 drop-trust-checks
-cookiesync              drop-trust-checks
-cc-skills:plugins/codex drop-trust-checks
+cookiesync              main
+cc-skills:plugins/codex main
 cc-runtime              drop-trust-checks
-cc-squash:go            drop-trust-checks
+cc-squash:go            main
