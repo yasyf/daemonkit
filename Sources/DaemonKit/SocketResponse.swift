@@ -13,7 +13,7 @@ public struct SocketResponseCode: RawRepresentable, Equatable, Hashable, Sendabl
     public static let runtimeDraining = SocketResponseCode(rawValue: "runtime_draining")
     public static let buildMismatch = SocketResponseCode(rawValue: "build_mismatch")
     public static let sessionCapacity = SocketResponseCode(rawValue: "session_capacity")
-    public static let peerUntrusted = SocketResponseCode(rawValue: "peer_untrusted")
+    public static let handshakeRejected = SocketResponseCode(rawValue: "handshake_rejected")
     public static let permissionDenied = SocketResponseCode(rawValue: "permission_denied")
     public static let invalidRequest = SocketResponseCode(rawValue: "invalid_request")
     public static let readinessSubscriptionExists = SocketResponseCode(
@@ -26,23 +26,13 @@ public struct SocketResponseCode: RawRepresentable, Equatable, Hashable, Sendabl
     public static let deadlineExceeded = SocketResponseCode(rawValue: "deadline_exceeded")
 }
 
-/// An authenticated server's typed handshake rejection.
+/// The server's typed handshake rejection.
 public struct SocketHandshakeRejectionError: Error, CustomStringConvertible, Sendable {
     public let code: SocketResponseCode
     public let reason: String
 
     public var description: String {
         reason
-    }
-}
-
-/// An exact wire-build mismatch proven by the handshake acknowledgment.
-public struct SocketWireBuildMismatchError: Error, CustomStringConvertible, Equatable, Sendable {
-    public let server: String
-    public let client: String
-
-    public var description: String {
-        "wire: build mismatch: server=\(server.debugDescription) client=\(client.debugDescription)"
     }
 }
 

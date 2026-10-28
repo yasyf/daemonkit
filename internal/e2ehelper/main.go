@@ -70,10 +70,22 @@ func main() {
 		os.Exit(66)
 	}
 	event(home, "serve.enter pid=%d variant=%s ppid=%d", os.Getpid(), variant, os.Getppid())
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "e2ehelper: %v\n", err)
+		os.Exit(67)
+	}
+	app := filepath.Dir(filepath.Dir(filepath.Dir(exe)))
+	program, err := daemonkit.InBundle(app, filepath.Join("Contents", "MacOS", filepath.Base(exe)))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "e2ehelper: %v\n", err)
+		os.Exit(67)
+	}
 	drained, err := daemonkit.Serve(
 		context.Background(),
 		daemonkit.Daemon{
 			Label:    daemonkit.Label(label),
+			Program:  program,
 			Schemas:  []daemonkit.Schema{"daemonkit.e2e.v1"},
 			Shutdown: daemonkit.Grace(shutdownGrace),
 		},

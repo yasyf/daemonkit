@@ -82,6 +82,8 @@ const (
 	// with the state root the harness hands that process is what every path the
 	// cut daemon owns derives from.
 	cutLabel = "mixedera"
+
+	foreignSchema = "daemonkit.mixedera.foreign.v1"
 )
 
 type peers struct {
@@ -246,22 +248,19 @@ var gateCases = []gateCase{
 		},
 	},
 	{
-		name: "drain/control-trust-gate",
+		name: "drain/foreign-schema",
 		run: func(t *testing.T, p *peers) {
-			strict := startCut(t, p.cut, "-strict")
-			refused, _ := runPeer(t, p.cut, peerWait, "drain", "-home", strict.home)
-			strict.aliveAfter(t, aliveSettle)
-			served, _ := runPeer(t, p.cut, peerWait, "dial", "-socket", strict.socket)
-
-			open := startCut(t, p.cut)
-			honoured, _ := runPeer(t, p.cut, peerWait, "drain", "-home", open.home)
-			if err := open.exitWithin(t, drainWait); err != nil {
-				t.Errorf("the drained cut daemon exited %v\nstderr:\n%s", err, open.log.String())
+			daemon := startCut(t, p.cut)
+			refused, _ := runPeer(t, p.cut, peerWait,
+				"dial", "-socket", daemon.socket, "-schema", foreignSchema)
+			drained, _ := runPeer(t, p.cut, peerWait,
+				"drain", "-home", daemon.home, "-schema", foreignSchema)
+			if err := daemon.exitWithin(t, drainWait); err != nil {
+				t.Errorf("the cut daemon drained by a foreign-schema peer exited %v\nstderr:\n%s",
+					err, daemon.log.String())
 			}
-			witnessControlTrustGate(t, refused, served, honoured, strict, open)
-			strict.terminate(t)
-			_ = strict.exitWithin(t, drainWait)
-			p.covered.Redeem(t, cutEra, mechanismControlTrustGate)
+			witnessSchemaGate(t, refused, drained, daemon)
+			p.covered.Redeem(t, cutEra, mechanismSchemaGate)
 		},
 	},
 	{
@@ -272,7 +271,7 @@ var gateCases = []gateCase{
 			conn := writePreamble(t, front)
 			daemon.witnessPreamble(t, front, preambleSettle)
 			awaitPeerClose(t, conn, aliveSettle)
-			p.covered.Redeem(t, precutEra, mechanismPreamble, mechanismTrustGate)
+			p.covered.Redeem(t, precutEra, mechanismPreamble)
 			daemon.terminate(t)
 			_ = daemon.exitWithin(t, drainWait)
 		},
@@ -280,20 +279,12 @@ var gateCases = []gateCase{
 	{
 		name: "drain/preamble-cut",
 		run: func(t *testing.T, p *peers) {
-			strict := startCut(t, p.cut, "-strict")
-			strictFront := newRelay(t, strict.socket)
-			held := writePreamble(t, strictFront)
-			strict.witnessPreambleTrustGate(t, strictFront, aliveSettle)
-			awaitPeerClose(t, held, aliveSettle)
-			strict.terminate(t)
-			_ = strict.exitWithin(t, drainWait)
-
-			open := startCut(t, p.cut)
-			front := newRelay(t, open.socket)
+			daemon := startCut(t, p.cut)
+			front := newRelay(t, daemon.socket)
 			conn := writePreamble(t, front)
-			open.witnessPreamble(t, front, preambleSettle)
+			daemon.witnessPreamble(t, front, preambleSettle)
 			awaitPeerClose(t, conn, aliveSettle)
-			p.covered.Redeem(t, cutEra, mechanismPreamble, mechanismTrustGate)
+			p.covered.Redeem(t, cutEra, mechanismPreamble)
 		},
 	},
 	{
@@ -515,11 +506,11 @@ func probeDeadline(err error) (bool, string) {
 		fmt.Sprintf("exited %d %s", exit.ExitCode(), saw)
 }
 
-func startCut(t *testing.T, p peer, args ...string) *daemonProc {
+func startCut(t *testing.T, p peer) *daemonProc {
 	t.Helper()
 	home := socketDir(t)
 	daemon := startDaemon(t, p, filepath.Join(home, paths.Agent(cutLabel).App, "daemon.sock"),
-		append([]string{"serve", "-home", home}, args...)...)
+		"serve", "-home", home)
 	daemon.home = home
 	return daemon
 }

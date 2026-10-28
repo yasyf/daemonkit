@@ -46,7 +46,7 @@ const (
 	precutProbeToken = "mixedera-precut: trust-verifier-probe-deadline"
 
 	failureProtocolMismatch = "protocol-mismatch"
-	failureUntrusted        = "untrusted"
+	failureBuildMismatch    = "build-mismatch"
 
 	// reapAbsent is how a peer reports daemonkit.ReapAbsent: the pinned identity
 	// observed gone from the process table.
@@ -284,33 +284,6 @@ func (d *daemonProc) witnessPreamble(t *testing.T, front *relay, settle time.Dur
 	))
 }
 
-// witnessPreambleTrustGate redeems the preamble's trust gate against the same
-// two artifacts witnessPreamble reads — the bytes a relay copied and whether
-// the OS reaped the daemon they crossed to — for the one configuration that
-// separates the gate from the drain: a daemon whose control lane names a
-// requirement the preamble's writer cannot prove. It refuses a preamble the
-// relay never carried, and files the direction the process table shows, so a
-// strict daemon the preamble did drain is filed as drained rather than gated.
-func (d *daemonProc) witnessPreambleTrustGate(t *testing.T, front *relay, settle time.Duration) {
-	t.Helper()
-	preamble := frozen(t, preambleFixture)
-	if !front.carried(preamble, drainWait) {
-		t.Fatalf("no connection the relay at %s copied opened with exactly the frozen drain preamble %#x, so nothing put that preamble in front of the strict %s daemon at %s and there is no refusal here to redeem",
-			front.path, preamble, d.era, d.socket)
-	}
-	if d.leftWithin(t, settle) {
-		coverage.ObservedAbsent(t, d.era, mechanismTrustGate, coverage.FromProcessTable, fmt.Sprintf(
-			"the OS reaped the strict %s daemon at %s within %s of the relay carrying it the frozen drain preamble %#x",
-			d.era, d.socket, settle, preamble,
-		))
-		return
-	}
-	coverage.ObservedPresent(t, d.era, mechanismTrustGate, coverage.FromProcessTable, fmt.Sprintf(
-		"the strict %s daemon at %s still held its socket %s after the relay carried it the frozen drain preamble %#x",
-		d.era, d.socket, settle, preamble,
-	))
-}
-
 func (d *daemonProc) terminate(t *testing.T) {
 	t.Helper()
 	if err := d.cmd.Process.Signal(syscall.SIGTERM); err != nil {
@@ -376,39 +349,39 @@ func witnessVerdict(t *testing.T, p peer, decoded report, elapsed time.Duration)
 	}
 }
 
-// witnessControlTrustGate names every half of the control lane's drain trust
-// gate in one fact, so none redeems it alone: a gate that only ever refuses is
-// a broken lane, and one that only ever admits is no gate. It refuses each half
-// on the reports themselves rather than trusting its caller to have refused it,
-// because a witness that only formats what it is handed leaves its row PROVEN
-// with the calling case emptied. All three halves are the peer process's own
-// verdicts on what it read back — the refusal, the session the refusing
-// incumbent went on to complete, and the reap.
-func witnessControlTrustGate(t *testing.T, refused, served, honoured report, strict, open *daemonProc) {
+// witnessSchemaGate names both halves of the schema gate in one fact, so
+// neither redeems it alone: a gate that refuses a foreign schema at the
+// handshake is the wedge, and one that never refuses it gates nothing. It
+// refuses each half on the reports themselves rather than trusting its caller
+// to have refused it, because a witness that only formats what it is handed
+// leaves its row PROVEN with the calling case emptied. Both halves are the peer
+// process's own verdicts on what it read back — the request-level refusal on a
+// session the daemon admitted, and the reap.
+func witnessSchemaGate(t *testing.T, refused, drained report, daemon *daemonProc) {
 	t.Helper()
 	switch {
-	case refused.Failure != failureUntrusted:
-		t.Fatalf("the cut daemon at %s, whose control lane names a requirement this peer cannot prove, answered that peer's drain with %+v, want %s",
-			strict.socket, refused, failureUntrusted)
-	case !served.Session || served.Protocol != served.PeerProtocol:
-		t.Fatalf("the cut daemon that refused this peer's drain answered that same peer's business-lane session with %+v, want a session completed at one protocol: a control-lane refusal leaves the incumbent serving",
-			served)
-	case served.Socket != strict.socket:
-		t.Fatalf("the session that outlived the refused drain ran against %q, want the socket the drain was refused from, %q",
-			served.Socket, strict.socket)
-	case honoured.Failure != "" || honoured.Reap != reapAbsent:
-		t.Fatalf("the drain of a cut daemon naming no control requirement = %+v, want a delivered drain reaping %q",
-			honoured, reapAbsent)
-	case honoured.DrainedPID != open.cmd.Process.Pid:
-		t.Fatalf("the honoured drain proves pid %d gone, want the daemon it stopped, %d",
-			honoured.DrainedPID, open.cmd.Process.Pid)
-	case refused.Self != served.Self || served.Self != honoured.Self:
-		t.Fatalf("the refusal, the session, and the drain name themselves %q, %q, and %q: this gate is one peer identity meeting two daemons, not three peers meeting one each",
-			refused.Self, served.Self, honoured.Self)
+	case refused.Failure != failureBuildMismatch:
+		t.Fatalf("the cut daemon at %s answered a peer presenting a schema it does not accept with %+v, want a session admitted and its product op refused %s",
+			daemon.socket, refused, failureBuildMismatch)
+	case refused.PeerProtocol != refused.Protocol:
+		t.Fatalf("the build-mismatch refusal carries peer protocol %d against the peer's own %d: a refusal read off a completed handshake names the daemon's protocol",
+			refused.PeerProtocol, refused.Protocol)
+	case refused.Socket != daemon.socket:
+		t.Fatalf("the build-mismatch refusal came from %q, want the socket of the daemon it drained, %q",
+			refused.Socket, daemon.socket)
+	case drained.Failure != "" || drained.Reap != reapAbsent:
+		t.Fatalf("the drain from a peer presenting a schema the cut daemon does not accept = %+v, want a delivered drain reaping %q",
+			drained, reapAbsent)
+	case drained.DrainedPID != daemon.cmd.Process.Pid:
+		t.Fatalf("the foreign-schema drain proves pid %d gone, want the daemon it stopped, %d",
+			drained.DrainedPID, daemon.cmd.Process.Pid)
+	case refused.Self != drained.Self:
+		t.Fatalf("the refusal and the drain name themselves %q and %q: this gate is one peer identity meeting one daemon, not two peers meeting it",
+			refused.Self, drained.Self)
 	}
-	coverage.ObservedPresent(t, cutEra, mechanismControlTrustGate, coverage.FromPeerVerdict, fmt.Sprintf(
-		"the cut peer %s, whose drain the cut daemon at %s typed %s because that daemon's control lane names a requirement the peer cannot prove, completed a session at protocol %d against that same socket, and drained the cut daemon at %s that names no control requirement, reaping %q for pid %d",
-		refused.Self, strict.socket, refused.Failure, served.PeerProtocol, open.socket, honoured.Reap, honoured.DrainedPID,
+	coverage.ObservedPresent(t, cutEra, mechanismSchemaGate, coverage.FromPeerVerdict, fmt.Sprintf(
+		"the cut peer %s, presenting a schema the cut daemon at %s does not accept, completed the handshake at protocol %d and had its product op typed %s, and with that same schema drained that daemon, reaping %q for pid %d",
+		refused.Self, daemon.socket, refused.PeerProtocol, refused.Failure, drained.Reap, drained.DrainedPID,
 	))
 }
 

@@ -2,19 +2,19 @@
 
 // Command cutpeer is daemonkit's cut-era mixed-era conformance peer, driven on
 // this working tree's real transport: serve runs daemonkit.Serve, so the socket,
-// the per-lane trust gate, the drain verb and the shutdown ladder are the ones a
-// consumer gets, and drain runs Control.Drain over that trust-gated control
-// lane. It lives in-tree, under the main module, because Go's internal-package
-// rule forbids the foreign per-era module the harness builds precut in from
+// the schema gate, the drain verb and the shutdown ladder are the ones a
+// consumer gets, and drain runs Client.Drain over the client's own session. It
+// lives in-tree, under the main module, because Go's internal-package rule
+// forbids the foreign per-era module the harness builds precut in from
 // importing internal/wire.
 //
-// dial reaches for internal/wire rather than the root, because the root publishes
-// no business-lane client: a refusal has to stay wire's own typed
-// ProtocolMismatchError for the matrix to read the peer's protocol out of it.
+// dial reaches for internal/wire rather than the root, because the root's client
+// dials only the socket its Label derives and the matrix dials the relay in
+// front of it, so the bytes the relay copies are the ones this peer read.
 //
-//	cutpeer serve -home DIR [-strict]
-//	cutpeer dial  -socket PATH
-//	cutpeer drain -home DIR
+//	cutpeer serve -home DIR
+//	cutpeer dial  -socket PATH [-schema SCHEMA]
+//	cutpeer drain -home DIR [-schema SCHEMA]
 //	cutpeer conformance
 package main
 
@@ -41,13 +41,14 @@ const (
 	protocol = wire.ProtocolVersion
 
 	label     = daemonkit.Label("mixedera")
+	cutBuild  = "mixedera.cut"
 	cutSchema = "daemonkit.mixedera.cut.v2"
 	echoOp    = "mixedera.echo"
 
 	readyLine = "READY"
 
 	failureProtocolMismatch = "protocol-mismatch"
-	failureUntrusted        = "untrusted"
+	failureBuildMismatch    = "build-mismatch"
 	failureDraining         = "draining"
 	failureAbsent           = "absent"
 	failureUnsettled        = "unsettled"
@@ -57,19 +58,18 @@ const (
 
 	shutdownGrace    = 20 * time.Second
 	dialTimeout      = 60 * time.Second
-	controlTimeout   = 60 * time.Second
+	drainTimeout     = 60 * time.Second
 	handshakeTimeout = 10 * time.Second
 
 	framePrefixSize = 4
 
-	mechanismFrame            = "frame-v1"
-	mechanismGate             = "protocol-gate"
-	mechanismSession          = "session"
-	mechanismSigterm          = "drain-sigterm"
-	mechanismPreamble         = "drain-preamble"
-	mechanismPreambleEmitted  = "drain-preamble-emitted"
-	mechanismTrustGate        = "drain-preamble-trust-gate"
-	mechanismControlTrustGate = "drain-control-trust-gate"
+	mechanismFrame           = "frame-v1"
+	mechanismGate            = "protocol-gate"
+	mechanismSession         = "session"
+	mechanismSigterm         = "drain-sigterm"
+	mechanismPreamble        = "drain-preamble"
+	mechanismPreambleEmitted = "drain-preamble-emitted"
+	mechanismSchemaGate      = "schema-gate"
 )
 
 // Each proposition below is quoted verbatim from
@@ -78,24 +78,14 @@ const (
 // differs, so the era this binary speaks for cannot come to answer a different
 // question than the other era's column does.
 const (
-	propositionFrame            = "a packet the relay copied carries that era's frozen 6-byte frame identity at the head of its body: the DKS1 magic and the era's own protocol number"
-	propositionGate             = "a handshake between the two eras is promptly refused as a typed protocol mismatch"
-	propositionSession          = "a client and a daemon at one protocol complete a request and its response over one unix socket"
-	propositionSigterm          = "SIGTERM ends the daemon at exit status 0"
-	propositionPreamble         = "a connection whose first bytes are the frozen two-byte drain preamble drains the daemon it reaches"
-	propositionPreambleEmitted  = "a daemon already draining answers a handshake it is still reading with exactly the frozen two-byte preamble and nothing else"
-	propositionTrustGate        = "the drain an inbound frozen preamble admits is still authorized by Trust.Control, the preamble sitting above the trust gate, so an untrusted peer's preamble leaves the incumbent running"
-	propositionControlTrustGate = "a drain arriving on the control lane is authorized by Trust.Control: one peer's drain of a daemon whose control lane names a requirement that peer cannot prove is refused untrusted, that daemon still completes the same peer's session at one protocol on the socket it refused the drain from, and that same peer's drain of a daemon naming no control requirement is honoured, reaping the pid of the daemon it stopped"
+	propositionFrame           = "a packet the relay copied carries that era's frozen 6-byte frame identity at the head of its body: the DKS1 magic and the era's own protocol number"
+	propositionGate            = "a handshake between the two eras is promptly refused as a typed protocol mismatch"
+	propositionSession         = "a client and a daemon at one protocol complete a request and its response over one unix socket"
+	propositionSigterm         = "SIGTERM ends the daemon at exit status 0"
+	propositionPreamble        = "a connection whose first bytes are the frozen two-byte drain preamble drains the daemon it reaches"
+	propositionPreambleEmitted = "a daemon already draining answers a handshake it is still reading with exactly the frozen two-byte preamble and nothing else"
+	propositionSchemaGate      = "the schema gates product dispatch and never admission: one peer presenting a schema the daemon does not accept completes the handshake and has its product op refused as a build mismatch on the socket it reached, and that same peer presenting that same schema drains the daemon, reaping the pid of the daemon it stopped"
 )
-
-// strictControl is a Developer ID requirement no `go build` output can satisfy,
-// so a daemon serving under it refuses this very binary's control attach. It is
-// how the harness reaches the untrusted half of the drain trust gate on a runner
-// that holds no signing identity.
-var strictControl = &daemonkit.Requirement{
-	TeamID:            "SXKCTF23Q2",
-	SigningIdentifier: "com.yasyf.daemonkit.mixedera.no-such-peer",
-}
 
 var reapNames = map[daemonkit.Reap]string{
 	daemonkit.ReapUndetermined: "undetermined",
@@ -159,28 +149,22 @@ func declare() error {
 	return json.NewEncoder(os.Stdout).Encode(conformance{
 		Era: era, Protocol: protocol,
 		Mechanisms: map[string]verdict{
-			mechanismFrame:            {Proposition: propositionFrame},
-			mechanismGate:             {Proposition: propositionGate},
-			mechanismSession:          {Proposition: propositionSession},
-			mechanismSigterm:          {Proposition: propositionSigterm},
-			mechanismPreamble:         {Proposition: propositionPreamble},
-			mechanismPreambleEmitted:  {Proposition: propositionPreambleEmitted},
-			mechanismTrustGate:        {Proposition: propositionTrustGate},
-			mechanismControlTrustGate: {Proposition: propositionControlTrustGate},
+			mechanismFrame:           {Proposition: propositionFrame},
+			mechanismGate:            {Proposition: propositionGate},
+			mechanismSession:         {Proposition: propositionSession},
+			mechanismSigterm:         {Proposition: propositionSigterm},
+			mechanismPreamble:        {Proposition: propositionPreamble},
+			mechanismPreambleEmitted: {Proposition: propositionPreambleEmitted},
+			mechanismSchemaGate:      {Proposition: propositionSchemaGate},
 		},
 	})
 }
 
-func socketFlag(mode string, args []string) (string, error) {
-	flags := flag.NewFlagSet(mode, flag.ContinueOnError)
-	socket := flags.String("socket", "", "unix socket path")
-	if err := flags.Parse(args); err != nil {
-		return "", err
-	}
-	if *socket == "" {
-		return "", fmt.Errorf("%s: -socket is required", mode)
-	}
-	return *socket, nil
+// schemaFlag registers -schema, the schema this peer presents in its hello:
+// the cut's own by default, or a foreign one to stand for a client of another
+// schema era at the cut's protocol.
+func schemaFlag(flags *flag.FlagSet) *string {
+	return flags.String("schema", cutSchema, "schema presented in the hello")
 }
 
 // homed parses -home and pins every daemonkit path under it, so a peer process
@@ -196,24 +180,24 @@ func homed(flags *flag.FlagSet, args []string) error {
 	return os.Setenv(realhome.EnvOverride, *home)
 }
 
-// serve runs the real root daemon: Serve owns the socket, the trust gate, the
+// serve runs the real root daemon: Serve owns the socket, the schema gate, the
 // drain verb, and the shutdown ladder, so every era claim the harness redeems
 // against this process is redeemed against the transport a consumer gets.
 func serve(args []string) error {
-	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
-	strict := flags.Bool("strict", false, "pin the control lane to a requirement this peer cannot prove")
-	if err := homed(flags, args); err != nil {
+	if err := homed(flag.NewFlagSet("serve", flag.ContinueOnError), args); err != nil {
 		return err
+	}
+	program, err := daemonkit.Stable(cutBuild)
+	if err != nil {
+		return fmt.Errorf("serve: %w", err)
 	}
 	d := daemonkit.Daemon{
 		Label:    label,
+		Program:  program,
 		Schemas:  []daemonkit.Schema{cutSchema},
 		Shutdown: daemonkit.Grace(shutdownGrace),
 	}
-	if *strict {
-		d.Trust.Control = strictControl
-	}
-	_, err := daemonkit.Serve(context.Background(), d, func(daemonkit.Ctx) (daemonkit.Product, error) {
+	_, err = daemonkit.Serve(context.Background(), d, func(daemonkit.Ctx) (daemonkit.Product, error) {
 		fmt.Println(readyLine)
 		return echo{}, nil
 	})
@@ -239,29 +223,28 @@ func (echo) Drain(daemonkit.Budget) error { return nil }
 
 func (echo) Close(daemonkit.Budget) error { return nil }
 
-// drain runs the cut era's repair channel: attach the trust-gated control lane
-// and stop the pinned incumbent, reporting the reap the process table proved.
+// drain runs the cut era's repair channel: send the drain verb on the client's
+// own session and stop the pinned incumbent, reporting the reap the process
+// table proved.
 func drain(args []string) error {
-	if err := homed(flag.NewFlagSet("drain", flag.ContinueOnError), args); err != nil {
+	flags := flag.NewFlagSet("drain", flag.ContinueOnError)
+	schema := schemaFlag(flags)
+	if err := homed(flags, args); err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), controlTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
 	defer cancel()
 
 	client, err := daemonkit.Open(daemonkit.Daemon{
 		Label:   label,
-		Schemas: []daemonkit.Schema{cutSchema},
+		Schemas: []daemonkit.Schema{daemonkit.Schema(*schema)},
 	})
 	if err != nil {
 		return fmt.Errorf("open: %w", err)
 	}
-	control, err := client.Control(ctx)
+	stopped, err := client.Drain(ctx, daemonkit.Expect{})
 	if err != nil {
-		return emit(classifyControl(err))
-	}
-	stopped, err := control.Drain(ctx, daemonkit.Expect{})
-	if err != nil {
-		return emit(classifyControl(err))
+		return emit(classifyDrain(err))
 	}
 	return emit(report{
 		Era: era, Protocol: protocol, Session: true,
@@ -269,13 +252,13 @@ func drain(args []string) error {
 	})
 }
 
-// classifyControl types one failed control verb the way the harness reads it,
-// off the root's own sentinels rather than off a message.
-func classifyControl(err error) report {
+// classifyDrain types one failed drain the way the harness reads it, off the
+// root's own sentinels rather than off a message.
+func classifyDrain(err error) report {
 	failed := report{Era: era, Protocol: protocol, Detail: err.Error()}
 	switch {
-	case errors.Is(err, daemonkit.ErrUntrusted):
-		failed.Failure = failureUntrusted
+	case errors.Is(err, daemonkit.ErrProtocolMismatch):
+		failed.Failure = failureProtocolMismatch
 	case errors.Is(err, daemonkit.ErrDraining):
 		failed.Failure = failureDraining
 	case errors.Is(err, daemonkit.ErrAbsent):
@@ -290,44 +273,41 @@ func classifyControl(err error) report {
 	return failed
 }
 
-// authorizeMatrixDaemon is this peer's named Authorize waiver: what the matrix
-// measures is the two eras' answers to each other on the socket — the refusal,
-// the preamble, the session — so the peer judges nothing before the handshake
-// and classifies exactly what it read back.
-func authorizeMatrixDaemon(net.Conn) error { return nil }
-
-// dial completes a real wire session on the business lane and reports it, or
-// classifies the wire error that refused it.
+// dial completes a real wire session and one product op on it and reports
+// them, or classifies the wire error or request-level rejection that refused
+// them.
 func dial(args []string) error {
-	socket, err := socketFlag("dial", args)
-	if err != nil {
+	flags := flag.NewFlagSet("dial", flag.ContinueOnError)
+	socket := flags.String("socket", "", "unix socket path")
+	schema := schemaFlag(flags)
+	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	if *socket == "" {
+		return errors.New("dial: -socket is required")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
 
 	client, err := wire.NewClient(ctx, wire.ClientConfig{
-		Dial: wire.UnixDialer(socket), Schema: cutSchema,
+		Dial: wire.UnixDialer(*socket), Schema: *schema,
 		HandshakeTimeout: handshakeTimeout,
 	})
 	if err != nil {
-		return emit(classifyDial(socket, err))
+		return emit(classifyDial(*socket, err))
 	}
 	defer func() { _ = client.Abort(nil) }()
 
 	if err := client.WaitReady(ctx); err != nil {
-		return emit(classifyDial(socket, err))
+		return emit(classifyDial(*socket, err))
 	}
 	body := []byte(`{"op":"echo"}`)
 	result, err := client.Call(ctx, echoOp, body)
 	if err != nil {
-		return emit(classifyDial(socket, err))
+		return emit(classifyDial(*socket, err))
 	}
 	if rejection := result.Rejection(); rejection != nil {
-		return emit(report{
-			Era: era, Protocol: protocol, PeerProtocol: client.PeerWireIdentity().Protocol,
-			Socket: socket, Failure: failureRefused, Detail: rejection.Error(),
-		})
+		return emit(classifyRejection(*socket, client.PeerWireIdentity().Protocol, rejection))
 	}
 	var replied daemonkit.Reply
 	if err := json.Unmarshal(result.Response.Payload, &replied); err != nil {
@@ -335,13 +315,13 @@ func dial(args []string) error {
 	}
 	if result.Outcome != wire.Delivered || !bytes.Equal(replied.Body, body) {
 		return emit(report{
-			Era: era, Protocol: protocol, Socket: socket, Failure: failureMalformed,
+			Era: era, Protocol: protocol, Socket: *socket, Failure: failureMalformed,
 			Detail: fmt.Sprintf("outcome=%s payload=%q", result.Outcome, result.Response.Payload),
 		})
 	}
 	return emit(report{
 		Era: era, Protocol: protocol, PeerProtocol: client.PeerWireIdentity().Protocol,
-		Socket: socket, Session: true,
+		Socket: *socket, Session: true,
 	})
 }
 
@@ -362,7 +342,7 @@ func classifyDial(socket string, err error) report {
 		failed.PeerProtocol = probePeerProtocol(socket)
 	case errors.Is(err, wire.ErrDraining):
 		failed.Failure = failureDraining
-	case errors.Is(err, wire.ErrBuildMismatch), errors.As(err, &rejection):
+	case errors.As(err, &rejection):
 		failed.Failure = failureRefused
 	case errors.Is(err, wire.ErrHandshake):
 		failed.Failure = failureMalformed
@@ -370,6 +350,20 @@ func classifyDial(socket string, err error) report {
 		failed.Failure = failureTransport
 	}
 	return failed
+}
+
+// classifyRejection types a request-level rejection on a session the daemon
+// admitted: a build mismatch is the schema gate refusing product dispatch, and
+// anything else is a refusal of another kind.
+func classifyRejection(socket string, peer uint16, rejection error) report {
+	refused := report{
+		Era: era, Protocol: protocol, PeerProtocol: peer,
+		Socket: socket, Failure: failureRefused, Detail: rejection.Error(),
+	}
+	if errors.Is(rejection, wire.ErrBuildMismatch) {
+		refused.Failure = failureBuildMismatch
+	}
+	return refused
 }
 
 // probePeerProtocol reads the wire version a refusing peer advertised in the
@@ -387,7 +381,7 @@ func probePeerProtocol(socket string) uint16 {
 	}
 	hello, err := wire.EncodePacket(wire.Frame{
 		Kind: wire.FrameHello, Flags: wire.FlagEnd,
-		Payload: []byte(fmt.Sprintf(`{"protocol":%d,"lane":"business","schema":%q}`, protocol, cutSchema)),
+		Payload: []byte(fmt.Sprintf(`{"protocol":%d,"schema":%q}`, protocol, cutSchema)),
 	})
 	if err != nil {
 		return 0

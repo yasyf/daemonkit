@@ -9,8 +9,8 @@ import (
 )
 
 // errForeignProcess means a live process is owned by another user. daemonkit's
-// trust floor is the same effective uid, so such a process is never one of
-// this consumer's own, and the inventory skips the one it cannot read rather
+// state lives under one user's home, so such a process is never one of this
+// consumer's own, and the inventory skips the one it cannot read rather
 // than counting it.
 var errForeignProcess = errors.New("proc: process is owned by another user")
 
@@ -22,8 +22,8 @@ var errUnresolvedExecutable = errors.New("proc: executable path is unresolvable"
 
 // Report is what one executable-scoped inventory proved about the live process
 // table, in the two sets that carry different authority. Both hold same-euid
-// processes alone: daemonkit's trust floor makes another user's process none of
-// this consumer's, and counting one refuses the gate for good.
+// processes alone: daemonkit's state lives under one user's home, which makes
+// another user's process none of this consumer's, and counting one refuses the gate for good.
 //
 // Matched is attributed to the query: every process the kernel names as
 // running that exact executable. Unnameable is attributed to nothing — no path

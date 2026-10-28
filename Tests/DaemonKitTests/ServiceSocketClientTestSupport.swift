@@ -45,8 +45,7 @@ final class GoWireServer: @unchecked Sendable {
     init(
         phases: String = "ready",
         schema: String = GoWireServer.schema,
-        accept: [String] = [],
-        controlTeam: String? = nil
+        accept: [String] = []
     ) throws {
         directory = try shortSocketDir()
         socketPath = directory.appendingPathComponent("s").path
@@ -55,9 +54,6 @@ final class GoWireServer: @unchecked Sendable {
         var arguments = ["-socket", socketPath, "-schema", schema, "-phases", phases]
         for accepted in accept {
             arguments += ["-accept", accepted]
-        }
-        if let controlTeam {
-            arguments += ["-control-team", controlTeam]
         }
         process.arguments = arguments
         let output = Pipe()
@@ -106,7 +102,6 @@ func businessServiceClient(
     try ServiceSocketClient(
         path: server.socketPath,
         schema: GoWireServer.schema,
-        lane: .business,
         onProgress: onProgress
     )
 }

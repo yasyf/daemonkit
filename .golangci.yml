@@ -20,12 +20,6 @@ linters:
     - staticcheck
     - unused
   settings:
-    govet:
-      # unsafeptr: internal/trust derefs dlsym'd data symbols — fixed dyld
-      # addresses, not Go pointers (ccn 239201e). Lockstep with the
-      # -unsafeptr=false vet step in Taskfile.yml and ci.yml.
-      disable:
-        - unsafeptr
     errcheck:
       # Best-effort teardown closes are the package idiom; no caller remedy.
       exclude-functions:

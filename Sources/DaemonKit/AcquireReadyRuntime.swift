@@ -9,7 +9,6 @@ public func acquireReadyRuntime(
     let client = try ServiceSocketClient(
         connection: configuration.connection,
         schema: configuration.schema,
-        lane: configuration.lane,
         configuration: configuration.socket,
         onProgress: configuration.onProgress
     )

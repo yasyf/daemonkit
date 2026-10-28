@@ -100,14 +100,12 @@ public final class SocketClient: @unchecked Sendable {
     public convenience init(
         path: String,
         schema: String,
-        lane: SessionLane,
         configuration: Configuration = .init(),
         onPhase: (@Sendable (PhaseSnapshot) -> Void)? = nil
     ) async throws {
         try await self.init(
             connection: .path(path),
             schema: schema,
-            lane: lane,
             configuration: configuration,
             onPhase: onPhase
         )
@@ -116,14 +114,12 @@ public final class SocketClient: @unchecked Sendable {
     public init(
         connection: SocketConnection,
         schema: String,
-        lane: SessionLane,
         configuration: Configuration = .init(),
         onPhase: (@Sendable (PhaseSnapshot) -> Void)? = nil
     ) async throws {
         core = try await SocketClientCore(
             connection: connection,
             schema: schema,
-            lane: lane,
             configuration: configuration,
             onPhase: onPhase
         )
@@ -282,19 +278,10 @@ final class SocketClientCore: @unchecked Sendable {
     init(
         connection: SocketConnection,
         schema: String,
-        lane: SessionLane,
         configuration: SocketClient.Configuration,
         onPhase: (@Sendable (PhaseSnapshot) -> Void)?
     ) async throws {
-        switch lane {
-        case .business:
-            guard !schema.isEmpty else { throw SessionTransportError.handshake("empty schema") }
-        case .control:
-            guard schema.isEmpty else { throw SessionTransportError.handshake("control lane carries no schema") }
-            if case .spawned = connection {
-                throw SessionTransportError.handshake("minted session requires the business lane")
-            }
-        }
+        try connection.validate(schema: schema)
         guard configuration.maximumFrameBytes > 0,
               (1 ... Int(UInt32.max)).contains(configuration.streamQueueDepth),
               (1 ... Int(UInt32.max)).contains(configuration.eventQueueDepth),
@@ -308,7 +295,6 @@ final class SocketClientCore: @unchecked Sendable {
         let bootstrap = try await Self.bootstrap(
             connection: connection,
             schema: schema,
-            lane: lane,
             configuration: configuration
         )
         self.configuration = configuration
@@ -629,13 +615,11 @@ extension SocketClientCore {
     static func handshake(
         codec: SessionFrameCodec,
         schema: String,
-        lane: SessionLane,
         nonce: Data? = nil,
         timeout: TimeInterval
     ) throws -> SessionWireIdentity {
         let payload = try JSONEncoder().encode(SessionHelloIdentity(
             protocolVersion: daemonKitSessionProtocolVersion,
-            lane: lane,
             schema: schema.isEmpty ? nil : schema,
             nonce: nonce
         ))
@@ -729,7 +713,6 @@ private extension SocketClientCore {
     private static func bootstrap(
         connection: SocketConnection,
         schema: String,
-        lane: SessionLane,
         configuration: SocketClient.Configuration
     ) async throws -> Bootstrap {
         let owner = OwnedDescriptor()
@@ -771,7 +754,6 @@ private extension SocketClientCore {
                     try handshake(
                         codec: codec,
                         schema: schema,
-                        lane: lane,
                         nonce: helloNonce,
                         timeout: configuration.handshakeTimeout
                     )

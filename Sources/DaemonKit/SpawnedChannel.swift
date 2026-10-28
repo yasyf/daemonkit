@@ -19,6 +19,11 @@ public enum SpawnedChannelError: Error, Equatable, Sendable {
 public enum SocketConnection: Sendable {
     case path(String)
     case spawned(SpawnedChannel)
+
+    func validate(schema: String) throws {
+        guard case .spawned = self, schema.isEmpty else { return }
+        throw SessionTransportError.handshake("spawned session requires a schema")
+    }
 }
 
 private let spawnedNonceEnvironment = "DAEMONKIT_SPAWNED_NONCE"
@@ -98,7 +103,7 @@ public final class SpawnedChannel: @unchecked Sendable {
     }
 
     /// Delegates a connected descriptor the child accepted — an App Group
-    /// peer — into the daemon's full trust admission. The caller keeps
+    /// peer — to the daemon as an ordinary session. The caller keeps
     /// ownership of the descriptor.
     public func delegate(descriptor: Int32, deadline: Date) async throws {
         try await queue.performIO { try self.lockedDelegate(descriptor: descriptor, deadline: deadline) }

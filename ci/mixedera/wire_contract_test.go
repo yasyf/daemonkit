@@ -163,7 +163,7 @@ func oldEraAckServer(t *testing.T, advertised uint16) string {
 
 func helloPacket(t *testing.T, advertised uint16) []byte {
 	t.Helper()
-	payload := []byte(fmt.Sprintf(`{"protocol":%d,"lane":"business","schema":%q}`, advertised, contractSchema))
+	payload := []byte(fmt.Sprintf(`{"protocol":%d,"schema":%q}`, advertised, contractSchema))
 	packet, err := wire.EncodePacket(wire.Frame{Kind: wire.FrameHello, Flags: wire.FlagEnd, Payload: payload})
 	if err != nil {
 		t.Fatalf("encode hello: %v", err)

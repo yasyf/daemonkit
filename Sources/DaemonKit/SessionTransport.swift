@@ -112,15 +112,6 @@ extension SessionFrameCodec {
 
 // wiregen:end
 
-/// The two session kinds protocol 2 admits: the trust-gated control lane and
-/// the schema-gated business lane.
-public enum SessionLane: String, Codable, Sendable {
-    /// The repair channel: drain and broker handoff, gated by control trust.
-    case control
-    /// The product channel: schema set-membership at attach.
-    case business
-}
-
 /// The runtime lifecycle state the server publishes to every session.
 public enum SessionPhase: String, Codable, Sendable {
     /// Pre-readiness; business dispatch is typed-rejected.
@@ -238,7 +229,7 @@ extension SessionTransportError {
     }
 }
 
-/// The server identity established by the mandatory protocol-2 handshake.
+/// The server identity established by the mandatory handshake.
 struct SessionWireIdentity: Sendable {
     let protocolVersion: UInt16
     let schema: String
@@ -248,20 +239,17 @@ struct SessionWireIdentity: Sendable {
 
 struct SessionHelloIdentity: Encodable, Sendable {
     let protocolVersion: UInt16
-    let lane: SessionLane
     let schema: String?
     let nonce: Data?
 
-    init(protocolVersion: UInt16, lane: SessionLane, schema: String? = nil, nonce: Data? = nil) {
+    init(protocolVersion: UInt16, schema: String? = nil, nonce: Data? = nil) {
         self.protocolVersion = protocolVersion
-        self.lane = lane
         self.schema = schema
         self.nonce = nonce
     }
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol"
-        case lane
         case schema
         case nonce
     }
@@ -269,7 +257,6 @@ struct SessionHelloIdentity: Encodable, Sendable {
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(protocolVersion, forKey: .protocolVersion)
-        try container.encode(lane, forKey: .lane)
         if let schema, !schema.isEmpty {
             try container.encode(schema, forKey: .schema)
         }
@@ -308,7 +295,7 @@ enum SessionHandshakeCodec {
             }
             let code = SocketResponseCode(rawValue: rawCode)
             switch code {
-            case .sessionCapacity, .peerUntrusted, .buildMismatch:
+            case .sessionCapacity, .handshakeRejected:
                 throw SocketHandshakeRejectionError(code: code, reason: reason)
             default:
                 throw SessionTransportError.handshake("invalid rejection code \(rawCode.debugDescription)")

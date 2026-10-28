@@ -17,7 +17,7 @@ import (
 
 // readinessReserve is the share of the readiness budget the wait gives up to
 // the attach that classifies its outcome. A quarter, because that attach is a
-// full dial, handshake, trust check and health self-attestation against a
+// full dial, handshake, and health self-attestation against a
 // daemon that may be busy starting — a sliver of the budget times out on a
 // daemon that is really there and reports it absent.
 const readinessReserve = 4
@@ -76,8 +76,8 @@ func (p ReadinessProof) Digest() SHA256 { return p.digest }
 
 // Quiesce proves this deployment's daemon gone and returns the evidence.
 //
-// The ladder observes before it acts. A live control session reads Health and
-// drains the pinned incumbent under an Expect derived from that read, so a
+// The ladder observes before it acts. A live session reads Health and drains
+// the pinned incumbent under an Expect derived from that read, so a
 // replacement that raced in between is refused rather than stopped. An
 // incumbent already leaving (ErrDraining) or a husk holding the lock with a
 // dead listener (ErrAbsent) has no session to pin, and settles from the
@@ -108,7 +108,7 @@ func (p ReadinessProof) Digest() SHA256 { return p.digest }
 // gate is not optional. It observes a recorded identity out of the table
 // directly, including one whose executable is gone.
 //
-// Like every verb that reaches the control lane, Quiesce requires a context
+// Like every verb that reaches the daemon's socket, Quiesce requires a context
 // carrying a deadline: it is the whole settlement budget, and every stall
 // bound inside derives from it.
 func (d *Deployment) Quiesce(ctx context.Context) (RuntimeProof, error) {

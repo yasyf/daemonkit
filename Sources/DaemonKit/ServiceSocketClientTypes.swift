@@ -17,21 +17,18 @@ public enum ServiceSocketReplayPolicy: Equatable, Sendable {
 public struct RuntimeClientConfiguration: Sendable {
     public let connection: SocketConnection
     public let schema: String
-    public let lane: SessionLane
     public let socket: SocketClient.Configuration
     public let onProgress: (@Sendable (PhaseSnapshot) -> Void)?
 
     public init(
         path: String,
         schema: String,
-        lane: SessionLane = .business,
         socket: SocketClient.Configuration = .init(),
         onProgress: (@Sendable (PhaseSnapshot) -> Void)? = nil
     ) {
         self.init(
             connection: .path(path),
             schema: schema,
-            lane: lane,
             socket: socket,
             onProgress: onProgress
         )
@@ -40,13 +37,11 @@ public struct RuntimeClientConfiguration: Sendable {
     public init(
         connection: SocketConnection,
         schema: String,
-        lane: SessionLane = .business,
         socket: SocketClient.Configuration = .init(),
         onProgress: (@Sendable (PhaseSnapshot) -> Void)? = nil
     ) {
         self.connection = connection
         self.schema = schema
-        self.lane = lane
         self.socket = socket
         self.onProgress = onProgress
     }

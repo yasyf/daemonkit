@@ -126,7 +126,7 @@ public struct ServiceSocketRejectionError: Error, Sendable {
 }
 
 /// A persistent unary client that crosses expected service startup and takeover
-/// by targeting any ready session on the schema- and trust-gated socket.
+/// by targeting any ready session on the daemon socket.
 public actor ServiceSocketClient {
     struct Generation: Sendable {
         let id: UInt64
@@ -139,7 +139,6 @@ public actor ServiceSocketClient {
 
     private let connection: SocketConnection
     private let schema: String
-    private let lane: SessionLane
     private let configuration: SocketClient.Configuration
     private let progressHandler: (@Sendable (PhaseSnapshot) -> Void)?
     private var generation: Generation?
@@ -162,18 +161,16 @@ public actor ServiceSocketClient {
         closeStepHook = hook
     }
 
-    /// Creates a lazy schema-pinned service client on the given lane.
+    /// Creates a lazy schema-pinned service client on the given socket path.
     public init(
         path: String,
         schema: String,
-        lane: SessionLane = .business,
         configuration: SocketClient.Configuration = .init(),
         onProgress: (@Sendable (PhaseSnapshot) -> Void)? = nil
     ) throws {
         try self.init(
             connection: .path(path),
             schema: schema,
-            lane: lane,
             configuration: configuration,
             onProgress: onProgress
         )
@@ -183,19 +180,12 @@ public actor ServiceSocketClient {
     public init(
         connection: SocketConnection,
         schema: String,
-        lane: SessionLane = .business,
         configuration: SocketClient.Configuration = .init(),
         onProgress: (@Sendable (PhaseSnapshot) -> Void)? = nil
     ) throws {
-        switch lane {
-        case .business:
-            guard !schema.isEmpty else { throw SessionTransportError.handshake("empty schema") }
-        case .control:
-            guard schema.isEmpty else { throw SessionTransportError.handshake("control lane carries no schema") }
-        }
+        try connection.validate(schema: schema)
         self.connection = connection
         self.schema = schema
-        self.lane = lane
         self.configuration = configuration
         progressHandler = onProgress
     }
@@ -322,13 +312,11 @@ private extension ServiceSocketClient {
             nextGeneration += 1
             let connection = connection
             let schema = schema
-            let lane = lane
             let onPhase = progressHandler
             let task = Task {
                 try await SocketClient(
                     connection: connection,
                     schema: schema,
-                    lane: lane,
                     configuration: attemptConfiguration,
                     onPhase: onPhase
                 )
@@ -376,13 +364,6 @@ private extension ServiceSocketClient {
                 let error = ServiceSocketRejectionError(
                     code: .buildMismatch,
                     reason: terminal.reason ?? "wire: build mismatch"
-                )
-                await fail(error)
-                throw error
-            case .peerUntrusted:
-                let error = ServiceSocketRejectionError(
-                    code: .peerUntrusted,
-                    reason: terminal.reason ?? "wire: untrusted peer"
                 )
                 await fail(error)
                 throw error
@@ -501,7 +482,7 @@ extension ServiceSocketClient {
             return client == .malformedAttempt
         }
         if let rejection = error as? ServiceSocketRejectionError {
-            return rejection.code == .buildMismatch || rejection.code == .peerUntrusted
+            return rejection.code == .buildMismatch
         }
         if let rejection = error as? SocketHandshakeRejectionError {
             return rejection.code != .sessionCapacity

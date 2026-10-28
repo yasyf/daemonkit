@@ -221,7 +221,6 @@ actor BrokerHandoffClient {
                     try await SocketClient(
                         path: path,
                         schema: "",
-                        lane: .control,
                         configuration: attemptConfiguration
                     )
                 }
@@ -322,7 +321,6 @@ public final class BrokerSocketBridge: @unchecked Sendable {
         lifecycleClient = try ServiceSocketClient(
             connection: lifecycle.connection,
             schema: lifecycle.schema,
-            lane: lifecycle.lane,
             configuration: lifecycle.socket,
             onProgress: lifecycle.onProgress
         )
@@ -407,7 +405,7 @@ public final class BrokerSocketBridge: @unchecked Sendable {
         await delegation.close()
     }
 
-    /// Stops admission and closes the authenticated outbound session.
+    /// Stops admission and closes the outbound session.
     public func shutdown() async {
         let owned = lock.withLock { () -> BoundListener? in
             stopped = true

@@ -12,7 +12,7 @@
 // narrows to its identifier clause, exactly as every other test in the package
 // does. Everything else is real: codesign, the tree copy, the swap record, the
 // rename pair, launchctl bootstrap/bootout, the launchd-spawned daemon,
-// Control.Drain, and the executable-scoped inventory.
+// Drain, and the executable-scoped inventory.
 //
 // The dke2e tag keeps it out of scripts/test.sh, because bootstrapping a real
 // LaunchAgent leaks a permanent row into the root-owned
@@ -192,7 +192,7 @@ func bootoutE2E(t *testing.T, label string) {
 // TestE2EDeployInstallActivateSupersedeUninstall is the whole verb chain
 // against real launchd: Install lands the bytes, Activate bootstraps the agent
 // and seals what the launchd-spawned daemon proves about itself, Supersede
-// quiesces that live daemon through Control.Drain and the real process-table
+// quiesces that live daemon through Drain and the real process-table
 // inventory before it swaps, a second Activate re-proves readiness on the new
 // generation, and Uninstall gates on both halves before the bytes go.
 func TestE2EDeployInstallActivateSupersedeUninstall(t *testing.T) {

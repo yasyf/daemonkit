@@ -56,7 +56,7 @@ func TestTheGateRefusesExactlyTheUnredeemedStatuses(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			status := coverage.StatusOf(tt.absence, tt.redeemed)
 			want := tt.redeemed == coverage.Unredeemed
-			if got := gateRefuses(t, line, coverageRow(cutEra, mechanismTrustGate, status)); got != want {
+			if got := gateRefuses(t, line, coverageRow(cutEra, mechanismPreamble, status)); got != want {
 				t.Errorf("%s reports %s and %s refuses it = %v, want %v", tt.name, status, gateScript, got, want)
 			}
 		})
@@ -72,8 +72,8 @@ func TestTheGateReadsOnlyTheSubjectEra(t *testing.T) {
 	line := gateLine(t, coverageGate)
 	if gateRefuses(
 		t, line,
-		coverageRow(cutEra, mechanismTrustGate, coverage.StatusProven),
-		coverageRow(precutEra, mechanismTrustGate, coverage.StatusOpen),
+		coverageRow(cutEra, mechanismPreamble, coverage.StatusProven),
+		coverageRow(precutEra, mechanismPreamble, coverage.StatusOpen),
 	) {
 		t.Errorf("a %s row refuses a %s subject whose own rows are all %s, so the coverage line no longer filters on the era",
 			precutEra, cutEra, coverage.StatusProven)
@@ -96,7 +96,7 @@ func TestTheGateRefusesAStubPeerOnlyForTheSubjectEra(t *testing.T) {
 		t, line,
 		peerRow(cutEra, cutEra),
 		peerRow(precutEra, "stub"),
-		coverageRow(cutEra, mechanismTrustGate, coverage.StatusProven),
+		coverageRow(cutEra, mechanismPreamble, coverage.StatusProven),
 	) {
 		t.Errorf("a %s peer row or a %s coverage row refuses a %s subject whose own peer reports %s, so the peer line no longer reads only the subject era's peer rows",
 			precutEra, cutEra, cutEra, cutEra)
