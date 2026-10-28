@@ -40,7 +40,7 @@ reposync                drop-trust-checks
 captain-hook            drop-trust-checks
 cc-notes                drop-trust-checks
 cc-patch                main
-cc-orchestrate          main
+cc-orchestrate          drop-trust-checks
 cc-interact             drop-trust-checks
 binrun                  main    darwin,linux
 cc-present              drop-trust-checks
