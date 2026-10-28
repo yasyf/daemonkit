@@ -1,1 +1,1 @@
-{"v":1,"lamport":2,"session":"cfa0f537-f63b-4af9-844c-1efcf2ab6814","ops":[{"kind":"add_comment","body":"Triage 2026-08-03 (v0.21 cut, fable-gated sweep): stays open. Routing: v0.22-wave — P1 security: seal-time refusal in deploy of csflags-clearing entitlements (allow-unsigned-executable-memory / disable-executable-page-protection); runtime-only check still fails late on a shipped binary, per the record's measured ccx wedge"}]}
+{"v":1,"lamport":3,"session":"f83679ca-3fa0-4ce8-ad00-8ac9f16462df","ops":[{"kind":"set_branch","branch":"go-1.26.10"}]}
