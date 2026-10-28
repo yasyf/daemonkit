@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-10-28
+
+### Added
+
+- `Installed(path, build)` names an executable a package manager keeps at a
+  stable path, such as `/opt/homebrew/bin/cookiesync`, a Homebrew link into a
+  versioned app bundle. `Ensure` places nothing for it and converges on
+  `build`, the version string the executable reports, as it does for `Stable`.
+  The LaunchAgent names the link, so a `brew upgrade` that deletes the old
+  bundle never strands the job, and the executable keeps its bundle's identity.
+
 ## [0.35.4] - 2026-10-28
 
 ### Fixed
@@ -1899,7 +1910,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.35.4...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.36.0...HEAD
+[0.36.0]: https://github.com/yasyf/daemonkit/compare/v0.35.4...v0.36.0
 [0.35.4]: https://github.com/yasyf/daemonkit/compare/v0.35.3...v0.35.4
 [0.35.3]: https://github.com/yasyf/daemonkit/compare/v0.35.2...v0.35.3
 [0.35.2]: https://github.com/yasyf/daemonkit/compare/v0.35.1...v0.35.2

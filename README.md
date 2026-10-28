@@ -150,7 +150,10 @@ process that serves it and the command that launches it. There is no trust
 field. The build identity is the version string the tool already reports,
 stamped at build time; `Stable` takes it, and `version.Running` gives an
 unstamped dev build one keyed by its modification time. `InBundle` reads the
-bundle's `CFBundleShortVersionString` and its executable's modification time. `Serve` publishes that build in `Health`, so
+bundle's `CFBundleShortVersionString` and its executable's modification time.
+`Installed` names an executable a package manager keeps at a stable path, such as
+a Homebrew bin link into an app bundle, and takes the version string as `Stable`
+does. `Serve` publishes that build in `Health`, so
 `Ensure` compares two strings instead of hashing an executable.
 
 ```go

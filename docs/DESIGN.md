@@ -168,6 +168,13 @@ func Stable(build string) (Program, error)
 // modification time, so a rebuild at the same version is a new build.
 func InBundle(app, rel string) (Program, error)
 
+// Installed names an executable a package manager keeps at a stable path,
+// such as a Homebrew bin link into a versioned app bundle, and never copies
+// it: the link survives the upgrade that replaces its target, and an
+// executable run through it keeps its bundle's identity. build is the version
+// string, as for Stable.
+func Installed(path, build string) (Program, error)
+
 type Restart uint8
 
 const (
