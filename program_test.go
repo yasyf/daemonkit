@@ -129,6 +129,13 @@ func TestStablePlacesTheInvokingExecutable(t *testing.T) {
 	if info.Mode().Perm() != 0o700 {
 		t.Fatalf("placed copy mode = %v, want 0700", info.Mode())
 	}
+	source, err := os.Stat(selfPath(t))
+	if err != nil {
+		t.Fatalf("inspect executable: %v", err)
+	}
+	if !info.ModTime().Equal(source.ModTime()) {
+		t.Fatalf("placed copy mtime = %v, want the executable's %v", info.ModTime(), source.ModTime())
+	}
 }
 
 // TestPlaceLeavesTheSameBuildAlone is placement's idempotence, asserted on the

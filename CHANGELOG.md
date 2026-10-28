@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.35.2] - 2026-10-27
+
+### Fixed
+
+- The copy `Stable` places keeps the source executable's modification time.
+  `version.Running` keys an unstamped dev build by mtime, so in 0.35.0 and
+  0.35.1 the placed daemon reported a different dev build than the client
+  that placed it, and `Ensure` failed with "daemon came up as build X, want
+  build Y" (captain-hook's linux host on yasyf/captain-hook#430).
+
 ## [0.35.1] - 2026-10-27
 
 ### Fixed
@@ -1870,7 +1880,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.35.1...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.35.2...HEAD
+[0.35.2]: https://github.com/yasyf/daemonkit/compare/v0.35.1...v0.35.2
 [0.35.1]: https://github.com/yasyf/daemonkit/compare/v0.35.0...v0.35.1
 [0.35.0]: https://github.com/yasyf/daemonkit/compare/v0.34.0...v0.35.0
 [0.34.0]: https://github.com/yasyf/daemonkit/compare/v0.33.1...v0.34.0
