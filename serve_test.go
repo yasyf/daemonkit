@@ -13,7 +13,6 @@ import (
 	"github.com/yasyf/daemonkit/internal/proc"
 	"github.com/yasyf/daemonkit/internal/realhome"
 	"github.com/yasyf/daemonkit/internal/wire"
-	"github.com/yasyf/daemonkit/internal/wire/wiretest"
 	"github.com/yasyf/daemonkit/paths"
 )
 
@@ -51,6 +50,7 @@ func TestServeDrainVerbDrivesReturn(t *testing.T) {
 	shortHome(t)
 	d := Daemon{
 		Label:    "dkt",
+		Program:  testProgram,
 		Schemas:  []Schema{"test.v1"},
 		Shutdown: Grace(5 * time.Second),
 	}
@@ -69,7 +69,7 @@ func TestServeDrainVerbDrivesReturn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Socket: %v", err)
 	}
-	session := awaitControlSession(t, socket)
+	session := awaitSession(t, socket)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -126,6 +126,7 @@ func TestServeRefusesLiveIncumbent(t *testing.T) {
 	shortHome(t)
 	d := Daemon{
 		Label:    "dkt",
+		Program:  testProgram,
 		Schemas:  []Schema{"test.v1"},
 		Shutdown: Grace(5 * time.Second),
 	}
@@ -139,7 +140,7 @@ func TestServeRefusesLiveIncumbent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Socket: %v", err)
 	}
-	session := awaitControlSession(t, socket)
+	session := awaitSession(t, socket)
 
 	if _, err := Serve(context.Background(), d, func(Ctx) (Product, error) { return product, nil }); !errors.Is(err, ErrBusy) {
 		t.Fatalf("second Serve() = %v, want ErrBusy", err)
@@ -160,21 +161,19 @@ func TestServeRefusesLiveIncumbent(t *testing.T) {
 	}
 }
 
-func awaitControlSession(t *testing.T, socket string) *wire.Client {
+func awaitSession(t *testing.T, socket string) *wire.Client {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		session, err := wire.NewClient(ctx, wire.ClientConfig{
-			Dial: wire.UnixDialer(socket), Lane: wire.LaneControl,
-		})
+		session, err := wire.NewClient(ctx, wire.ClientConfig{Dial: wire.UnixDialer(socket)})
 		cancel()
 		if err == nil {
 			t.Cleanup(func() { _ = session.Abort(nil) })
 			return session
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("dial control: %v", err)
+			t.Fatalf("dial: %v", err)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}

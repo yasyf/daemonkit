@@ -29,15 +29,19 @@ func supervisedDaemon(t *testing.T, label Label) (Daemon, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	program := filepath.Join(realPath(t, t.TempDir()), "daemon")
+	root := realPath(t, t.TempDir())
+	program := filepath.Join(root, "daemon")
 	if err := os.WriteFile(program, body, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	app := filepath.Join(root, "Daemon.app")
+	versionBundle(t, app, "1.0.0")
 	t.Setenv(controlChildEnv, "1")
 	t.Setenv(controlChildLabel, string(label))
+	t.Setenv(controlChildApp, app)
 	return Daemon{
 		Label:    label,
-		Program:  Program{policy: bundled{file: program}},
+		Program:  Program{policy: bundled{app: app, file: program}},
 		Schemas:  []Schema{"test.v1"},
 		Shutdown: Grace(5 * time.Second),
 		Restart:  RestartOnFailure,
@@ -135,20 +139,16 @@ func TestEnsureRefusesWithNoSupervisorBeforeTouchingTheDaemon(t *testing.T) {
 	child := startControlChild(t, string(d.Label))
 	ctx := bounded(t, 60*time.Second)
 	client := openClient(t, d)
-	warmup := awaitControl(ctx, t, client)
-	if err := warmup.Close(ctx); err != nil {
-		t.Fatalf("Close() = %v", err)
-	}
+	awaitServing(ctx, t, client)
 
 	if _, err := client.Ensure(bounded(t, 10*time.Second)); !errors.Is(err, supervise.ErrNoSupervisor) {
 		t.Fatalf("Ensure() with no supervisor = %v, want supervise.ErrNoSupervisor", err)
 	}
-	control := awaitControl(ctx, t, client)
-	health, err := control.Health(ctx)
+	health, err := client.Health(ctx)
 	if err != nil || health.PID != child.Process.Pid || health.Phase != PhaseReady {
 		t.Fatalf("Health() after the refused Ensure = %+v, %v, want the same daemon still ready", health, err)
 	}
-	if _, err := control.Drain(ctx, Expect{}); err != nil {
+	if _, err := client.Drain(ctx, Expect{}); err != nil {
 		t.Fatalf("Drain() = %v", err)
 	}
 }
@@ -196,6 +196,7 @@ func TestEnsureAndStopConvergeThroughTheSupervisor(t *testing.T) {
 	if err := durable.WriteFile(program, append(body, "upgraded"...), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	versionBundle(t, d.Program.policy.(bundled).app, "1.0.1")
 	next, err := d.Program.build()
 	if err != nil {
 		t.Fatalf("build() = %v", err)
@@ -214,8 +215,8 @@ func TestEnsureAndStopConvergeThroughTheSupervisor(t *testing.T) {
 	if err := client.Stop(bounded(t, 60*time.Second)); err != nil {
 		t.Fatalf("Stop() = %v", err)
 	}
-	if _, err := client.Control(bounded(t, 5*time.Second)); !errors.Is(err, ErrAbsent) {
-		t.Fatalf("Control() after Stop = %v, want ErrAbsent", err)
+	if _, err := client.Health(bounded(t, 5*time.Second)); !errors.Is(err, ErrAbsent) {
+		t.Fatalf("Health() after Stop = %v, want ErrAbsent", err)
 	}
 	if alive(upgraded.After.PID) {
 		t.Fatalf("the stopped daemon %d is still running", upgraded.After.PID)

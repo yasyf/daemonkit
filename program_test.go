@@ -1,6 +1,7 @@
 package daemonkit
 
 import (
+	"bytes"
 	"errors"
 	"io/fs"
 	"os"
@@ -20,7 +21,7 @@ func placedElement(t *testing.T) element {
 	return mustElement(t, placedLabel)
 }
 
-func selfDigest(t *testing.T) string {
+func selfBytes(t *testing.T) []byte {
 	t.Helper()
 	exe, err := os.Executable()
 	if err != nil {
@@ -30,7 +31,16 @@ func selfDigest(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("read executable: %v", err)
 	}
-	return digest(source)
+	return source
+}
+
+func stable(t *testing.T, build string) Program {
+	t.Helper()
+	program, err := Stable(build)
+	if err != nil {
+		t.Fatalf("Stable() error = %v", err)
+	}
+	return program
 }
 
 func placedAt(t *testing.T, home string) string {
@@ -55,19 +65,11 @@ func inode(t *testing.T, path string) uint64 {
 func TestTwoDaemonsCannotShareAProgramPath(t *testing.T) {
 	t.Setenv(realhome.EnvOverride, t.TempDir())
 
-	first, err := Stable()
-	if err != nil {
-		t.Fatalf("Stable() error = %v", err)
-	}
-	second, err := Stable()
-	if err != nil {
-		t.Fatalf("Stable() error = %v", err)
-	}
-	one, err := (Daemon{Label: "com.example.one", Program: first}).agent()
+	one, err := (Daemon{Label: "com.example.one", Program: stable(t, "1.0.0")}).agent()
 	if err != nil {
 		t.Fatalf("agent() error = %v", err)
 	}
-	two, err := (Daemon{Label: "com.example.two", Program: second}).agent()
+	two, err := (Daemon{Label: "com.example.two", Program: stable(t, "1.0.0")}).agent()
 	if err != nil {
 		t.Fatalf("agent() error = %v", err)
 	}
@@ -76,15 +78,18 @@ func TestTwoDaemonsCannotShareAProgramPath(t *testing.T) {
 	}
 }
 
+func TestStableRefusesAnUnnamedBuild(t *testing.T) {
+	if _, err := Stable(""); err == nil {
+		t.Fatal("Stable(\"\") succeeded, want a refusal: the version string is the whole build identity")
+	}
+}
+
 func TestStablePlacesTheInvokingExecutable(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv(realhome.EnvOverride, home)
-	deployed := selfDigest(t)
+	deployed := selfBytes(t)
 
-	program, err := Stable()
-	if err != nil {
-		t.Fatalf("Stable() error = %v", err)
-	}
+	program := stable(t, "1.2.3")
 	path, err := program.path(placedElement(t))
 	if err != nil {
 		t.Fatalf("path() error = %v", err)
@@ -96,8 +101,8 @@ func TestStablePlacesTheInvokingExecutable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build() error = %v", err)
 	}
-	if build != deployed {
-		t.Fatalf("build = %q, want the current executable's %q", build, deployed)
+	if build != "1.2.3" {
+		t.Fatalf("build = %q, want the version Stable was given", build)
 	}
 
 	replaced, err := program.place(placedElement(t))
@@ -111,7 +116,7 @@ func TestStablePlacesTheInvokingExecutable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read placed copy: %v", err)
 	}
-	if digest(landed) != deployed {
+	if !bytes.Equal(landed, deployed) {
 		t.Fatal("placed bytes differ from the executable")
 	}
 	info, err := os.Lstat(path)
@@ -126,17 +131,14 @@ func TestStablePlacesTheInvokingExecutable(t *testing.T) {
 	}
 }
 
-// TestPlaceLeavesMatchingBytesAlone is placement's idempotence, asserted on the
+// TestPlaceLeavesTheSameBuildAlone is placement's idempotence, asserted on the
 // inode: every write lands by rename, so a path that still carries the inode it
 // carried before was not rewritten under the daemon already running from it.
-func TestPlaceLeavesMatchingBytesAlone(t *testing.T) {
+func TestPlaceLeavesTheSameBuildAlone(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv(realhome.EnvOverride, home)
 
-	program, err := Stable()
-	if err != nil {
-		t.Fatalf("Stable() error = %v", err)
-	}
+	program := stable(t, "1.2.3")
 	if _, err := program.place(placedElement(t)); err != nil {
 		t.Fatalf("place() error = %v", err)
 	}
@@ -148,20 +150,28 @@ func TestPlaceLeavesMatchingBytesAlone(t *testing.T) {
 		t.Fatalf("second place() error = %v", err)
 	}
 	if replaced {
-		t.Fatal("place() rewrote a path that already held these bytes")
+		t.Fatal("place() rewrote a path that already held this build")
 	}
 	if after := inode(t, target); after != before {
 		t.Fatalf("program inode = %d, want the untouched %d", after, before)
 	}
+	replaced, err = stable(t, "1.2.4").place(placedElement(t))
+	if err != nil {
+		t.Fatalf("place() of another build error = %v", err)
+	}
+	if !replaced {
+		t.Fatal("place() left the previous build at the path for a build carrying another version")
+	}
 }
 
-// TestPlaceReplacesPlantedBytes pins that the path is written, never trusted: a
-// same-uid writer can leave anything at a path that outlives every upgrade, and
-// what launchd receives is always this binary, executable, in full.
+// TestPlaceReplacesPlantedBytes pins that a path with no build recorded for it
+// is written, never trusted: anything can sit at a path that outlives every
+// upgrade, and what launchd receives is always this binary, executable, in
+// full.
 func TestPlaceReplacesPlantedBytes(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv(realhome.EnvOverride, home)
-	deployed := selfDigest(t)
+	deployed := selfBytes(t)
 
 	target := placedAt(t, home)
 	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
@@ -171,11 +181,7 @@ func TestPlaceReplacesPlantedBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	program, err := Stable()
-	if err != nil {
-		t.Fatalf("Stable() error = %v", err)
-	}
-	replaced, err := program.place(placedElement(t))
+	replaced, err := stable(t, "1.2.3").place(placedElement(t))
 	if err != nil {
 		t.Fatalf("place() error = %v", err)
 	}
@@ -186,7 +192,7 @@ func TestPlaceReplacesPlantedBytes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read placed copy: %v", err)
 	}
-	if digest(landed) != deployed {
+	if !bytes.Equal(landed, deployed) {
 		t.Error("placed bytes are not the current executable's")
 	}
 	info, err := os.Stat(target)
@@ -198,16 +204,20 @@ func TestPlaceReplacesPlantedBytes(t *testing.T) {
 	}
 }
 
-// TestPlaceReplacesAPlantedSymlink is the planted-bytes case the idempotence
-// shortcut would otherwise wave through. A link whose target holds these exact
-// bytes reads as settled, and its target is swapped afterwards for whatever
+// TestPlaceReplacesAPlantedSymlink is the planted case the idempotence
+// shortcut would otherwise wave through. A link standing where this build was
+// recorded reads as settled, and its target is swapped afterwards for whatever
 // launchd then execs from the plist's Program path — so the final component is
 // never followed and a link is replaced like any other bytes that are not
 // these.
 func TestPlaceReplacesAPlantedSymlink(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv(realhome.EnvOverride, home)
-	deployed := selfDigest(t)
+	deployed := selfBytes(t)
+	program := stable(t, "1.2.3")
+	if _, err := program.place(placedElement(t)); err != nil {
+		t.Fatalf("place() error = %v", err)
+	}
 
 	exe, err := os.Executable()
 	if err != nil {
@@ -222,17 +232,13 @@ func TestPlaceReplacesAPlantedSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	target := placedAt(t, home)
-	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+	if err := os.Remove(target); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(elsewhere, target); err != nil {
 		t.Fatal(err)
 	}
 
-	program, err := Stable()
-	if err != nil {
-		t.Fatalf("Stable() error = %v", err)
-	}
 	replaced, err := program.place(placedElement(t))
 	if err != nil {
 		t.Fatalf("place() error = %v", err)
@@ -251,7 +257,7 @@ func TestPlaceReplacesAPlantedSymlink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if digest(landed) != deployed {
+	if !bytes.Equal(landed, deployed) {
 		t.Error("placed bytes are not the current executable's")
 	}
 }
@@ -265,10 +271,7 @@ func TestPlaceSweepsOnlyItsOwnStumps(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv(realhome.EnvOverride, home)
 
-	program, err := Stable()
-	if err != nil {
-		t.Fatalf("Stable() error = %v", err)
-	}
+	program := stable(t, "1.2.3")
 	target := placedAt(t, home)
 	dir := filepath.Dir(target)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -312,31 +315,6 @@ func TestPlaceSweepsOnlyItsOwnStumps(t *testing.T) {
 	}
 }
 
-// TestPlaceRefusesAnExecutableReplacedUnderTheLauncher keeps the promise the
-// constructor made: the build Ensure converges on is the digest Stable took, so
-// bytes that no longer hash to it are refused rather than deployed as a build
-// no launcher asked for.
-func TestPlaceRefusesAnExecutableReplacedUnderTheLauncher(t *testing.T) {
-	t.Setenv(realhome.EnvOverride, t.TempDir())
-
-	body := []byte("#!/bin/sh\nexit 0\n")
-	source := filepath.Join(t.TempDir(), "launcher")
-	if err := os.WriteFile(source, body, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	program := Program{policy: copied{source: source, digest: digest(body)}}
-	if _, err := program.place(placedElement(t)); err != nil {
-		t.Fatalf("place() error = %v", err)
-	}
-	if err := os.WriteFile(source, []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := program.place(mustElement(t, "com.example.moved")); err == nil ||
-		!strings.Contains(err.Error(), "this Program was built from") {
-		t.Fatalf("place() error = %v, want the replaced executable refused", err)
-	}
-}
-
 func TestInBundle(t *testing.T) {
 	app := filepath.Join(t.TempDir(), "Fake.app")
 	exe := filepath.Join(app, "Contents", "MacOS", "fake")
@@ -347,7 +325,8 @@ func TestInBundle(t *testing.T) {
 		t.Fatal(err)
 	}
 	plain := filepath.Join(app, "Contents", "Info.plist")
-	if err := os.WriteFile(plain, []byte("{}"), 0o600); err != nil {
+	info := `<plist><dict><key>CFBundleShortVersionString</key><string>4.5.6</string></dict></plist>`
+	if err := os.WriteFile(plain, []byte(info), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -389,8 +368,8 @@ func TestInBundle(t *testing.T) {
 			if err != nil {
 				t.Fatalf("build() error = %v", err)
 			}
-			if want := digest([]byte("#!/bin/sh\n")); build != want {
-				t.Errorf("build = %q, want %q", build, want)
+			if build != "4.5.6" {
+				t.Errorf("build = %q, want the bundle's CFBundleShortVersionString", build)
 			}
 		})
 	}

@@ -300,7 +300,7 @@ func TestServeSpawnChannelEndsWithItsContext(t *testing.T) {
 	}
 }
 
-func TestServeChannelServesTheSpawnSuspendedIdentityAfterSettlement(t *testing.T) {
+func TestServeChannelServesAfterTheChildSettles(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	owned, err := OwnProcesses(ctx, filepath.Join(t.TempDir(), "daemon.records"))
@@ -328,10 +328,6 @@ func TestServeChannelServesTheSpawnSuspendedIdentityAfterSettlement(t *testing.T
 	if exit.Code != 0 || exit.Signal != 0 {
 		t.Fatalf("child exit = %+v, want clean", exit)
 	}
-	if !pinsSpawned(child.token, child.PID()) {
-		t.Fatalf("pinned token = pid %d valid %t, want the spawned pid %d",
-			child.token.PID(), child.token.Valid(), child.PID())
-	}
 	c := Ctx{
 		Context: ctx,
 		owner:   owned,
@@ -345,7 +341,7 @@ func TestServeChannelServesTheSpawnSuspendedIdentityAfterSettlement(t *testing.T
 		},
 	}
 	if err := c.ServeChannel(ctx, child); err != nil {
-		t.Fatalf("ServeChannel() = %v, want nil: identity was pinned at the suspended spawn, not read from the PID table", err)
+		t.Fatalf("ServeChannel() = %v, want nil: the child's identity is the spawn's, not a PID table read", err)
 	}
 }
 
@@ -360,6 +356,7 @@ func TestServeChannelMintsAndAdoptsForARealSpawnedChild(t *testing.T) {
 	shortHome(t)
 	d := Daemon{
 		Label:    "dkchan",
+		Program:  testProgram,
 		Schemas:  []Schema{spawnChannelSchema},
 		Shutdown: Grace(10 * time.Second),
 	}

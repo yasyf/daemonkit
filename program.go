@@ -39,7 +39,8 @@ type placement interface {
 }
 
 // Stable is the policy for a daemon launchd runs from a copy of the invoking
-// executable, kept at ~/.daemonkit/bin/<Label>. build is the version string
+// executable, kept at ~/.daemonkit/bin/<Label>, with the build it holds
+// recorded at ~/.daemonkit/builds/<Label>. build is the version string
 // the executable reports for itself, stamped at build time; it is the whole
 // build identity, so a build that should replace a running daemon must carry
 // a different one. Stable reads nothing: the copy is Ensure's, made under the
@@ -136,7 +137,7 @@ func (p Program) query(el element) (string, error) {
 
 // copied runs the daemon from a copy of source, kept at a Label-derived path
 // under the one program root every daemonkit consumer shares, with the build
-// it holds recorded beside it.
+// it holds recorded under the same Label in a sibling root.
 type copied struct {
 	source  string
 	version string
@@ -153,7 +154,7 @@ func (c copied) path(el element) (string, error) {
 }
 
 // place copies source over the program path, and does so only when the build
-// recorded beside that path is not this one: re-converging a settled system
+// recorded for that path is not this one: re-converging a settled system
 // reads one small file, rewrites nothing, and leaves the inode launchd already
 // knows alone. The executable is written before its build record, so a crash
 // between the two leaves a record naming the old build and the next place
@@ -167,7 +168,8 @@ func (c copied) place(el element) (bool, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return false, fmt.Errorf("daemonkit: create program dir %q: %w", dir, err)
 	}
-	held, err := placedBuild(target)
+	record := filepath.Join(filepath.Dir(dir), "builds", el.label)
+	held, err := placedBuild(target, record)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return false, fmt.Errorf("daemonkit: read program %q: %w", target, err)
 	}
@@ -181,7 +183,10 @@ func (c copied) place(el element) (bool, error) {
 	if err := durable.WriteFile(target, data, 0o700); err != nil {
 		return false, fmt.Errorf("daemonkit: place %q at %q: %w", c.source, target, err)
 	}
-	if err := durable.WriteFile(buildRecord(target), []byte(c.version), 0o600); err != nil {
+	if err := os.MkdirAll(filepath.Dir(record), 0o700); err != nil {
+		return false, fmt.Errorf("daemonkit: create build record dir: %w", err)
+	}
+	if err := durable.WriteFile(record, []byte(c.version), 0o600); err != nil {
 		return false, fmt.Errorf("daemonkit: record the build placed at %q: %w", target, err)
 	}
 	return true, nil
@@ -210,11 +215,12 @@ func (b bundled) path(element) (string, error) { return b.file, nil }
 
 func (b bundled) place(element) (bool, error) { return false, nil }
 
-// placedBuild is the build recorded beside path, and empty when path itself is
-// not a regular file: a program path that outlives every upgrade is a name a
-// writer can point somewhere else, and anything but a regular file holds none
-// of the bytes this build placed, so the rename replaces it.
-func placedBuild(path string) (string, error) {
+// placedBuild is the build recorded for the program at path, and empty when
+// path itself is not a regular file: a program path that outlives every
+// upgrade is a name a writer can point somewhere else, and anything but a
+// regular file holds none of the bytes this build placed, so the rename
+// replaces it.
+func placedBuild(path, record string) (string, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
 		return "", err
@@ -222,11 +228,9 @@ func placedBuild(path string) (string, error) {
 	if !info.Mode().IsRegular() {
 		return "", nil
 	}
-	data, err := os.ReadFile(buildRecord(path))
+	data, err := os.ReadFile(record)
 	if err != nil {
 		return "", err
 	}
 	return string(data), nil
 }
-
-func buildRecord(path string) string { return path + ".build" }

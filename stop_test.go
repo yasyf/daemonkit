@@ -22,9 +22,9 @@ func TestStopRequiresDeadline(t *testing.T) {
 // any install ran.
 func neverPlacedDaemon(t *testing.T, label Label) (Daemon, string) {
 	t.Helper()
-	program, err := Stable()
+	program, err := Stable(testBuild)
 	if err != nil {
-		t.Fatalf("Stable() error = %v", err)
+		t.Fatalf("Stable(testBuild) error = %v", err)
 	}
 	d := Daemon{Label: label, Program: program}
 	return d, programPath(t, d)

@@ -62,6 +62,7 @@ func TestServeRefusesOversizedReport(t *testing.T) {
 	shortHome(t)
 	d := Daemon{
 		Label:    "dkdetail",
+		Program:  testProgram,
 		Schemas:  []Schema{"test.v1"},
 		Shutdown: Grace(5 * time.Second),
 		MaxFrame: Bytes(16 << 10),
@@ -79,7 +80,7 @@ func TestServeRefusesOversizedReport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Socket: %v", err)
 	}
-	session := awaitControlSession(t, socket)
+	session := awaitSession(t, socket)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := session.WaitReady(ctx); err != nil {

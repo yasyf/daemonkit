@@ -28,6 +28,9 @@ func (l serviceLayer) removeService(ctx context.Context, label string) error {
 	return launchd.Remove(ctx, l.launchctl, label)
 }
 
+// reachService is nil: launchd is always there to start the next daemon.
+func (serviceLayer) reachService(context.Context, service) error { return nil }
+
 // AgentPath is the PATH every daemonkit LaunchAgent runs under. launchd's own
 // default omits the Homebrew prefixes, so a daemon that execs `git` reaches the
 // Xcode shim at /usr/bin/git, which re-execs Xcode's binary and pays a second

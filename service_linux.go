@@ -28,6 +28,14 @@ func (serviceLayer) removeService(ctx context.Context, label string) error {
 	return supervise.Remove(ctx, label)
 }
 
+// reachService refuses with supervise.ErrNoSupervisor when no supervisor
+// answers for the service: replacing a running daemon needs one there to
+// start the next.
+func (serviceLayer) reachService(ctx context.Context, agent service) error {
+	_, err := supervise.Verify(ctx, agent)
+	return err
+}
+
 // agent is the supervised service that runs this daemon. Every field is
 // already on the Daemon, so nothing about the service is declared twice; an
 // unset Log sinks to the state directory's daemon.log. The service inherits

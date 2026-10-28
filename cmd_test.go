@@ -16,7 +16,7 @@ func TestCmdBoundaryRefusals(t *testing.T) {
 		{
 			name: "empty path",
 			verb: "Run",
-			cmd:  Cmd{Exec: ServingSameUser()},
+			cmd:  Cmd{},
 			want: "Cmd.Path is required",
 		},
 		{
@@ -36,12 +36,6 @@ func TestCmdBoundaryRefusals(t *testing.T) {
 			verb: "Run",
 			cmd:  Cmd{Path: "/bin/echo", Dir: "rel"},
 			want: "Cmd.Dir",
-		},
-		{
-			name: "unstated exec posture",
-			verb: "Run",
-			cmd:  Cmd{Path: "/bin/echo"},
-			want: "requires a stated Cmd.Exec posture",
 		},
 		{
 			name:    "channel out of range",

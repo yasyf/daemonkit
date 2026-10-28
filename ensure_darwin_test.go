@@ -204,9 +204,9 @@ func TestEnsurePlacesTheProgramOnlyUnderTheStartLock(t *testing.T) {
 	}
 	defer func() { _ = held.Close() }()
 
-	program, err := Stable()
+	program, err := Stable(testBuild)
 	if err != nil {
-		t.Fatalf("Stable() error = %v", err)
+		t.Fatalf("Stable(testBuild) error = %v", err)
 	}
 	client := openClient(t, Daemon{Label: label, Program: program})
 	client.launchctl = (&launchctlRecorder{}).run

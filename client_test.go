@@ -10,11 +10,9 @@ import (
 	"github.com/yasyf/daemonkit/internal/proc"
 )
 
-// openClient states the same-user posture a test daemon takes and fails the
-// test on a Daemon Open refuses.
+// openClient fails the test on a Daemon Open refuses.
 func openClient(t *testing.T, d Daemon) *Client {
 	t.Helper()
-	d.Trust.Serving = ServingSameUser()
 	client, err := Open(d)
 	if err != nil {
 		t.Fatalf("Open() = %v", err)

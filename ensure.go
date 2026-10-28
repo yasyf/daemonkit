@@ -163,6 +163,9 @@ func (c *Client) ensureOnce(ctx context.Context, want string, agent service, rep
 	if action == ActionNothing && !replaced {
 		return Ensured{Before: before, Did: ActionNothing, After: before}, nil
 	}
+	if err := c.reachService(ctx, agent); err != nil {
+		return Ensured{}, err
+	}
 	switch {
 	case world.Serving():
 		if action == ActionNothing {

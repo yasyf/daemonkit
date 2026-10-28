@@ -59,8 +59,6 @@ func TestDaemonValidateForServe(t *testing.T) {
 		{"negative handshake", Daemon{Label: "x", Handshake: Grace(-1)}, "Handshake"},
 		{"saturated idle", Daemon{Label: "x", Idle: Grace(math.MaxInt64)}, "Idle"},
 		{"negative idle", Daemon{Label: "x", Idle: Grace(-1)}, "Idle"},
-		{"nil business set", Daemon{Label: "x"}, ""},
-		{"business set stated but empty", Daemon{Label: "x", Trust: Trust{Business: Requirements{}}}, "Trust.Business"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -78,24 +76,19 @@ func TestDaemonValidateForServe(t *testing.T) {
 	}
 }
 
-// TestDaemonValidateForClient is Open's whole config boundary. The unstated
-// Trust.Serving is the one this type exists to delete: a nil requirement used
-// to read as the floor alone, so a caller that never decided got the posture a
-// socket squatter clears, silently.
+// TestDaemonValidateForClient is Open's whole config boundary.
 func TestDaemonValidateForClient(t *testing.T) {
-	stated := Trust{Serving: ServingSameUser()}
 	tests := []struct {
 		name    string
 		d       Daemon
 		wantErr string
 	}{
-		{"same-user waiver", Daemon{Label: "x", Trust: stated}, ""},
-		{"unstated serving", Daemon{Label: "x"}, "Trust.Serving"},
-		{"no label", Daemon{Trust: stated}, "not canonical"},
-		{"label escaping the state root", Daemon{Label: "../../evil", Trust: stated}, "not canonical"},
-		{"overlong shutdown", Daemon{Label: "x", Trust: stated, Shutdown: Grace(24*time.Hour + 1)}, "Shutdown"},
-		{"negative shutdown", Daemon{Label: "x", Trust: stated, Shutdown: Grace(-time.Second)}, "Shutdown"},
-		{"handshake is the serving half", Daemon{Label: "x", Trust: stated, Handshake: Grace(math.MaxInt64)}, ""},
+		{"label alone", Daemon{Label: "x"}, ""},
+		{"no label", Daemon{}, "not canonical"},
+		{"label escaping the state root", Daemon{Label: "../../evil"}, "not canonical"},
+		{"overlong shutdown", Daemon{Label: "x", Shutdown: Grace(24*time.Hour + 1)}, "Shutdown"},
+		{"negative shutdown", Daemon{Label: "x", Shutdown: Grace(-time.Second)}, "Shutdown"},
+		{"handshake is the serving half", Daemon{Label: "x", Handshake: Grace(math.MaxInt64)}, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

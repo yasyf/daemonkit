@@ -541,10 +541,10 @@ func TestUndispatchedReadsTheTransportsOwnOutcome(t *testing.T) {
 	}{
 		{"nil", nil, false},
 		{"a foreign error proves nothing", errors.New("something"), false},
-		{"a bare sentinel proves nothing", ErrUntrusted, false},
+		{"a bare sentinel proves nothing", ErrProtocolMismatch, false},
 		{"a bare sentinel the lane does return proves nothing", ErrLaneClosed, false},
 		{"never written", refused(ErrAbsent), true},
-		{"an untrusted peer no byte reached", refused(ErrUntrusted), true},
+		{"a foreign protocol no byte reached", refused(ErrProtocolMismatch), true},
 		{"rejected", &callError{outcome: wire.Rejected, err: ErrNotReady}, true},
 		{"delivered", &callError{outcome: wire.Delivered, err: &ProductError{Message: "no"}}, false},
 		{"sent, no terminal", &callError{outcome: wire.PostSendFailure, err: errors.New("lost")}, false},

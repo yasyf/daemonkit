@@ -2,6 +2,8 @@ package daemonkit
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -46,34 +48,6 @@ func TestWaitReadyRequiresDeadline(t *testing.T) {
 	client := openClient(t, Daemon{Label: "com.example.ensure"})
 	if _, err := client.WaitReady(context.Background()); err == nil {
 		t.Fatal("WaitReady() without a deadline succeeded")
-	}
-	control := &Control{}
-	if _, err := control.WaitReady(context.Background()); err == nil {
-		t.Fatal("Control.WaitReady() without a deadline succeeded")
-	}
-}
-
-// TestProgramBuildIsTheContentDigestServePublishes pins the launcher's half of
-// every upgrade comparison to the daemon's. Ensure wants the build the Program
-// carries and the daemon publishes buildDigest of its own executable, so the
-// two are the same function of the same bytes or no decision between them can
-// ever come out equal.
-func TestProgramBuildIsTheContentDigestServePublishes(t *testing.T) {
-	t.Setenv(realhome.EnvOverride, t.TempDir())
-	program, err := Stable()
-	if err != nil {
-		t.Fatalf("Stable() error = %v", err)
-	}
-	carried, err := program.build()
-	if err != nil {
-		t.Fatalf("build() error = %v", err)
-	}
-	published, err := buildDigest()
-	if err != nil {
-		t.Fatalf("buildDigest() error = %v", err)
-	}
-	if carried != published {
-		t.Fatalf("Program.build = %q, the daemon publishes %q", carried, published)
 	}
 }
 
@@ -128,7 +102,7 @@ func TestLabelIsRefusedUnlessLaunchdWouldAcceptIt(t *testing.T) {
 // must not do: it names an escaped path and reads nothing at it.
 func TestNoPathIsJoinedFromALabelLaunchdWouldRefuse(t *testing.T) {
 	root := escapeRoot(t)
-	program, err := Stable()
+	program, err := Stable(testBuild)
 	if err != nil {
 		t.Fatalf("Stable() error = %v", err)
 	}
@@ -230,7 +204,8 @@ func treeOf(t *testing.T, root string) map[string]string {
 			if err != nil {
 				return err
 			}
-			tree[rel] = info.Mode().String() + " " + digest(data)
+			sum := sha256.Sum256(data)
+			tree[rel] = info.Mode().String() + " " + hex.EncodeToString(sum[:])
 		}
 		return nil
 	})
@@ -521,7 +496,7 @@ func TestInventoryClearQueriesTheProgramPathAlone(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv(realhome.EnvOverride, home)
 	label := Label("com.example.mine")
-	program, err := Stable()
+	program, err := Stable(testBuild)
 	if err != nil {
 		t.Fatalf("Stable() error = %v", err)
 	}
@@ -913,8 +888,7 @@ func servedReport(phase wire.Phase, build string, generation uint64) wire.Health
 	}
 }
 
-func TestMovedNamesTheRacesEnsureReObserves(t *testing.T) {
-	control := &Control{pinned: proc.Identity{PID: 11}, generation: 7}
+func TestMovedNamesTheRaceEnsureReObserves(t *testing.T) {
 	tests := []struct {
 		name string
 		err  error
@@ -923,10 +897,9 @@ func TestMovedNamesTheRacesEnsureReObserves(t *testing.T) {
 		{name: "nothing went wrong", err: nil},
 		{name: "the expectation disagreed", err: ErrWrongIncumbent, want: true},
 		{name: "a wrapped expectation disagreed", err: fmt.Errorf("drain: %w", ErrWrongIncumbent), want: true},
-		{name: "the pinned peer moved", err: control.pinnedBy(servedReport(wire.PhaseReady, "b", 9)), want: true},
 		{name: "nothing is listening", err: ErrAbsent},
 		{name: "the incumbent did not leave", err: ErrUnsettled},
-		{name: "the peer is untrusted", err: ErrUntrusted},
+		{name: "the peer speaks another protocol", err: ErrProtocolMismatch},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
