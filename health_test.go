@@ -8,6 +8,7 @@ import (
 
 	"github.com/yasyf/daemonkit/internal/wire"
 	"github.com/yasyf/daemonkit/paths"
+	"github.com/yasyf/daemonkit/version"
 )
 
 func TestPhaseFromWire(t *testing.T) {
@@ -120,5 +121,34 @@ func TestServeRefusesOversizedReport(t *testing.T) {
 		}
 	case <-time.After(20 * time.Second):
 		t.Fatal("Serve did not return after the drain verb")
+	}
+}
+
+func TestServeWithoutProgramPublishesTheRunningBuild(t *testing.T) {
+	shortHome(t)
+	d := Daemon{Label: "dknoprog", Schemas: []Schema{"test.v1"}, Shutdown: Grace(5 * time.Second)}
+	done := serveInBackground(context.Background(), t, d, func(Ctx) (Product, error) { return &stubProduct{}, nil })
+	socket, err := paths.Socket("dknoprog")
+	if err != nil {
+		t.Fatalf("Socket: %v", err)
+	}
+	session := awaitSession(t, socket)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := session.WaitReady(ctx); err != nil {
+		t.Fatalf("WaitReady() = %v", err)
+	}
+	report, err := session.Health(ctx)
+	if err != nil {
+		t.Fatalf("Health() = %v", err)
+	}
+	if want := version.Running("dev"); report.Build != want {
+		t.Fatalf("Build = %q, want the running build %q", report.Build, want)
+	}
+	if _, err := session.Drain(ctx); err != nil {
+		t.Fatalf("Drain() = %v", err)
+	}
+	if out := <-done; out.err != nil {
+		t.Fatalf("Serve() = %v", out.err)
 	}
 }

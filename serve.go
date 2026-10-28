@@ -15,6 +15,7 @@ import (
 	"github.com/yasyf/daemonkit/durable"
 	"github.com/yasyf/daemonkit/internal/proc"
 	"github.com/yasyf/daemonkit/internal/wire"
+	"github.com/yasyf/daemonkit/version"
 )
 
 // Start builds the product once ownership is proven. Its return IS readiness.
@@ -161,6 +162,10 @@ var drainSignals = []os.Signal{syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP}
 // own goroutine and ends by cancelling the serve context it handed the wire
 // server, so the accept park unblocks, Serve returns, and the process exits
 // by itself. No signal is sent and launchd does nothing on the happy path.
+//
+// Health publishes the Program's build. A Daemon with no Program, such as an
+// in-process daemon nothing Ensures, publishes version.Running's build for
+// the serving executable.
 func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 	if err := d.ValidateForServe(); err != nil {
 		return Drained{}, err
@@ -183,9 +188,11 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 	if err := el.state().EnsureStateDir(); err != nil {
 		return Drained{}, fmt.Errorf("daemonkit: create state dir: %w", err)
 	}
-	build, err := d.Program.build()
-	if err != nil {
-		return Drained{}, err
+	build := version.Running("dev")
+	if d.Program.policy != nil {
+		if build, err = d.Program.build(); err != nil {
+			return Drained{}, err
+		}
 	}
 	if err := probeIncumbent(socket); err != nil {
 		return Drained{}, err
