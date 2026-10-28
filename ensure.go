@@ -54,8 +54,8 @@ type Ensured struct {
 // Program, ready and serving, and reports what that took.
 //
 // The ladder is fixed and every step observes rather than assumes. The state
-// directory's start lock serializes concurrent Ensures. Placement is the first
-// step under it: a Program whose policy is a copy of the invoking executable
+// directory's start lock serializes concurrent Ensures. Past the current-build
+// check below, placement is the first step under it: a Program whose policy is a copy of the invoking executable
 // gets those bytes put at the path the plist names, idempotently, before
 // anything is observed. It happens here rather than at construction because it
 // replaces the file launchd is currently executing, which is a transition of
@@ -65,6 +65,15 @@ type Ensured struct {
 // that did replace those bytes never reports ActionNothing: the process running
 // is not the one the new bytes produce, so it restarts rather than answering
 // from a report the old image wrote.
+//
+// On darwin, before placement, Ensure asks the running daemon over its control lane, on a
+// quarter of the budget, which build it serves. An incumbent the attach trusts
+// that reports the wanted build, ready, ends Ensure there with ActionNothing:
+// the placed bytes are not re-hashed and launchd is not consulted. A replaced
+// executable or a drifted LaunchAgent under a current daemon is therefore
+// repaired by the next Ensure that finds a different build or nothing serving,
+// not by this one. No answer, any other build, or any other phase falls
+// through to the full ladder below on what the budget has left.
 //
 // The world is re-derived from the socket, the durable owner record, and
 // launchd's own view of the LaunchAgent — never from stored intent. A pure
@@ -120,6 +129,9 @@ func (c *Client) Ensure(ctx context.Context) (Ensured, error) {
 		return Ensured{}, fmt.Errorf("daemonkit: serialize ensure: %w", err)
 	}
 	defer func() { _ = lock.Close() }()
+	if current, ok := c.current(ctx, want); ok {
+		return Ensured{Before: current, Did: ActionNothing, After: current}, nil
+	}
 	replaced, err := c.daemon.Program.place(el)
 	if err != nil {
 		return Ensured{}, err

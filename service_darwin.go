@@ -44,6 +44,20 @@ func (c *Client) observeWorld(ctx context.Context, agent launchd.Agent) (converg
 	})
 }
 
+const currentShare = 0.25
+
+func (c *Client) current(ctx context.Context, want string) (Health, bool) {
+	probeCtx, cancel := Grace(left(ctx)).mint("ensure").Share("current", currentShare).Context(ctx)
+	defer cancel()
+	report, _, err := c.servedHealth(probeCtx)
+	if err != nil || probeCtx.Err() != nil {
+		return Health{}, false
+	}
+	health := healthFromReport(report)
+	action, err := decide(health, want)
+	return health, err == nil && action == ActionNothing
+}
+
 // AgentPath is the PATH every daemonkit LaunchAgent runs under. launchd's own
 // default omits the Homebrew prefixes, so a daemon that execs `git` reaches the
 // Xcode shim at /usr/bin/git, which re-execs Xcode's binary and pays a second

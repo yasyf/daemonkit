@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -219,6 +220,62 @@ func TestEnsurePlacesTheProgramOnlyUnderTheStartLock(t *testing.T) {
 	target := programPath(t, client.daemon)
 	if _, err := os.Stat(target); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("the program was placed at %q while another launcher held the start lock (stat: %v)", target, err)
+	}
+}
+
+func TestEnsureTrustsACurrentIncumbentWithoutPlacingOrAskingLaunchd(t *testing.T) {
+	ladderHome(t)
+	program, err := Stable()
+	if err != nil {
+		t.Fatalf("Stable() error = %v", err)
+	}
+	d := Daemon{Label: "dkfast", Program: program, Schemas: []Schema{"test.v1"}, Shutdown: Grace(5 * time.Second)}
+	child := startControlChild(t, string(d.Label))
+	client := openClient(t, d)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	_ = awaitControl(ctx, t, client).Close(ctx)
+	recorder := &launchctlRecorder{}
+	client.launchctl = recorder.run
+
+	ensured, err := client.Ensure(ctx)
+	if err != nil {
+		t.Fatalf("Ensure() = %v", err)
+	}
+	if ensured.Did != ActionNothing || ensured.After.PID != child.Process.Pid {
+		t.Fatalf("Ensure() = %+v, want ActionNothing on the running child %d", ensured, child.Process.Pid)
+	}
+	if len(recorder.verbs) != 0 {
+		t.Fatalf("launchctl verbs = %v, want none", recorder.verbs)
+	}
+	target := programPath(t, client.daemon)
+	if _, err := os.Stat(target); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Ensure placed %q under a current incumbent (stat: %v)", target, err)
+	}
+}
+
+func TestEnsureRunsTheFullLadderWhenTheIncumbentIsAnotherBuild(t *testing.T) {
+	ladderHome(t)
+	other := filepath.Join(realPath(t, t.TempDir()), "other")
+	if err := os.WriteFile(other, []byte("another build"), 0o700); err != nil {
+		t.Fatalf("write other program: %v", err)
+	}
+	d := Daemon{Label: "dkstale", Program: Program{policy: bundled{file: other}}, Schemas: []Schema{"test.v1"}, Shutdown: Grace(5 * time.Second)}
+	startControlChild(t, string(d.Label))
+	client := openClient(t, d)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	_ = awaitControl(ctx, t, client).Close(ctx)
+	recorder := &launchctlRecorder{}
+	client.launchctl = recorder.run
+
+	ensureCtx, cancelEnsure := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelEnsure()
+	if _, err := client.Ensure(ensureCtx); err == nil {
+		t.Fatal("Ensure() succeeded though the recorder starts no daemon")
+	}
+	if !slices.Contains(recorder.verbs, "bootstrap") {
+		t.Fatalf("launchctl verbs = %v, want the full ladder's bootstrap", recorder.verbs)
 	}
 }
 

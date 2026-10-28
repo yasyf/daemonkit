@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- On macOS, `Ensure` first asks the running daemon over its control lane
+  which build it serves. When the trusted incumbent reports the wanted build
+  and is ready, `Ensure` returns `ActionNothing` without re-hashing the placed
+  executable or running `launchctl print`, which saves about 30 ms per call. A
+  replaced placed copy or a drifted LaunchAgent under a current daemon is
+  repaired by the next `Ensure` that finds another build or nothing serving.
+  Any other answer, or none within a quarter of the budget, runs the full
+  ladder. Linux keeps the full ladder, so its supervisor check still runs on
+  every call.
+
 ### Security
 
 - Builds with Go 1.26.10, which fixes GO-2026-6809 in `crypto/x509`.

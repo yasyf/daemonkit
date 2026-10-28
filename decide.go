@@ -11,8 +11,8 @@ type Action uint8
 
 const (
 	actionInvalid Action = iota
-	// ActionNothing means the wanted build was already serving and ready, and
-	// its LaunchAgent was already exactly applied.
+	// ActionNothing means the wanted build was already serving and ready, so
+	// nothing was evicted, placed, or applied.
 	ActionNothing
 	// ActionStarted means nothing was serving and the daemon was started.
 	ActionStarted

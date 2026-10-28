@@ -588,7 +588,8 @@ expiry names its `Stage` in `Abandoned`.
 
 ### 5.2 `Ensure` — the seven-step ladder, shipped once
 
-lock (two `Ensure`s serialize) → observe `Health` → **decide** — a pure function
+lock (two `Ensure`s serialize) → ask the incumbent over the control lane, and stop with
+`ActionNothing` when it serves the wanted build, ready → place → observe `Health` → **decide** — a pure function
 `(Health, Daemon) Action`, cc-interact's `runtimeAction` (`launcher.go:212-240`) promoted
 verbatim: newer-build refusal, incomplete-identity refusal, upgrade, drain-observe,
 failed→restart, healthy→noop; I/O-free and table-testable → `launchd.Converge` → when required:

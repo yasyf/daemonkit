@@ -48,6 +48,8 @@ func (c *Client) observeWorld(ctx context.Context, agent service) (converge.Worl
 // unset Log sinks to the state directory's daemon.log. The service inherits
 // its supervisor's environment, PATH included: on linux the workspace that
 // owns the supervisor owns that environment too.
+func (*Client) current(context.Context, string) (Health, bool) { return Health{}, false }
+
 func (d Daemon) agent() (service, error) {
 	el, err := d.Label.element()
 	if err != nil {
