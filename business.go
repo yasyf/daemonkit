@@ -364,7 +364,7 @@ func sleepUntil(ctx context.Context, d time.Duration) bool {
 	defer timer.Stop()
 	select {
 	case <-timer.C:
-		return true
+		return ctx.Err() == nil
 	case <-ctx.Done():
 		return false
 	}
