@@ -159,7 +159,9 @@ func (c copied) path(el element) (string, error) {
 // reads one small file, rewrites nothing, and leaves the inode launchd already
 // knows alone. The old record is removed before the executable is replaced and
 // the new one written after, so a crash anywhere between leaves no record and
-// the next place copies again.
+// the next place copies again. The copy keeps the source's modification time,
+// so a dev build that version.Running keys by mtime names the same build from
+// either path.
 func (c copied) place(el element) (bool, error) {
 	target, err := c.path(el)
 	if err != nil {
@@ -177,6 +179,10 @@ func (c copied) place(el element) (bool, error) {
 	if held == c.version {
 		return false, nil
 	}
+	info, err := os.Stat(c.source)
+	if err != nil {
+		return false, fmt.Errorf("daemonkit: stat executable %q: %w", c.source, err)
+	}
 	data, err := os.ReadFile(c.source)
 	if err != nil {
 		return false, fmt.Errorf("daemonkit: read executable %q: %w", c.source, err)
@@ -189,6 +195,9 @@ func (c copied) place(el element) (bool, error) {
 	}
 	if err := durable.WriteFile(target, data, 0o700); err != nil {
 		return false, fmt.Errorf("daemonkit: place %q at %q: %w", c.source, target, err)
+	}
+	if err := os.Chtimes(target, info.ModTime(), info.ModTime()); err != nil {
+		return false, fmt.Errorf("daemonkit: carry %q's modification time to %q: %w", c.source, target, err)
 	}
 	if err := durable.WriteFile(record, []byte(c.version), 0o600); err != nil {
 		return false, fmt.Errorf("daemonkit: record the build placed at %q: %w", target, err)
