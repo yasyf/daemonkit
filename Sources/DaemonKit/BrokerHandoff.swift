@@ -486,10 +486,7 @@ public final class BrokerSocketBridge: @unchecked Sendable {
 
     private func reclaimStaleSocket() throws {
         guard access(path, F_OK) == 0 else { return }
-        guard let observed = socketNode() else {
-            throw SocketServerError.addressInUse(path: path)
-        }
-        guard unlinkIfOwned(observed) else {
+        guard let observed = socketNode(), unlinkIfOwned(observed) else {
             throw SocketServerError.addressInUse(path: path)
         }
     }

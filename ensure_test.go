@@ -544,7 +544,11 @@ func TestInventoryClearQueriesTheProgramPathAlone(t *testing.T) {
 // process table reports it under that exact path.
 func live(t *testing.T, program string) *exec.Cmd {
 	t.Helper()
-	body, err := os.ReadFile("/bin/sleep")
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(self)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -552,7 +556,8 @@ func live(t *testing.T, program string) *exec.Cmd {
 		t.Fatal(err)
 	}
 	signRunnable(t, program)
-	child := exec.Command(program, "600")
+	child := exec.Command(program)
+	child.Env = append(os.Environ(), childRoleEnv+"=sleep")
 	if err := child.Start(); err != nil {
 		t.Fatalf("start %q: %v", program, err)
 	}
