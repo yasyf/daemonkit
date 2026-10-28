@@ -2,8 +2,6 @@ package daemonkit
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -16,7 +14,6 @@ import (
 
 	"github.com/yasyf/daemonkit/durable"
 	"github.com/yasyf/daemonkit/internal/proc"
-	"github.com/yasyf/daemonkit/internal/trust"
 	"github.com/yasyf/daemonkit/internal/wire"
 )
 
@@ -44,7 +41,7 @@ type Ctx struct {
 
 	// adoptMinted and adoptHandoff are the serving wire server's admission
 	// entries, set only by Serve; ServeChannel refuses without them.
-	adoptMinted  func(*net.UnixConn, trust.Peer, []byte) error
+	adoptMinted  func(*net.UnixConn, proc.Peer, []byte) error
 	adoptHandoff func(*net.UnixConn) error
 }
 
@@ -159,7 +156,7 @@ var drainSignals = []os.Signal{syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP}
 // drain → release. The steps are not callable, so they cannot be reordered,
 // skipped, or claimed twice, and recovery cannot precede singleton ownership.
 //
-// The drain — triggered by ctx, a signal, Ctx.Stop, Control.Drain, or the
+// The drain — triggered by ctx, a signal, Ctx.Stop, Client.Drain, or the
 // wire verb: one path, five triggers — runs the Shutdown ladder on Serve's
 // own goroutine and ends by cancelling the serve context it handed the wire
 // server, so the accept park unblocks, Serve returns, and the process exits
@@ -186,7 +183,7 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 	if err := el.state().EnsureStateDir(); err != nil {
 		return Drained{}, fmt.Errorf("daemonkit: create state dir: %w", err)
 	}
-	build, err := buildDigest()
+	build, err := d.Program.build()
 	if err != nil {
 		return Drained{}, err
 	}
@@ -228,7 +225,6 @@ func Serve(ctx context.Context, d Daemon, start Start) (Drained, error) {
 	rt := newServeRuntime(int(MaxDetail(d.MaxFrame)))
 	server, err := wire.NewServer(rt, wire.Config{
 		Schemas:     d.wireSchemas(),
-		Trust:       wire.Trust{Control: wireRequirement(d.Trust.Control), Business: wireRequirements(d.Trust.Business)},
 		Concurrency: d.Concurrency,
 		MaxFrame:    int(d.MaxFrame),
 		Handshake:   time.Duration(d.Handshake),
@@ -457,72 +453,6 @@ func probeIncumbent(socket string) error {
 		return fmt.Errorf("daemonkit: probe incumbent listener: %w", err)
 	}
 	return nil
-}
-
-// buildDigest re-reads the path this process was executed from, and carries a
-// documented residual: a replace landing between execve and this read has the
-// daemon publish and record the replacement's build while running the old
-// code. Ensure's placement is serialized by the start lock and evicts whatever
-// is serving first, so the triggering agent is an out-of-band replace — a
-// package manager bypassing deploy's sealed supersession — racing a launchd
-// restart, a window of microseconds at daemon start. Against a copied Program
-// the next Ensure evicts; against a bundled one bundled.build re-reads the
-// same replaced path, agrees with the record, and every later Ensure decides
-// ActionNothing — silent forever. Nothing reachable from the path can close
-// it. The fix is digesting the running image: a CS_OPS_CDHASH self-read
-// beside internal/trust's peer path, with the owner record carrying cdhash
-// alongside sha256 for one release cycle — build identity is
-// record-schema-visible, so that is a v0.22+ change riding the soak gate.
-func buildDigest() (string, error) {
-	exe, err := os.Executable()
-	if err != nil {
-		return "", fmt.Errorf("daemonkit: resolve current executable: %w", err)
-	}
-	data, err := os.ReadFile(exe)
-	if err != nil {
-		return "", fmt.Errorf("daemonkit: read executable %q: %w", exe, err)
-	}
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:]), nil
-}
-
-func wireRequirement(r *Requirement) *trust.Requirement {
-	if r == nil {
-		return nil
-	}
-	requirement := wiredRequirement(*r)
-	return &requirement
-}
-
-func wireRequirements(rs Requirements) []trust.Requirement {
-	if rs == nil {
-		return nil
-	}
-	wired := make([]trust.Requirement, len(rs))
-	for i, r := range rs {
-		wired[i] = wiredRequirement(r)
-	}
-	return wired
-}
-
-func wiredRequirement(r Requirement) trust.Requirement {
-	requirement := trust.Requirement{
-		TeamID:            r.TeamID,
-		SigningIdentifier: r.SigningIdentifier,
-		RequiredAppGroup:  r.RequiredAppGroup,
-		AllowJIT:          r.AllowJIT,
-	}
-	if len(r.RequiredEntitlements) > 0 {
-		requirement.RequiredEntitlements = make(map[string]trust.EntitlementRequirement, len(r.RequiredEntitlements))
-		for key, entitlement := range r.RequiredEntitlements {
-			requirement.RequiredEntitlements[key] = trust.EntitlementRequirement{
-				Match:   trust.EntitlementMatch(entitlement.Match),
-				Boolean: entitlement.Boolean,
-				String:  entitlement.String,
-			}
-		}
-	}
-	return requirement
 }
 
 // serveRuntime is the wire.Runtime inside Serve: one in-memory phase, the

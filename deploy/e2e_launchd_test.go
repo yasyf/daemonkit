@@ -83,11 +83,10 @@ func newE2EFixture(t *testing.T) *e2eFixture {
 	}
 	deployment, err := Open(Config{
 		App:         app,
-		Requirement: daemonkit.Requirement{TeamID: testTeamID, SigningIdentifier: testSigning},
+		Requirement: Requirement{TeamID: testTeamID, SigningIdentifier: testSigning},
 		Daemon: daemonkit.Daemon{
 			Label:    daemonkit.Label(e2eDaemonLabel),
 			Schemas:  []daemonkit.Schema{"daemonkit.e2e.v1"},
-			Trust:    daemonkit.Trust{Serving: daemonkit.ServingSameUser()},
 			Shutdown: daemonkit.Grace(6 * time.Second),
 		},
 		Agents: []launchd.Agent{agent},

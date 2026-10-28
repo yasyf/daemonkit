@@ -5,7 +5,6 @@ import (
 
 	"github.com/yasyf/daemonkit/internal/maintenance"
 	"github.com/yasyf/daemonkit/internal/proc"
-	"github.com/yasyf/daemonkit/internal/trust"
 	"github.com/yasyf/daemonkit/internal/wire"
 )
 
@@ -37,24 +36,15 @@ var (
 	// ErrNotReady means the daemon is starting; retry in-session.
 	ErrNotReady = errors.New("daemonkit: daemon is starting")
 
-	// ErrUntrusted means the peer failed a lane's trust requirement.
-	ErrUntrusted = errors.New("daemonkit: peer failed trust verification")
-
-	// ErrSessionCapacity means the lane had no free session slot. It is
+	// ErrSessionCapacity means the daemon had no free session slot. It is
 	// transient and says nothing about whether the daemon is installed.
 	ErrSessionCapacity = wire.ErrSessionCapacity
 
-	// ErrPeerGone means the process accepting on the socket ended its
-	// execution generation before verification could finish: the ordinary
-	// daemon-restart race, never a verdict about the peer. It is
-	// internal/trust's own sentinel, so the branch this package already has on
-	// it and any branch a consumer writes are the same identity.
-	ErrPeerGone = trust.ErrPeerGone
-
-	// ErrNoVerifier means a requirement was stated with no code-identity
-	// verifier to run it — a build defect, never a trust verdict. It is
-	// internal/trust's own sentinel, aliased for the same reason.
-	ErrNoVerifier = trust.ErrNoVerifier
+	// ErrProtocolMismatch means the process answering on the socket speaks
+	// another wire protocol: a daemon of another daemonkit era. Nothing can be
+	// read or drained over its session; Ensure and Stop settle it from its
+	// owner record by signal.
+	ErrProtocolMismatch = wire.ErrProtocolVersion
 
 	// ErrOversize means the Call body is larger than the session's MaxFrame
 	// can carry once the envelope is on it. Nothing was written.
@@ -78,12 +68,6 @@ var (
 	// ladder; re-observe with Settle, or leave the record for the next
 	// generation to reclaim.
 	ErrUnsettled = proc.ErrUnsettled
-
-	// errPinMoved means the process answering on a pinned session is no longer
-	// the one the attach pinned: the incumbent was replaced between two reads.
-	// It is unexported because it is nobody's error to handle — Ensure absorbs
-	// it by observing again, exactly as it absorbs ErrWrongIncumbent.
-	errPinMoved = errors.New("daemonkit: pinned incumbent moved")
 
 	// ErrUnrecorded means Settle found no owner record naming an incumbent:
 	// nothing of this daemon ever recorded itself here. Absence is then an

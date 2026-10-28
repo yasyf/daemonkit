@@ -11,7 +11,7 @@ import (
 
 const (
 	// ProtocolVersion is the exact transport version accepted by every peer.
-	ProtocolVersion uint16 = 2
+	ProtocolVersion uint16 = 3
 	// DefaultMaxFrame caps one length-prefixed frame at 4 MiB.
 	DefaultMaxFrame = 4194304
 	frameHeaderSize = 32

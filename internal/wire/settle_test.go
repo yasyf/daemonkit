@@ -110,7 +110,7 @@ func dialBusinessFrame(t *testing.T, sock string, maxFrame int) *wire.Client {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	client, err := wire.NewClient(ctx, wire.ClientConfig{
-		Dial: wire.UnixDialer(sock), Authorize: wiretest.AuthorizeTestServer, Lane: wire.LaneBusiness, Schema: testSchema, MaxFrame: maxFrame,
+		Dial: wire.UnixDialer(sock), Schema: testSchema, MaxFrame: maxFrame,
 	})
 	if err != nil {
 		t.Fatalf("NewClient() = %v", err)

@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yasyf/daemonkit/internal/trust"
+	"github.com/yasyf/daemonkit/internal/proc"
 )
 
 // SpawnedNonceEnv carries the parent-minted attach nonce to a spawned child,
@@ -88,14 +88,10 @@ func RunSpawnedSession(ctx context.Context, config SpawnedSessionConfig) error {
 		_ = conn.Close()
 		return err
 	}
-	peer, err := trust.PeerCredentials(conn)
+	peer, err := proc.PeerCredentials(conn)
 	if err != nil {
 		_ = conn.Close()
 		return fmt.Errorf("wire: identify spawned peer: %w", err)
-	}
-	if err := trust.Verify(peer, nil); err != nil {
-		_ = conn.Close()
-		return fmt.Errorf("wire: verify spawned peer: %w", err)
 	}
 	codec := NewCodec(conn)
 	codec.MaxFrame = server.maxFrame()
@@ -107,10 +103,6 @@ func RunSpawnedSession(ctx context.Context, config SpawnedSessionConfig) error {
 	if err != nil {
 		_ = conn.Close()
 		return err
-	}
-	if hello.Lane != LaneBusiness {
-		_ = conn.Close()
-		return fmt.Errorf("%w: spawned session requires the business lane", ErrHandshake)
 	}
 	if hello.Schema != config.Schema {
 		_ = conn.Close()
@@ -130,18 +122,11 @@ func RunSpawnedSession(ctx context.Context, config SpawnedSessionConfig) error {
 		return err
 	}
 	codec.WriteTimeout = server.writeTimeout()
-	return server.runSession(ctx, conn, codec, LaneBusiness, hello.Schema, peer, generation, func() {})
+	return server.runSession(ctx, conn, codec, hello.Schema, peer, generation, func() {})
 }
 
-// authorizeSpawnedConn is the spawned lane's named Authorize waiver. The lane's
-// property is directional confinement, not peer identity: the conn is the
-// parent's own end of a kernel socketpair, a channel no other process has a
-// path to dial, so there is no accepting peer to judge — the child's nonce
-// check is the fd-mixup defence on the other end.
-func authorizeSpawnedConn(net.Conn) error { return nil }
-
 // NewSpawnedClient attaches the parent end of the handoff socketpair, carrying
-// the minted nonce, and completes the protocol-2 handshake. It verifies no
+// the minted nonce, and completes the protocol-3 handshake. It verifies no
 // peer: credentials read from a self-created socketpair name the creator —
 // the parent itself — so a check here would only ever judge this process.
 // Confinement is directional, by construction of the pair.
@@ -166,8 +151,6 @@ func NewSpawnedClient(ctx context.Context, config SpawnedClientConfig) (*Client,
 	}
 	return NewClient(ctx, ClientConfig{
 		Dial:                    dial,
-		Authorize:               authorizeSpawnedConn,
-		Lane:                    LaneBusiness,
 		Schema:                  config.Schema,
 		Nonce:                   config.Nonce,
 		Concurrency:             config.Limits.Concurrency,

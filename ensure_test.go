@@ -139,7 +139,7 @@ func TestNoPathIsJoinedFromALabelLaunchdWouldRefuse(t *testing.T) {
 		"../daemon", "bin/daemon", "/daemon", "daemon/", "com example", "com.example.daemon\n",
 	} {
 		t.Run(fmt.Sprintf("%q", string(bad)), func(t *testing.T) {
-			daemon := Daemon{Label: bad, Program: program, Trust: Trust{Serving: ServingSameUser()}}
+			daemon := Daemon{Label: bad, Program: program}
 			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 			defer cancel()
 

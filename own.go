@@ -111,8 +111,7 @@ func (o *Owned) Ctx(ctx context.Context) Ctx {
 // verification, streams, termination, settlement — derives from it, with the
 // terminate ladder reserved a tail so settlement is never starved. The
 // RunResult is returned alongside any error; the exit lands in *ExitError,
-// truncation in ErrTruncated, a failed Cmd.Exec verify in ErrUntrusted, and
-// a deadline in an error matching context.DeadlineExceeded. The run's child
+// truncation in ErrTruncated, and a deadline in an error matching context.DeadlineExceeded. The run's child
 // is held for its duration exactly as Spawn's is, so a scope settling under
 // an in-flight Run terminates it: that run returns the bytes collected so
 // far and an *ExitError naming the fatal signal.
@@ -167,15 +166,13 @@ func (o *Owned) Run(ctx context.Context, c Cmd) (RunResult, error) {
 	return out, errors.Join(faults...)
 }
 
-// Spawn starts one long-lived owned child whose record is durable and whose
-// Cmd.Exec posture is proven before its first instruction runs, with channel
-// established and stderr already draining before release — the child can
-// never block on an unwired pipe or race its own recording. The verification
-// order is fixed: spawn suspended, record durably, read the suspended child's
-// kernel-held code identity in place, release only on success; a failed
-// verify aborts through the same path as a failed record and the child never
-// executes an instruction. ctx must carry a deadline; it bounds the record
-// write, the probe, and the verification — never the child's life. stderr
+// Spawn starts one long-lived owned child whose record is durable before its
+// first instruction runs, with channel established and stderr already
+// draining before release — the child can never block on an unwired pipe or
+// race its own recording. The order is fixed: spawn suspended, record
+// durably, release only on success; a failed record aborts and the child
+// never executes an instruction. ctx must carry a deadline; it bounds the
+// record write and the probe — never the child's life. stderr
 // nil goes to /dev/null; the copy runs for the child's whole life and a copy
 // failure surfaces via Child.StderrErr without touching the child.
 //
@@ -200,21 +197,7 @@ func (o *Owned) Spawn(ctx context.Context, c Cmd, channel Channel, stderr io.Wri
 			return nil, fmt.Errorf("daemonkit: mint the handoff attach nonce: %w", err)
 		}
 	}
-	spawnCmd := command(c, channel, nonce)
-	verify := spawnCmd.Verify
-	var token proc.AuditToken
-	spawnCmd.Verify = func(pid int) error {
-		if err := verify(pid); err != nil {
-			return err
-		}
-		minted, err := suspendedToken(pid)
-		if err != nil {
-			return err
-		}
-		token = minted
-		return nil
-	}
-	spawned, err := o.store.Spawn(ctx, spawnCmd, stderr)
+	spawned, err := o.store.Spawn(ctx, command(c, channel, nonce), stderr)
 	if err != nil {
 		if o.store.Policy() == proc.PreserveOwned && errors.Is(err, ErrUnsettled) {
 			o.mu.Lock()
@@ -223,7 +206,7 @@ func (o *Owned) Spawn(ctx context.Context, c Cmd, channel Channel, stderr io.Wri
 		}
 		return nil, err
 	}
-	child := &Child{child: spawned, channel: channel, nonce: nonce, limits: c.Limits, token: token}
+	child := &Child{child: spawned, channel: channel, nonce: nonce, limits: c.Limits}
 	o.hold(res, child)
 	go o.releaseOnExit(child)
 	return child, nil

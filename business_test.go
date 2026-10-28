@@ -512,7 +512,7 @@ func TestBusinessConfigBoundary(t *testing.T) {
 	t.Run("a lane with no schema refuses", func(t *testing.T) {
 		ctx, cancel := deadlined()
 		defer cancel()
-		client, err := Open(Daemon{Label: "com.yasyf.daemonkit.business", Trust: Trust{Serving: ServingSameUser()}})
+		client, err := Open(Daemon{Label: "com.yasyf.daemonkit.business"})
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
@@ -564,7 +564,6 @@ func TestClientBusinessPerformsNoIO(t *testing.T) {
 	client, err := Open(Daemon{
 		Label:   "com.yasyf.daemonkit.business",
 		Schemas: []Schema{businessSchema},
-		Trust:   Trust{Serving: ServingSameUser()},
 	})
 	if err != nil {
 		t.Fatalf("Open: %v", err)

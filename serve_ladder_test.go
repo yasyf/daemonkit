@@ -351,7 +351,7 @@ func awaitBusinessSession(t *testing.T, socket string, maxFrame int) *wire.Clien
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		session, err := wire.NewClient(ctx, wire.ClientConfig{
-			Dial: wire.UnixDialer(socket), Authorize: wiretest.AuthorizeTestServer, Lane: wire.LaneBusiness, Schema: "test.v1", MaxFrame: maxFrame,
+			Dial: wire.UnixDialer(socket), Schema: "test.v1", MaxFrame: maxFrame,
 		})
 		cancel()
 		if err == nil {

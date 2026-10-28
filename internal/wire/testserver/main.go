@@ -19,7 +19,6 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/yasyf/daemonkit/internal/trust"
 	"github.com/yasyf/daemonkit/internal/wire"
 	"github.com/yasyf/daemonkit/internal/wire/wiretest"
 )
@@ -40,8 +39,6 @@ func run() error {
 		return nil
 	})
 	phases := flag.String("phases", "ready", `phase script advanced one step per stdin line: "ready" | "starting,ready" | "ready,draining"`)
-	controlTeam := flag.String("control-team", "", "Trust.Control team identifier")
-	controlIdentifier := flag.String("control-identifier", "", "Trust.Control signing identifier")
 	flag.Parse()
 	if *socket == "" || *schema == "" {
 		return fmt.Errorf("-socket and -schema are required")
@@ -55,11 +52,7 @@ func run() error {
 	rt.SetHandle(handle)
 	rt.SetPhase(script[0], nil)
 
-	cfg := wire.Config{Schemas: append(wire.Schemas{*schema}, accepted...)}
-	if *controlTeam != "" {
-		cfg.Trust.Control = &trust.Requirement{TeamID: *controlTeam, SigningIdentifier: *controlIdentifier}
-	}
-	server, err := wire.NewServer(rt, cfg)
+	server, err := wire.NewServer(rt, wire.Config{Schemas: append(wire.Schemas{*schema}, accepted...)})
 	if err != nil {
 		return err
 	}

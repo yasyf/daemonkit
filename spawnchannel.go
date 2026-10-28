@@ -12,7 +12,6 @@ import (
 	"os"
 
 	"github.com/yasyf/daemonkit/internal/proc"
-	"github.com/yasyf/daemonkit/internal/trust"
 	"github.com/yasyf/daemonkit/internal/wire"
 	"golang.org/x/sys/unix"
 )
@@ -21,9 +20,8 @@ const spawnChannelReasonLimit = 256
 
 // ServeChannel serves a ChannelHandoff child's spawn channel until ctx ends
 // or the child closes it: a mint answers with a fresh socketpair end, the
-// daemon side admitted as a business session pinned to the spawn-proven
-// child; an adopt delivers a child-accepted descriptor into full trust
-// admission. Every request echoes the spawn nonce; the take is the one Conn
+// daemon side admitted as a session whose peer is the spawned child; an adopt
+// delivers a child-accepted descriptor into the daemon's ordinary admission. Every request echoes the spawn nonce; the take is the one Conn
 // and Business share.
 func (c Ctx) ServeChannel(ctx context.Context, child *Child) error {
 	if c.adoptMinted == nil || c.adoptHandoff == nil {
@@ -38,7 +36,7 @@ func (c Ctx) ServeChannel(ctx context.Context, child *Child) error {
 		_ = conn.Close()
 		return fmt.Errorf("daemonkit: the spawn channel is %T, want a unix socketpair end", conn)
 	}
-	peer := trust.Peer{UID: os.Getuid(), Token: child.token}
+	peer := proc.Peer{UID: os.Getuid(), PID: child.PID()}
 	return serveSpawnChannel(ctx, channel, child.nonce, peer, c.adoptMinted, c.adoptHandoff)
 }
 
@@ -46,8 +44,8 @@ func serveSpawnChannel(
 	ctx context.Context,
 	channel *net.UnixConn,
 	spawnNonce []byte,
-	peer trust.Peer,
-	adoptMinted func(*net.UnixConn, trust.Peer, []byte) error,
+	peer proc.Peer,
+	adoptMinted func(*net.UnixConn, proc.Peer, []byte) error,
 	adoptHandoff func(*net.UnixConn) error,
 ) error {
 	defer func() { _ = channel.Close() }()
@@ -94,8 +92,8 @@ func serveSpawnChannel(
 
 func serveSpawnChannelMint(
 	channel *net.UnixConn,
-	peer trust.Peer,
-	adoptMinted func(*net.UnixConn, trust.Peer, []byte) error,
+	peer proc.Peer,
+	adoptMinted func(*net.UnixConn, proc.Peer, []byte) error,
 ) error {
 	nonce := make([]byte, 32)
 	if _, err := rand.Read(nonce); err != nil {

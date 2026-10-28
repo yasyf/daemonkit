@@ -146,9 +146,9 @@ func TestBrokerHandoffAdoptionAndNonceReplayRejection(t *testing.T) {
 	}
 	defer conn.Close()
 	codec := NewCodec(conn)
-	identity, err := clientHandshake(codec, helloIdentity{Protocol: ProtocolVersion, Lane: LaneControl})
+	identity, err := clientHandshake(codec, helloIdentity{Protocol: ProtocolVersion, Schema: "test.v1"})
 	if err != nil {
-		t.Fatalf("control handshake: %v", err)
+		t.Fatalf("handshake: %v", err)
 	}
 	codec.ReadTimeout = 5 * time.Second
 
@@ -164,7 +164,7 @@ func TestBrokerHandoffAdoptionAndNonceReplayRejection(t *testing.T) {
 		}
 		defer keptConn.Close()
 		adoptedCodec := NewCodec(keptConn)
-		_, err = clientHandshake(adoptedCodec, helloIdentity{Protocol: ProtocolVersion, Lane: LaneBusiness, Schema: "test.v1"})
+		_, err = clientHandshake(adoptedCodec, helloIdentity{Protocol: ProtocolVersion, Schema: "test.v1"})
 		adoptedDone <- err
 	}()
 	sendPacketWithRights(t, conn.(*net.UnixConn), handoffPacket(t, 1, nonce), passed)
@@ -184,30 +184,5 @@ func TestBrokerHandoffAdoptionAndNonceReplayRejection(t *testing.T) {
 	}
 	if cause := responseCodeCause(replay.Code); !errors.Is(cause, ErrHandoffReplay) {
 		t.Fatalf("replay cause = %v, want ErrHandoffReplay", cause)
-	}
-}
-
-func TestBusinessLaneCannotInvokeBrokerHandoff(t *testing.T) {
-	server := mustServer(t, stubRuntime{phase: PhaseReady}, Config{Write: 2 * time.Second})
-	sock := startServing(t, server)
-
-	conn, err := net.Dial("unix", sock)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer conn.Close()
-	codec := NewCodec(conn)
-	identity, err := clientHandshake(codec, helloIdentity{Protocol: ProtocolVersion, Lane: LaneBusiness, Schema: "test.v1"})
-	if err != nil {
-		t.Fatalf("business handshake: %v", err)
-	}
-	codec.ReadTimeout = 5 * time.Second
-
-	nonce := make([]byte, brokerHandoffNonceBytes)
-	passed, _ := handoffSocketpair(t)
-	sendPacketWithRights(t, conn.(*net.UnixConn), handoffPacket(t, 1, nonce), passed)
-	response := readControlResponse(t, codec, 1, identity.Session)
-	if !response.Rejected || response.Code != ResponseCodePermissionDenied {
-		t.Fatalf("business handoff response = %+v, want permission_denied rejection", response)
 	}
 }

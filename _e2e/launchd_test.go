@@ -104,7 +104,6 @@ func newLane(t *testing.T, label string, shutdown time.Duration, restart daemonk
 		Program:  program,
 		Args:     []string{home, label},
 		Schemas:  []daemonkit.Schema{"daemonkit.e2e.v1"},
-		Trust:    daemonkit.Trust{Serving: daemonkit.ServingSameUser()},
 		Shutdown: daemonkit.Grace(shutdown),
 		Restart:  restart,
 	}

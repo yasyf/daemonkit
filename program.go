@@ -1,14 +1,13 @@
 package daemonkit
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 
+	"github.com/yasyf/daemonkit/bundle"
 	"github.com/yasyf/daemonkit/durable"
 	"github.com/yasyf/daemonkit/internal/realhome"
 )
@@ -30,12 +29,9 @@ type placement interface {
 	// is written, so the LaunchAgent can be declared and the process table
 	// queried without a placement having run.
 	path(el element) (string, error)
-	// build is the Health.Build the daemon this program becomes will publish,
-	// since Serve digests its own executable. When it is read is the policy's
-	// own answer and not one arm's inherited from the other: a policy that
-	// deploys bytes owes the launcher the ones it deployed and freezes them,
-	// and a policy that deploys nothing owes the launcher whatever is at the
-	// path launchd execs and re-reads it.
+	// build is the Health.Build the daemon this program becomes publishes:
+	// Serve reports its own Program's build, so the launcher and the daemon
+	// read the same answer.
 	build() (string, error)
 	// place makes path hold build's bytes and reports whether that took a
 	// write. Ensure is its only caller and holds the start lock across it.
@@ -43,11 +39,13 @@ type placement interface {
 }
 
 // Stable is the policy for a daemon launchd runs from a copy of the invoking
-// executable, kept at ~/.daemonkit/bin/<Label>. It reads that executable to
-// learn which build it is and places nothing: the copy is Ensure's, made under
-// the start lock, because replacing the file launchd is currently executing is
-// a transition of the live daemon and belongs to the convergence that owns
-// every other one.
+// executable, kept at ~/.daemonkit/bin/<Label>. build is the version string
+// the executable reports for itself, stamped at build time; it is the whole
+// build identity, so a build that should replace a running daemon must carry
+// a different one. Stable reads nothing: the copy is Ensure's, made under the
+// start lock, because replacing the file launchd is currently executing is a
+// transition of the live daemon and belongs to the convergence that owns every
+// other one.
 //
 // The path lies outside any versioned install directory, so a package upgrade
 // that deletes the directory this binary was installed into cannot delete the
@@ -57,16 +55,15 @@ type placement interface {
 // launchd itself enforces unique — so two consumers deploying over each other
 // is not a collision to be detected on a root they share, but a state neither
 // can write down.
-func Stable() (Program, error) {
+func Stable(build string) (Program, error) {
+	if build == "" {
+		return Program{}, errors.New("daemonkit: Stable requires the executable's build version")
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return Program{}, fmt.Errorf("daemonkit: resolve current executable: %w", err)
 	}
-	data, err := os.ReadFile(exe)
-	if err != nil {
-		return Program{}, fmt.Errorf("daemonkit: read executable %q: %w", exe, err)
-	}
-	return Program{policy: copied{source: exe, digest: digest(data)}}, nil
+	return Program{policy: copied{source: exe, version: build}}, nil
 }
 
 // InBundle names an executable inside a signed .app and never copies it: an
@@ -104,7 +101,7 @@ func InBundle(app, rel string) (Program, error) {
 	if within, err := filepath.Rel(root, resolved); err != nil || !filepath.IsLocal(within) {
 		return Program{}, fmt.Errorf("daemonkit: %q does not stay inside %q", rel, app)
 	}
-	return Program{policy: bundled{file: path}}, nil
+	return Program{policy: bundled{app: app, file: path}}, nil
 }
 
 // build is the build Ensure converges on, and the last point at which a Daemon
@@ -138,17 +135,14 @@ func (p Program) query(el element) (string, error) {
 }
 
 // copied runs the daemon from a copy of source, kept at a Label-derived path
-// under the one program root every daemonkit consumer shares.
+// under the one program root every daemonkit consumer shares, with the build
+// it holds recorded beside it.
 type copied struct {
-	source string
-	digest string
+	source  string
+	version string
 }
 
-// build is frozen at construction. The source is this launcher's own
-// executable, so bytes that no longer hash to it mean someone replaced the
-// binary while it was running — an anomaly place refuses out loud, never a new
-// intent to deploy.
-func (c copied) build() (string, error) { return c.digest, nil }
+func (c copied) build() (string, error) { return c.version, nil }
 
 func (c copied) path(el element) (string, error) {
 	home, err := realhome.Dir()
@@ -158,15 +152,12 @@ func (c copied) path(el element) (string, error) {
 	return filepath.Join(home, ".daemonkit", "bin", el.label), nil
 }
 
-// place copies source over the program path, and does so only when that path
-// does not already hold these bytes: re-converging a settled system rewrites
-// nothing and leaves the inode launchd already knows alone.
-//
-// The source is re-read here rather than carried, so a Program held by a
-// long-lived daemon pins no executable image in memory, and the digest the
-// constructor took is what says the two reads saw the same build — an
-// executable replaced under a running launcher is refused rather than deployed
-// as a build nobody asked for.
+// place copies source over the program path, and does so only when the build
+// recorded beside that path is not this one: re-converging a settled system
+// reads one small file, rewrites nothing, and leaves the inode launchd already
+// knows alone. The executable is written before its build record, so a crash
+// between the two leaves a record naming the old build and the next place
+// copies again.
 func (c copied) place(el element) (bool, error) {
 	target, err := c.path(el)
 	if err != nil {
@@ -176,25 +167,22 @@ func (c copied) place(el element) (bool, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return false, fmt.Errorf("daemonkit: create program dir %q: %w", dir, err)
 	}
-	held, err := placedDigest(target)
+	held, err := placedBuild(target)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return false, fmt.Errorf("daemonkit: read program %q: %w", target, err)
 	}
-	if held == c.digest {
+	if held == c.version {
 		return false, nil
 	}
 	data, err := os.ReadFile(c.source)
 	if err != nil {
 		return false, fmt.Errorf("daemonkit: read executable %q: %w", c.source, err)
 	}
-	if placing := digest(data); placing != c.digest {
-		return false, fmt.Errorf(
-			"daemonkit: executable %q is now build %q, this Program was built from %q",
-			c.source, placing, c.digest,
-		)
-	}
 	if err := durable.WriteFile(target, data, 0o700); err != nil {
 		return false, fmt.Errorf("daemonkit: place %q at %q: %w", c.source, target, err)
+	}
+	if err := durable.WriteFile(buildRecord(target), []byte(c.version), 0o600); err != nil {
+		return false, fmt.Errorf("daemonkit: record the build placed at %q: %w", target, err)
 	}
 	return true, nil
 }
@@ -202,43 +190,31 @@ func (c copied) place(el element) (bool, error) {
 // bundled runs the daemon from an executable already in place inside a signed
 // .app: the bundle names the path, so the Label decides nothing, and there is
 // nothing to write.
-type bundled struct{ file string }
+type bundled struct {
+	app  string
+	file string
+}
 
-// build re-reads the bundle every time it is asked, and carries no digest to go
-// stale. Nothing here deploys, so the bytes at file are the ones launchd execs
-// whoever put them there: an .app upgraded under a long-lived Client is the
-// build the daemon already publishes. The freeze copied needs is a launcher's
-// own deployment intent being overwritten by another launcher's copy, which is
-// a hazard of copying.
-//
-// The residual the re-read carries is a daemon launchd restarted at the instant
-// an installer replaced the bundle executable. The process execs the old image
-// while serve.go's buildDigest reads the new bytes off the same path
-// microseconds later, so it publishes and records a build it is not running.
-// This read agrees with that record, decide answers ActionNothing, and Ensure
-// reports converged on a build the daemon does not execute — permanently, since
-// nothing on this policy ever disagrees. copied answers the same interleaving
-// with an eviction it can force; bundled cannot, because daemonkit does not
-// deploy those bytes. Closing it is buildDigest's documented v0.22 residual.
+// build re-reads the bundle's CFBundleShortVersionString every time it is
+// asked, and carries nothing to go stale: an .app upgraded under a long-lived
+// Client is the build the daemon already publishes.
 func (b bundled) build() (string, error) {
-	data, err := os.ReadFile(b.file)
+	version, err := bundle.ShortVersion(b.app)
 	if err != nil {
-		return "", fmt.Errorf("daemonkit: read bundle executable %q: %w", b.file, err)
+		return "", fmt.Errorf("daemonkit: read bundle version of %q: %w", b.app, err)
 	}
-	return digest(data), nil
+	return version, nil
 }
 
 func (b bundled) path(element) (string, error) { return b.file, nil }
 
 func (b bundled) place(element) (bool, error) { return false, nil }
 
-// placedDigest is the digest of the bytes path itself holds, and it does not
-// follow the final component: a program path that outlives every upgrade is a
-// name a same-uid writer can point somewhere else, and reading through that
-// link would answer with the bytes it aims at while launchd execs whatever
-// they are swapped for afterwards. Anything but a regular file holds none of
-// these bytes, so the rename replaces it.
-func placedDigest(path string) (string, error) {
+// placedBuild is the build recorded beside path, and empty when path itself is
+// not a regular file: a program path that outlives every upgrade is a name a
+// writer can point somewhere else, and anything but a regular file holds none
+// of the bytes this build placed, so the rename replaces it.
+func placedBuild(path string) (string, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
 		return "", err
@@ -246,14 +222,11 @@ func placedDigest(path string) (string, error) {
 	if !info.Mode().IsRegular() {
 		return "", nil
 	}
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(buildRecord(path))
 	if err != nil {
 		return "", err
 	}
-	return digest(data), nil
+	return string(data), nil
 }
 
-func digest(data []byte) string {
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
-}
+func buildRecord(path string) string { return path + ".build" }

@@ -164,20 +164,15 @@ func (d *Deployment) stop(ctx context.Context) (daemonkit.Stopped, error) {
 }
 
 func (d *Deployment) drain(ctx context.Context) (daemonkit.Expect, daemonkit.Stopped, error) {
-	control, err := d.client.Control(ctx)
+	health, err := d.client.Health(ctx)
 	switch {
 	case errors.Is(err, daemonkit.ErrDraining), errors.Is(err, daemonkit.ErrAbsent):
 		return d.settle(ctx)
 	case err != nil:
 		return daemonkit.Expect{}, daemonkit.Stopped{}, err
 	}
-	defer func() { _ = control.Close(ctx) }()
-	health, err := control.Health(ctx)
-	if err != nil {
-		return daemonkit.Expect{}, daemonkit.Stopped{}, err
-	}
 	expect := daemonkit.Expect{Build: health.Build, Generation: health.Generation}
-	stopped, err := control.Drain(ctx, expect)
+	stopped, err := d.client.Drain(ctx, expect)
 	return expect, stopped, err
 }
 
@@ -306,10 +301,9 @@ func (d *Deployment) awaitReady(ctx context.Context) (daemonkit.Health, error) {
 	}
 	attachCtx, cancelAttach := attachContext(ctx, grace)
 	defer cancelAttach()
-	control, attachErr := d.client.Control(attachCtx)
+	_, attachErr := d.client.Health(attachCtx)
 	switch {
 	case attachErr == nil:
-		_ = control.Close(attachCtx)
 		return daemonkit.Health{}, fmt.Errorf(
 			"%w: the daemon is listening but published no readiness within the budget", ErrConflict,
 		)
@@ -341,7 +335,7 @@ func attachContext(ctx context.Context, grace time.Duration) (context.Context, c
 
 // unanswered names the wait outcomes that say nothing about the daemon:
 // nothing was listening yet, the incumbent was still leaving, or a clock ran
-// out mid-attach. Every other refusal — an untrusted server, an incomplete
+// out mid-attach. Every other refusal — a foreign protocol, an incomplete
 // pin, a runtime that failed to start — is an answer, and an answer is never
 // asked again.
 func unanswered(err error) bool {

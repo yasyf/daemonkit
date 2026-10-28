@@ -4,12 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"syscall"
 
 	"github.com/yasyf/daemonkit/internal/proc"
-	"github.com/yasyf/daemonkit/internal/trust"
 	"github.com/yasyf/daemonkit/internal/wire"
 )
 
@@ -36,14 +34,12 @@ func (e Expect) mismatch(build string, generation uint64) bool {
 // table, never by a delivered signal or an acked verb.
 //
 // The proof reaches exactly one identity, and only as far as whatever named
-// it: Control judges the process answering for it against Trust.Serving —
-// the floor alone under ServingSameUser, which any same-UID socket squatter
-// clears — and Settle reads its identity out of a same-UID-writable owner
-// record. Neither says anything about orphaned children, a second instance, or
-// a separate app executable. Gating an irreversible action — uninstall,
-// deactivation — on Stopped alone is therefore unsound: state Trust.Serving as
-// ServingSigned and require an executable-scoped inventory of the real process
-// table to be empty besides.
+// it: Drain pins whatever process answers on the socket, and Settle reads its
+// identity out of a writable owner record. Neither says anything about
+// orphaned children, a second instance, or a separate app executable. Gating
+// an irreversible action — uninstall, deactivation — on Stopped alone is
+// therefore unsound: require an executable-scoped inventory of the real
+// process table to be empty besides.
 type Stopped struct {
 	Before Health
 	Reap   Reap
@@ -70,123 +66,85 @@ const (
 	ReapTerminated
 )
 
-// Control is the trust-gated lifecycle lane of one connected daemon, pinned
-// to exactly one kernel process instance. The pin is assembled at attach, in
-// an order that closes the PID-reuse window without a server nonce:
-//
-//  1. the peer PID is read from the connected socket (LOCAL_PEERPID);
-//  2. that PID is probed through the process table for {start, boot};
-//  3. the native health verb is asked on the same session and must answer
-//     PID == the socket-observed PID — a self-attestation only a peer still
-//     alive after the probe can serve, which is what proves the probed
-//     {start, boot} belong to the session's peer and not a reused PID;
-//  4. Health.Generation is captured as the instance pin.
-//
-// Attach refuses on any mismatch, and refuses a pinned PID equal to
-// os.Getpid(). Every subsequent verb re-reads Health on the pinned session
-// and refuses when PID or Generation moved — a replacement on the same
-// socket is a dead session, never a silently retargeted one.
-type Control struct {
-	session    *wire.Client
-	pinned     proc.Identity
-	generation uint64
-	observe    func(proc.Identity) (proc.Reap, bool, error)
-}
-
-// Control attaches the control lane. It exists only past Trust.Control (the
-// same-EUID floor runs regardless and cannot be turned off). ErrAbsent on a
-// proven no-listener; ErrDraining when the incumbent answers with the frozen
-// drain preamble; ErrUntrusted on a trust refusal. Both ErrAbsent and
-// ErrDraining leave settlement to Settle, which needs no session. The lane has
-// one slot, so an attach that finds it held waits for it and returns
-// ErrSessionCapacity only once ctx's deadline passes with the slot still held.
-//
-// Authorization runs in both directions. The daemon judges the attaching
-// client against Trust.Control; the client judges the process accepting for
-// it against Trust.Serving — between dial and the hello write, so nothing the
-// accepting process answers, a forged drain preamble included, is believed
-// before it proves itself — on the same kernel-held code-signing state and
-// over the same unconditional same-EUID floor. Without it a same-UID process
-// that rebinds the socket answers the pin with its own honest identity and
-// hands back an absence proof for a daemon that is still running.
-func (c *Client) Control(ctx context.Context) (*Control, error) {
+// Health reports the daemon serving on the socket, drain included: the verb is
+// answered below product dispatch and below the schema gate, so a draining
+// daemon and one of another schema era still answer. It rides the client's own
+// session, the one Ensure observes on and the first business lane takes over,
+// so asking costs no connection of its own once one is open.
+func (c *Client) Health(ctx context.Context) (Health, error) {
 	if _, ok := ctx.Deadline(); !ok {
-		return nil, errors.New("daemonkit: Control requires a context deadline")
+		return Health{}, errors.New("daemonkit: Health requires a context deadline")
 	}
-	el, err := c.daemon.Label.element()
+	report, err := c.link.health(ctx)
 	if err != nil {
-		return nil, err
+		return Health{}, err
 	}
-	socket, err := el.socket()
-	if err != nil {
-		return nil, fmt.Errorf("daemonkit: derive socket path: %w", err)
-	}
-	var servingPID int
-	attach := func() (*wire.Client, error) {
-		return wire.NewClient(ctx, wire.ClientConfig{
-			Dial: wire.UnixDialer(socket), Lane: wire.LaneControl, MaxFrame: int(c.daemon.MaxFrame),
-			Authorize: func(conn net.Conn) error {
-				pid, err := authorizeServer(conn.(*net.UnixConn), c.daemon.Trust.Serving)
-				if err != nil {
-					return err
-				}
-				servingPID = pid
-				return nil
-			},
-		})
-	}
-	session, err := attach()
-	for backoff := capacityBackoff; errors.Is(err, wire.ErrSessionCapacity); backoff = min(2*backoff, controlCapacityCeiling) {
-		if !sleepUntil(ctx, backoff) {
-			break
-		}
-		session, err = attach()
-	}
-	if err != nil {
-		return nil, classifyWire(err)
-	}
-	pinned, report, err := assemblePin(ctx, os.Getpid(), servingPID, session)
-	if err != nil {
-		_ = session.Abort(err)
-		return nil, err
-	}
-	return &Control{
-		session:    session,
-		pinned:     pinned,
-		generation: report.Generation,
-		observe:    proc.Observe,
-	}, nil
+	return healthFromReport(report), nil
 }
 
-// authorizeServer judges the process accepting for this client, between dial
-// and the hello write, off one PeerCredentials read that serves the
-// unconditional same-EUID floor, the posture against the peer's audit token,
-// and the PID the attach pins. ServingSameUser is the named waiver, exactly as
-// on the serving side. It returns the judged connection's peer PID:
-// per-connection state is established inside the authorization, so nothing but
-// immutable config survives to a replacement connection.
-func authorizeServer(conn *net.UnixConn, serving Serving) (int, error) {
-	peer, err := trust.PeerCredentials(conn)
+// Drain stops the incumbent serving on the socket and proves it gone.
+//
+// Order: pin the process answering on the client's session — its socket PID,
+// probed for {start, boot}, and the same-session health self-attestation that
+// proves the probed identity is the session's peer and not a reused PID;
+// refuse with ErrWrongIncumbent when a non-zero Expect field disagrees with
+// the Health just read (nothing dispatched); send the drain verb, which the
+// server acknowledges once its runtime observably reached PhaseDraining; then
+// observe the pinned {pid, start, boot} until it leaves the process table. The
+// ack is not the proof and its loss is not a failure: a verb whose terminal
+// was lost to session teardown proceeds to observation anyway — only a typed
+// refusal or a pre-send failure returns without observing.
+//
+// The verb is idempotent. Success returns Stopped with Reap one of ReapAbsent,
+// ReapReused, or ReapCrossBoot — each an anti-PID-reuse absence proof reached
+// only by observing the process table. ErrAbsent on a proven no-listener and
+// ErrDraining on an incumbent already leaving leave settlement to Settle.
+// ErrUnsettled (joined with ctx.Err()) reports a delivered drain whose exit
+// was not observed within ctx; the incumbent keeps draining on its own
+// Shutdown budget and Settle re-observes without a session.
+//
+// The proof reaches exactly one identity: the process answering on the
+// socket, which any process able to open the socket can be. It says nothing
+// about orphaned children, a second instance, or a separate app executable,
+// so gating an irreversible action — uninstall, deactivation — on Stopped
+// alone is unsound: require an executable-scoped inventory of the real
+// process table to be empty besides.
+func (c *Client) Drain(ctx context.Context, expect Expect) (Stopped, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		return Stopped{}, errors.New("daemonkit: Drain requires a context deadline")
+	}
+	session, pinned, report, err := c.link.pinned(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("daemonkit: read serving peer identity: %w", err)
+		return Stopped{}, err
 	}
-	if err := trust.Verify(peer, wireRequirement(serving.policy.requirement())); err != nil {
-		return 0, classifyServingTrust(err)
+	before := healthFromReport(report)
+	if expect.mismatch(before.Build, before.Generation) {
+		return Stopped{}, ErrWrongIncumbent
 	}
-	return peer.Token.PID(), nil
+	refusal := dispatchDrain(ctx, session)
+	c.link.retire(session)
+	if refusal != nil {
+		return Stopped{}, refusal
+	}
+	reap, err := observeGone(ctx, proc.Observe, pinned)
+	if err != nil {
+		return Stopped{}, err
+	}
+	return Stopped{Before: before, Reap: reap}, nil
 }
 
-// classifyServingTrust keeps trust's three denials disjoint through the root
-// sentinel: only a policy mismatch is ErrUntrusted. A peer that exited before
-// verification completed (trust.ErrPeerGone) and a configured requirement with
-// no verifier (trust.ErrNoVerifier) stay their own errors — an absence race
-// and a build defect are not trust verdicts, and a caller branching on
-// ErrUntrusted must never conflate them with one.
-func classifyServingTrust(err error) error {
-	if errors.Is(err, trust.ErrUntrustedPeer) {
-		return fmt.Errorf("%w: serving peer: %w", ErrUntrusted, err)
+// dispatchDrain sends the drain verb. Only a typed refusal or a pre-send
+// failure returns non-nil; a delivered ack, a lost terminal, and an error
+// terminal all proceed to observation — the verb already landed.
+func dispatchDrain(ctx context.Context, session *wire.Client) error {
+	result, err := session.Drain(ctx)
+	if rejection := result.Rejection(); rejection != nil {
+		return fmt.Errorf("daemonkit: drain refused: %w", rejection)
 	}
-	return fmt.Errorf("daemonkit: serving peer: %w", err)
+	if err != nil && result.Outcome == wire.PreSendFailure {
+		return fmt.Errorf("daemonkit: send drain: %w", err)
+	}
+	return nil
 }
 
 // assemblePin runs the attach pin in the documented order: self-pin refusal,
@@ -213,120 +171,20 @@ func assemblePin(ctx context.Context, self, peerPID int, session *wire.Client) (
 }
 
 // classifyWire turns one wire-side failure into the root sentinel a caller
-// branches on: an attach refusal on either lane, or a business dispatch
-// rejection. One function reads them all, so a rejection and an attach naming
-// the same condition cannot answer with two different sentinels.
+// branches on: an attach refusal or a dispatch rejection. One function reads
+// them all, so a rejection and an attach naming the same condition cannot
+// answer with two different sentinels.
 func classifyWire(err error) error {
 	switch {
 	case errors.Is(err, wire.ErrDraining):
 		return ErrDraining
 	case errors.Is(err, wire.ErrNotReady):
 		return ErrNotReady
-	case errors.Is(err, ErrUntrusted):
-		return err
-	case errors.Is(err, wire.ErrUntrustedPeer), errors.Is(err, trust.ErrUntrustedPeer):
-		return fmt.Errorf("%w: %w", ErrUntrusted, err)
-	case errors.Is(err, ErrNoVerifier), errors.Is(err, ErrPeerGone), errors.Is(err, ErrSessionCapacity):
+	case errors.Is(err, ErrSessionCapacity), errors.Is(err, ErrProtocolMismatch):
 		return err
 	case errors.Is(err, syscall.ENOENT), errors.Is(err, os.ErrNotExist), errors.Is(err, syscall.ECONNREFUSED):
 		return fmt.Errorf("%w: %w", ErrAbsent, err)
 	default:
 		return err
 	}
-}
-
-// Health reports the pinned incumbent, drain included: the verb is answered
-// below product dispatch, so a draining daemon still answers on this session.
-// A report naming another PID or generation is refused, never returned: a
-// caller derives its Expect and its proofs from this read.
-func (c *Control) Health(ctx context.Context) (Health, error) {
-	report, err := c.session.Health(ctx)
-	if err != nil {
-		return Health{}, err
-	}
-	if err := c.pinnedBy(report); err != nil {
-		return Health{}, err
-	}
-	return healthFromReport(report), nil
-}
-
-func (c *Control) pinnedBy(report wire.HealthReport) error {
-	if report.PID != c.pinned.PID || report.Generation != c.generation {
-		return fmt.Errorf(
-			"%w: health names pid %d generation %d, pinned pid %d generation %d",
-			errPinMoved, report.PID, report.Generation, c.pinned.PID, c.generation,
-		)
-	}
-	return nil
-}
-
-// Drain stops the pinned incumbent and proves it gone.
-//
-// Order: read Health on the pinned session; refuse with ErrWrongIncumbent
-// when a non-zero Expect field disagrees (nothing dispatched); send the
-// drain verb, which the server acknowledges once its runtime observably
-// reached PhaseDraining; then observe the pinned {pid, start, boot} until it
-// leaves the process table. The ack is not the proof and its loss is not a
-// failure: a verb whose terminal was lost to session teardown proceeds to
-// observation anyway — only a typed refusal or a pre-send failure returns
-// without observing.
-//
-// The verb is idempotent; draining an already-draining incumbent through an
-// established session settles normally. Success returns Stopped with Reap
-// one of ReapAbsent, ReapReused, or ReapCrossBoot — each an anti-PID-reuse
-// absence proof reached only by observing the process table. ErrUnsettled
-// (joined with ctx.Err()) reports a delivered drain whose exit was not
-// observed within ctx; the incumbent keeps draining on its own Shutdown
-// budget and Settle re-observes without a session.
-func (c *Control) Drain(ctx context.Context, expect Expect) (Stopped, error) {
-	if _, ok := ctx.Deadline(); !ok {
-		return Stopped{}, errors.New("daemonkit: Drain requires a context deadline")
-	}
-	report, err := c.session.Health(ctx)
-	if err != nil {
-		return Stopped{}, fmt.Errorf("daemonkit: pre-drain health: %w", err)
-	}
-	if err := c.pinnedBy(report); err != nil {
-		return Stopped{}, err
-	}
-	before := healthFromReport(report)
-	if expect.mismatch(before.Build, before.Generation) {
-		return Stopped{}, ErrWrongIncumbent
-	}
-	if refusal := c.dispatchDrain(ctx); refusal != nil {
-		return Stopped{}, refusal
-	}
-	reap, err := observeGone(ctx, c.observe, c.pinned)
-	if err != nil {
-		return Stopped{}, err
-	}
-	return Stopped{Before: before, Reap: reap}, nil
-}
-
-// dispatchDrain sends the drain verb. Only a typed refusal or a pre-send
-// failure returns non-nil; a delivered ack, a lost terminal, and an error
-// terminal all proceed to observation — the verb already landed.
-func (c *Control) dispatchDrain(ctx context.Context) error {
-	result, err := c.session.Drain(ctx)
-	if rejection := result.Rejection(); rejection != nil {
-		if errors.Is(rejection, wire.ErrPermissionDenied) {
-			return fmt.Errorf("%w: %w", ErrUntrusted, rejection)
-		}
-		return fmt.Errorf("daemonkit: drain refused: %w", rejection)
-	}
-	if err != nil && result.Outcome == wire.PreSendFailure {
-		return fmt.Errorf("daemonkit: send drain: %w", err)
-	}
-	return nil
-}
-
-// Close releases the control session without affecting the daemon. Like every
-// other verb it refuses a context without a deadline, and it honors the one it
-// is given: a pending call that will not settle inside ctx tears the session
-// down instead of holding Close for the transport's own timeouts.
-func (c *Control) Close(ctx context.Context) error {
-	if _, ok := ctx.Deadline(); !ok {
-		return errors.New("daemonkit: Close requires a context deadline")
-	}
-	return c.session.Close(ctx)
 }

@@ -16,7 +16,6 @@ func TestChildConnIsSingleTakeAndAbsentWithoutAChannel(t *testing.T) {
 		child, err := owned.Spawn(bounded(t, 20*time.Second), Cmd{
 			Path: "/bin/sh",
 			Args: []string{"-c", "cat <&3 >/dev/null"},
-			Exec: ServingSameUser(),
 		}, ChannelHandoff, nil)
 		if err != nil {
 			t.Fatalf("Spawn() = %v", err)
@@ -39,7 +38,6 @@ func TestChildConnIsSingleTakeAndAbsentWithoutAChannel(t *testing.T) {
 		child, err := owned.Spawn(bounded(t, 20*time.Second), Cmd{
 			Path: "/bin/sleep",
 			Args: []string{"0"},
-			Exec: ServingSameUser(),
 		}, ChannelNone, nil)
 		if err != nil {
 			t.Fatalf("Spawn() = %v", err)
@@ -56,7 +54,6 @@ func TestChildStopIsIdempotentAndConvergesOnOneTerminal(t *testing.T) {
 	child, err := owned.Spawn(bounded(t, 20*time.Second), Cmd{
 		Path: "/bin/sleep",
 		Args: []string{"600"},
-		Exec: ServingSameUser(),
 	}, ChannelNone, nil)
 	if err != nil {
 		t.Fatalf("Spawn() = %v", err)
@@ -88,7 +85,6 @@ func TestChildStopRequiresADeadline(t *testing.T) {
 	child, err := owned.Spawn(bounded(t, 20*time.Second), Cmd{
 		Path: "/bin/sleep",
 		Args: []string{"600"},
-		Exec: ServingSameUser(),
 	}, ChannelNone, nil)
 	if err != nil {
 		t.Fatalf("Spawn() = %v", err)
@@ -108,7 +104,6 @@ func TestStderrCopyFailureNeverKillsTheChild(t *testing.T) {
 	child, err := owned.Spawn(bounded(t, 20*time.Second), Cmd{
 		Path: "/bin/sh",
 		Args: []string{"-c", "echo noise >&2; sleep 0.3; exit 7"},
-		Exec: ServingSameUser(),
 	}, ChannelNone, sink)
 	if err != nil {
 		t.Fatalf("Spawn() = %v", err)
@@ -128,7 +123,6 @@ func TestSpawnedStderrReachesACapture(t *testing.T) {
 	child, err := owned.Spawn(bounded(t, 20*time.Second), Cmd{
 		Path: "/bin/sh",
 		Args: []string{"-c", "printf 'abcdefghij' >&2"},
-		Exec: ServingSameUser(),
 	}, ChannelNone, capture)
 	if err != nil {
 		t.Fatalf("Spawn() = %v", err)

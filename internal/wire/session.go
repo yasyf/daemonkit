@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/yasyf/daemonkit/internal/trust"
+	"github.com/yasyf/daemonkit/internal/proc"
 )
 
 var errPeerGoAway = errors.New("wire: peer requested session close")
@@ -27,9 +27,9 @@ type AcceptedSession struct{ s *session }
 func (s *AcceptedSession) ID() uint64 { return s.s.id }
 
 // Peer returns the kernel identity captured once from the accepted socket.
-func (s *AcceptedSession) Peer() trust.Peer { return s.s.peer }
+func (s *AcceptedSession) Peer() proc.Peer { return s.s.peer }
 
-// WireBuild returns the business schema the peer presented at attach.
+// WireBuild returns the schema the peer presented at attach.
 func (s *AcceptedSession) WireBuild() string { return s.s.schema }
 
 // Done closes after this exact authenticated session is fully settled and
@@ -55,9 +55,9 @@ type session struct {
 	codec        *Codec
 	ctx          context.Context
 	cancel       context.CancelFunc
-	peer         trust.Peer
-	lane         Lane
+	peer         proc.Peer
 	schema       string
+	current      bool
 	generation   []byte
 	release      func()
 	accepted     *AcceptedSession
@@ -175,7 +175,7 @@ func (s *session) disconnect() {
 
 // touchIdle re-arms idle reclaim. The timer runs only between requests, so a
 // slow request is never idle; expiry closes the transport, and that close is
-// what releases the lane slot a quiet peer would otherwise hold forever.
+// what releases the session slot a quiet peer would otherwise hold forever.
 func (s *session) touchIdle() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -481,26 +481,22 @@ func (s *session) execute(sessCtx, requestCtx context.Context, frame Frame, stat
 	}
 }
 
-// dispatch routes one request: control verbs match before any runtime
-// dispatch, so Runtime.Handle never sees a daemon.-prefixed op.
+// dispatch routes one request: daemon verbs match before any runtime
+// dispatch and answer whatever schema the session presented, so a successor
+// of another era can read and drain this one, and Runtime.Handle never sees a
+// daemon.-prefixed op nor a schema outside the accepted set.
 func (s *session) dispatch(requestCtx context.Context, frame Frame, state *requestState) (any, error) {
 	switch {
 	case frame.Op == healthOp:
 		return s.server.executeHealth()
 	case frame.Op == brokerHandoffOp:
-		if s.lane != LaneControl {
-			return nil, ErrPermissionDenied
-		}
 		return s.executeBrokerHandoff(frame, state)
 	case frame.Op == drainControlOp:
-		if s.lane != LaneControl {
-			return nil, ErrPermissionDenied
-		}
 		return s.server.executeDrain(requestCtx)
 	case strings.HasPrefix(string(frame.Op), reservedOpPrefix):
 		return nil, ErrPermissionDenied
-	case s.lane != LaneBusiness:
-		return nil, ErrPermissionDenied
+	case !s.current:
+		return nil, ErrBuildMismatch
 	default:
 		if err := s.server.gatePhase(); err != nil {
 			return nil, err
@@ -533,6 +529,8 @@ func rejectionCode(err error) (ResponseCode, bool) {
 		return ResponseCodeRuntimeDraining, true
 	case errors.Is(err, ErrPermissionDenied):
 		return ResponseCodePermissionDenied, true
+	case errors.Is(err, ErrBuildMismatch):
+		return ResponseCodeBuildMismatch, true
 	case errors.Is(err, ErrHandoffReplay):
 		return ResponseCodeHandoffReplay, true
 	case errors.Is(err, ErrSessionCapacity):

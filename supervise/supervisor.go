@@ -16,7 +16,6 @@ import (
 
 	"github.com/yasyf/daemonkit/durable"
 	"github.com/yasyf/daemonkit/internal/proc"
-	"github.com/yasyf/daemonkit/internal/trust"
 )
 
 const (
@@ -360,19 +359,9 @@ func accept(listener net.Listener, verbs chan<- verb, done <-chan struct{}) {
 	}
 }
 
-// answer serves one connection one verb. The peer is held to the
-// same-effective-UID floor before anything it sent is read.
+// answer serves one connection one verb.
 func answer(conn *net.UnixConn, verbs chan<- verb, done <-chan struct{}) {
 	defer func() { _ = conn.Close() }()
-	peer, err := trust.PeerCredentials(conn)
-	if err != nil {
-		slog.Warn("supervise: read control peer credentials", "err", err)
-		return
-	}
-	if err := trust.Floor(peer.UID); err != nil {
-		slog.Warn("supervise: refused a control peer", "err", err)
-		return
-	}
 	if err := conn.SetReadDeadline(time.Now().Add(requestGrace)); err != nil {
 		return
 	}

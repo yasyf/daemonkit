@@ -106,18 +106,8 @@ type Dialer func(ctx context.Context) (net.Conn, error)
 // ClientConfig configures one persistent multiplexed client session.
 type ClientConfig struct {
 	Dial Dialer
-	// Authorize judges the process accepting the dialed connection, between
-	// Dial and the hello write, so no handshake byte reaches an unjudged peer
-	// and nothing a socket squatter answers — a forged drain preamble, a forged
-	// build mismatch — is believed before the peer proves itself. Required: a
-	// constructor whose connection needs no judging passes a named waiver. It
-	// runs against the exact connection the session uses, so per-connection
-	// state is established by Dial and Authorize together and nothing but this
-	// immutable config survives to a replacement connection.
-	Authorize func(net.Conn) error
-	// Lane selects control or business.
-	Lane Lane
-	// Schema is the business lane's RPC-schema digest; empty on control.
+	// Schema is the RPC-schema digest this session speaks; empty for a
+	// session that only asks the daemon verbs.
 	Schema string
 	// Nonce attaches a spawned session; empty everywhere else.
 	Nonce []byte
@@ -138,7 +128,7 @@ type UnaryClient interface {
 	WireBuild() string
 }
 
-// Client is one persistent, concurrent protocol-2 session.
+// Client is one persistent, concurrent protocol-3 session.
 type Client struct {
 	conn   net.Conn
 	codec  *Codec
@@ -238,10 +228,6 @@ func NewClient(ctx context.Context, config ClientConfig) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("wire: dial: %w", err)
 	}
-	if err := config.Authorize(conn); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("wire: authorize accepting peer: %w", err)
-	}
 	codec := NewCodec(conn)
 	if config.MaxFrame > 0 {
 		codec.MaxFrame = config.MaxFrame
@@ -252,7 +238,7 @@ func NewClient(ctx context.Context, config ClientConfig) (*Client, error) {
 		return nil, err
 	}
 	peer, err := clientHandshake(codec, helloIdentity{
-		Protocol: ProtocolVersion, Lane: config.Lane, Schema: config.Schema, Nonce: config.Nonce,
+		Protocol: ProtocolVersion, Schema: config.Schema, Nonce: config.Nonce,
 	})
 	if err != nil {
 		_ = conn.Close()
@@ -293,18 +279,6 @@ func NewClient(ctx context.Context, config ClientConfig) (*Client, error) {
 func validateClientConfig(config ClientConfig) error {
 	if config.Dial == nil {
 		return errors.New("wire: Dial is required")
-	}
-	if config.Authorize == nil {
-		return errors.New("wire: Authorize is required; judge the accepting peer or pass a named waiver")
-	}
-	if !config.Lane.valid() {
-		return fmt.Errorf("wire: invalid lane %q", config.Lane)
-	}
-	if config.Lane == LaneBusiness && config.Schema == "" {
-		return errors.New("wire: Schema is required on the business lane")
-	}
-	if config.Lane == LaneControl && (config.Schema != "" || len(config.Nonce) != 0) {
-		return errors.New("wire: control lane carries no schema or nonce")
 	}
 	if config.MaxFrame > maxFrameCeiling {
 		return fmt.Errorf("wire: MaxFrame %d admits a frame whose length prefix opens with the drain preamble; the cap stays at or below %#x", config.MaxFrame, maxFrameCeiling)

@@ -14,17 +14,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/daemonkit/internal/trust"
+	"github.com/yasyf/daemonkit/internal/proc"
 	"golang.org/x/sys/unix"
 )
 
-func testSelfPeer(t *testing.T) trust.Peer {
-	t.Helper()
-	token, err := trust.ProcessToken(os.Getpid())
-	if err != nil {
-		t.Fatalf("ProcessToken() = %v", err)
-	}
-	return trust.Peer{UID: os.Getuid(), Token: token}
+func testSelfPeer(*testing.T) proc.Peer {
+	return proc.Peer{UID: os.Getuid(), PID: os.Getpid()}
 }
 
 func testMintNonce(t *testing.T) []byte {
@@ -212,11 +207,9 @@ func TestAdoptMintedAdmitsTheBusinessHelloEchoingTheNonce(t *testing.T) {
 	go func() { adopted <- server.AdoptMinted(serverEnd, testSelfPeer(t), nonce) }()
 
 	client, err := NewClient(t.Context(), ClientConfig{
-		Dial:      func(context.Context) (net.Conn, error) { return clientEnd, nil },
-		Authorize: authorizeTestServer,
-		Lane:      LaneBusiness,
-		Schema:    "test.v1",
-		Nonce:     nonce,
+		Dial:   func(context.Context) (net.Conn, error) { return clientEnd, nil },
+		Schema: "test.v1",
+		Nonce:  nonce,
 	})
 	if err != nil {
 		t.Fatalf("NewClient() = %v", err)
@@ -248,18 +241,13 @@ func TestAdoptMintedRefusesEveryOffContractHello(t *testing.T) {
 	}{
 		{
 			name:  "wrong nonce",
-			hello: helloIdentity{Protocol: ProtocolVersion, Lane: LaneBusiness, Schema: "test.v1", Nonce: make([]byte, 32)},
+			hello: helloIdentity{Protocol: ProtocolVersion, Schema: "test.v1", Nonce: make([]byte, 32)},
 			want:  "nonce",
 		},
 		{
 			name:  "absent nonce",
-			hello: helloIdentity{Protocol: ProtocolVersion, Lane: LaneBusiness, Schema: "test.v1"},
+			hello: helloIdentity{Protocol: ProtocolVersion, Schema: "test.v1"},
 			want:  "nonce",
-		},
-		{
-			name:  "control lane",
-			hello: helloIdentity{Protocol: ProtocolVersion, Lane: LaneControl},
-			want:  "business lane",
 		},
 	}
 	for _, tt := range tests {

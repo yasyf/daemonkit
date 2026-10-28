@@ -149,7 +149,6 @@ func TestOwnedRunReportsStreamsExitAndTruncation(t *testing.T) {
 		result, err := owned.Run(bounded(t, 20*time.Second), Cmd{
 			Path:  "/bin/cat",
 			Stdin: []byte("through the pipe"),
-			Exec:  ServingSameUser(),
 		})
 		if err != nil {
 			t.Fatalf("Run() = %v", err)
@@ -166,7 +165,6 @@ func TestOwnedRunReportsStreamsExitAndTruncation(t *testing.T) {
 		result, err := owned.Run(bounded(t, 20*time.Second), Cmd{
 			Path: "/bin/sh",
 			Args: []string{"-c", "echo out; echo err >&2; exit 3"},
-			Exec: ServingSameUser(),
 		})
 		var exitErr *ExitError
 		if !errors.As(err, &exitErr) {
@@ -185,7 +183,6 @@ func TestOwnedRunReportsStreamsExitAndTruncation(t *testing.T) {
 			Path:      "/bin/sh",
 			Args:      []string{"-c", "printf 0123456789abcdef"},
 			MaxOutput: 8,
-			Exec:      ServingSameUser(),
 		})
 		if !errors.Is(err, ErrTruncated) {
 			t.Fatalf("Run() = %v, want ErrTruncated", err)
@@ -199,7 +196,6 @@ func TestOwnedRunReportsStreamsExitAndTruncation(t *testing.T) {
 		result, err := owned.Run(bounded(t, 2*time.Second), Cmd{
 			Path: "/bin/sleep",
 			Args: []string{"60"},
-			Exec: ServingSameUser(),
 		})
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("Run() = %v, want an error matching context.DeadlineExceeded", err)
@@ -210,7 +206,7 @@ func TestOwnedRunReportsStreamsExitAndTruncation(t *testing.T) {
 	})
 
 	t.Run("no deadline is refused", func(t *testing.T) {
-		_, err := owned.Run(context.Background(), Cmd{Path: "/usr/bin/true", Exec: ServingSameUser()})
+		_, err := owned.Run(context.Background(), Cmd{Path: "/usr/bin/true"})
 		if err == nil {
 			t.Fatal("Run() accepted a context without a deadline")
 		}
@@ -222,7 +218,7 @@ func TestOwnedRunReportsStreamsExitAndTruncation(t *testing.T) {
 
 func TestOwnedRunRestatesTheBoundaryInThisPackagesRegister(t *testing.T) {
 	owned := ownedScope(t)
-	_, err := owned.Run(bounded(t, 5*time.Second), Cmd{Path: "bin/echo", Exec: ServingSameUser()})
+	_, err := owned.Run(bounded(t, 5*time.Second), Cmd{Path: "bin/echo"})
 	if err == nil {
 		t.Fatal("Run() accepted a relative path")
 	}
@@ -236,12 +232,12 @@ func TestSpawnAndAdoptRequireADeadline(t *testing.T) {
 	ctx := owned.Ctx(context.Background())
 	undeadlined := map[string]func() error{
 		"Owned.Spawn": func() error {
-			_, err := owned.Spawn(context.Background(), Cmd{Path: "/usr/bin/true", Exec: ServingSameUser()}, ChannelNone, nil)
+			_, err := owned.Spawn(context.Background(), Cmd{Path: "/usr/bin/true"}, ChannelNone, nil)
 			return err
 		},
 		"Owned.Adopt": func() error { _, err := owned.Adopt(context.Background(), os.Getpid()); return err },
 		"Ctx.Spawn": func() error {
-			_, err := ctx.Spawn(context.Background(), Cmd{Path: "/usr/bin/true", Exec: ServingSameUser()}, ChannelNone, nil)
+			_, err := ctx.Spawn(context.Background(), Cmd{Path: "/usr/bin/true"}, ChannelNone, nil)
 			return err
 		},
 		"Ctx.Adopt": func() error { _, err := ctx.Adopt(context.Background(), os.Getpid()); return err },
@@ -259,10 +255,10 @@ func TestSpawnAndAdoptRequireADeadline(t *testing.T) {
 
 func TestZeroCtxRefusesTheVerbs(t *testing.T) {
 	var zero Ctx
-	if _, err := zero.Run(bounded(t, time.Second), Cmd{Path: "/usr/bin/true", Exec: ServingSameUser()}); !errors.Is(err, errZeroCtx) {
+	if _, err := zero.Run(bounded(t, time.Second), Cmd{Path: "/usr/bin/true"}); !errors.Is(err, errZeroCtx) {
 		t.Fatalf("Ctx.Run() = %v, want the zero-Ctx refusal", err)
 	}
-	if _, err := zero.Spawn(bounded(t, time.Second), Cmd{Path: "/usr/bin/true", Exec: ServingSameUser()}, ChannelNone, nil); !errors.Is(err, errZeroCtx) {
+	if _, err := zero.Spawn(bounded(t, time.Second), Cmd{Path: "/usr/bin/true"}, ChannelNone, nil); !errors.Is(err, errZeroCtx) {
 		t.Fatalf("Ctx.Spawn() = %v, want the zero-Ctx refusal", err)
 	}
 	if _, err := zero.Adopt(bounded(t, time.Second), os.Getpid()); !errors.Is(err, errZeroCtx) {
@@ -283,7 +279,6 @@ func TestOwnedCtxRunsProductCodeUnchanged(t *testing.T) {
 	result, err := ctx.Run(bounded(t, 20*time.Second), Cmd{
 		Path: "/bin/echo",
 		Args: []string{"from a CLI scope"},
-		Exec: ServingSameUser(),
 	})
 	if err != nil {
 		t.Fatalf("Ctx.Run() = %v", err)
@@ -311,7 +306,6 @@ func TestOwnedCloseSettlesEverythingItOwns(t *testing.T) {
 	child, err := owned.Spawn(bounded(t, 20*time.Second), Cmd{
 		Path: "/bin/sleep",
 		Args: []string{"600"},
-		Exec: ServingSameUser(),
 	}, ChannelNone, nil)
 	if err != nil {
 		t.Fatalf("Spawn() = %v", err)
@@ -354,7 +348,6 @@ func TestServeSettlesChildrenSpawnedThroughCtx(t *testing.T) {
 			child, err := x.Spawn(bounded(t, 20*time.Second), Cmd{
 				Path: "/bin/sleep",
 				Args: []string{"600"},
-				Exec: ServingSameUser(),
 			}, ChannelNone, nil)
 			if err != nil {
 				return nil, err
@@ -402,7 +395,6 @@ func parkedRun(pidFile string) Cmd {
 	return Cmd{
 		Path: "/bin/sh",
 		Args: []string{"-c", "echo $$ > " + pidFile + "; exec sleep 600"},
-		Exec: ServingSameUser(),
 	}
 }
 
@@ -487,7 +479,6 @@ func runForksADescendant(pidFile, holderFile, marker string) Cmd {
 	return Cmd{
 		Path: "/bin/sh",
 		Args: []string{"-c", script},
-		Exec: ServingSameUser(),
 	}
 }
 
@@ -546,7 +537,6 @@ func forkedHolderRun(pidFile, holderFile, marker string) Cmd {
 	return Cmd{
 		Path: "/bin/sh",
 		Args: []string{"-c", script},
-		Exec: ServingSameUser(),
 	}
 }
 
@@ -675,7 +665,6 @@ func TestOwnedCloseFaultsOnAChildWhoseExitWasNeverProven(t *testing.T) {
 		child, err := owned.Spawn(bounded(t, 20*time.Second), Cmd{
 			Path: "/bin/sleep",
 			Args: []string{"600"},
-			Exec: ServingSameUser(),
 		}, ChannelNone, nil)
 		if err != nil {
 			t.Fatalf("Spawn() attempt %d = %v", attempt, err)
@@ -709,7 +698,6 @@ func publishingRun(pidFile string) Cmd {
 	return Cmd{
 		Path: "/bin/sh",
 		Args: []string{"-c", "echo $$ > " + pidFile},
-		Exec: ServingSameUser(),
 	}
 }
 
@@ -837,11 +825,11 @@ func TestSpentContextIsRefusedInThisPackagesRegister(t *testing.T) {
 
 	verbs := map[string]func() error{
 		"Owned.Run": func() error {
-			_, err := owned.Run(spent, Cmd{Path: "/usr/bin/true", Exec: ServingSameUser()})
+			_, err := owned.Run(spent, Cmd{Path: "/usr/bin/true"})
 			return err
 		},
 		"Owned.Spawn": func() error {
-			_, err := owned.Spawn(spent, Cmd{Path: "/usr/bin/true", Exec: ServingSameUser()}, ChannelNone, nil)
+			_, err := owned.Spawn(spent, Cmd{Path: "/usr/bin/true"}, ChannelNone, nil)
 			return err
 		},
 		"Owned.Adopt":  func() error { _, err := owned.Adopt(spent, os.Getpid()); return err },
@@ -871,7 +859,6 @@ func sessionHolderCmd(dir string, attempt int) (c Cmd, pidFile, holderFile strin
 		Path:    "/bin/sh",
 		Args:    []string{"-c", "trap '' TERM; sleep 600 & " + publish(holderFile, "$!") + publish(pidFile, "$$") + "exec sleep 600"},
 		Session: true,
-		Exec:    ServingSameUser(),
 	}, pidFile, holderFile
 }
 
@@ -1185,7 +1172,7 @@ func racingRun(pidFile, holderFile, marker string) Cmd {
 	}
 	holder := "/bin/sh -c 'while :; do sleep 60; done # " + marker + "-descendant' & "
 	script := publish(pidFile, "$$") + holder + publish(holderFile, "$!") + "wait # " + marker + "-leader"
-	return Cmd{Path: "/bin/sh", Args: []string{"-c", script}, Exec: ServingSameUser()}
+	return Cmd{Path: "/bin/sh", Args: []string{"-c", script}}
 }
 
 // TestOwnedCloseNeverAnswersCleanOverAChildAVerbStarted is the same property

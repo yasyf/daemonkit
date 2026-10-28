@@ -251,7 +251,6 @@ func drain(args []string) error {
 	client, err := daemonkit.Open(daemonkit.Daemon{
 		Label:   label,
 		Schemas: []daemonkit.Schema{cutSchema},
-		Trust:   daemonkit.Trust{Serving: daemonkit.ServingSameUser()},
 	})
 	if err != nil {
 		return fmt.Errorf("open: %w", err)
@@ -308,8 +307,7 @@ func dial(args []string) error {
 	defer cancel()
 
 	client, err := wire.NewClient(ctx, wire.ClientConfig{
-		Dial: wire.UnixDialer(socket), Authorize: authorizeMatrixDaemon,
-		Lane: wire.LaneBusiness, Schema: cutSchema,
+		Dial: wire.UnixDialer(socket), Schema: cutSchema,
 		HandshakeTimeout: handshakeTimeout,
 	})
 	if err != nil {

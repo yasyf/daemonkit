@@ -318,13 +318,12 @@ func (d *Deployment) bareMetadata() error {
 }
 
 func (d *Deployment) daemonAbsent(ctx context.Context) error {
-	control, err := d.client.Control(ctx)
+	_, err := d.client.Health(ctx)
 	switch {
 	case errors.Is(err, daemonkit.ErrAbsent):
 		return nil
 	case err != nil:
-		return fmt.Errorf("%w: the control attach proved no absence: %w", ErrNotFresh, err)
+		return fmt.Errorf("%w: the health probe proved no absence: %w", ErrNotFresh, err)
 	}
-	_ = control.Close(ctx)
 	return fmt.Errorf("%w: a daemon is serving %q", ErrNotFresh, d.config.Daemon.Label)
 }

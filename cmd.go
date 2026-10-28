@@ -48,14 +48,6 @@ type Cmd struct {
 	// into a dedicated session because a disposable command that leaves
 	// descendants behind is a leak, not a posture.
 	Session bool
-	// Exec is the trust posture the executable behind Path must prove before
-	// the child runs its first instruction. Required: the zero Serving refuses
-	// at the boundary, so every Run and Spawn site states its posture
-	// greppably. ServingSigned(r) verifies the suspended child's kernel-held
-	// code identity — the image the kernel established at exec, in place,
-	// never a staged copy — and a failed verify aborts the spawn before
-	// release. ServingSameUser() is the named waiver.
-	Exec Serving
 	// Limits is the spawned session's resource declaration, ChannelHandoff
 	// only: Spawn conveys it to the child alongside the nonce, and both ends
 	// adopt it, so the two ends of one handoff cannot skew. Refused non-zero
@@ -155,14 +147,6 @@ func (c Cmd) validate(verb string, channel Channel) error {
 	if c.Dir != "" && (!filepath.IsAbs(c.Dir) || filepath.Clean(c.Dir) != c.Dir) {
 		return fmt.Errorf("daemonkit: Cmd.Dir %q is not absolute and clean", c.Dir)
 	}
-	if !c.Exec.stated() {
-		return fmt.Errorf("daemonkit: %s requires a stated Cmd.Exec posture (ServingSigned or ServingSameUser)", verb)
-	}
-	if _, signed := c.Exec.policy.(signedServing); signed {
-		if err := requirementVerifiable("Cmd.Exec"); err != nil {
-			return err
-		}
-	}
 	if channel >= channelLimit {
 		return fmt.Errorf("daemonkit: channel %d is not one of ChannelNone, ChannelHandoff, ChannelStdio", channel)
 	}
@@ -249,11 +233,8 @@ func parseSpawnLimits(value string) (Limits, error) {
 	return Limits{MaxFrame: Bytes(maxFrame), Concurrency: inFlight}, nil
 }
 
-// command compiles a validated Cmd into the internal spawn contract, with the
-// exec posture compiled into the release gate that runs against the suspended
-// child.
+// command compiles a validated Cmd into the internal spawn contract.
 func command(c Cmd, channel Channel, nonce []byte) proc.Cmd {
-	exec := c.Exec
 	return proc.Cmd{
 		Path:      c.Path,
 		Dir:       c.Dir,
@@ -263,7 +244,6 @@ func command(c Cmd, channel Channel, nonce []byte) proc.Cmd {
 		MaxOutput: proc.Bytes(c.MaxOutput),
 		Session:   c.Session,
 		Channel:   procChannel(channel),
-		Verify:    func(pid int) error { return exec.verifyProcess(pid) },
 	}
 }
 

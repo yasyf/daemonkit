@@ -1,8 +1,7 @@
 // Package converge observes what is actually on the system. Every fact in a
 // World is re-derived from a real boundary at the moment it is read — the
-// socket, the durable owner record, the service layer's own view of the
-// daemon's service — so a repair decision is never taken from an intent someone
-// claimed and stored.
+// socket and the durable owner record — so a repair decision is never taken
+// from an intent someone claimed and stored.
 package converge
 
 import (
@@ -20,24 +19,17 @@ type World struct {
 	Health wire.HealthReport
 	// Pinned is the process instance the attach that read Health pinned, zero
 	// when nothing served. It is the strongest thing an observation names: the
-	// process that answered on the socket and cleared the serving requirement,
-	// where the owner record beside it is same-UID writable.
+	// process that answered on the socket, where the owner record beside it is
+	// writable by anyone who can write the state directory.
 	Pinned proc.Identity
-	// Attach is why nothing served, kept verbatim: absence, drain, and distrust
-	// are the caller's vocabulary to classify, never this package's to name.
+	// Attach is why nothing served, kept verbatim: absence, drain, and a
+	// foreign protocol are the caller's vocabulary to classify, never this
+	// package's to name.
 	Attach error
 	// Owner is the recorded incumbent, valid only when Recorded is true.
 	Owner proc.Owner
 	// Recorded reports whether a well-formed owner record names an incumbent.
 	Recorded bool
-	// Applied reports whether the service layer already holds exactly the
-	// desired service. On darwin that is the byte-exact plist where launchd
-	// reads it and launchd itself reporting the job bootstrapped; on linux, the
-	// label's supervisor answering with the same specification. It is a fact
-	// about the service layer's configuration, never about the process — a
-	// loaded service whose program exited still reads true — but one the
-	// service layer has never heard of does not, however exact its file.
-	Applied bool
 }
 
 // Serving reports whether a daemon answered on the socket.
@@ -50,10 +42,9 @@ func (w World) Serving() bool { return w.Attach == nil }
 // with a pin no live process can match rather than with nothing at all.
 //
 // The attach's pin comes first because it is the stronger evidence and the only
-// one a live peer guarantees: it answered on the socket and cleared the serving
-// requirement, while the record beside it is same-UID writable and may name
-// nobody at all — which is exactly what an upgrade that unlinked the daemon's
-// bytes and its record leaves behind.
+// one a live peer guarantees: it answered on the socket, while the record
+// beside it may name nobody at all — which is exactly what an upgrade that
+// unlinked the daemon's bytes and its record leaves behind.
 func (w World) Observed() proc.Identity {
 	if w.Pinned != (proc.Identity{}) {
 		return w.Pinned
@@ -64,11 +55,23 @@ func (w World) Observed() proc.Identity {
 	return w.Owner.Identity()
 }
 
-// ObserveRuntime re-derives the runtime half of a World — the socket and the
-// owner record — leaving Applied unobserved. It is what a caller observes when
-// it decides nothing from launchd's configuration and may hold no Agent to
-// verify against: the label's agent is going away whatever state it is in.
-func ObserveRuntime(ctx context.Context, s Sources) (World, error) {
+// Sources are the boundaries Observe re-derives a World from.
+type Sources struct {
+	// Serving asks whatever is on the socket for the health it publishes, and
+	// names the process instance the attach pinned to answer it.
+	Serving func(context.Context) (wire.HealthReport, proc.Identity, error)
+	// Recorded shared-reads the durable owner record.
+	Recorded func(string) (proc.Owner, bool, error)
+	// RecordPath is the record file Recorded reads.
+	RecordPath string
+}
+
+// Observe re-derives a World from s: the socket and the owner record. A
+// boundary that answers with a refusal is recorded as that refusal; only a
+// record that could not be read at all fails the observation. The service
+// layer is never asked: applying the service is the one step that needs it,
+// and that step reads launchd itself.
+func Observe(ctx context.Context, s Sources) (World, error) {
 	if s.Serving == nil || s.Recorded == nil {
 		return World{}, errors.New("converge: Serving and Recorded observers are required")
 	}

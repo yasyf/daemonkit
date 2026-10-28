@@ -19,14 +19,14 @@ import (
 // started.
 //
 // The ladder is Ensure's own, aimed at absence, and every step observes rather
-// than assumes. A serving incumbent is drained through the control lane,
-// pinned to the build and generation just observed, so a replacement that
-// raced in is re-observed rather than stopped. One already draining, or a husk
-// whose listener is gone, is settled out of the process table from the durable
+// than assumes. A serving incumbent is drained over its session, pinned to the
+// build and generation just observed, so a replacement that raced in is
+// re-observed rather than stopped. One already draining, or a husk whose
+// listener is gone, is settled out of the process table from the durable
 // owner record — a recorded incumbent that will not leave is signalled at its
-// recorded identity first. Stopping a stopped daemon is success. An attach the
-// ladder cannot classify — an untrusted peer holding the socket — propagates,
-// and nothing is removed over it.
+// recorded identity first. One speaking another protocol is signalled at its
+// recorded identity at once. Stopping a stopped daemon is success. An attach
+// the ladder cannot classify propagates, and nothing is removed over it.
 //
 // Stop needs no Program: it renders no LaunchAgent and places nothing, so a
 // launcher's Daemon that declares only the Label — one that must answer "not
@@ -97,7 +97,7 @@ func (c *Client) Stop(ctx context.Context) error {
 // serving incumbent is evicted, and an absent or draining one is settled from
 // the record.
 func (c *Client) stopOnce(ctx context.Context) error {
-	world, err := c.observeRuntime(ctx)
+	world, err := c.observe(ctx)
 	if err != nil {
 		return err
 	}
@@ -110,20 +110,21 @@ func (c *Client) stopOnce(ctx context.Context) error {
 	if errors.Is(world.Attach, ErrAbsent) || errors.Is(world.Attach, ErrDraining) {
 		return c.proveRecorded(ctx, world)
 	}
+	if errors.Is(world.Attach, ErrProtocolMismatch) {
+		return c.terminateRecorded(ctx, world)
+	}
 	return world.Attach
 }
 
-// observeRuntime is Stop's observation: the socket and the owner record, never
-// launchd's configuration. Stop decides nothing from Applied — the agent is
-// going away whatever state it is in — and skipping that leg is also what
-// frees Stop from Ensure's Program requirement: no agent is rendered, so a
+// observe is Ensure's and Stop's one observation: the socket and the owner
+// record, never the service layer's configuration. No agent is rendered, so a
 // Daemon that declares no Program still observes.
-func (c *Client) observeRuntime(ctx context.Context) (converge.World, error) {
+func (c *Client) observe(ctx context.Context) (converge.World, error) {
 	record, err := c.record()
 	if err != nil {
 		return converge.World{}, err
 	}
-	return converge.ObserveRuntime(ctx, converge.Sources{
+	return converge.Observe(ctx, converge.Sources{
 		Serving:    c.servedHealth,
 		Recorded:   proc.ReadOwner,
 		RecordPath: record,

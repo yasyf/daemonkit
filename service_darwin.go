@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"os/exec"
 
-	"github.com/yasyf/daemonkit/internal/converge"
-	"github.com/yasyf/daemonkit/internal/proc"
 	"github.com/yasyf/daemonkit/launchd"
 )
 
@@ -28,20 +26,6 @@ func (l serviceLayer) applyService(ctx context.Context, agent service) error {
 
 func (l serviceLayer) removeService(ctx context.Context, label string) error {
 	return launchd.Remove(ctx, l.launchctl, label)
-}
-
-func (c *Client) observeWorld(ctx context.Context, agent launchd.Agent) (converge.World, error) {
-	record, err := c.record()
-	if err != nil {
-		return converge.World{}, err
-	}
-	return converge.Observe(ctx, converge.Sources{
-		Serving:    c.servedHealth,
-		Recorded:   proc.ReadOwner,
-		RecordPath: record,
-		Agent:      agent,
-		Launchctl:  c.launchctl,
-	})
 }
 
 // AgentPath is the PATH every daemonkit LaunchAgent runs under. launchd's own

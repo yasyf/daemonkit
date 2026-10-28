@@ -166,7 +166,6 @@ func childCmd(t *testing.T, role string, extra ...string) Cmd {
 	return Cmd{
 		Path: executable,
 		Env:  append(append(os.Environ(), childRoleEnv+"="+role), extra...),
-		Exec: ServingSameUser(),
 	}
 }
 

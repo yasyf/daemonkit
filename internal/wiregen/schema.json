@@ -1,6 +1,6 @@
 {
   "magic": "DKS1",
-  "version": 2,
+  "version": 3,
   "defaultMaxFrameBytes": 4194304,
   "lengthPrefixBytes": 4,
   "header": [
