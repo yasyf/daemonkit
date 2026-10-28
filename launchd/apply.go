@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -507,46 +506,23 @@ func canonicalAgent(agent Agent) (Agent, error) {
 	return agent, nil
 }
 
-// validateProgramTree is a live-filesystem check: it walks the program path from
-// the root, refusing any symlinked component, a non-directory ancestor, or a
-// final component that is not a regular executable file. It is Apply's
-// serviceability gate, and NewPlan invokes it to require program residency at
-// plan creation.
+// validateProgramTree is a live-filesystem check that the program resolves to
+// a regular executable file. It is Apply's serviceability gate, and NewPlan
+// invokes it to require program residency at plan creation.
 func validateProgramTree(agent Agent) error {
 	program, err := agent.programPath()
 	if err != nil {
 		return err
 	}
-	current := string(filepath.Separator)
-	root, err := os.Lstat(current)
+	info, err := os.Stat(program)
 	if err != nil {
-		return fmt.Errorf("launchd: inspect program root: %w", err)
+		return fmt.Errorf("launchd: inspect program %q: %w", program, err)
 	}
-	if root.Mode()&os.ModeSymlink != 0 || !root.IsDir() {
-		return errors.New("launchd: program root is not a real directory")
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("launchd: program %q is not a regular file", program)
 	}
-	parts := strings.Split(strings.TrimPrefix(program, current), current)
-	for index, part := range parts {
-		current = filepath.Join(current, part)
-		info, err := os.Lstat(current)
-		if err != nil {
-			return fmt.Errorf("launchd: inspect program path %q: %w", current, err)
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("launchd: program path %q is a symlink", current)
-		}
-		if index < len(parts)-1 {
-			if !info.IsDir() {
-				return fmt.Errorf("launchd: program ancestor %q is not a directory", current)
-			}
-			continue
-		}
-		if !info.Mode().IsRegular() {
-			return fmt.Errorf("launchd: program %q is not a regular file", current)
-		}
-		if info.Mode().Perm()&0o111 == 0 {
-			return fmt.Errorf("launchd: program %q is not executable", current)
-		}
+	if info.Mode().Perm()&0o111 == 0 {
+		return fmt.Errorf("launchd: program %q is not executable", program)
 	}
 	return nil
 }
