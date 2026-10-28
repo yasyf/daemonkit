@@ -14,6 +14,7 @@ const (
 	controlChildEnv   = "DAEMONKIT_CONTROL_CHILD"
 	controlChildLabel = "DAEMONKIT_CONTROL_CHILD_LABEL"
 	controlChildApp   = "DAEMONKIT_CONTROL_CHILD_APP"
+	controlChildFile  = "DAEMONKIT_CONTROL_CHILD_FILE"
 	testBuild         = "test.build"
 )
 
@@ -23,7 +24,7 @@ var testProgram = Program{policy: copied{version: testBuild}}
 // ladder test versions through its Info.plist, or the fixed test build.
 func controlChildProgram() Program {
 	if app := os.Getenv(controlChildApp); app != "" {
-		return Program{policy: bundled{app: app}}
+		return Program{policy: bundled{app: app, file: os.Getenv(controlChildFile)}}
 	}
 	return testProgram
 }

@@ -368,7 +368,7 @@ func TestInBundle(t *testing.T) {
 			if err != nil {
 				t.Fatalf("build() error = %v", err)
 			}
-			if build != "4.5.6" {
+			if !strings.HasPrefix(build, "4.5.6+") {
 				t.Errorf("build = %q, want the bundle's CFBundleShortVersionString", build)
 			}
 		})

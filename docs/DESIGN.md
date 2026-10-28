@@ -157,13 +157,15 @@ type Program struct{ policy placement }
 // package upgrade cannot delete the running program, and fixed across
 // upgrades, so the plist's Program key stays put and path-keyed TCC grants
 // survive. build is the version string the executable already reports, and
-// it is the whole build identity: Ensure makes the copy and records the build
+// must change on every rebuild (version.Running keys a dev build by its
+// modification time); it is the whole build identity: Ensure makes the copy and records the build
 // at ~/.daemonkit/builds/<Label>, and copies again only when that differs.
 func Stable(build string) (Program, error)
 
 // InBundle names an executable inside a signed .app and never copies it:
 // macOS keys TCC and notification grants to identifier, team, and path. Its
-// build is the bundle's CFBundleShortVersionString.
+// build is the bundle's CFBundleShortVersionString plus its executable's
+// modification time, so a rebuild at the same version is a new build.
 func InBundle(app, rel string) (Program, error)
 
 type Restart uint8
@@ -633,7 +635,7 @@ Default answer: nothing survives. Deleted, with why nothing needs it:
 | The same-EUID floor, the kernel-only `csops_audittoken` verifier, `internal/trust`, `internal/csposture`, and the `daemonkit_unsigned` build tag (2026-10-27) | The socket sits in the user's 0700 state directory, and any process that can open it is trusted. No code signature, team, entitlement, designated requirement, or UID is checked on a connecting process or a spawned child. |
 | `Requirement`, `Requirements`, `EntitlementMatch`/`EntitlementRequirement`, `PolicyDigest`, `Serving`/`ServingSigned`/`ServingSameUser`, `Trust` and `Daemon.Trust`, `Cmd.Exec`, `ErrUntrusted`, `ErrPeerGone`, `ErrNoVerifier` (2026-10-27) | Nothing is pinned, so nothing names a pin or reports one failing. |
 | The separate control connection: `Control`, `Client.Control`, the lane field in the hello (2026-10-27) | One session kind (wire protocol 3). `Client.Health` and `Client.Drain(ctx, Expect)` ride the client's one session, and the first `Business` lane takes it over. |
-| The SHA-256 build digest of the executable (2026-10-27) | The build is the version string the tool already reports: `Stable(build)`, `InBundle`'s `CFBundleShortVersionString`, published by `Serve` from `Program`. Placement compares the record at `~/.daemonkit/builds/<Label>`. |
+| The SHA-256 build digest of the executable (2026-10-27) | The build is the version string the tool already reports: `Stable(build)`, `InBundle`'s `CFBundleShortVersionString` plus executable mtime, published by `Serve` from `Program`. Placement compares the record at `~/.daemonkit/builds/<Label>`. |
 | `Ensure`'s `launchctl print` on every call, `converge.World.Applied` (2026-10-27) | A daemon already serving the wanted build is `ActionNothing` without asking launchd; the apply step reads launchd when it installs or restarts. |
 | `worker` as a package (pool claims, `ClaimRuntime`→`Recover`→`Activate` dance, 15 nil-receiver guards) | `Ctx.Run` is one bounded command; capacity is the caller's semaphore (synckit already keeps one). Two consumers build 1-byte degenerate pools purely to satisfy `RuntimeConfig.Workers`; the field is gone. |
 | Credit/ack flow control, observation slots, per-frame build re-checks, `writerStateMu`/`beginWriterDrain`/the writer-identity panic | Backpressure is the `Concurrency` group plus the socket buffer; the writer owns the fd; observation is a native verb, not a slotted lane. FrameAck survives as terminal-reached-peer proof (K32) — a different mechanism. |

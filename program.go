@@ -43,7 +43,8 @@ type placement interface {
 // recorded at ~/.daemonkit/builds/<Label>. build is the version string
 // the executable reports for itself, stamped at build time; it is the whole
 // build identity, so a build that should replace a running daemon must carry
-// a different one. Stable reads nothing: the copy is Ensure's, made under the
+// a different one; version.Running gives an unstamped dev build one keyed by
+// its modification time. Stable reads nothing: the copy is Ensure's, made under the
 // start lock, because replacing the file launchd is currently executing is a
 // transition of the live daemon and belongs to the convergence that owns every
 // other one.
@@ -203,15 +204,20 @@ type bundled struct {
 	file string
 }
 
-// build re-reads the bundle's CFBundleShortVersionString every time it is
-// asked, and carries nothing to go stale: an .app upgraded under a long-lived
-// Client is the build the daemon already publishes.
+// build re-reads the bundle's CFBundleShortVersionString and its executable's
+// modification time every time it is asked, and carries nothing to go stale:
+// an .app upgraded or rebuilt at the same version under a long-lived Client is
+// the build the daemon already publishes.
 func (b bundled) build() (string, error) {
 	version, err := bundle.ShortVersion(b.app)
 	if err != nil {
 		return "", fmt.Errorf("daemonkit: read bundle version of %q: %w", b.app, err)
 	}
-	return version, nil
+	info, err := os.Stat(b.file)
+	if err != nil {
+		return "", fmt.Errorf("daemonkit: stat bundle executable %q: %w", b.file, err)
+	}
+	return fmt.Sprintf("%s+%d", version, info.ModTime().UnixNano()), nil
 }
 
 func (b bundled) path(element) (string, error) { return b.file, nil }

@@ -39,8 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drain. Protocol 2 daemons and clients do not speak to protocol 3 ones over a
   session.
 - Build identity is a version string rather than a SHA-256 of the executable.
-  `Stable(build string)` takes the build's version, `InBundle` reads the
-  bundle's `CFBundleShortVersionString`, and `Serve` publishes its `Program`'s
+  `Stable(build string)` takes the build's version, which must change on every
+  rebuild: pass `version.Running(stamp)`, which turns a `dev` stamp into one
+  keyed by the executable's modification time. `InBundle` reads the bundle's
+  `CFBundleShortVersionString` plus its executable's modification time, so a
+  rebuilt app at the same version is still a new build. `Serve` publishes its `Program`'s
   build, so `Serve` now requires `Daemon.Program`. Placement compares the
   build recorded at `~/.daemonkit/builds/<Label>` instead of hashing either
   copy.

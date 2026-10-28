@@ -39,6 +39,7 @@ func supervisedDaemon(t *testing.T, label Label) (Daemon, string) {
 	t.Setenv(controlChildEnv, "1")
 	t.Setenv(controlChildLabel, string(label))
 	t.Setenv(controlChildApp, app)
+	t.Setenv(controlChildFile, program)
 	return Daemon{
 		Label:    label,
 		Program:  Program{policy: bundled{app: app, file: program}},
