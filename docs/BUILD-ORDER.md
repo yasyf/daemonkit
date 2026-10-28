@@ -33,8 +33,8 @@ Phase 0 is purely additive — nothing is deleted yet, so `main` still builds fo
 throughout it.
 
 **Also in phase 0, concurrently:** **G1, the AMFI team-identifier binding measurement**
-(DESIGN §9/§12.1). With a real Developer ID identity for team A, sign a binary whose CodeDirectory
-declares a foreign `teamID`/`identifier`, run it, and read `CS_OPS_VALIDATION_CATEGORY` /
+(moot since 2026-10-27, when every peer check was removed). With a real Developer ID identity
+for team A, sign a binary whose CodeDirectory declares a foreign `teamID`/`identifier`, run it, and read `CS_OPS_VALIDATION_CATEGORY` /
 `CS_OPS_TEAMID`. Category ≠ 6, or the team reported as A, confirms the binding and `internal/trust`
 ships as specified; category 6 with the foreign team reported adds the `cdhash`-memoized
 off-handshake-path chain check before phase 2 starts, and changes nothing else. **No host
@@ -46,11 +46,10 @@ ships signed apps and `repo-bootstrap:apple-certs` mints them, so the gate is ru
 no CI home.** It needs a Developer ID identity, and this box reports `0 valid identities` (line 43
 above) as does every runner; ad-hoc signing reports `TeamIdentifier=not set` and validation
 category ≠ 6, which `verifyToken` refuses. So the suite left `internal/trust` for `_e2e/trust/`,
-where the go tool cannot reach it, and `scripts/e2e-trust.sh` — which mints the fixtures and exits
-2 naming the missing identity — is its home; CI vets the package so it cannot rot silently.
-**The signed-peer path is therefore verified by whoever holds the identity and by nobody in CI**,
-and G2 in phase 1 rests on that hand run. Putting a signing identity in CI remains a
-release-infrastructure prerequisite, not a test chore.
+where the go tool could not reach it, and `scripts/e2e-trust.sh`, which minted the fixtures and
+exited 2 naming the missing identity, was its home. Whoever held the identity verified the
+signed-peer path, nobody in CI did, and G2 in phase 1 rested on that hand run. The suite, the
+script, and the path they tested were deleted on 2026-10-27.
 
 **Gates:** budget property tests; mixed-era harness runs (against a stub daemon until phase 3);
 fleet-build still green (nothing has been deleted).
@@ -70,14 +69,15 @@ entitlements parsed with stdlib `encoding/asn1`, the six injection rejections un
 `RequiredEntitlements`/`RequiredAppGroup`). No Security.framework binding, no cache, no budget
 share. Non-darwin and `daemonkit_unsigned` stubs as today. **Deletes:** public `trust`,
 `codeidentity`, `peer`, `RunVerifierChild` and every `main` dispatch site for it, and the entire
-purego Security.framework binding (`loadSecurity`, ~19 symbols).
+purego Security.framework binding (`loadSecurity`, ~19 symbols). `internal/trust`, the floor, and
+the `daemonkit_unsigned` tag were themselves removed on 2026-10-27; no peer is verified now
+(DESIGN, top note).
 
 **Lands (wire, same phase):** `go s.startConnection(...)` — off the accept loop, fixing a live
 unauthenticated same-UID DoS in the shipped tree — plus the pre-verification connection cap, its
 own named counter bounding unverified handshakes in flight, derived from `Concurrency`. Session
-capacity acquisition **stays after** `verifyPeer`: the per-role capacity-1 reservation is what
-keeps the trust-gated Drain verb reachable under flood, and `identity.Role` is peer-supplied, so
-anything acquired before verification is a denial primitive an unverified peer can hold.
+capacity acquisition stayed after `verifyPeer` until 2026-10-27, when verification and the
+per-role reservation were removed; the bounded pending-connection pool remains.
 
 **Gates:** the A2 adversarial settlement scenarios replayed as **compile-fail** tests (the two
 evasions must not compile) plus the concurrent-stop and fsync-pin scenarios as runtime tests; the
@@ -132,7 +132,7 @@ dependency-only; there are no waves, because there is no overlap window to stage
 
 | Order | Repos | Constraint |
 |---|---|---|
-| 1 (parallel) | synckit, captain-hook, cc-orchestrate, fusekit | each owns both ends of its socket — no cross-repo wire compatibility. One real-machine `Stable()` re-bootstrap test before the tag (DESIGN §12.4) |
+| 1 (parallel) | synckit, captain-hook, cc-orchestrate, fusekit | each owns both ends of its socket — no cross-repo wire compatibility. One real-machine `Stable` re-bootstrap test before the tag (DESIGN §12.3) |
 | 2 (lockstep ×3) | cc-interact + cc-present + cc-review | cc-present/cc-review import daemonkit directly *and* consume cc-interact's launcher. Signed-app end-to-end: `Ensure` against a real signed DR |
 | 3 | cc-notes, reposync, cc-patch, claude-pool/cc-pool, cookiesync | consume order 1–2's surfaces. cc-notes rewrites its source-text contract test (`release_contract_test.go`) in the same change; cc-patch is a `launchd`-leaf bump |
 

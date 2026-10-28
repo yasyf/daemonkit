@@ -156,9 +156,9 @@ func (c copied) path(el element) (string, error) {
 // place copies source over the program path, and does so only when the build
 // recorded for that path is not this one: re-converging a settled system
 // reads one small file, rewrites nothing, and leaves the inode launchd already
-// knows alone. The executable is written before its build record, so a crash
-// between the two leaves a record naming the old build and the next place
-// copies again.
+// knows alone. The old record is removed before the executable is replaced and
+// the new one written after, so a crash anywhere between leaves no record and
+// the next place copies again.
 func (c copied) place(el element) (bool, error) {
 	target, err := c.path(el)
 	if err != nil {
@@ -180,11 +180,14 @@ func (c copied) place(el element) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("daemonkit: read executable %q: %w", c.source, err)
 	}
-	if err := durable.WriteFile(target, data, 0o700); err != nil {
-		return false, fmt.Errorf("daemonkit: place %q at %q: %w", c.source, target, err)
-	}
 	if err := os.MkdirAll(filepath.Dir(record), 0o700); err != nil {
 		return false, fmt.Errorf("daemonkit: create build record dir: %w", err)
+	}
+	if err := durable.Remove(record); err != nil {
+		return false, fmt.Errorf("daemonkit: retire the build record for %q: %w", target, err)
+	}
+	if err := durable.WriteFile(target, data, 0o700); err != nil {
+		return false, fmt.Errorf("daemonkit: place %q at %q: %w", c.source, target, err)
 	}
 	if err := durable.WriteFile(record, []byte(c.version), 0o600); err != nil {
 		return false, fmt.Errorf("daemonkit: record the build placed at %q: %w", target, err)

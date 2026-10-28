@@ -147,9 +147,6 @@ func (d Daemon) contract() Contract {
 	return Contract{Schema: d.ownSchema(), MaxFrame: d.MaxFrame, Concurrency: d.Concurrency}
 }
 
-// attachSocket dials the daemon's socket and completes the handshake under
-// the daemon's own schema, reading the accepting process's pid off the
-// connection the session then uses.
 func attachSocket(ctx context.Context, d Daemon) (*wire.Client, int, error) {
 	el, err := d.Label.element()
 	if err != nil {
@@ -321,8 +318,6 @@ func (b *Business) Close(ctx context.Context) error {
 	return session.Close(ctx)
 }
 
-// acquire returns the lane's live session and the pid of the process that
-// accepted it, attaching one when the lane holds none.
 func (b *Business) acquire(ctx context.Context) (*wire.Client, int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -352,8 +347,6 @@ func (b *Business) acquire(ctx context.Context) (*wire.Client, int, error) {
 	}
 }
 
-// surrender hands the lane's live session to whoever takes it, leaving the
-// lane to attach afresh on its next use.
 func (b *Business) surrender() (*wire.Client, int, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -365,9 +358,6 @@ func (b *Business) surrender() (*wire.Client, int, bool) {
 	return session, peer, true
 }
 
-// health reads the daemon's report on the lane's session. A session the lane
-// already held may have outlived its peer before the transport noticed, so a
-// failure on one is retired and asked once more on a fresh attach.
 func (b *Business) health(ctx context.Context) (wire.HealthReport, error) {
 	_, _, report, err := b.ask(ctx, func(session *wire.Client, _ int) (proc.Identity, wire.HealthReport, error) {
 		report, err := session.Health(ctx)
@@ -376,8 +366,6 @@ func (b *Business) health(ctx context.Context) (wire.HealthReport, error) {
 	return report, err
 }
 
-// pinned reads the daemon's report on the lane's session and pins the kernel
-// process instance answering it, retrying a held session once as health does.
 func (b *Business) pinned(ctx context.Context) (*wire.Client, proc.Identity, wire.HealthReport, error) {
 	return b.ask(ctx, func(session *wire.Client, peer int) (proc.Identity, wire.HealthReport, error) {
 		return assemblePin(ctx, os.Getpid(), peer, session)

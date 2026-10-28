@@ -167,7 +167,9 @@ func (d *Deployment) drain(ctx context.Context) (daemonkit.Expect, daemonkit.Sto
 	health, err := d.client.Health(ctx)
 	switch {
 	case errors.Is(err, daemonkit.ErrDraining), errors.Is(err, daemonkit.ErrAbsent):
-		return d.settle(ctx)
+		return d.recorded(ctx, d.client.Settle)
+	case errors.Is(err, daemonkit.ErrProtocolMismatch):
+		return d.recorded(ctx, d.client.Terminate)
 	case err != nil:
 		return daemonkit.Expect{}, daemonkit.Stopped{}, err
 	}
@@ -176,12 +178,17 @@ func (d *Deployment) drain(ctx context.Context) (daemonkit.Expect, daemonkit.Sto
 	return expect, stopped, err
 }
 
-// settle is the session-less arm. The owner record is what pins it: the build
-// and generation read here are what a later escalation must find the record
-// still naming. An unrecorded incumbent is the already-absent case: nothing of
-// this daemon ever named itself here, so there is no identity to observe out of
-// the table and absence rests entirely on the inventory gate Quiesce runs next.
-func (d *Deployment) settle(ctx context.Context) (daemonkit.Expect, daemonkit.Stopped, error) {
+// recorded is the session-less arm: settle an incumbent already leaving, or
+// signal one speaking another protocol, which no session can drain. The owner
+// record is what pins it: the build and generation read here are what a later
+// escalation must find the record still naming. An unrecorded incumbent is the
+// already-absent case: nothing of this daemon ever named itself here, so there
+// is no identity to act on and absence rests entirely on the inventory gate
+// Quiesce runs next.
+func (d *Deployment) recorded(
+	ctx context.Context,
+	act func(context.Context, daemonkit.Expect) (daemonkit.Stopped, error),
+) (daemonkit.Expect, daemonkit.Stopped, error) {
 	owner, recorded, err := proc.ReadOwner(d.config.Daemon.RecordPath())
 	if err != nil {
 		return daemonkit.Expect{}, daemonkit.Stopped{}, fmt.Errorf("deploy: read owner record: %w", err)
@@ -190,7 +197,7 @@ func (d *Deployment) settle(ctx context.Context) (daemonkit.Expect, daemonkit.St
 		return daemonkit.Expect{}, daemonkit.Stopped{Reap: daemonkit.ReapAbsent}, nil
 	}
 	expect := daemonkit.Expect{Build: owner.Build, Generation: owner.Generation}
-	stopped, err := d.client.Settle(ctx, expect)
+	stopped, err := act(ctx, expect)
 	return expect, stopped, err
 }
 

@@ -35,6 +35,12 @@ type Client struct {
 	link *Business
 }
 
+// Close releases the session the client's own Health, Drain, WaitReady, and
+// Ensure hold, and every later one of those verbs refuses with ErrLaneClosed.
+// A business lane that took the session over keeps it until its own Close.
+// Like every verb it refuses a context without a deadline.
+func (c *Client) Close(ctx context.Context) error { return c.link.Close(ctx) }
+
 // record is the durable owner record's path, derived past the Label rule
 // wherever a verb is about to read it. The rule runs at each derivation rather
 // than once at the constructor, so a path added later inherits it instead of

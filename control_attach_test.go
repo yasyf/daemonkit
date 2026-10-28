@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -27,20 +26,6 @@ func controlChildProgram() Program {
 		return Program{policy: bundled{app: app}}
 	}
 	return testProgram
-}
-
-// versionBundle writes app's Info.plist declaring version, the build a
-// bundled Program reports.
-func versionBundle(t *testing.T, app, version string) {
-	t.Helper()
-	contents := filepath.Join(app, "Contents")
-	if err := os.MkdirAll(contents, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	info := "<plist><dict><key>CFBundleShortVersionString</key><string>" + version + "</string></dict></plist>"
-	if err := os.WriteFile(filepath.Join(contents, "Info.plist"), []byte(info), 0o600); err != nil {
-		t.Fatal(err)
-	}
 }
 
 // TestMain branches on the child marker before m.Run so a spawned copy of this

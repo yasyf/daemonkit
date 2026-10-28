@@ -47,7 +47,8 @@ func (c *Client) WaitReady(ctx context.Context) (Health, error) {
 }
 
 // waitReadyOnce rides the phase stream of the client's session — the daemon's
-// publication wakes it — and costs the daemon nothing while it waits. A
+// publication wakes it — and costs the daemon nothing while it waits, then
+// reads Health on that same session, so the report is the ready daemon's. A
 // session whose peer leaves instead of becoming ready, or dies under it, is
 // retired and reported as the drain it was, for the loop to attach again.
 func (c *Client) waitReadyOnce(ctx context.Context) (Health, error) {
@@ -55,14 +56,20 @@ func (c *Client) waitReadyOnce(ctx context.Context) (Health, error) {
 	if err != nil {
 		return Health{}, err
 	}
-	if err := session.WaitReady(ctx); err != nil {
-		c.link.retire(session)
-		if errors.Is(err, wire.ErrDraining) || session.Failure() != nil {
-			return Health{}, fmt.Errorf("%w: %w", ErrDraining, err)
-		}
-		return Health{}, err
+	err = session.WaitReady(ctx)
+	var report wire.HealthReport
+	if err == nil {
+		report, err = session.Health(ctx)
 	}
-	return c.Health(ctx)
+	if err == nil {
+		return healthFromReport(report), nil
+	}
+	broken := session.Failure() != nil
+	c.link.retire(session)
+	if errors.Is(err, wire.ErrDraining) || broken {
+		return Health{}, fmt.Errorf("%w: %w", ErrDraining, err)
+	}
+	return Health{}, err
 }
 
 // attachCadence derives the retry interval from the caller's own deadline, on

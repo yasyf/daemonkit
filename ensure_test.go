@@ -21,7 +21,6 @@ import (
 	"github.com/yasyf/daemonkit/internal/proc"
 	"github.com/yasyf/daemonkit/internal/realhome"
 	"github.com/yasyf/daemonkit/internal/state"
-	"github.com/yasyf/daemonkit/internal/wire"
 )
 
 func TestEnsureRequiresDeadline(t *testing.T) {
@@ -875,16 +874,6 @@ func TestPinRefusesAnIncompleteIncumbent(t *testing.T) {
 				t.Fatalf("expect() = %+v, want %+v", target.expect(), want)
 			}
 		})
-	}
-}
-
-func servedReport(phase wire.Phase, build string, generation uint64) wire.HealthReport {
-	return wire.HealthReport{
-		Phase:      phase,
-		Protocol:   wire.ProtocolVersion,
-		Generation: generation,
-		PID:        4242,
-		Build:      build,
 	}
 }
 

@@ -6,6 +6,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- Every per-connection security check. Any process that can open a daemon's
+  socket in the user's 0700 state directory may connect and is trusted. No
+  code-signature, team-ID, entitlement, or designated-requirement check runs
+  on a connecting process or a spawned child, and no same-UID check remains.
+  `Requirement`, `Requirements`, `EntitlementMatch`, `EntitlementRequirement`,
+  `PolicyDigest`, `Serving`, `ServingSigned`, `ServingSameUser`, `Trust`,
+  `Daemon.Trust`, `Cmd.Exec`, `ErrUntrusted`, `ErrPeerGone`, and
+  `ErrNoVerifier` are gone, along with `internal/trust` and the
+  `daemonkit_unsigned` build tag. `deploy` keeps its install-time `codesign`
+  verification of each app bundle, configured with the new
+  `deploy.Requirement`.
+- The separate control connection. `Control` and `Client.Control` are gone.
+
+### Added
+
+- `Client.Health`, `Client.Drain`, and `Client.Close`. `Health`, `Drain`,
+  `WaitReady`, and `Ensure` share one session that the client holds, and the
+  first `Client.Business` lane takes it over, so a command that converges and
+  then calls the daemon opens one connection.
+- `ErrProtocolMismatch`, returned by a daemon that speaks another wire
+  protocol. Ensure and Stop settle such a daemon by SIGTERM at the identity
+  its owner record names.
+
+### Changed
+
+- Wire protocol 3. The hello carries no lane, and the schema gates product
+  requests with a typed `build_mismatch` rejection instead of gating
+  admission, so a client of another schema era can still read health and
+  drain. Protocol 2 daemons and clients do not speak to protocol 3 ones over a
+  session.
+- Build identity is a version string rather than a SHA-256 of the executable.
+  `Stable(build string)` takes the build's version, `InBundle` reads the
+  bundle's `CFBundleShortVersionString`, and `Serve` publishes its `Program`'s
+  build, so `Serve` now requires `Daemon.Program`. Placement compares the
+  build recorded at `~/.daemonkit/builds/<Label>` instead of hashing either
+  copy.
+- `Ensure` no longer asks launchd about a daemon already serving the wanted
+  build: it returns `ActionNothing` without running `launchctl print`. Apply
+  still verifies the agent when Ensure installs or restarts the daemon, and a
+  drifted plist under a current daemon is repaired at its next replacement.
+- The Swift package drops its lane parameters, `SessionLane`,
+  `SocketResponseCode.peerUntrusted`, and `SocketWireBuildMismatchError`.
+
 ### Security
 
 - Builds with Go 1.26.10, which fixes GO-2026-6809 in `crypto/x509`.

@@ -39,6 +39,7 @@
 .	func	ClaimHandoff	all
 .	type	Client	all
 .	method	Client.Business	all
+.	method	Client.Close	all
 .	method	Client.Drain	all
 .	method	Client.Ensure	all
 .	method	Client.Health	all
