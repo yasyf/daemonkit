@@ -420,7 +420,7 @@ func TestInBundlePlacesNothing(t *testing.T) {
 func TestInstalledNamesItsPathAndBuildAndPlacesNothing(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv(realhome.EnvOverride, home)
-	link := "/opt/homebrew/bin/fake"
+	link := filepath.Join(t.TempDir(), "bin", "fake")
 
 	program, err := Installed(link, "1.2.3")
 	if err != nil {
@@ -443,10 +443,11 @@ func TestInstalledNamesItsPathAndBuildAndPlacesNothing(t *testing.T) {
 }
 
 func TestInstalledRefusesAnInexactPathOrAnUnnamedBuild(t *testing.T) {
+	link := filepath.Join(t.TempDir(), "bin", "fake")
 	for _, tc := range []struct{ path, build string }{
-		{"bin/fake", "1.2.3"},
-		{"/opt/homebrew/bin/../bin/fake", "1.2.3"},
-		{"/opt/homebrew/bin/fake", ""},
+		{filepath.Join("bin", "fake"), "1.2.3"},
+		{filepath.Dir(link) + "/../bin/fake", "1.2.3"},
+		{link, ""},
 	} {
 		if _, err := Installed(tc.path, tc.build); err == nil {
 			t.Errorf("Installed(%q, %q) succeeded, want a refusal", tc.path, tc.build)
