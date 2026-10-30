@@ -2,6 +2,7 @@ package artifact
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -59,5 +60,45 @@ func TestResolvePythonToolInstallsAndIsIdempotent(t *testing.T) {
 	calls, _ = os.ReadFile(marker)
 	if got := strings.Count(string(calls), "install"); got != 1 {
 		t.Fatalf("uv invoked %d times, want 1 (env already materialized)", got)
+	}
+}
+
+func TestPythonToolDurabilityFailureCannotPublishOrReuseTheEnvironment(t *testing.T) {
+	calls := filepath.Join(t.TempDir(), "uv.calls")
+	uv := fakeUV(t, calls)
+	store := Store{Root: t.TempDir()}
+	toolDir := filepath.Join(store.ToolsDir(), "capt-hook", "1.2.3")
+	binDir := filepath.Join(toolDir, "bin")
+	marker := filepath.Join(toolDir, installedMarker)
+	wantErr := errors.New("durability failure")
+	err := installPythonTool(context.Background(), uv, "capt-hook", "1.2.3", toolDir, binDir, filepath.Join(binDir, "capt-hookd"), marker, func(root string) error {
+		if root != toolDir {
+			t.Fatalf("sync root = %s, want %s", root, toolDir)
+		}
+		if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("marker before durability = %v, want absent", err)
+		}
+		return wantErr
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("install = %v, want durability failure", err)
+	}
+	if _, err := os.Stat(toolDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed environment = %v, want removed", err)
+	}
+	desc := &Descriptor{
+		Schema: 1, Name: "capt-hook", Kind: PythonTool,
+		Version: VersionSource{Static: "1.2.3"},
+		Tool:    &ToolSpec{Dist: "capt-hook", Entrypoint: "capt-hookd"},
+	}
+	if _, err := store.Resolve(context.Background(), desc, WithUV(uv)); err != nil {
+		t.Fatalf("fresh Resolve = %v", err)
+	}
+	data, err := os.ReadFile(calls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(data), "install"); got != 2 {
+		t.Fatalf("uv installs = %d, want 2", got)
 	}
 }
