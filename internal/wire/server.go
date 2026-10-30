@@ -418,6 +418,7 @@ func (s *Server) runSession(
 		peer:         peer,
 		schema:       schema,
 		current:      s.cfg.Schemas.Accepts(schema),
+		legacy:       codec.legacy.Load(),
 		generation:   generation,
 		release:      release,
 		outbound:     make(chan sessionOutbound, 4*s.concurrency),

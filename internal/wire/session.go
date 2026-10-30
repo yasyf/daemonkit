@@ -58,6 +58,7 @@ type session struct {
 	peer         proc.Peer
 	schema       string
 	current      bool
+	legacy       bool
 	generation   []byte
 	release      func()
 	accepted     *AcceptedSession
@@ -487,7 +488,7 @@ func (s *session) execute(sessCtx, requestCtx context.Context, frame Frame, stat
 // daemon.-prefixed op nor a schema outside the accepted set.
 func (s *session) dispatch(requestCtx context.Context, frame Frame, state *requestState) (any, error) {
 	switch {
-	case s.codec.legacy.Load() && frame.Op != healthOp:
+	case s.legacy && frame.Op != healthOp:
 		return nil, ErrPermissionDenied
 	case frame.Op == healthOp:
 		return s.server.executeHealth()
