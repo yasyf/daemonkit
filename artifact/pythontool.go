@@ -45,17 +45,14 @@ func (s Store) resolvePythonTool(ctx context.Context, desc *Descriptor, version 
 		if regular(marker) {
 			return nil
 		}
-		return installPythonTool(ctx, o.uvExecutable(), desc.Tool.Dist, version, toolDir, binDir, link, marker)
+		return installPythonTool(ctx, o.uvExecutable(), desc.Tool.Dist, version, toolDir, binDir, link, marker, syncTree)
 	}); err != nil {
 		return "", err
 	}
 	return realEntrypoint(link)
 }
 
-// installPythonTool materializes a tool env and writes .installed only after uv
-// succeeds and the entrypoint is present, so a failed or interrupted install is
-// never reused: any prior partial is cleared first, and a failure removes the env.
-func installPythonTool(ctx context.Context, uv, dist, version, toolDir, binDir, link, marker string) error {
+func installPythonTool(ctx context.Context, uv, dist, version, toolDir, binDir, link, marker string, syncEnv func(string) error) error {
 	if err := os.RemoveAll(toolDir); err != nil {
 		return fmt.Errorf("artifact: clear prior tool env: %w", err)
 	}
@@ -67,10 +64,7 @@ func installPythonTool(ctx context.Context, uv, dist, version, toolDir, binDir, 
 		_ = os.RemoveAll(toolDir)
 		return fmt.Errorf("artifact: uv tool install %s did not produce its entrypoint: %w", dist, err)
 	}
-	// Fsync the env's file data before the marker, so a crash cannot leave a
-	// durable .installed pointing at a truncated env (the release path SyncDirs
-	// its stage before the rename for the same reason).
-	if err := syncTree(toolDir); err != nil {
+	if err := syncEnv(toolDir); err != nil {
 		_ = os.RemoveAll(toolDir)
 		return fmt.Errorf("artifact: sync tool env: %w", err)
 	}

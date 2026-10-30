@@ -64,6 +64,8 @@ jobs:
           go vet -tags dke2e ./deploy
       - name: Test (race, via the process-cap harness)
         run: ./scripts/test.sh -race ./...
+      - name: Python tool tree durability work counters
+        run: ./scripts/test.sh -v ./artifact -run '^TestSyncTreeBatchesDriveBarriers$'
       - name: Build (pure)
         run: CGO_ENABLED=0 go build ./...
 
