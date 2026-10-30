@@ -47,7 +47,7 @@ func TestSyncTreeBatchesDriveBarriers(t *testing.T) {
 			if kernelCalls != files+3 || driveCalls != 1 {
 				t.Fatalf("kernel fsyncs = %d, drive barriers = %d; want %d, 1", kernelCalls, driveCalls, files+3)
 			}
-			t.Logf("entries=%d kernel_fsync_calls=%d fullfsync_requests=%d filesystems=1", files+3, kernelCalls, driveCalls)
+			t.Logf("entries=%d kernel_fsync_calls=%d terminal_file_sync_calls=%d filesystems=1", files+3, kernelCalls, driveCalls)
 		})
 	}
 }

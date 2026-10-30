@@ -6,6 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.36.1] - 2026-10-30
+
+### Fixed
+
+- Python tool installation on macOS batches full-drive flushes per file system.
+  Every file and directory is still fsynced before the completion marker is
+  published.
+
 ## [0.36.0] - 2026-10-28
 
 ### Added
@@ -1910,7 +1918,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.36.0...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.36.1...HEAD
+[0.36.1]: https://github.com/yasyf/daemonkit/compare/v0.36.0...v0.36.1
 [0.36.0]: https://github.com/yasyf/daemonkit/compare/v0.35.4...v0.36.0
 [0.35.4]: https://github.com/yasyf/daemonkit/compare/v0.35.3...v0.35.4
 [0.35.3]: https://github.com/yasyf/daemonkit/compare/v0.35.2...v0.35.3
