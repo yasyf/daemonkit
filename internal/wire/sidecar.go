@@ -15,5 +15,5 @@ type frameSidecar interface {
 type frameRightsCodec interface {
 	peek(dst []byte) error
 	discard()
-	readFrame(maxFrame int, peeked []byte) (Frame, frameSidecar, error)
+	readFrame(maxFrame int, peeked []byte, decode func([]byte) (Frame, error)) (Frame, frameSidecar, error)
 }

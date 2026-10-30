@@ -7,10 +7,21 @@ import (
 	"io"
 )
 
-const sessionGenerationBytes = 16
+const (
+	sessionGenerationBytes = 16
+	legacyProtocolVersion  = ProtocolVersion - 1
+	legacyControlLane      = "control"
+)
 
 type helloIdentity struct {
 	Protocol uint16 `json:"protocol"`
+	Schema   string `json:"schema,omitempty"`
+	Nonce    []byte `json:"nonce,omitempty"`
+}
+
+type legacyHello struct {
+	Protocol uint16 `json:"protocol"`
+	Lane     string `json:"lane"`
 	Schema   string `json:"schema,omitempty"`
 	Nonce    []byte `json:"nonce,omitempty"`
 }
@@ -88,6 +99,9 @@ func readClientHello(codec *Codec) (helloIdentity, error) {
 	if frame.Kind != FrameHello {
 		return helloIdentity{}, fmt.Errorf("%w: invalid hello frame", ErrHandshake)
 	}
+	if codec.legacy.Load() {
+		return readLegacyHello(frame.Payload)
+	}
 	var hello helloIdentity
 	if err := decodeStrict(frame.Payload, &hello); err != nil {
 		return helloIdentity{}, fmt.Errorf("%w: identity: %w", ErrHandshake, err)
@@ -96,6 +110,17 @@ func readClientHello(codec *Codec) (helloIdentity, error) {
 		return helloIdentity{}, &ProtocolMismatchError{Theirs: hello.Protocol, Ours: ProtocolVersion}
 	}
 	return hello, nil
+}
+
+func readLegacyHello(payload []byte) (helloIdentity, error) {
+	var hello legacyHello
+	if err := decodeStrict(payload, &hello); err != nil {
+		return helloIdentity{}, fmt.Errorf("%w: identity: %w", ErrHandshake, err)
+	}
+	if hello.Protocol != legacyProtocolVersion || hello.Lane != legacyControlLane {
+		return helloIdentity{}, &ProtocolMismatchError{Theirs: hello.Protocol, Ours: ProtocolVersion}
+	}
+	return helloIdentity{Protocol: ProtocolVersion, Nonce: hello.Nonce}, nil
 }
 
 // clientHandshake writes hello, peeks for the drain preamble, and reads the

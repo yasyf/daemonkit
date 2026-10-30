@@ -6,6 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.36.2] - 2026-10-30
+
+### Fixed
+
+- A daemon answers a protocol-2 client's control-lane hello and its health
+  read, in protocol-2 frames, and refuses every other verb on that session.
+  A client built before the protocol-3 cut can now see that a newer daemon
+  is serving and hand its work to that daemon's executable, where before
+  every read failed with `unsupported protocol version: got 3, want 2` until
+  the client process restarted. The health report still names protocol 3,
+  so an older `Ensure` never takes the newer daemon for its own build and
+  never drains it. A protocol-2 business-lane hello still gets
+  `ErrProtocolMismatch`.
+
 ## [0.36.1] - 2026-10-30
 
 ### Fixed
@@ -1918,7 +1932,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.36.1...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.36.2...HEAD
+[0.36.2]: https://github.com/yasyf/daemonkit/compare/v0.36.1...v0.36.2
 [0.36.1]: https://github.com/yasyf/daemonkit/compare/v0.36.0...v0.36.1
 [0.36.0]: https://github.com/yasyf/daemonkit/compare/v0.35.4...v0.36.0
 [0.35.4]: https://github.com/yasyf/daemonkit/compare/v0.35.3...v0.35.4

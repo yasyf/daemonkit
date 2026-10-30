@@ -425,3 +425,74 @@ func TestOldEraPeersGetProtocolMismatch(t *testing.T) {
 		}
 	})
 }
+
+func TestPreviousProtocolControlLaneReadsHealthOnly(t *testing.T) {
+	server := mustServer(t, stubRuntime{phase: PhaseReady}, Config{Serving: Serving{PID: 4242, Build: "b3", Generation: 7}})
+	clientConn, serverConn := testPair(t)
+	done := make(chan error, 1)
+	go func() { done <- server.startConnection(context.Background(), serverConn) }()
+	if _, err := clientConn.Write(encodeEraFrame(t, 2, FrameHello, []byte(`{"protocol":2,"lane":"control"}`))); err != nil {
+		t.Fatalf("write protocol-2 hello: %v", err)
+	}
+	codec := NewCodec(clientConn)
+	codec.legacy.Store(true)
+	if ack := readAck(t, codec); ack.Rejected || ack.Protocol != 2 {
+		t.Fatalf("ack = %+v, want a protocol-2 acceptance", ack)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("startConnection() = %v", err)
+	}
+
+	health := legacyCall(t, codec, 1, healthOp)
+	var report HealthReport
+	if err := json.Unmarshal(health.Payload, &report); err != nil {
+		t.Fatalf("decode health: %v", err)
+	}
+	if report.Protocol != ProtocolVersion || report.PID != 4242 || report.Build != "b3" {
+		t.Fatalf("health = %+v, want the serving daemon at protocol %d", report, ProtocolVersion)
+	}
+	if drain := legacyCall(t, codec, 2, drainControlOp); !drain.Rejected || drain.Code != ResponseCodePermissionDenied {
+		t.Fatalf("drain = %+v, want permission_denied", drain)
+	}
+}
+
+func TestPreviousProtocolBusinessLaneGetsProtocolMismatch(t *testing.T) {
+	server := mustServer(t, stubRuntime{phase: PhaseReady}, Config{})
+	clientConn, serverConn := testPair(t)
+	done := make(chan error, 1)
+	go func() { done <- server.startConnection(context.Background(), serverConn) }()
+	hello := encodeEraFrame(t, 2, FrameHello, []byte(`{"protocol":2,"lane":"business","schema":"test.v1"}`))
+	if _, err := clientConn.Write(hello); err != nil {
+		t.Fatalf("write protocol-2 hello: %v", err)
+	}
+	var mismatch *ProtocolMismatchError
+	if err := <-done; !errors.As(err, &mismatch) || mismatch.Theirs != 2 {
+		t.Fatalf("startConnection() = %v, want ProtocolMismatchError{2, %d}", err, ProtocolVersion)
+	}
+	codec := NewCodec(clientConn)
+	codec.legacy.Store(true)
+	if ack := readAck(t, codec); !ack.Rejected || ack.Protocol != ProtocolVersion {
+		t.Fatalf("ack = %+v, want a protocol-%d rejection", ack, ProtocolVersion)
+	}
+}
+
+func legacyCall(t *testing.T, codec *Codec, id uint64, op Op) Response {
+	t.Helper()
+	if err := codec.WriteFrame(Frame{Kind: FrameRequest, Flags: FlagEnd, ID: id, Op: op}); err != nil {
+		t.Fatalf("write %s: %v", op, err)
+	}
+	for {
+		frame, err := codec.ReadFrame()
+		if err != nil {
+			t.Fatalf("read %s response: %v", op, err)
+		}
+		if frame.Kind != FrameResponse || frame.ID != id {
+			continue
+		}
+		var response Response
+		if err := json.Unmarshal(frame.Payload, &response); err != nil {
+			t.Fatalf("decode %s response: %v", op, err)
+		}
+		return response
+	}
+}

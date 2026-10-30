@@ -915,6 +915,12 @@ to re-derive or silently contradict them.
   (2026-10-27). §8.4 requires an old client meeting a new daemon to get a crisp typed
   `ErrProtocolMismatch`; with both eras at one protocol the hellos differ in shape only and there
   is nothing to reject on.
+- **Protocol 2 keeps a health window** (2026-10-30). A protocol-3 server admits a protocol-2
+  control-lane hello and answers its `daemon.health` read in protocol-2 frames, refusing every
+  other verb, so a long-lived pre-cut client can see that a newer daemon serves and hand its work
+  to that daemon's executable. The report names protocol 3, which an old `decide` refuses as an
+  incomplete identity, so the window grants no drain. Every other protocol-2 hello still gets
+  `ErrProtocolMismatch`.
 - **The frozen drain preamble is `0x4452` ("DR").** Chosen so it can never open a frame: a frame
   begins with a big-endian `uint32` body length, so `0x4452….` implies a body over 1 GiB — above
   every `MaxFrame` ceiling (4 / 16 / 64 MiB).

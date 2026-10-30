@@ -272,6 +272,7 @@ func (s *Server) startConnection(ctx context.Context, conn *net.UnixConn) error 
 	start := time.Now()
 	codec := NewCodec(conn)
 	codec.MaxFrame = s.maxFrame()
+	codec.admitsLegacy = true
 	if err := codec.SetDeadline(earlierDeadline(ctx, start.Add(s.handshakeReadTimeout()))); err != nil {
 		_ = conn.Close()
 		return err
@@ -542,7 +543,7 @@ func (s *Server) completeHandshake(codec *Codec) ([]byte, error) {
 		return nil, fmt.Errorf("%w: generate session: %w", ErrHandshake, err)
 	}
 	if err := s.writeAck(codec, helloAck{
-		Protocol: ProtocolVersion, Schema: s.cfg.Schemas.Own(),
+		Protocol: codec.protocol(), Schema: s.cfg.Schemas.Own(),
 		Session: generation, Phase: s.rt.Phase().Phase,
 	}); err != nil {
 		return nil, fmt.Errorf("%w: acknowledge: %w", ErrHandshake, err)
