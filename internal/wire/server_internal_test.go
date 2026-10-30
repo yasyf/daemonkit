@@ -431,11 +431,11 @@ func TestPreviousProtocolControlLaneReadsHealthOnly(t *testing.T) {
 	clientConn, serverConn := testPair(t)
 	done := make(chan error, 1)
 	go func() { done <- server.startConnection(context.Background(), serverConn) }()
+	codec := NewCodec(clientConn)
+	codec.legacy.Store(true)
 	if _, err := clientConn.Write(encodeEraFrame(t, 2, FrameHello, []byte(`{"protocol":2,"lane":"control"}`))); err != nil {
 		t.Fatalf("write protocol-2 hello: %v", err)
 	}
-	codec := NewCodec(clientConn)
-	codec.legacy.Store(true)
 	if ack := readAck(t, codec); ack.Rejected || ack.Protocol != 2 {
 		t.Fatalf("ack = %+v, want a protocol-2 acceptance", ack)
 	}
@@ -461,18 +461,18 @@ func TestPreviousProtocolBusinessLaneGetsProtocolMismatch(t *testing.T) {
 	clientConn, serverConn := testPair(t)
 	done := make(chan error, 1)
 	go func() { done <- server.startConnection(context.Background(), serverConn) }()
+	codec := NewCodec(clientConn)
+	codec.legacy.Store(true)
 	hello := encodeEraFrame(t, 2, FrameHello, []byte(`{"protocol":2,"lane":"business","schema":"test.v1"}`))
 	if _, err := clientConn.Write(hello); err != nil {
 		t.Fatalf("write protocol-2 hello: %v", err)
 	}
+	if ack := readAck(t, codec); !ack.Rejected || ack.Protocol != ProtocolVersion {
+		t.Fatalf("ack = %+v, want a protocol-%d rejection", ack, ProtocolVersion)
+	}
 	var mismatch *ProtocolMismatchError
 	if err := <-done; !errors.As(err, &mismatch) || mismatch.Theirs != 2 {
 		t.Fatalf("startConnection() = %v, want ProtocolMismatchError{2, %d}", err, ProtocolVersion)
-	}
-	codec := NewCodec(clientConn)
-	codec.legacy.Store(true)
-	if ack := readAck(t, codec); !ack.Rejected || ack.Protocol != ProtocolVersion {
-		t.Fatalf("ack = %+v, want a protocol-%d rejection", ack, ProtocolVersion)
 	}
 }
 
