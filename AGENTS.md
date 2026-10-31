@@ -32,7 +32,7 @@ the next render.
 <!-- BEGIN GENERATED: package table (scripts/gen-package-table.sh) -->
 | Package | Owns | Files | Lines |
 |---|---|---|---|
-| `artifact` | resolves a version-exact executable from a declarative descriptor, for the cc-family's one central "give me the binary that matches my version" primitive. | 17 | 3412 |
+| `artifact` | resolves a version-exact executable from a declarative descriptor, for the cc-family's one central "give me the binary that matches my version" primitive. | 22 | 3763 |
 | `bundle` | reads a macOS .app's Info.plist and resolves the stable bundle paths a daemon installs to. | 5 | 208 |
 | `deploy` | owns sealed installation, activation, supersession, and removal of one fixed signed application. | 17 | 7623 |
 | `durable` | makes filesystem state survive crashes: atomic, fsynced publication of files and directory mutations, a strict validated JSON codec, and one bounded cross-process lock. | 11 | 1433 |
