@@ -8,6 +8,7 @@ import (
 	"math"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -33,12 +34,14 @@ type Codec struct {
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
 
-	conn      net.Conn
-	rights    frameRightsCodec
-	rightsErr error
-	peeked    []byte
-	readMu    sync.Mutex
-	writeMu   sync.Mutex
+	conn         net.Conn
+	rights       frameRightsCodec
+	rightsErr    error
+	peeked       []byte
+	admitsLegacy bool
+	legacy       atomic.Bool
+	readMu       sync.Mutex
+	writeMu      sync.Mutex
 }
 
 // NewCodec wraps conn with the default frame cap and no deadlines.
@@ -145,7 +148,7 @@ func (c *Codec) readFrameWithSidecar() (frame Frame, sidecar frameSidecar, err e
 	peeked := c.peeked
 	c.peeked = nil
 	if c.rights != nil {
-		return c.rights.readFrame(c.MaxFrame, peeked)
+		return c.rights.readFrame(c.MaxFrame, peeked, c.decode)
 	}
 	var prefix [4]byte
 	n := copy(prefix[:], peeked)
@@ -173,8 +176,29 @@ func (c *Codec) readFrameWithSidecar() (frame Frame, sidecar frameSidecar, err e
 		}
 		return Frame{}, nil, err
 	}
-	frame, err = decodeValidFrame(body)
+	frame, err = c.decode(body)
 	return frame, nil, err
+}
+
+func (c *Codec) decode(body []byte) (Frame, error) {
+	if c.admitsLegacy {
+		c.admitsLegacy = false
+		c.legacy.Store(binary.BigEndian.Uint16(body[4:6]) == legacyProtocolVersion)
+	}
+	if c.legacy.Load() {
+		if version := binary.BigEndian.Uint16(body[4:6]); version != legacyProtocolVersion {
+			return Frame{}, fmt.Errorf("%w: got %d, want %d", ErrProtocolVersion, version, legacyProtocolVersion)
+		}
+		binary.BigEndian.PutUint16(body[4:6], ProtocolVersion)
+	}
+	return decodeValidFrame(body)
+}
+
+func (c *Codec) protocol() uint16 {
+	if c.legacy.Load() {
+		return legacyProtocolVersion
+	}
+	return ProtocolVersion
 }
 
 // WriteFrame writes one complete frame under the configured bound.
@@ -191,6 +215,7 @@ func (c *Codec) writeFrame(frame Frame) (started, complete bool, err error) {
 	if err != nil {
 		return false, false, err
 	}
+	binary.BigEndian.PutUint16(body[4:6], c.protocol())
 	limit := c.MaxFrame
 	if limit <= 0 {
 		limit = DefaultMaxFrame

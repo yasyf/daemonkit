@@ -55,7 +55,9 @@ func (c *scmRightsCodec) discard() {
 	c.pending = nil
 }
 
-func (c *scmRightsCodec) readFrame(maxFrame int, peeked []byte) (frame Frame, sidecar frameSidecar, err error) {
+func (c *scmRightsCodec) readFrame(
+	maxFrame int, peeked []byte, decode func([]byte) (Frame, error),
+) (frame Frame, sidecar frameSidecar, err error) {
 	received := c.pending
 	c.pending = nil
 	defer func() {
@@ -90,7 +92,7 @@ func (c *scmRightsCodec) readFrame(maxFrame int, peeked []byte) (frame Frame, si
 		}
 		return Frame{}, nil, err
 	}
-	frame, err = decodeValidFrame(body)
+	frame, err = decode(body)
 	if err != nil {
 		return Frame{}, nil, err
 	}
