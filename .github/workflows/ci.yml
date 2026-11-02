@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
 
 # PRs only: cancel-in-progress on main repeatedly killed the slow swift job
 # mid-run, leaving commits with no CI verdict (ccn af9889a).
