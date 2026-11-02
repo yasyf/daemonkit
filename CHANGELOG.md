@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.36.3] - 2026-11-02
+
+### Fixed
+
+- Process ownership on macOS now reads `kern.bootsessionuuid` instead of the calendar-adjustable `kern.boottime`, reusing the existing Linux UUID parsing and folding. Old timestamp records are unchanged, so live consumers need an independently verified transition.
+
 ## [0.36.2] - 2026-10-30
 
 ### Fixed
@@ -1932,7 +1938,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.36.2...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.36.3...HEAD
+[0.36.3]: https://github.com/yasyf/daemonkit/compare/v0.36.2...v0.36.3
 [0.36.2]: https://github.com/yasyf/daemonkit/compare/v0.36.1...v0.36.2
 [0.36.1]: https://github.com/yasyf/daemonkit/compare/v0.36.0...v0.36.1
 [0.36.0]: https://github.com/yasyf/daemonkit/compare/v0.35.4...v0.36.0
