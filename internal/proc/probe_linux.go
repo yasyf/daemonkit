@@ -2,8 +2,6 @@ package proc
 
 import (
 	"bytes"
-	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -95,23 +93,12 @@ func probeGroupMembers(sessionID int) ([]groupMember, error) {
 	return members, nil
 }
 
-// bootSession folds the kernel's per-boot random id into the boot stamp. The
-// boot time /proc/stat reports is wall clock minus uptime and moves when the
-// clock is stepped, which would read a live process as one from another boot.
 func bootSession() (uint64, error) {
 	raw, err := os.ReadFile(bootIDPath)
 	if err != nil {
 		return 0, fmt.Errorf("read %s: %w", bootIDPath, err)
 	}
-	id, err := hex.DecodeString(strings.ReplaceAll(strings.TrimSpace(string(raw)), "-", ""))
-	if err != nil || len(id) != 16 {
-		return 0, fmt.Errorf("parse %s: %q is not a uuid", bootIDPath, raw)
-	}
-	boot := binary.BigEndian.Uint64(id[:8])
-	if boot == 0 {
-		return 0, fmt.Errorf("parse %s: %q folds to a zero boot stamp", bootIDPath, raw)
-	}
-	return boot, nil
+	return parseBootSession(string(raw), bootIDPath)
 }
 
 // tablePIDs lists every process id the process table holds right now.
