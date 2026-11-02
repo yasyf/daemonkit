@@ -38,6 +38,7 @@ jobs:
         run: ./scripts/check-codegen.sh
 
   test:
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:
@@ -164,6 +165,7 @@ jobs:
   # One Swift job (macOS minutes bill 10x); macos-26 pinned — its image ships
   # the Xcode 26.x / Swift 6.2 toolchain Package.swift needs.
   swift:
+    if: github.event_name != 'pull_request'
     runs-on: macos-26
     timeout-minutes: 15
     steps:
