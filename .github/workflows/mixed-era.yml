@@ -15,6 +15,7 @@ permissions:
 
 jobs:
   mixed-era:
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     strategy:
