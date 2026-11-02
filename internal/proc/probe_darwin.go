@@ -77,11 +77,11 @@ func procInfoFromKinfo(kp unix.KinfoProc, sessionID int) procInfo {
 }
 
 func bootSession() (uint64, error) {
-	tv, err := unix.SysctlTimeval("kern.boottime")
+	raw, err := unix.Sysctl("kern.bootsessionuuid")
 	if err != nil {
-		return 0, fmt.Errorf("sysctl kern.boottime: %w", err)
+		return 0, fmt.Errorf("sysctl kern.bootsessionuuid: %w", err)
 	}
-	return microStamp(tv.Sec, int64(tv.Usec)), nil
+	return parseBootSession(raw, "kern.bootsessionuuid")
 }
 
 func microStamp(sec, usec int64) uint64 {
