@@ -3,6 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v0.*"]
+  schedule:
+    - cron: "7 10 * * *"
   pull_request:
     branches: [main]
 
@@ -39,7 +42,7 @@ jobs:
         run: ./scripts/check-codegen.sh
 
   test:
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/')
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:
@@ -166,7 +169,7 @@ jobs:
   # One Swift job (macOS minutes bill 10x); macos-26 pinned — its image ships
   # the Xcode 26.x / Swift 6.2 toolchain Package.swift needs.
   swift:
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/')
     runs-on: macos-26
     timeout-minutes: 15
     steps:
