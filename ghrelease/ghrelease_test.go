@@ -71,3 +71,24 @@ func TestLatestEmptyRepoErrors(t *testing.T) {
 		t.Fatal("Latest(\"\") = nil, want error")
 	}
 }
+
+func TestTaggedReturnsTheTagsAssetsWithTheirAPIURLs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/yasyf/cc-slack/releases/tags/v0.7.2" {
+			t.Errorf("path = %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(`{"tag_name":"v0.7.2","assets":[{"name":"cc-slack_0.7.2_darwin_arm64.tar.gz","browser_download_url":"https://example.test/dl","url":"https://api.example.test/repos/yasyf/cc-slack/releases/assets/9","size":42}]}`))
+	}))
+	defer server.Close()
+
+	release, err := (Client{BaseURL: server.URL}).Tagged(context.Background(), "yasyf/cc-slack", "v0.7.2")
+	if err != nil {
+		t.Fatalf("Tagged() = %v", err)
+	}
+	want := Asset{Name: "cc-slack_0.7.2_darwin_arm64.tar.gz", URL: "https://example.test/dl", APIURL: "https://api.example.test/repos/yasyf/cc-slack/releases/assets/9", Size: 42}
+	if release.Tag != "v0.7.2" || len(release.Assets) != 1 || release.Assets[0] != want {
+		t.Fatalf("release = %+v, want tag v0.7.2 with %+v", release, want)
+	}
+}

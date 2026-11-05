@@ -281,6 +281,7 @@ artifact	field	Descriptor.Tool	all
 artifact	method	Descriptor.Validate	all
 artifact	field	Descriptor.Version	all
 artifact	var	ErrChecksumMismatch	all
+artifact	var	ErrDownload	all
 artifact	var	ErrDynamicIntegrity	all
 artifact	var	ErrEntrypointChanged	all
 artifact	var	ErrInvalidDescriptor	all
@@ -351,6 +352,7 @@ artifact	field	VersionSource.JSONField	all
 artifact	field	VersionSource.PlistKey	all
 artifact	field	VersionSource.Static	all
 artifact	func	WithGitHubToken	all
+artifact	func	WithGitHubTokenSource	all
 artifact	func	WithHTTPClient	all
 artifact	func	WithUV	all
 artifact	const	Zip	all
@@ -454,6 +456,7 @@ durable	method	Writer.Close	all
 durable	method	Writer.Commit	all
 durable	method	Writer.Write	all
 ghrelease	type	Asset	all
+ghrelease	field	Asset.APIURL	all
 ghrelease	field	Asset.Name	all
 ghrelease	field	Asset.Size	all
 ghrelease	field	Asset.URL	all
@@ -461,6 +464,7 @@ ghrelease	type	Client	all
 ghrelease	field	Client.BaseURL	all
 ghrelease	field	Client.HTTPClient	all
 ghrelease	method	Client.Latest	all
+ghrelease	method	Client.Tagged	all
 ghrelease	field	Client.Token	all
 ghrelease	func	Latest	all
 ghrelease	type	Release	all

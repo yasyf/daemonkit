@@ -6,6 +6,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.37.0] - 2026-11-05
+
+### Added
+
+- A release-binary download survives a failing release download host. Each
+  route retries a 5xx, a 429, or a transport failure three times with
+  backoff, and when `github.com/.../releases/download` still fails, the
+  asset is fetched through the GitHub API's release-asset endpoint. Both
+  routes' bytes are checked against the descriptor's size and digest, so a
+  mismatch is still `ErrChecksumMismatch` or `ErrSizeMismatch`.
+- `ErrDownload` marks a resolution that failed because every route to the
+  asset failed, which a caller can tell apart from a verified mismatch.
+- `WithGitHubTokenSource(func(context.Context) string)` supplies the API
+  route's token lazily, read only once the release download host has failed
+  and only when `WithGitHubToken` set none, so a caller can shell out to
+  `gh auth token` without paying for it on every cold resolve.
+- `ghrelease.Client.Tagged` returns the release at an exact tag, and
+  `ghrelease.Asset.APIURL` carries each asset's API endpoint.
+
 ## [0.36.3] - 2026-11-02
 
 ### Fixed
@@ -1938,7 +1957,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.36.3...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.37.0...HEAD
+[0.37.0]: https://github.com/yasyf/daemonkit/compare/v0.36.3...v0.37.0
 [0.36.3]: https://github.com/yasyf/daemonkit/compare/v0.36.2...v0.36.3
 [0.36.2]: https://github.com/yasyf/daemonkit/compare/v0.36.1...v0.36.2
 [0.36.1]: https://github.com/yasyf/daemonkit/compare/v0.36.0...v0.36.1

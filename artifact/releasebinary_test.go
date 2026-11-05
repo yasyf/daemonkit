@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type redirectTransport struct{ base *url.URL }
@@ -200,5 +201,162 @@ func TestResolveReleaseBinaryUnsupportedPlatform(t *testing.T) {
 	}
 	if _, err := store.Resolve(context.Background(), desc, opt); !errors.Is(err, ErrUnsupportedPlatform) {
 		t.Fatalf("Resolve() = %v, want ErrUnsupportedPlatform", err)
+	}
+}
+
+const (
+	directPath = "/yasyf/tool/releases/download/v1.0.0/tool_asset"
+	tagPath    = "/repos/yasyf/tool/releases/tags/v1.0.0"
+	assetPath  = "/repos/yasyf/tool/releases/assets/7"
+)
+
+func serveRoutes(t *testing.T, routes map[string]http.HandlerFunc) (Store, Option, map[string]*atomic.Int64) {
+	t.Helper()
+	backoff := downloadBackoff
+	downloadBackoff = time.Millisecond
+	t.Cleanup(func() { downloadBackoff = backoff })
+	hits := map[string]*atomic.Int64{}
+	for path := range routes {
+		hits[path] = &atomic.Int64{}
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handler, ok := routes[r.URL.Path]
+		if !ok {
+			t.Errorf("unexpected request %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		hits[r.URL.Path].Add(1)
+		handler(w, r)
+	}))
+	t.Cleanup(server.Close)
+	base, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Store{Root: t.TempDir()}, WithHTTPClient(&http.Client{Transport: redirectTransport{base: base}}), hits
+}
+
+func status(code int) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(code) }
+}
+
+func serve(content []byte) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(content) }
+}
+
+func releaseByTag(w http.ResponseWriter, _ *http.Request) {
+	_, _ = w.Write([]byte(`{"tag_name":"v1.0.0","assets":[{"name":"other","url":"https://api.github.com/repos/yasyf/tool/releases/assets/6"},{"name":"tool_asset","url":"https://api.github.com` + assetPath + `"}]}`))
+}
+
+func rawEntry(content []byte) PlatformEntry {
+	return PlatformEntry{Size: int64(len(content)), Hash: "sha256", Digest: sha256hex(content), Format: Raw, Path: "tool"}
+}
+
+func TestResolveReleaseBinaryRetriesAGatewayTimeout(t *testing.T) {
+	content := []byte("#!/bin/sh\necho retried\n")
+	var calls atomic.Int64
+	store, opt, hits := serveRoutes(t, map[string]http.HandlerFunc{
+		directPath: func(w http.ResponseWriter, r *http.Request) {
+			if calls.Add(1) == 1 {
+				w.WriteHeader(http.StatusGatewayTimeout)
+				return
+			}
+			serve(content)(w, r)
+		},
+	})
+	source := WithGitHubTokenSource(func(context.Context) string {
+		t.Error("token source read while the release download host answered")
+		return ""
+	})
+
+	path, err := store.Resolve(context.Background(), releaseDescriptor(t, rawEntry(content)), opt, source)
+	if err != nil {
+		t.Fatalf("Resolve() = %v", err)
+	}
+	if got, _ := os.ReadFile(path); string(got) != string(content) {
+		t.Fatalf("materialized content = %q, want %q", got, content)
+	}
+	if got := hits[directPath].Load(); got != 2 {
+		t.Fatalf("release download hits = %d, want 2", got)
+	}
+}
+
+func TestResolveReleaseBinaryFetchesThroughTheAPIWhenTheDownloadHostKeepsFailing(t *testing.T) {
+	content := []byte("#!/bin/sh\necho through the api\n")
+	store, opt, hits := serveRoutes(t, map[string]http.HandlerFunc{
+		directPath: status(http.StatusGatewayTimeout),
+		tagPath:    releaseByTag,
+		assetPath: func(w http.ResponseWriter, r *http.Request) {
+			if got := r.Header.Get("Accept"); got != "application/octet-stream" {
+				t.Errorf("Accept = %q, want application/octet-stream", got)
+			}
+			if got := r.Header.Get("Authorization"); got != "Bearer from-source" {
+				t.Errorf("Authorization = %q, want Bearer from-source", got)
+			}
+			serve(content)(w, r)
+		},
+	})
+	source := WithGitHubTokenSource(func(context.Context) string { return "from-source" })
+
+	path, err := store.Resolve(context.Background(), releaseDescriptor(t, rawEntry(content)), opt, source)
+	if err != nil {
+		t.Fatalf("Resolve() = %v", err)
+	}
+	if got, _ := os.ReadFile(path); string(got) != string(content) {
+		t.Fatalf("materialized content = %q, want %q", got, content)
+	}
+	if got := hits[directPath].Load(); got != downloadAttempts {
+		t.Fatalf("release download hits = %d, want %d", got, downloadAttempts)
+	}
+}
+
+func TestResolveReleaseBinaryDoesNotRetryANotFound(t *testing.T) {
+	content := []byte("#!/bin/sh\necho moved\n")
+	store, opt, hits := serveRoutes(t, map[string]http.HandlerFunc{
+		directPath: status(http.StatusNotFound),
+		tagPath:    releaseByTag,
+		assetPath:  serve(content),
+	})
+
+	if _, err := store.Resolve(context.Background(), releaseDescriptor(t, rawEntry(content)), opt); err != nil {
+		t.Fatalf("Resolve() = %v", err)
+	}
+	if got := hits[directPath].Load(); got != 1 {
+		t.Fatalf("release download hits = %d, want 1", got)
+	}
+}
+
+func TestResolveReleaseBinaryReportsErrDownloadWhenEveryRouteFails(t *testing.T) {
+	content := []byte("#!/bin/sh\necho never\n")
+	store, opt, hits := serveRoutes(t, map[string]http.HandlerFunc{
+		directPath: status(http.StatusGatewayTimeout),
+		tagPath:    releaseByTag,
+		assetPath:  status(http.StatusBadGateway),
+	})
+
+	_, err := store.Resolve(context.Background(), releaseDescriptor(t, rawEntry(content)), opt)
+	if !errors.Is(err, ErrDownload) {
+		t.Fatalf("Resolve() = %v, want ErrDownload", err)
+	}
+	if msg := err.Error(); !strings.Contains(msg, "504") || !strings.Contains(msg, "502") || strings.Contains(msg, "\n") {
+		t.Fatalf("Resolve() = %q, want both routes' statuses on one line", msg)
+	}
+	if got := hits[assetPath].Load(); got != downloadAttempts {
+		t.Fatalf("API asset hits = %d, want %d", got, downloadAttempts)
+	}
+}
+
+func TestResolveReleaseBinaryVerifiesTheAPIRouteAgainstThePinnedDigest(t *testing.T) {
+	pinned := []byte("aaaaaa")
+	store, opt, _ := serveRoutes(t, map[string]http.HandlerFunc{
+		directPath: status(http.StatusGatewayTimeout),
+		tagPath:    releaseByTag,
+		assetPath:  serve([]byte("bbbbbb")),
+	})
+
+	_, err := store.Resolve(context.Background(), releaseDescriptor(t, rawEntry(pinned)), opt)
+	if !errors.Is(err, ErrChecksumMismatch) || errors.Is(err, ErrDownload) {
+		t.Fatalf("Resolve() = %v, want ErrChecksumMismatch alone", err)
 	}
 }
