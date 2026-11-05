@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/durable"
+	"github.com/yasyf/daemonkit/ghrelease"
 	"github.com/yasyf/daemonkit/internal/flock"
 	"github.com/yasyf/daemonkit/internal/realhome"
 )
@@ -120,6 +122,7 @@ type Option func(*options)
 type options struct {
 	httpClient  *http.Client
 	githubToken string
+	tokenSource func(context.Context) string
 	uv          string
 }
 
@@ -138,6 +141,13 @@ func (o options) http() *http.Client {
 	return defaultDownloadClient
 }
 
+func (o options) apiToken(ctx context.Context) string {
+	if o.githubToken != "" || o.tokenSource == nil {
+		return o.githubToken
+	}
+	return o.tokenSource(ctx)
+}
+
 func (o options) uvExecutable() string {
 	if o.uv != "" {
 		return o.uv
@@ -150,6 +160,14 @@ func WithHTTPClient(c *http.Client) Option { return func(o *options) { o.httpCli
 
 // WithGitHubToken authenticates github-release downloads.
 func WithGitHubToken(token string) Option { return func(o *options) { o.githubToken = token } }
+
+// WithGitHubTokenSource supplies a token for the GitHub API download route,
+// read only when the release download host has failed and only when no
+// WithGitHubToken token is set. An empty token sends the request
+// unauthenticated.
+func WithGitHubTokenSource(source func(context.Context) string) Option {
+	return func(o *options) { o.tokenSource = source }
+}
 
 // WithUV overrides the uv executable used by the python-tool backend.
 func WithUV(path string) Option { return func(o *options) { o.uv = path } }
@@ -171,9 +189,65 @@ func writeCacheMeta(digestDir string, meta cacheMeta) error {
 	return durable.WriteFile(filepath.Join(digestDir, "meta.json"), append(data, '\n'), 0o600)
 }
 
-func download(ctx context.Context, client *http.Client, url, token string, dst *os.File) (digest string, size int64, err error) {
-	ctx, cancel := context.WithTimeout(ctx, materializeLockDeadline)
+func fetchAsset(parent context.Context, provider Provider, o options, path string) (digest string, size int64, err error) {
+	ctx, cancel := context.WithTimeout(parent, materializeLockDeadline)
 	defer cancel()
+	direct, err := provider.URL()
+	if err != nil {
+		return "", 0, err
+	}
+	digest, size, directErr := retryDownload(ctx, func() (string, int64, error) {
+		return download(ctx, o.http(), direct, o.githubToken, "", path)
+	})
+	if directErr == nil || parent.Err() != nil {
+		return digest, size, directErr
+	}
+	token := o.apiToken(ctx)
+	digest, size, apiErr := retryDownload(ctx, func() (string, int64, error) {
+		release, err := (ghrelease.Client{HTTPClient: o.http(), Token: token}).Tagged(ctx, provider.Repo, provider.Tag)
+		if err != nil {
+			return "", 0, retryable{err}
+		}
+		for _, asset := range release.Assets {
+			if asset.Name == provider.Name {
+				return download(ctx, o.http(), asset.APIURL, token, "application/octet-stream", path)
+			}
+		}
+		return "", 0, fmt.Errorf("artifact: release %s of %q has no asset %q", provider.Tag, provider.Repo, provider.Name)
+	})
+	if apiErr != nil {
+		return "", 0, fmt.Errorf("%w: %w; through the GitHub API: %w", ErrDownload, directErr, apiErr)
+	}
+	slog.Warn("artifact: release download failed, fetched through the GitHub API", "asset", provider.Name, "error", directErr)
+	return digest, size, nil
+}
+
+var downloadBackoff = time.Second
+
+const downloadAttempts = 3
+
+type retryable struct{ error }
+
+func (r retryable) Unwrap() error { return r.error }
+
+func retryDownload(ctx context.Context, attempt func() (string, int64, error)) (string, int64, error) {
+	for i := 1; ; i++ {
+		digest, size, err := attempt()
+		if err == nil {
+			return digest, size, nil
+		}
+		if i == downloadAttempts || !errors.As(err, new(retryable)) || ctx.Err() != nil {
+			return "", 0, fmt.Errorf("attempt %d: %w", i, err)
+		}
+		select {
+		case <-ctx.Done():
+			return "", 0, fmt.Errorf("attempt %d: %w; %w", i, err, ctx.Err())
+		case <-time.After(downloadBackoff << (i - 1)):
+		}
+	}
+}
+
+func download(ctx context.Context, client *http.Client, url, token, accept, path string) (digest string, size int64, err error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", 0, fmt.Errorf("artifact: build request: %w", err)
@@ -181,19 +255,33 @@ func download(ctx context.Context, client *http.Client, url, token string, dst *
 	if token != "" {
 		request.Header.Set("Authorization", "Bearer "+token)
 	}
+	if accept != "" {
+		request.Header.Set("Accept", accept)
+	}
 	response, err := client.Do(request)
 	if err != nil {
-		return "", 0, fmt.Errorf("artifact: download %q: %w", url, err)
+		return "", 0, retryable{fmt.Errorf("artifact: download %q: %w", url, err)}
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return "", 0, fmt.Errorf("artifact: download %q: status %s", url, response.Status)
+		err := fmt.Errorf("artifact: download %q: status %s", url, response.Status)
+		if response.StatusCode >= http.StatusInternalServerError || response.StatusCode == http.StatusTooManyRequests {
+			return "", 0, retryable{err}
+		}
+		return "", 0, err
+	}
+	dst, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0)
+	if err != nil {
+		return "", 0, fmt.Errorf("artifact: open download temp: %w", err)
 	}
 	hash := sha256.New()
 	written, copyErr := io.Copy(io.MultiWriter(dst, hash), response.Body)
 	syncErr := dst.Sync()
 	closeErr := dst.Close()
-	if err := errors.Join(copyErr, syncErr, closeErr); err != nil {
+	if copyErr != nil {
+		return "", 0, retryable{fmt.Errorf("artifact: stream download %q: %w", url, copyErr)}
+	}
+	if err := errors.Join(syncErr, closeErr); err != nil {
 		return "", 0, fmt.Errorf("artifact: stream download: %w", err)
 	}
 	return hex.EncodeToString(hash.Sum(nil)), written, nil

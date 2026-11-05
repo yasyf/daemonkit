@@ -11,8 +11,12 @@
 // # Kinds
 //
 // ReleaseBinary resolves a github-release asset pinned by exact tag and sha256.
-// It downloads with hash-while-streaming, verifies size and digest before any
-// rename, and stores the result in a content-addressed cache under
+// It downloads with hash-while-streaming, retrying a 5xx, a 429, or a transport
+// failure with backoff; when the release download host still fails, it fetches
+// the same asset through the GitHub API, authenticated by WithGitHubToken or
+// WithGitHubTokenSource, and reports ErrDownload only once both routes fail.
+// Either route's bytes are verified for size and digest before any rename, and
+// it stores the result in a content-addressed cache under
 // Store.CacheDir as cache/<first-two-hex>/<digest>/<path>; the verified rename is
 // the receipt, and a sibling meta.json records provenance. A second resolution
 // is a stat-and-return cache hit. Store.CacheEntries and Store.RemoveCacheEntry

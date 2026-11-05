@@ -54,10 +54,6 @@ func cacheHit(digestDir, target string) bool {
 }
 
 func (s Store) materializeReleaseBinary(ctx context.Context, desc *Descriptor, entry PlatformEntry, digestDir string, o options) error {
-	url, err := entry.Providers[0].URL()
-	if err != nil {
-		return err
-	}
 	shardDir := filepath.Dir(digestDir)
 	if err := os.MkdirAll(shardDir, 0o750); err != nil {
 		return fmt.Errorf("artifact: create cache shard: %w", err)
@@ -78,8 +74,11 @@ func (s Store) materializeReleaseBinary(ctx context.Context, desc *Descriptor, e
 	}
 	tmpPath := tmp.Name()
 	defer func() { _ = os.Remove(tmpPath) }()
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("artifact: close download temp: %w", err)
+	}
 
-	digest, size, err := download(ctx, o.http(), url, o.githubToken, tmp)
+	digest, size, err := fetchAsset(ctx, entry.Providers[0], o, tmpPath)
 	if err != nil {
 		return err
 	}

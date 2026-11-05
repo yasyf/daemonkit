@@ -16,6 +16,10 @@ var (
 	ErrDynamicIntegrity = errors.New("artifact: dynamic version requires an independent integrity gate")
 	// ErrUnsupportedPlatform means a descriptor has no entry for the running host.
 	ErrUnsupportedPlatform = errors.New("artifact: no entry for the current platform")
+	// ErrDownload means every route to a release asset failed before any bytes
+	// could be verified; a verified mismatch is ErrChecksumMismatch or
+	// ErrSizeMismatch instead.
+	ErrDownload = errors.New("artifact: download failed")
 	// ErrChecksumMismatch means a downloaded artifact's sha256 did not match the
 	// descriptor.
 	ErrChecksumMismatch = errors.New("artifact: artifact checksum mismatch")
