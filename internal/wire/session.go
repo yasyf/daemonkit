@@ -544,10 +544,14 @@ func rejectionCode(err error) (ResponseCode, bool) {
 }
 
 func terminalCode(err error) ResponseCode {
-	if errors.Is(err, context.DeadlineExceeded) {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
 		return ResponseCodeDeadlineExceeded
+	case errors.Is(err, context.Canceled):
+		return ResponseCodeCancelled
+	default:
+		return ""
 	}
-	return ""
 }
 
 func (s *session) sendValue(

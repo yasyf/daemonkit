@@ -252,6 +252,7 @@
 .	method	Tracked.PID	all
 .	method	Tracked.Release	all
 .	method	Tracked.Stop	all
+.	func	Unanswered	all
 .	func	Undispatched	all
 artifact	type	AppSpec	all
 artifact	field	AppSpec.AppName	all

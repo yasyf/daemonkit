@@ -78,8 +78,10 @@ var (
 // RemoteError is the daemon session's own failure on a request it admitted,
 // not the product's *ProductError. Err is what the response code classified
 // Message as — context.DeadlineExceeded when the conveyed deadline ended on
-// the serving side. It proves the daemon answered; its absence proves
-// nothing, one conveyed deadline ending on both sides at once.
+// the serving side, context.Canceled when that side cancelled the handler
+// before it answered, as a draining daemon does. It proves the daemon
+// answered; its absence proves nothing, one conveyed deadline ending on both
+// sides at once.
 type RemoteError struct {
 	Message string
 	Err     error

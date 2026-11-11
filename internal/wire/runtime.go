@@ -117,6 +117,11 @@ const (
 	// ever ran: a request still waiting on the concurrency semaphore is
 	// abandoned under the same code.
 	ResponseCodeDeadlineExceeded ResponseCode = "deadline_exceeded"
+	// ResponseCodeCancelled identifies an admitted request the serving side
+	// cancelled before it answered, as a draining daemon does to a handler
+	// still running when its requests share ends. Like a deadline it is no
+	// rejection: the handler may have done some or all of its work.
+	ResponseCodeCancelled ResponseCode = "cancelled"
 )
 
 // Request is one admitted request on a persistent session.
@@ -192,6 +197,8 @@ func responseCodeCause(code ResponseCode) error {
 		return ErrHandoffReplay
 	case ResponseCodeDeadlineExceeded:
 		return context.DeadlineExceeded
+	case ResponseCodeCancelled:
+		return context.Canceled
 	default:
 		return nil
 	}

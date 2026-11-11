@@ -24,6 +24,7 @@ public struct SocketResponseCode: RawRepresentable, Equatable, Hashable, Sendabl
     public static let handoffReplay = SocketResponseCode(rawValue: "handoff_replay")
     public static let handoffSessionExhausted = SocketResponseCode(rawValue: "handoff_session_exhausted")
     public static let deadlineExceeded = SocketResponseCode(rawValue: "deadline_exceeded")
+    public static let cancelled = SocketResponseCode(rawValue: "cancelled")
 }
 
 /// The server's typed handshake rejection.
