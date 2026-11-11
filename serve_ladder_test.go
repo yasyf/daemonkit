@@ -178,7 +178,11 @@ func TestServeJoinsRequestsCancelledAtTheShare(t *testing.T) {
 	if err := business.WaitReady(ctx); err != nil {
 		t.Fatalf("WaitReady() = %v", err)
 	}
-	go func() { _, _ = business.Call(ctx, "product.block.v1", nil) }()
+	answered := make(chan wire.Result, 1)
+	go func() {
+		result, _ := business.Call(ctx, "product.block.v1", nil)
+		answered <- result
+	}()
 	<-product.admitted
 	control := awaitSession(t, socket)
 	if _, err := control.Drain(ctx); err != nil {
@@ -193,6 +197,14 @@ func TestServeJoinsRequestsCancelledAtTheShare(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
 		t.Fatal("Serve parked over a request it had cancelled and whose handler had returned")
+	}
+	result := <-answered
+	terminal := result.Terminal()
+	if result.Outcome != wire.Delivered || terminal == nil || terminal.Code != wire.ResponseCodeCancelled {
+		t.Fatalf("Call() = %+v, want a delivered terminal with code %q", result, wire.ResponseCodeCancelled)
+	}
+	if !errors.Is(terminal, context.Canceled) {
+		t.Fatalf("errors.Is(%v, context.Canceled) = false, want true", terminal)
 	}
 }
 

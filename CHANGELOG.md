@@ -6,6 +6,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-11-11
+
+### Added
+
+- A request the serving side cancels before it answers, as a draining daemon
+  does to a handler still running when its requests share ends, now answers
+  with the response code `cancelled`, and its `*RemoteError` unwraps to
+  `context.Canceled`. A caller can tell a drain's cut from any other remote
+  failure with `errors.Is(err, context.Canceled)`, after ruling out its own
+  context. Before, the cut carried no code, so the caller read only the text
+  "context canceled". A client of an earlier release reads the new code as it
+  read the uncoded failure before, with no cause.
+- `Unanswered(err)` reports a call whose request was written and whose
+  terminal never came back, such as one whose daemon was killed mid-call, the
+  counterpart of `Undispatched`: the request may have run, so only a product
+  whose handler recognises a repeat resends it.
+
 ## [0.37.0] - 2026-11-05
 
 ### Added
@@ -1957,7 +1974,8 @@ Initial release: the fleet's detached-daemon + signed-app pattern as one Go modu
 - Swift `DaemonKit`: `SocketServer` with `PeerTrust` (audit-token codesign check over the same EUID-floor posture as Go `trust`), `SnapshotWatcher`, `LoginItem`, `RealHome`, `ReloadCoalescer`, and the generated `LifecycleWire`.
 - `templates/release.yml.tmpl`: the caller workflow consumers use to release signed, notarized apps through the shared tap pipeline.
 
-[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.37.0...HEAD
+[Unreleased]: https://github.com/yasyf/daemonkit/compare/v0.38.0...HEAD
+[0.38.0]: https://github.com/yasyf/daemonkit/compare/v0.37.0...v0.38.0
 [0.37.0]: https://github.com/yasyf/daemonkit/compare/v0.36.3...v0.37.0
 [0.36.3]: https://github.com/yasyf/daemonkit/compare/v0.36.2...v0.36.3
 [0.36.2]: https://github.com/yasyf/daemonkit/compare/v0.36.1...v0.36.2

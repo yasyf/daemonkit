@@ -257,9 +257,10 @@ func BusinessOverConn(ctx context.Context, conn net.Conn, contract Contract) (*B
 // ErrProtocolMismatch, and ErrOversize are typed refusals that provably never
 // dispatched, as is a daemon refusing this lane's schema; *ProductError is the product's own delivered
 // failure and *RemoteError the daemon session's, unwrapping to
-// context.DeadlineExceeded when the conveyed deadline ended on that side;
+// context.DeadlineExceeded when the conveyed deadline ended on that side and
+// to context.Canceled when that side cancelled the handler, as a drain does;
 // anything else is transport loss or the caller's own expired context, with
-// delivery unknown.
+// delivery unknown (Unanswered).
 func (b *Business) Call(ctx context.Context, op string, body []byte) (Reply, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		return Reply{}, errors.New("daemonkit: Call requires a context deadline")
@@ -443,6 +444,20 @@ func Undispatched(err error) bool {
 		return false
 	}
 	return call.outcome.Replayable()
+}
+
+// Unanswered reports whether err proves the request was written and no
+// terminal came back, as when the daemon is killed mid-call: it may have been
+// dispatched, and nothing says how far it got. The caller's own expired
+// context ends a call the same way, so a caller that resends on Unanswered
+// first rules out its own context, and resends only a request whose handler
+// can tell a repeat from a first attempt.
+func Unanswered(err error) bool {
+	var call *callError
+	if !errors.As(err, &call) {
+		return false
+	}
+	return call.outcome == wire.PostSendFailure || call.outcome == wire.DeliveryUnknown
 }
 
 // handleBusiness is the one terminal encode both business servers share, so a

@@ -560,6 +560,30 @@ func TestUndispatchedReadsTheTransportsOwnOutcome(t *testing.T) {
 	}
 }
 
+func TestUnansweredReadsTheTransportsOwnOutcome(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"a foreign error proves nothing", errors.New("something"), false},
+		{"never written", refused(ErrAbsent), false},
+		{"rejected", &callError{outcome: wire.Rejected, err: ErrNotReady}, false},
+		{"delivered", &callError{outcome: wire.Delivered, err: &RemoteError{Message: "context canceled", Err: context.Canceled}}, false},
+		{"sent, no terminal", &callError{outcome: wire.PostSendFailure, err: errors.New("lost")}, true},
+		{"delivery unknown", &callError{outcome: wire.DeliveryUnknown, err: errors.New("lost")}, true},
+		{"wrapped", fmt.Errorf("outer: %w", &callError{outcome: wire.PostSendFailure, err: errors.New("lost")}), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := Unanswered(tt.err); got != tt.want {
+				t.Fatalf("Unanswered(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestClientBusinessPerformsNoIO(t *testing.T) {
 	client, err := Open(Daemon{
 		Label:   "com.yasyf.daemonkit.business",
