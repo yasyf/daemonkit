@@ -81,6 +81,7 @@
 .	field	Daemon.Log	all
 .	field	Daemon.MaxFrame	all
 .	field	Daemon.Program	all
+.	method	Daemon.ProgramPath	all
 .	method	Daemon.RecordPath	all
 .	field	Daemon.Restart	all
 .	field	Daemon.Schemas	all
