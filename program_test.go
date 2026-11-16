@@ -78,6 +78,23 @@ func TestTwoDaemonsCannotShareAProgramPath(t *testing.T) {
 	}
 }
 
+func TestProgramPathNamesWhatLaunchdRuns(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv(realhome.EnvOverride, home)
+	d := Daemon{Label: "com.example.one", Program: stable(t, "1.0.0")}
+	agent, err := d.agent()
+	if err != nil {
+		t.Fatalf("agent() error = %v", err)
+	}
+	got, err := d.ProgramPath()
+	if err != nil {
+		t.Fatalf("ProgramPath() error = %v", err)
+	}
+	if want := filepath.Join(home, ".daemonkit", "bin", "com.example.one"); got != want || got != agent.Program {
+		t.Fatalf("ProgramPath() = %q, want %q, the program launchd runs (%q)", got, want, agent.Program)
+	}
+}
+
 func TestStableRefusesAnUnnamedBuild(t *testing.T) {
 	if _, err := Stable(""); err == nil {
 		t.Fatal("Stable(\"\") succeeded, want a refusal: the version string is the whole build identity")

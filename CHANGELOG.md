@@ -6,6 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Daemon.ProgramPath` names the executable launchd runs for a daemon. For a
+  `Stable` program that is the copy at `~/.daemonkit/bin/<Label>`, which holds
+  whichever build was placed last, so a client that will not place its own
+  build can find and run the one already there.
+
 ### Security
 
 - Builds with Go 1.26.11, which fixes GO-2026-6859 in `net/http`.

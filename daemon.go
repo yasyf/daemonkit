@@ -72,6 +72,18 @@ func (e element) record() string { return filepath.Join(e.state().StateDir(), "d
 // unchecked join here, and the file it names is not one to read.
 func (d Daemon) RecordPath() string { return element{label: string(d.Label)}.record() }
 
+// ProgramPath is where launchd runs this daemon's executable from: for a
+// Stable program, the copy Ensure keeps at ~/.daemonkit/bin/<Label>, whichever
+// build last placed it. A launcher that refuses to place its own build reads
+// the build already placed there and can run that instead.
+func (d Daemon) ProgramPath() (string, error) {
+	el, err := d.Label.element()
+	if err != nil {
+		return "", err
+	}
+	return d.Program.path(el)
+}
+
 // ShutdownGrace is the budget this daemon's shutdown ladder runs on: Shutdown,
 // or 30s when unset. A drain that has not exited past it has abandoned a stage
 // and parked, which is the moment a deploy escalates.
